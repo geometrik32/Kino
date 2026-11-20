@@ -6,7 +6,7 @@ use kino_core::{
     episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
     TracksUpdate,
 };
-use kino_ui::{PlayerMenu, PlayerState, PlayerView};
+use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView};
 
 use crate::{api, native, platform, platform::video::video, telegram};
 
@@ -36,6 +36,18 @@ fn release_label(r: &ReleaseChoiceUpdate) -> String {
         _ => r.title.clone().unwrap_or_default(),
     }
 }
+
+/// Gives the screen back (rotation, system bars) when the player goes away.
+struct PlayerModeGuard;
+
+impl Drop for PlayerModeGuard {
+    fn drop(&mut self) {
+        platform::player_mode(false);
+    }
+}
+
+/// How long the controls stay on screen while a film plays, milliseconds.
+const CONTROLS_MS: u32 = 3_500;
 
 /// Leaves Telegram's full screen when the player goes away.
 struct FullscreenGuard;
@@ -75,6 +87,60 @@ pub fn Player(
     let mut last_saved = use_signal(|| 0.0_f64);
     let device = use_hook(device_name);
     platform::video::use_bridge();
+    // Finger or mouse: a tap on the picture shows the controls on a phone, pauses on a computer.
+    let touch = use_resource(platform::touch_screen);
+    // Bumped on every touch so that a stale timer does not hide the controls.
+    let mut interaction = use_signal(|| 0u32);
+    let mut flash_gen = use_signal(|| 0u32);
+    let mut rate = use_signal(|| 1.0_f32);
+    // The episodes of the season being watched, with the ones already seen.
+    let season_list = {
+        let token = token.clone();
+        use_resource(move || {
+            let token = token.clone();
+            let (season, _) = target();
+            async move {
+                if kind != MediaKind::Tv {
+                    return Vec::new();
+                }
+                let Ok(list) = api::season(&token, id, season).await else {
+                    return Vec::new();
+                };
+                let seen: Vec<i32> = api::title_progress(&token, kind, id)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|p| p.season == season && p.finished)
+                    .map(|p| p.episode)
+                    .collect();
+                list.episodes
+                    .iter()
+                    .map(|e| PlayerEpisode {
+                        number: e.number,
+                        title: e.name.clone(),
+                        watched: seen.contains(&e.number),
+                    })
+                    .collect()
+            }
+        })
+    };
+
+    // Shows the controls and hides them again after a few seconds of playing.
+    let mut show_controls = move || {
+        ui.with_mut(|s| s.controls = true);
+        let n = interaction() + 1;
+        interaction.set(n);
+        spawn(async move {
+            platform::sleep(CONTROLS_MS).await;
+            if interaction() == n {
+                ui.with_mut(|s| {
+                    if !s.paused && s.menu.is_none() {
+                        s.controls = false;
+                    }
+                });
+            }
+        });
+    };
 
     // Points the video at the right source for the given audio track and second.
     let mut load_source = move |at: f64| {
@@ -286,6 +352,10 @@ pub fn Player(
                     if let Some(at) = pending_seek.take() {
                         v.set_current_time(at);
                     }
+                    // A new source starts at normal speed.
+                    if (rate() - 1.0).abs() > 0.001 {
+                        v.set_rate(f64::from(rate()));
+                    }
                 }
                 "waiting" => ui.with_mut(|s| s.waiting = true),
                 "playing" | "play" => ui.with_mut(|s| {
@@ -338,11 +408,106 @@ pub fn Player(
         }
         std::rc::Rc::new(FullscreenGuard)
     });
+    // Films are watched sideways: the phone turns, the bars go.
+    use_hook(|| {
+        platform::player_mode(true);
+        std::rc::Rc::new(PlayerModeGuard)
+    });
+    use_hook(show_controls);
+
+    // Jump by seconds from the current place (double tap, buttons).
+    let mut jump = move |by: f64| {
+        let s = ui.peek().clone();
+        let at = s.position + by;
+        let at = match s.duration {
+            Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
+            None => at.max(0.0),
+        };
+        if s.transcoded {
+            load_source(at);
+        } else if let Some(v) = video() {
+            v.set_current_time(at);
+            ui.with_mut(|s| s.position = at);
+        }
+    };
+    // Plays episode `n` of the current season.
+    let mut play_episode = {
+        let mut save = save.clone();
+        let mut begin = begin.clone();
+        move |n: i32| {
+            let (season, current) = target();
+            if n == current {
+                ui.with_mut(|s| s.menu = None);
+                return;
+            }
+            save(false);
+            target.set((season, n));
+            begin();
+        }
+    };
+
+    // What the view shows: our state plus the episode list and the current episode.
+    let shown = {
+        let mut st = ui();
+        let (season, episode) = target();
+        st.season = season;
+        st.episode = episode;
+        st.rate = rate();
+        st.episodes = season_list.read().clone().unwrap_or_default();
+        st
+    };
+    let finger = touch.read().unwrap_or(false);
 
     rsx! {
         native::BackButton { on_back: move |_| close.call(()) }
         PlayerView {
-            state: ui(),
+            state: shown,
+            on_tap: move |_| {
+                if ui.peek().menu.is_some() {
+                    ui.with_mut(|s| s.menu = None);
+                } else if finger {
+                    if ui.peek().controls {
+                        ui.with_mut(|s| s.controls = false);
+                    } else {
+                        show_controls();
+                    }
+                } else {
+                    // Mouse: a click on the picture pauses or resumes.
+                    if let Some(v) = video() {
+                        if v.paused() { v.play() } else { v.pause() }
+                    }
+                }
+            },
+            on_double_tap: move |forward: bool| {
+                jump(if forward { 10.0 } else { -10.0 });
+                let n = flash_gen() + 1;
+                flash_gen.set(n);
+                ui.with_mut(|s| {
+                    let total = match s.flash {
+                        Some((f, secs)) if f == forward => secs + 10,
+                        _ => 10,
+                    };
+                    s.flash = Some((forward, total));
+                });
+                spawn(async move {
+                    platform::sleep(700).await;
+                    if flash_gen() == n {
+                        ui.with_mut(|s| s.flash = None);
+                    }
+                });
+            },
+            on_speed: move |r: f32| {
+                rate.set(r);
+                ui.with_mut(|s| s.menu = None);
+                if let Some(v) = video() {
+                    v.set_rate(f64::from(r));
+                }
+            },
+            on_episode: move |n: i32| play_episode(n),
+            on_pick_release: move |_| {
+                let (season, episode) = target();
+                on_need_release.call((season, episode));
+            },
             on_toggle: move |_| {
                 if let Some(v) = video() {
                     if v.paused() {
@@ -365,7 +530,19 @@ pub fn Player(
                     ui.with_mut(|s| s.position = at);
                 }
             },
-            on_menu: move |m: Option<PlayerMenu>| ui.with_mut(|s| s.menu = m),
+            on_menu: move |m: Option<PlayerMenu>| {
+                ui.with_mut(|s| s.menu = m);
+                show_controls();
+                if m == Some(PlayerMenu::Episodes) {
+                    // The list is long: bring the current episode into view.
+                    spawn(async move {
+                        platform::sleep(50).await;
+                        let _ = dioxus::document::eval(
+                            "var e = document.querySelector('.p-menu .p-opt.on'); if (e) { e.scrollIntoView({ block: 'center' }); }",
+                        );
+                    });
+                }
+            },
             on_audio: {
                 let save_tracks = save_tracks.clone();
                 move |a: i32| {
