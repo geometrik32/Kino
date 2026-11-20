@@ -30,9 +30,8 @@ jobs:
       # ffmpeg: for the test that re-encodes a real video. libmpv: for the player test.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg libmpv2
       - run: cargo fmt --all --check
-      # The Windows app is checked by desktop.yml (it needs the GUI libraries of its platform).
-      - run: cargo clippy --workspace --exclude kino-desktop --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --exclude kino-desktop --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
       - run: cargo clippy -p kino-app --target wasm32-unknown-unknown --locked -- -D warnings
 
   image:

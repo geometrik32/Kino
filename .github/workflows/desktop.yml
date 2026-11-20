@@ -41,9 +41,9 @@ jobs:
         shell: bash
         run: echo "v=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
 
-      - run: cargo clippy -p kino-desktop -p kino-mpv --all-targets --locked -- -D warnings
-      - run: cargo test -p kino-desktop -p kino-mpv --locked
-      - run: cargo build --release -p kino-desktop --locked
+      - run: cargo clippy -p kino-app -p kino-mpv --no-default-features --features desktop --all-targets --locked -- -D warnings
+      - run: cargo test -p kino-app -p kino-mpv --no-default-features --features desktop --locked
+      - run: cargo build --release -p kino-app --no-default-features --features desktop --locked
 
       # libmpv: the video player library, built for Windows by the mpv project's community.
       - name: Fetch libmpv
@@ -60,7 +60,7 @@ jobs:
           $dll = Get-ChildItem mpv-dev -Recurse -Filter 'libmpv-2.dll' | Select-Object -First 1
           if (-not $dll) { throw "libmpv-2.dll not found in the archive" }
           Copy-Item $dll.FullName stage/libmpv-2.dll
-          Copy-Item target/release/orel-kino.exe stage/orel-kino.exe
+          Copy-Item target/release/kino-app.exe stage/orel-kino.exe
 
       - name: Installer
         shell: pwsh
