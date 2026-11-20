@@ -2,6 +2,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod config;
+#[allow(dead_code)] // wired to the player screen once the shared app layer lands
+mod native;
 
 use dioxus::desktop::{tao::window::Icon, Config as WindowConfig, LogicalSize, WindowBuilder};
 use dioxus::prelude::*;
