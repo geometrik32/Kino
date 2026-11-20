@@ -42,7 +42,7 @@ services:
       - "${RENDER_GID:-107}"
     volumes:
       # Preloaded releases, the same folder qBittorrent downloads into.
-      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads:ro
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads:ro
     networks: [kino, proxy]
     labels:
       traefik.enable: "true"
@@ -114,7 +114,7 @@ services:
       WEBUI_PORT: "8085"
     volumes:
       - ./data/qbittorrent:/config
-      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads
     ports:
       - "8085:8085"
       - "6882:6882"
