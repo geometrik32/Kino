@@ -10,12 +10,13 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, Role, WatchlistItem, WebAppAuthRequest,
-    WidgetAuthRequest,
+    AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ProgressUpdate, Role, SearchResults, Season,
+    TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    catalog::{Catalog, CatalogError},
     config::Config,
     db::{self, LoginOutcome, Pool},
     error::AppError,
@@ -27,6 +28,7 @@ use crate::{
 pub struct AppState {
     pub pool: Pool,
     pub config: Arc<Config>,
+    pub catalog: Arc<dyn Catalog>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -45,6 +47,11 @@ pub fn router() -> Router<AppState> {
             put(watchlist_add).delete(watchlist_remove),
         )
         .route("/invites", post(create_invite))
+        .route("/catalog/home", get(catalog_home))
+        .route("/catalog/search", get(catalog_search))
+        .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
+        .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
+        .route("/img/{size}/{file}", get(image))
 }
 
 /// The logged-in user, from `Authorization: Bearer <token>`.
@@ -125,7 +132,17 @@ async fn continue_watching(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Json<Vec<ContinueItem>>, AppError> {
-    Ok(Json(db::continue_watching(&state.pool, user.0, 20).await?))
+    let mut items = db::continue_watching(&state.pool, user.0, 20).await?;
+    // Names and posters; a title the catalog can't resolve still shows, just without them.
+    for item in &mut items {
+        item.title = state
+            .catalog
+            .details(item.last.kind, item.last.tmdb_id)
+            .await
+            .ok()
+            .map(|d| d.summary);
+    }
+    Ok(Json(items))
 }
 
 fn validate(u: &ProgressUpdate) -> Result<(), AppError> {
@@ -233,4 +250,78 @@ async fn create_invite(State(state): State<AppState>, user: CurrentUser) -> Resu
     let code = db::create_invite(&state.pool, Some(me.id)).await?;
     let link = format!("{}/?invite={code}", state.config.public_url);
     Ok(Json(InviteResponse { code, link }))
+}
+
+impl From<CatalogError> for AppError {
+    fn from(e: CatalogError) -> Self {
+        match e {
+            CatalogError::NotFound => AppError::not_found(),
+            CatalogError::Upstream(msg) => {
+                tracing::warn!(error = %msg, "catalog request failed");
+                AppError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "catalog_unavailable",
+                    "Каталог сейчас недоступен",
+                )
+            }
+        }
+    }
+}
+
+async fn catalog_home(State(state): State<AppState>, _user: CurrentUser) -> Result<Json<HomeFeed>, AppError> {
+    Ok(Json(state.catalog.home().await?))
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    #[serde(default)]
+    q: String,
+}
+
+async fn catalog_search(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    axum::extract::Query(query): axum::extract::Query<SearchQuery>,
+) -> Result<Json<SearchResults>, AppError> {
+    if query.q.chars().count() > 200 {
+        return Err(AppError::bad_request("query is too long"));
+    }
+    Ok(Json(state.catalog.search(&query.q).await?))
+}
+
+async fn catalog_details(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+) -> Result<Json<TitleDetails>, AppError> {
+    Ok(Json(state.catalog.details(parse_kind(&kind)?, tmdb_id).await?))
+}
+
+async fn catalog_season(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((tmdb_id, number)): Path<(i64, i32)>,
+) -> Result<Json<Season>, AppError> {
+    Ok(Json(state.catalog.season(tmdb_id, number).await?))
+}
+
+/// Image proxy. Public (an `<img>` can't send a token) and cacheable for a year,
+/// since TMDB image paths never change content.
+async fn image(
+    State(state): State<AppState>,
+    Path((size, file)): Path<(String, String)>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::response::IntoResponse;
+    let (bytes, ctype) = state.catalog.image(&size, &file).await?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, ctype),
+            (
+                axum::http::header::CACHE_CONTROL,
+                "public, max-age=31536000, immutable".to_owned(),
+            ),
+        ],
+        bytes,
+    )
+        .into_response())
 }

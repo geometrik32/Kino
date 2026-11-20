@@ -1,0 +1,11 @@
+[package]
+name = "kino-ui"
+description = "Kino screens and widgets as Dioxus components (shared by the web app and the preview tool)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kino-core.workspace = true
+dioxus = { version = "0.7", default-features = false, features = ["macro", "html", "signals", "hooks"] }

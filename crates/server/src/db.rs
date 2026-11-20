@@ -229,7 +229,11 @@ pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Resul
         .map(|row| {
             let last = progress_from_row(row)?;
             let next_episode = (last.kind == MediaKind::Tv && last.finished).then_some((last.season, last.episode + 1));
-            Ok(ContinueItem { last, next_episode })
+            Ok(ContinueItem {
+                last,
+                next_episode,
+                title: None,
+            })
         })
         .collect()
 }

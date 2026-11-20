@@ -88,6 +88,9 @@ pub struct ContinueItem {
     /// For a series whose last episode is finished: the episode to play next
     /// (same season, episode + 1). The client checks it against TMDB.
     pub next_episode: Option<(i32, i32)>,
+    /// Name and poster, filled in by the server from the catalog.
+    #[serde(default)]
+    pub title: Option<TitleSummary>,
 }
 
 /// An entry of the "Want to watch" list.
@@ -162,5 +165,137 @@ mod tests {
             assert_eq!(MediaKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(MediaKind::parse("anime"), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (metadata from TMDB)
+// ---------------------------------------------------------------------------
+
+/// A title as shown on a poster card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TitleSummary {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    /// Localised title (Russian when TMDB has it).
+    pub title: String,
+    pub original_title: Option<String>,
+    pub year: Option<i32>,
+    /// TMDB image path such as `/abc.jpg`; see [`image_url`].
+    pub poster_path: Option<String>,
+    pub backdrop_path: Option<String>,
+    /// TMDB user rating, 0–10.
+    pub rating: Option<f32>,
+    pub overview: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeasonSummary {
+    pub number: i32,
+    pub name: String,
+    pub episode_count: i32,
+    pub year: Option<i32>,
+}
+
+/// Everything the title page needs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TitleDetails {
+    pub summary: TitleSummary,
+    pub genres: Vec<String>,
+    /// Film length, or a typical episode length for a series.
+    pub runtime_min: Option<i32>,
+    pub tagline: Option<String>,
+    /// Empty for films. Season 0 ("Specials") comes last if present.
+    pub seasons: Vec<SeasonSummary>,
+    pub imdb_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Episode {
+    pub number: i32,
+    pub name: String,
+    pub overview: Option<String>,
+    pub still_path: Option<String>,
+    pub runtime_min: Option<i32>,
+    /// `YYYY-MM-DD`.
+    pub air_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Season {
+    pub number: i32,
+    pub name: String,
+    pub episodes: Vec<Episode>,
+}
+
+/// A named row of posters on the home screen.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogRow {
+    pub title: String,
+    pub items: Vec<TitleSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HomeFeed {
+    pub rows: Vec<CatalogRow>,
+    /// True when the server runs on built-in demo data instead of TMDB.
+    pub demo: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SearchResults {
+    pub query: String,
+    pub items: Vec<TitleSummary>,
+}
+
+/// Poster/backdrop sizes TMDB serves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageSize {
+    Poster,
+    Backdrop,
+    Still,
+}
+
+impl ImageSize {
+    pub fn tmdb(self) -> &'static str {
+        match self {
+            ImageSize::Poster => "w342",
+            ImageSize::Backdrop => "w1280",
+            ImageSize::Still => "w300",
+        }
+    }
+}
+
+/// URL of a TMDB image through the server's image proxy (TMDB's CDN is not
+/// reachable everywhere, so the server fetches and caches it).
+pub fn image_url(path: &str, size: ImageSize) -> String {
+    format!("/api/img/{}{}", size.tmdb(), path)
+}
+
+/// "S02E06".
+pub fn episode_code(season: i32, episode: i32) -> String {
+    format!("S{season:02}E{episode:02}")
+}
+
+/// "1:02:03" or "41:12".
+pub fn clock(sec: f64) -> String {
+    let s = sec.max(0.0) as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn helpers() {
+        assert_eq!(episode_code(2, 6), "S02E06");
+        assert_eq!(clock(2472.5), "41:12");
+        assert_eq!(clock(3723.0), "1:02:03");
+        assert_eq!(image_url("/a.jpg", ImageSize::Poster), "/api/img/w342/a.jpg");
     }
 }

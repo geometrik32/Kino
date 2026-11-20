@@ -1,7 +1,10 @@
 //! Talks to the Kino server. The app is served by the same server, so URLs are relative.
 
 use gloo_net::http::{Request, Response};
-use kino_core::{ApiError, AuthResponse, ContinueItem, Me, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest};
+use kino_core::{
+    ApiError, AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, SearchResults, Season, TitleDetails,
+    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+};
 use serde::{de::DeserializeOwned, Deserialize};
 
 const TOKEN_KEY: &str = "kino.token";
@@ -104,4 +107,46 @@ pub async fn continue_watching(token: &str) -> Result<Vec<ContinueItem>, Failure
 
 pub async fn watchlist(token: &str) -> Result<Vec<WatchlistItem>, Failure> {
     get("/api/watchlist", token).await
+}
+
+pub async fn home(token: &str) -> Result<HomeFeed, Failure> {
+    get("/api/catalog/home", token).await
+}
+
+pub async fn search(token: &str, q: &str) -> Result<SearchResults, Failure> {
+    let q = js_sys::encode_uri_component(q);
+    get(&format!("/api/catalog/search?q={q}"), token).await
+}
+
+pub async fn details(token: &str, kind: MediaKind, id: i64) -> Result<TitleDetails, Failure> {
+    get(&format!("/api/catalog/{}/{id}", kind.as_str()), token).await
+}
+
+pub async fn season(token: &str, id: i64, number: i32) -> Result<Season, Failure> {
+    get(&format!("/api/catalog/tv/{id}/season/{number}"), token).await
+}
+
+pub async fn title_progress(token: &str, kind: MediaKind, id: i64) -> Result<Vec<Progress>, Failure> {
+    get(&format!("/api/progress/{}/{id}", kind.as_str()), token).await
+}
+
+/// Adds to or removes from "Хочу посмотреть".
+pub async fn set_watchlist(token: &str, kind: MediaKind, id: i64, on: bool) -> Result<(), Failure> {
+    let path = format!("/api/watchlist/{}/{id}", kind.as_str());
+    let auth = format!("Bearer {token}");
+    let req = if on {
+        Request::put(&path)
+    } else {
+        Request::delete(&path)
+    };
+    let resp = req
+        .header("Authorization", &auth)
+        .send()
+        .await
+        .map_err(Failure::network)?;
+    if resp.ok() || resp.status() == 404 {
+        Ok(())
+    } else {
+        decode::<serde_json::Value>(resp).await.map(|_| ())
+    }
 }

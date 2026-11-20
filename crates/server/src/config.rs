@@ -21,6 +21,10 @@ pub struct Config {
     pub bot_username: Option<String>,
     /// Public URL of the site, used to build invite links.
     pub public_url: String,
+    /// TMDB API key (v3) or read access token (v4). Without it the demo catalog is used.
+    pub tmdb_api_key: Option<String>,
+    /// Language for titles and descriptions, e.g. `ru-RU`.
+    pub tmdb_language: String,
     /// Directory with the built Dioxus web app; served at `/` when set.
     pub static_dir: Option<PathBuf>,
 }
@@ -32,6 +36,10 @@ impl std::fmt::Debug for Config {
             .field("bind_addr", &self.bind_addr)
             .field("admin_telegram_ids", &self.admin_telegram_ids)
             .field("public_url", &self.public_url)
+            .field(
+                "tmdb",
+                &self.tmdb_api_key.as_ref().map(|_| "set").unwrap_or("demo catalog"),
+            )
             .field("static_dir", &self.static_dir)
             .finish_non_exhaustive()
     }
@@ -70,6 +78,8 @@ impl Config {
             public_url: var_or("PUBLIC_URL", "http://localhost:8080")
                 .trim_end_matches('/')
                 .to_owned(),
+            tmdb_api_key: std::env::var("TMDB_API_KEY").ok().filter(|s| !s.trim().is_empty()),
+            tmdb_language: var_or("TMDB_LANGUAGE", "ru-RU"),
             static_dir: std::env::var("STATIC_DIR").ok().map(PathBuf::from),
         })
     }

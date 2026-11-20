@@ -10,7 +10,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use kino_core::{AuthResponse, ContinueItem, Me, Progress, Role, WatchlistItem};
-use kino_server::{app, config::Config, telegram_auth, AppState};
+use kino_server::{app, catalog::DemoCatalog, config::Config, telegram_auth, AppState};
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use tower::ServiceExt;
@@ -29,11 +29,14 @@ fn test_app(pool: PgPool) -> Router {
         admin_telegram_ids: vec![ADMIN_TG],
         bot_username: Some("kino_test_bot".into()),
         public_url: "https://kino.example.com".into(),
+        tmdb_api_key: None,
+        tmdb_language: "ru-RU".into(),
         static_dir: None,
     };
     app(AppState {
         pool,
         config: Arc::new(config),
+        catalog: Arc::new(DemoCatalog),
     })
 }
 
@@ -349,4 +352,50 @@ async fn watchlist_add_list_remove(pool: PgPool) {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = call(&app, Method::PUT, "/api/watchlist/anime/1", Some(&u.token), None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn catalog_browse_and_continue_has_titles(pool: PgPool) {
+    let app = test_app(pool);
+    let (status, _) = call(&app, Method::GET, "/api/catalog/home", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "catalog needs login");
+
+    let u = login_ok(&app, ADMIN_TG, None).await;
+    let (status, home) = call(&app, Method::GET, "/api/catalog/home", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(home["demo"], true);
+    assert!(home["rows"].as_array().unwrap().len() >= 2);
+
+    let (_, found) = call(
+        &app,
+        Method::GET,
+        "/api/catalog/search?q=%D0%BC%D0%B0%D1%82%D1%80",
+        Some(&u.token),
+        None,
+    )
+    .await;
+    assert_eq!(found["items"][0]["tmdb_id"], 603, "search finds «Матрица» by «матр»");
+
+    let (status, tv) = call(&app, Method::GET, "/api/catalog/tv/1396", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tv["seasons"].as_array().unwrap().len(), 5);
+    let (_, season) = call(&app, Method::GET, "/api/catalog/tv/1396/season/2", Some(&u.token), None).await;
+    assert_eq!(season["episodes"].as_array().unwrap().len(), 13);
+    let (status, _) = call(&app, Method::GET, "/api/catalog/tv/1396/season/9", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, Method::GET, "/api/catalog/movie/999999", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    call(
+        &app,
+        Method::PUT,
+        "/api/progress",
+        Some(&u.token),
+        Some(json!({
+            "kind": "tv", "tmdb_id": 1396, "season": 2, "episode": 6, "position_sec": 600.0, "duration_sec": 2800.0
+        })),
+    )
+    .await;
+    let (_, cont) = call(&app, Method::GET, "/api/continue", Some(&u.token), None).await;
+    assert_eq!(cont[0]["title"]["title"], "Во все тяжкие");
 }
