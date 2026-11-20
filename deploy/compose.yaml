@@ -129,7 +129,7 @@ services:
   xray:
     image: ghcr.io/xtls/xray-core:26.10.31
     restart: unless-stopped
-    command: ["run", "-c", "/etc/xray/config.json"]
+    entrypoint: ["/usr/local/bin/xray", "run", "-c", "/etc/xray/config.json"]
     volumes:
       - ./data/xray/config.json:/etc/xray/config.json:ro
     mem_limit: 64m
