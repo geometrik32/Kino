@@ -1,12 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use kino_server::{
-    app,
-    catalog::{Catalog, DemoCatalog, TmdbCatalog},
-    config::Config,
-    db, AppState,
-};
+use kino_server::{app, catalog, config::Config, db, AppState};
 use sqlx::postgres::PgPoolOptions;
 use tracing_subscriber::EnvFilter;
 
@@ -31,17 +26,11 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind_addr))?;
     tracing::info!("listening on {}", config.bind_addr);
 
-    let catalog: Arc<dyn Catalog> = match &config.tmdb_api_key {
-        Some(key) => Arc::new(TmdbCatalog::new(
-            key.clone(),
-            config.tmdb_language.clone(),
-            config.tmdb_proxy.as_deref(),
-        )?),
-        None => {
-            tracing::warn!("TMDB_API_KEY is not set: serving the built-in demo catalog");
-            Arc::new(DemoCatalog)
-        }
-    };
+    let catalog = catalog::from_settings(
+        config.tmdb_api_key.as_deref(),
+        &config.tmdb_language,
+        config.tmdb_proxy.as_deref(),
+    )?;
     let media = Arc::new(kino_server::play::Media::new(&config.torrents));
     let state = AppState {
         media,

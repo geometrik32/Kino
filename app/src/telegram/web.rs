@@ -322,6 +322,14 @@ pub fn invite() -> Option<String> {
         .or_else(|| start_param().and_then(|p| p.strip_prefix("inv_").map(str::to_owned)))
 }
 
+/// One-time sign-in code from `?login=<code>`: the bot's `/login` link.
+pub fn login_token() -> Option<String> {
+    query()
+        .get("login")
+        .cloned()
+        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
 /// Login Widget fields if Telegram just redirected back here with them.
 pub fn widget_fields() -> Option<BTreeMap<String, String>> {
     const WIDGET_KEYS: [&str; 7] = [

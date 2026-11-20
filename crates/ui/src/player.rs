@@ -286,7 +286,7 @@ pub fn PlayerView(
                 }
             }
             if let Some(menu) = s.menu {
-                div { class: "p-menu",
+                div { class: if menu == PlayerMenu::Speed { "p-menu speed" } else { "p-menu" },
                     h4 {
                         match menu {
                             PlayerMenu::Audio => "Звуковая дорожка".to_owned(),
@@ -309,10 +309,14 @@ pub fn PlayerView(
                         for e in s.episodes.clone() {
                             button {
                                 key: "e{e.number}",
-                                class: if e.number == s.episode { "p-opt on" } else { "p-opt" },
+                                class: if e.number == s.episode { "p-opt ep on" } else { "p-opt ep" },
                                 onclick: move |_| on_episode.call(e.number),
                                 span { "{e.number}. {e.title}" }
-                                if e.watched { span { class: "muted small", "просмотрена" } }
+                                if e.watched {
+                                    span { class: "p-seen done", title: "Просмотрена", "✓" }
+                                } else {
+                                    span { class: "p-seen", title: "Не просмотрена", "○" }
+                                }
                             }
                         }
                     } else if menu == PlayerMenu::Audio {

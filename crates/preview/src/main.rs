@@ -105,7 +105,7 @@ fn Page(props: PageProps) -> Element {
         Screen::Home(feed, cont) => {
             rsx! { HomeView { feed, continue_items: cont, on_open: |_| {}, on_play: |_| {}, on_drop: |_| {} } }
         }
-        Screen::Search(q, r) => rsx! { SearchView { query: q, results: Some(r), on_open: |_| {}, on_query: |_| {} } },
+        Screen::Search(_, r) => rsx! { SearchView { results: Some(r), on_open: |_| {} } },
         Screen::Person(person) => rsx! { PersonView { person, on_open: |_| {} } },
         Screen::Mine(items, filter) => rsx! { MyView { items, filter, on_filter: |_| {}, on_open: |_| {} } },
         Screen::Profile(history, preloads, prefs) => rsx! {
