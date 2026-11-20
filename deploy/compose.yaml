@@ -1,0 +1,59 @@
+# Kino on TrueNAS: put this folder next to the other compose projects
+# (e.g. /mnt/M2_Apps/arcane/projects/kino), copy .env.example to .env, fill it in,
+# then `docker compose up -d`.
+#
+# HTTPS comes from the Traefik that already runs on the server (network "proxy").
+
+services:
+  kino-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kino
+      POSTGRES_DB: kino
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kino -d kino"]
+      interval: 10s
+      retries: 5
+    mem_limit: 256m
+    networks: [kino]
+
+  kino-server:
+    image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+    depends_on:
+      kino-db:
+        condition: service_healthy
+    mem_limit: 256m
+    networks: [kino, proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: proxy
+      traefik.http.routers.kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
+      traefik.http.routers.kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.services.kino.loadbalancer.server.port: "8080"
+
+  kino-bot:
+    image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
+    command: ["kino-bot"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+    depends_on:
+      kino-server:
+        condition: service_started
+    mem_limit: 64m
+    networks: [kino]
+
+networks:
+  kino: {}
+  proxy:
+    external: true

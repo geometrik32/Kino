@@ -1,0 +1,274 @@
+//! Database access. Queries are checked at runtime (no live DB needed to build).
+
+use chrono::{DateTime, Utc};
+use kino_core::{is_finished, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseRef, Role, WatchlistItem};
+use rand::{distr::Alphanumeric, Rng};
+use sqlx::{PgPool, Row};
+
+use crate::telegram_auth::TelegramUser;
+
+pub type Pool = PgPool;
+
+pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("./migrations").run(pool).await
+}
+
+fn me_from_row(row: &sqlx::postgres::PgRow) -> Result<Me, sqlx::Error> {
+    let role: String = row.try_get("role")?;
+    Ok(Me {
+        id: row.try_get("id")?,
+        telegram_id: row.try_get("telegram_id")?,
+        first_name: row.try_get("first_name")?,
+        username: row.try_get("username")?,
+        role: if role == "admin" { Role::Admin } else { Role::User },
+    })
+}
+
+const ME_COLUMNS: &str = "id, telegram_id, first_name, username, role";
+
+pub async fn get_user(pool: &PgPool, id: i64) -> Result<Option<Me>, sqlx::Error> {
+    let row = sqlx::query(&format!("SELECT {ME_COLUMNS} FROM users WHERE id = $1"))
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(me_from_row).transpose()
+}
+
+#[derive(Debug, PartialEq)]
+pub enum LoginOutcome {
+    LoggedIn(Me),
+    /// Unknown user without a valid invite.
+    NotInvited,
+}
+
+/// Logs a Telegram user in. Existing users get their profile refreshed; new
+/// users need to be in `admins` or bring an unused invite code.
+pub async fn login(
+    pool: &PgPool,
+    tg: &TelegramUser,
+    invite: Option<&str>,
+    admins: &[i64],
+) -> Result<LoginOutcome, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let existing = sqlx::query(&format!(
+        "UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5, last_seen_at = now()
+         WHERE telegram_id = $1 RETURNING {ME_COLUMNS}"
+    ))
+    .bind(tg.id)
+    .bind(&tg.username)
+    .bind(&tg.first_name)
+    .bind(&tg.last_name)
+    .bind(&tg.photo_url)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(row) = existing {
+        let me = me_from_row(&row)?;
+        tx.commit().await?;
+        return Ok(LoginOutcome::LoggedIn(me));
+    }
+
+    let is_admin = admins.contains(&tg.id);
+    let mut claimed_invite = None;
+    if !is_admin {
+        let Some(code) = invite else {
+            return Ok(LoginOutcome::NotInvited);
+        };
+        // Claim the invite atomically so it can't be used twice.
+        let claimed =
+            sqlx::query("UPDATE invites SET used_at = now() WHERE code = $1 AND used_at IS NULL RETURNING code")
+                .bind(code)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if claimed.is_none() {
+            return Ok(LoginOutcome::NotInvited);
+        }
+        claimed_invite = Some(code);
+    }
+
+    let row = sqlx::query(&format!(
+        "INSERT INTO users (telegram_id, username, first_name, last_name, photo_url, role)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {ME_COLUMNS}"
+    ))
+    .bind(tg.id)
+    .bind(&tg.username)
+    .bind(&tg.first_name)
+    .bind(&tg.last_name)
+    .bind(&tg.photo_url)
+    .bind(if is_admin { "admin" } else { "user" })
+    .fetch_one(&mut *tx)
+    .await?;
+    let me = me_from_row(&row)?;
+    if let Some(code) = claimed_invite {
+        sqlx::query("UPDATE invites SET used_by = $2 WHERE code = $1")
+            .bind(code)
+            .bind(me.id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(LoginOutcome::LoggedIn(me))
+}
+
+/// Creates a one-time invite code.
+pub async fn create_invite(pool: &PgPool, created_by: Option<i64>) -> Result<String, sqlx::Error> {
+    let code: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(12)
+        .map(char::from)
+        .collect();
+    sqlx::query("INSERT INTO invites (code, created_by) VALUES ($1, $2)")
+        .bind(&code)
+        .bind(created_by)
+        .execute(pool)
+        .await?;
+    Ok(code)
+}
+
+const PROGRESS_COLUMNS: &str = "media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished,
+     release_infohash, release_file, release_title, updated_at";
+
+fn progress_from_row(row: &sqlx::postgres::PgRow) -> Result<Progress, sqlx::Error> {
+    let kind: String = row.try_get("media_kind")?;
+    let infohash: Option<String> = row.try_get("release_infohash")?;
+    let file: Option<i32> = row.try_get("release_file")?;
+    Ok(Progress {
+        kind: MediaKind::parse(&kind).ok_or_else(|| sqlx::Error::Decode(format!("bad media_kind {kind}").into()))?,
+        tmdb_id: row.try_get("tmdb_id")?,
+        season: row.try_get("season")?,
+        episode: row.try_get("episode")?,
+        position_sec: row.try_get("position_sec")?,
+        duration_sec: row.try_get("duration_sec")?,
+        finished: row.try_get("finished")?,
+        release: match (infohash, file) {
+            (Some(infohash), Some(file_index)) => Some(ReleaseRef {
+                infohash,
+                file_index,
+                title: row.try_get("release_title")?,
+            }),
+            _ => None,
+        },
+        updated_at: row.try_get::<DateTime<Utc>, _>("updated_at")?,
+    })
+}
+
+/// Saves the player position. A release given here replaces the stored one;
+/// `None` keeps whatever was stored.
+pub async fn save_progress(pool: &PgPool, user_id: i64, u: &ProgressUpdate) -> Result<Progress, sqlx::Error> {
+    let (season, episode) = match u.kind {
+        MediaKind::Movie => (0, 0),
+        MediaKind::Tv => (u.season, u.episode),
+    };
+    let row = sqlx::query(&format!(
+        "INSERT INTO watch_progress
+           (user_id, media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished,
+            release_infohash, release_file, release_title, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+         ON CONFLICT (user_id, media_kind, tmdb_id, season, episode) DO UPDATE SET
+           position_sec = EXCLUDED.position_sec,
+           duration_sec = EXCLUDED.duration_sec,
+           finished = watch_progress.finished OR EXCLUDED.finished,
+           release_infohash = COALESCE(EXCLUDED.release_infohash, watch_progress.release_infohash),
+           release_file = COALESCE(EXCLUDED.release_file, watch_progress.release_file),
+           release_title = CASE WHEN EXCLUDED.release_infohash IS NULL
+                                THEN watch_progress.release_title ELSE EXCLUDED.release_title END,
+           updated_at = now()
+         RETURNING {PROGRESS_COLUMNS}"
+    ))
+    .bind(user_id)
+    .bind(u.kind.as_str())
+    .bind(u.tmdb_id)
+    .bind(season)
+    .bind(episode)
+    .bind(u.position_sec)
+    .bind(u.duration_sec)
+    .bind(is_finished(u.position_sec, u.duration_sec))
+    .bind(u.release.as_ref().map(|r| r.infohash.as_str()))
+    .bind(u.release.as_ref().map(|r| r.file_index))
+    .bind(u.release.as_ref().and_then(|r| r.title.as_deref()))
+    .fetch_one(pool)
+    .await?;
+    progress_from_row(&row)
+}
+
+/// All saved positions for one title (every episode of a series).
+pub async fn title_progress(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+) -> Result<Vec<Progress>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT {PROGRESS_COLUMNS} FROM watch_progress
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 ORDER BY season, episode"
+    ))
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(progress_from_row).collect()
+}
+
+/// "Continue watching": the latest position per title, newest first.
+/// Finished films drop out; a finished episode points at the next one.
+pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Result<Vec<ContinueItem>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT * FROM (
+           SELECT DISTINCT ON (media_kind, tmdb_id) {PROGRESS_COLUMNS}
+           FROM watch_progress WHERE user_id = $1
+           ORDER BY media_kind, tmdb_id, updated_at DESC
+         ) latest
+         WHERE NOT (media_kind = 'movie' AND finished)
+         ORDER BY updated_at DESC LIMIT $2"
+    ))
+    .bind(user_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let last = progress_from_row(row)?;
+            let next_episode = (last.kind == MediaKind::Tv && last.finished).then_some((last.season, last.episode + 1));
+            Ok(ContinueItem { last, next_episode })
+        })
+        .collect()
+}
+
+pub async fn watchlist(pool: &PgPool, user_id: i64) -> Result<Vec<WatchlistItem>, sqlx::Error> {
+    let rows =
+        sqlx::query("SELECT media_kind, tmdb_id, added_at FROM watchlist WHERE user_id = $1 ORDER BY added_at DESC")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    rows.iter()
+        .map(|row| {
+            let kind: String = row.try_get("media_kind")?;
+            Ok(WatchlistItem {
+                kind: MediaKind::parse(&kind)
+                    .ok_or_else(|| sqlx::Error::Decode(format!("bad media_kind {kind}").into()))?,
+                tmdb_id: row.try_get("tmdb_id")?,
+                added_at: row.try_get("added_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn watchlist_add(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("INSERT INTO watchlist (user_id, media_kind, tmdb_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
+        .bind(user_id)
+        .bind(kind.as_str())
+        .bind(tmdb_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn watchlist_remove(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i64) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM watchlist WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3")
+        .bind(user_id)
+        .bind(kind.as_str())
+        .bind(tmdb_id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected() > 0)
+}
