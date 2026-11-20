@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 mod release;
 pub use release::*;
+mod stream;
+pub use stream::*;
 
 /// A film or a series, as TMDB distinguishes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -290,6 +292,28 @@ pub struct Season {
     pub episodes: Vec<Episode>,
 }
 
+/// An actor in the cast of a title.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastMember {
+    pub id: i64,
+    pub name: String,
+    /// The role played, e.g. "Уолтер Уайт".
+    pub character: Option<String>,
+    /// TMDB image path of the photo; see [`image_url`] with [`ImageSize::Profile`].
+    pub profile_path: Option<String>,
+}
+
+/// What the title page shows below the description: `GET /api/catalog/{kind}/{id}/extras`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TitleExtras {
+    /// Billing order, the first ones are the leads.
+    pub cast: Vec<CastMember>,
+    /// "Рекомендации": what TMDB suggests to those who liked the title.
+    pub recommendations: Vec<TitleSummary>,
+    /// "Похожие": alike by genre and keywords.
+    pub similar: Vec<TitleSummary>,
+}
+
 /// A named row of posters on the home screen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogRow {
@@ -316,6 +340,8 @@ pub enum ImageSize {
     Poster,
     Backdrop,
     Still,
+    /// Photo of an actor.
+    Profile,
 }
 
 impl ImageSize {
@@ -324,6 +350,7 @@ impl ImageSize {
             ImageSize::Poster => "w342",
             ImageSize::Backdrop => "w1280",
             ImageSize::Still => "w300",
+            ImageSize::Profile => "w185",
         }
     }
 }

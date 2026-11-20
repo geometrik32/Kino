@@ -14,7 +14,8 @@ use axum::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
-    demo_releases, language_name, MediaKind, MediaTrack, PlayInfo, PlayRequest, ReleaseList, TitleDetails, UserPrefs,
+    demo_releases, language_name, MediaKind, MediaTrack, PlayInfo, PlayRequest, ReleaseList, StreamProgress,
+    TitleDetails, UserPrefs,
 };
 use serde::Deserialize;
 use tower::ServiceExt;
@@ -89,6 +90,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/releases/{kind}/{tmdb_id}", get(releases))
         .route("/play", post(play))
+        .route("/play/progress/{release}", get(play_progress))
         .route("/stream/{token}", get(stream))
         .route("/stream/{token}/sub/{file}", get(subtitle))
 }
@@ -137,7 +139,7 @@ async fn releases(
     };
     let items = torrent::search(jackett, &details).await?;
     torrent::save_sources(&state.pool, &items).await?;
-    let mut releases: Vec<_> = items.iter().map(torrent::to_release).collect();
+    let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, &details)).collect();
     // Releases downloaded before are shown by their real info-hash, so the
     // remembered choice and "По просмотренным" find them.
     let keys: Vec<String> = releases
@@ -209,6 +211,8 @@ async fn play(
                 ));
             }
             let f = files::pick(&list, episode).cloned().ok_or_else(no_file)?;
+            // Load the start of the file now, so the player can show how far it got.
+            ts.warm_up(&hash, f.index);
             let input = ts.stream_url_for_ffmpeg(&hash, f.index);
             (f, input, false)
         }
@@ -269,6 +273,31 @@ async fn play(
         next,
         preloaded,
     }))
+}
+
+/// How far the connection to a release has got, for the bar shown while the
+/// player starts. Never fails: until TorrServer knows the torrent it is "connecting".
+async fn play_progress(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path(release): Path<String>,
+) -> Result<Json<StreamProgress>, AppError> {
+    let key = release.to_ascii_lowercase();
+    if !kino_core::is_release_key(&key) {
+        return Err(AppError::bad_request("need a release key"));
+    }
+    let Some(ts) = &state.media.torrserver else {
+        return Ok(Json(StreamProgress::default()));
+    };
+    let hash = match torrent::source(&state.pool, &key).await? {
+        Some(src) => src.infohash,
+        None => None,
+    }
+    .or_else(|| kino_core::is_infohash(&key).then_some(key));
+    let Some(hash) = hash else {
+        return Ok(Json(StreamProgress::default()));
+    };
+    Ok(Json(ts.progress(&hash).await.unwrap_or_default()))
 }
 
 fn no_file() -> AppError {

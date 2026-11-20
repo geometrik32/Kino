@@ -20,7 +20,7 @@ use axum::{
     Json, Router,
 };
 use common::*;
-use kino_core::{PlayInfo, PreloadItem, PreloadState, ReleaseList};
+use kino_core::{PlayInfo, PreloadItem, PreloadState, ReleaseList, StreamPhase, StreamProgress};
 use kino_server::{app, config::TorrentConfig, jobs};
 use serde_json::json;
 use sqlx::PgPool;
@@ -77,6 +77,9 @@ async fn start_jackett() -> String {
 fn file_stats() -> serde_json::Value {
     json!({
         "hash": "",
+        // TorrServer is preloading: 8 of 32 MB, nine peers.
+        "stat": 2, "preloaded_bytes": 8 << 20, "preload_size": 32 << 20,
+        "active_peers": 9, "connected_seeders": 4, "download_speed": 1_048_576.0,
         "file_stats": EPISODES.iter().enumerate()
             .map(|(i, p)| json!({ "id": i + 1, "path": p, "length": 1000 }))
             .collect::<Vec<_>>()
@@ -228,6 +231,10 @@ async fn search_play_and_stream(pool: PgPool) {
         lostfilm.infohash.starts_with('u'),
         "no hash in the feed, so a placeholder key"
     );
+    // 28.4 GB over 13 episodes of 47 minutes; a pack of several seasons has no estimate.
+    assert_eq!((lostfilm.bitrate_kbps, lostfilm.bitrate_approx), (Some(6197), true));
+    let pack = list.releases.iter().find(|r| r.season.is_none()).unwrap();
+    assert_eq!(pack.bitrate_kbps, None);
 
     let (code, body) = call(
         &app,
@@ -244,6 +251,37 @@ async fn search_play_and_stream(pool: PgPool) {
     assert_eq!(info.file_name, "Breaking.Bad.S02E02.mp4");
     assert!(info.direct, "an .mp4 is tried as it is when ffprobe is missing");
     assert_eq!(info.next, Some((2, 3)));
+
+    // While connecting, the player asks how far the torrent got: 8 of 32 MB is a quarter.
+    let (code, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/play/progress/{}", lostfilm.infohash),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let p: StreamProgress = serde_json::from_value(body).unwrap();
+    assert_eq!(
+        (p.phase, p.percent(), p.peers, p.seeders),
+        (StreamPhase::Buffering, Some(25), 9, 4)
+    );
+    assert_eq!(p.speed_bps, 1_048_576);
+    // A release key the server never heard of is simply "connecting".
+    let unknown = format!("u{}", "d".repeat(39));
+    let (code, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/play/progress/{unknown}"),
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["phase"], "connecting");
+    let (code, _) = call(&app, Method::GET, "/api/play/progress/not-a-key", Some(&t), None).await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
 
     // The stream needs no Bearer header, keeps Range, and refuses a forged link.
     let (code, headers, bytes) = raw(&app, Method::GET, &info.stream, None, &[("Range", "bytes=9-")]).await;

@@ -3,7 +3,8 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, TracksUpdate,
+    episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
+    TracksUpdate,
 };
 use kino_ui::{PlayerMenu, PlayerState, PlayerView, VIDEO_ID};
 use wasm_bindgen::JsCast;
@@ -160,6 +161,42 @@ pub fn Player(
         }
     };
 
+    // While connecting or buffering, shows how far the torrent has got instead of a bare spinner.
+    {
+        let token = token.clone();
+        use_future(move || {
+            let token = token.clone();
+            async move {
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    let busy = {
+                        let s = ui.peek();
+                        s.error.is_none() && (s.status.is_some() || s.waiting)
+                    };
+                    if !busy {
+                        if ui.peek().progress.is_some() {
+                            ui.with_mut(|s| s.progress = None);
+                        }
+                        continue;
+                    }
+                    let key = release.peek().infohash.clone();
+                    if let Ok(p) = api::play_progress(&token, &key).await {
+                        // The answer may arrive after playback began.
+                        let (connecting, waiting) = {
+                            let s = ui.peek();
+                            (s.status.is_some(), s.waiting)
+                        };
+                        if connecting || waiting {
+                            // Stalling in the middle of a film is not "starting": plain spinner.
+                            let shown = (connecting || p.phase != StreamPhase::Ready).then_some(p);
+                            ui.with_mut(|s| s.progress = shown);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Asks the server for the stream of the current target.
     let begin = {
         let token = token.clone();
@@ -178,6 +215,7 @@ pub fn Player(
                 s.release = release_label(&rel);
                 s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
                 s.status = Some("Подключаемся к раздаче…".into());
+                s.progress = None;
             });
             spawn(async move {
                 let req = PlayRequest {

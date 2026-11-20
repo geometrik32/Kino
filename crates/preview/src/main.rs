@@ -12,12 +12,13 @@ use chrono::{Duration, Utc};
 use dioxus::prelude::*;
 use kino_core::{
     ContinueItem, HistoryEntry, HomeFeed, MediaKind, MediaTrack, PreloadItem, PreloadState, Progress, ReleaseRef,
-    SearchResults, Season, TitleDetails, TitleState, TitleStatus, UserPrefs,
+    SearchResults, Season, StreamPhase, StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, UserPrefs,
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
     mock_releases, HomeView, LoginView, MyView, PickerPanel, PlayerMenu, PlayerState, PlayerView, ProfileView,
-    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
+    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView,
+    STYLE,
 };
 
 #[derive(Clone, PartialEq)]
@@ -45,6 +46,7 @@ enum Screen {
         my_rating: Option<i16>,
         release_label: Option<String>,
         picker: Option<Picker>,
+        extras: Option<TitleExtras>,
     },
     Mine(Vec<TitleState>, Option<TitleStatus>),
     Profile(Vec<HistoryEntry>, Vec<PreloadItem>, UserPrefs),
@@ -120,6 +122,7 @@ fn Page(props: PageProps) -> Element {
             my_rating,
             release_label,
             picker,
+            extras,
         } => rsx! {
             TitleView {
                 details,
@@ -134,6 +137,9 @@ fn Page(props: PageProps) -> Element {
                 on_rate: |_| {},
                 on_mark: |_| {},
                 on_season: |_| {},
+            }
+            if let Some(extras) = extras {
+                TitleExtrasView { extras, on_open: |_| {} }
             }
             if let Some(p) = picker {
                 ReleasePicker {
@@ -282,7 +288,9 @@ async fn main() -> anyhow::Result<()> {
     for (ep, date) in bb_s2.episodes.iter_mut().zip(1..) {
         ep.air_date = Some(format!("2009-{:02}-{:02}", 3 + date / 4, 1 + (date * 7) % 28));
     }
+    let bb_extras = cat.extras(MediaKind::Tv, 1396).await?;
     let inception = cat.details(MediaKind::Movie, 27205).await?;
+    let inc_extras = cat.extras(MediaKind::Movie, 27205).await?;
     // "Мои": a mix of statuses and ratings.
     let mut mine = Vec::new();
     for (k, id, st, rating) in [
@@ -406,10 +414,14 @@ async fn main() -> anyhow::Result<()> {
         my_rating: None,
         release_label: Some(chosen.label()),
         picker,
+        extras: Some(bb_extras.clone()),
     };
     // Releases as the indexer delivers them: names from a tracker feed, parsed.
     let feed = kino_server::torrent::torznab::parse_feed(include_str!("feed.xml"))?;
-    let mut live: Vec<ReleaseOption> = feed.iter().map(kino_server::torrent::to_release).collect();
+    let mut live: Vec<ReleaseOption> = feed
+        .iter()
+        .map(|it| kino_server::torrent::to_release(it, &bb))
+        .collect();
     live.sort_by_key(|r| std::cmp::Reverse(r.seeders));
     let live_picker = Picker {
         heading: "Во все тяжкие · S02E06 · продолжить с 41:12".to_string(),
@@ -441,6 +453,7 @@ async fn main() -> anyhow::Result<()> {
         paused: true,
         waiting: false,
         status: None,
+        progress: None,
         error: None,
         audio: vec![
             track(0, "rus", Some("LostFilm"), "eac3", 6, true),
@@ -505,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
                 my_rating: Some(4),
                 release_label: Some("NewStudio · 1080p · RuTor".into()),
                 picker: None,
+                extras: Some(inc_extras),
             },
         ),
         ("releases-live", "Раздачи с трекеров", bb_screen(Some(live_picker))),
@@ -535,6 +549,34 @@ async fn main() -> anyhow::Result<()> {
                 duration: None,
                 paused: false,
                 status: Some("Подключаемся к раздаче…".into()),
+                // 38% of the first part is loaded.
+                progress: Some(StreamProgress {
+                    phase: StreamPhase::Buffering,
+                    loaded_bytes: 12_400_000,
+                    needed_bytes: 33_554_432,
+                    peers: 14,
+                    seeders: 6,
+                    speed_bps: 2_600_000,
+                }),
+                audio: vec![],
+                subtitle_tracks: vec![],
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-connecting",
+            "Плеер · поиск раздающих",
+            Screen::Player(PlayerState {
+                position: 0.0,
+                duration: None,
+                paused: false,
+                status: Some("Подключаемся к раздаче…".into()),
+                // Nothing to measure yet: peers are still being found.
+                progress: Some(StreamProgress {
+                    phase: StreamPhase::Connecting,
+                    peers: 3,
+                    ..StreamProgress::default()
+                }),
                 audio: vec![],
                 subtitle_tracks: vec![],
                 ..player.clone()
