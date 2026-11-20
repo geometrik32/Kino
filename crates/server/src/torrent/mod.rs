@@ -13,7 +13,7 @@ pub mod torznab;
 use std::collections::HashMap;
 
 pub use kino_core::is_infohash;
-use kino_core::{MediaKind, ReleaseOption, TitleDetails};
+use kino_core::{estimate_bitrate_kbps, MediaKind, ReleaseOption, TitleDetails};
 use sha1::{Digest, Sha1};
 use sqlx::PgPool;
 
@@ -47,8 +47,38 @@ pub fn release_key(item: &TorznabItem) -> String {
     }
 }
 
-pub fn to_release(item: &TorznabItem) -> ReleaseOption {
+/// Running time of what the release holds, in minutes, when it can be worked out:
+/// a film, one episode, or a season whose length is known.
+fn running_minutes(p: &title::ParsedTitle, details: &TitleDetails) -> Option<f64> {
+    let each = f64::from(details.runtime_min.filter(|m| *m > 0)?);
+    match details.summary.kind {
+        MediaKind::Movie => Some(each),
+        MediaKind::Tv if p.single_episode => Some(each),
+        MediaKind::Tv => {
+            let season = p.season?;
+            // A running season is only as long as what has aired.
+            let aired = match details.last_episode {
+                Some((s, e)) if s == season => Some(e),
+                _ => details
+                    .seasons
+                    .iter()
+                    .find(|s| s.number == season)
+                    .map(|s| s.episode_count),
+            }?;
+            (aired > 0).then(|| each * f64::from(aired))
+        }
+    }
+}
+
+pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     let p = parse_title(&item.title);
+    let (bitrate_kbps, bitrate_approx) = match p.bitrate_kbps {
+        Some(b) => (Some(b), false),
+        None => (
+            running_minutes(&p, details).and_then(|m| estimate_bitrate_kbps(item.size, m)),
+            true,
+        ),
+    };
     let direct_play = p.codec.as_deref() == Some("H.264") && !p.hdr && p.quality != "2160p";
     ReleaseOption {
         infohash: release_key(item),
@@ -71,6 +101,8 @@ pub fn to_release(item: &TorznabItem) -> ReleaseOption {
         subtitles: p.subtitles,
         direct_play,
         codec: p.codec,
+        bitrate_kbps,
+        bitrate_approx,
     }
 }
 

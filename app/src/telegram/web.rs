@@ -1,9 +1,13 @@
 //! Browser and Telegram glue: Mini App `initData`, URL query, Login Widget.
 
-use std::collections::BTreeMap;
+use std::{
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    rc::Rc,
+};
 
 use js_sys::Reflect;
-use wasm_bindgen::JsValue;
+use wasm_bindgen::{closure::Closure, JsCast, JsValue};
 
 fn get(obj: &JsValue, key: &str) -> Option<JsValue> {
     Reflect::get(obj, &JsValue::from_str(key))
@@ -31,18 +35,265 @@ pub fn start_param() -> Option<String> {
     get(&unsafe_data, "start_param")?.as_string()
 }
 
-/// Tells Telegram the app is ready and expands it to full height.
-pub fn ready() {
-    if let Some(w) = web_app() {
-        for method in ["ready", "expand"] {
-            if let Some(f) = get(&w, method).and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
-                let _ = f.call0(&w);
-            }
+/// Property chain on `Telegram.WebApp`, e.g. `["BackButton"]`.
+fn node(path: &[&str]) -> Option<JsValue> {
+    path.iter().try_fold(web_app()?, |obj, key| get(&obj, key))
+}
+
+/// Calls `method` on `Telegram.WebApp.<path>`; clients that lack the method are skipped.
+/// (The SDK only logs for features older clients do not have, so nothing needs a version check.)
+fn call(path: &[&str], method: &str, args: &[JsValue]) {
+    let Some(target) = node(path) else { return };
+    let Some(f) = get(&target, method).and_then(|f| f.dyn_into::<js_sys::Function>().ok()) else {
+        return;
+    };
+    let args: js_sys::Array = args.iter().collect();
+    let _ = f.apply(&target, &args);
+}
+
+/// Dark palette of the app, used where Telegram's own colours cannot be.
+const APP_BG: &str = "#0d0f14";
+
+/// Makes the page behave like part of Telegram: full height, no swipe-to-close while
+/// scrolling, native bars in the page colour, and CSS classes (`tg`, `tg-dark`/`tg-light`,
+/// `tg-<platform>`) that the stylesheet uses. Does nothing in a normal browser.
+pub fn init() {
+    let Some(w) = web_app() else { return };
+    let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    else {
+        return;
+    };
+    let scheme = get(&w, "colorScheme")
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| "dark".into());
+    let platform = get(&w, "platform").and_then(|v| v.as_string()).unwrap_or_default();
+    let classes = root.class_list();
+    let _ = classes.add_1("tg");
+    let _ = classes.add_1(if scheme == "light" { "tg-light" } else { "tg-dark" });
+    if !platform.is_empty() {
+        let _ = classes.add_1(&format!("tg-{platform}"));
+    }
+    cover_notch();
+    call(&[], "ready", &[]);
+    call(&[], "expand", &[]);
+    call(&[], "disableVerticalSwipes", &[]);
+    paint_bars();
+    // The user can change the Telegram theme while the app is open.
+    let on_theme = Closure::<dyn FnMut()>::new(move || {
+        if let Some(root) = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+        {
+            let light = web_app()
+                .and_then(|w| get(&w, "colorScheme"))
+                .and_then(|v| v.as_string())
+                .is_some_and(|s| s == "light");
+            let classes = root.class_list();
+            let _ = classes.remove_1(if light { "tg-dark" } else { "tg-light" });
+            let _ = classes.add_1(if light { "tg-light" } else { "tg-dark" });
         }
+        paint_bars();
+    });
+    call(&[], "onEvent", &["themeChanged".into(), on_theme.as_ref().clone()]);
+    on_theme.forget();
+}
+
+/// Lets the page use the whole screen (`viewport-fit=cover`), so `env(safe-area-inset-*)`
+/// reports the notch and the home bar and the stylesheet can keep clear of them.
+fn cover_notch() {
+    let Some(meta) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector("meta[name=viewport]").ok().flatten())
+    else {
+        return;
+    };
+    let content = meta.get_attribute("content").unwrap_or_default();
+    if !content.contains("viewport-fit") {
+        let _ = meta.set_attribute("content", &format!("{content}, viewport-fit=cover"));
     }
 }
 
-use wasm_bindgen::JsCast;
+/// Header, background and bottom bar of Telegram in the colour of the page.
+fn paint_bars() {
+    let Some(w) = web_app() else { return };
+    let params = get(&w, "themeParams");
+    let dark = get(&w, "colorScheme").and_then(|v| v.as_string()).as_deref() != Some("light");
+    let from_theme = |key: &str| params.as_ref().and_then(|p| get(p, key)).and_then(|v| v.as_string());
+    let bg = from_theme("bg_color").unwrap_or_else(|| if dark { APP_BG.into() } else { "#ffffff".into() });
+    for method in ["setHeaderColor", "setBackgroundColor", "setBottomBarColor"] {
+        call(&[], method, &[JsValue::from_str(&bg)]);
+    }
+}
+
+// --- Back button -----------------------------------------------------------
+
+type Handler = Rc<RefCell<dyn FnMut()>>;
+
+thread_local! {
+    /// Screens that want the Back button, newest last; the newest one gets the click.
+    static BACKS: RefCell<Vec<(u64, Handler)>> = const { RefCell::new(Vec::new()) };
+    static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    static BACK_WIRED: Cell<bool> = const { Cell::new(false) };
+    static MAIN: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
+}
+
+/// Takes over the native Back button until [`pop_back`]. Returns the id to give back.
+/// Outside Telegram it only records the handler.
+pub fn push_back(handler: impl FnMut() + 'static) -> u64 {
+    let id = NEXT_ID.with(|n| {
+        let id = n.get();
+        n.set(id + 1);
+        id
+    });
+    BACKS.with(|b| b.borrow_mut().push((id, Rc::new(RefCell::new(handler)))));
+    sync_back();
+    id
+}
+
+/// Lets go of the Back button taken with [`push_back`].
+pub fn pop_back(id: u64) {
+    BACKS.with(|b| b.borrow_mut().retain(|(i, _)| *i != id));
+    sync_back();
+}
+
+fn sync_back() {
+    if !BACK_WIRED.with(|w| w.replace(true)) {
+        let click = Closure::<dyn FnMut()>::new(|| {
+            let top = BACKS.with(|b| b.borrow().last().map(|(_, h)| h.clone()));
+            if let Some(h) = top {
+                (h.borrow_mut())();
+            }
+        });
+        call(&["BackButton"], "onClick", &[click.as_ref().clone()]);
+        click.forget();
+    }
+    let any = BACKS.with(|b| !b.borrow().is_empty());
+    call(&["BackButton"], if any { "show" } else { "hide" }, &[]);
+}
+
+// --- Main button -----------------------------------------------------------
+
+/// Shows the big native button at the bottom with `text`; `on_click` runs when it is pressed.
+/// Calling it again replaces both. Outside Telegram nothing is shown.
+pub fn show_main_button(text: &str, on_click: impl FnMut() + 'static) {
+    let Some(button) = node(&["MainButton"]) else { return };
+    hide_main_button();
+    let closure = Closure::<dyn FnMut()>::new(on_click);
+    call(&["MainButton"], "onClick", &[closure.as_ref().clone()]);
+    MAIN.with(|m| *m.borrow_mut() = Some(closure));
+    let params = js_sys::Object::new();
+    let _ = Reflect::set(&params, &"text".into(), &text.into());
+    let _ = Reflect::set(&params, &"color".into(), &ACCENT.into());
+    let _ = Reflect::set(&params, &"text_color".into(), &"#ffffff".into());
+    let _ = Reflect::set(&params, &"is_visible".into(), &true.into());
+    let _ = Reflect::set(&params, &"is_active".into(), &true.into());
+    set_root_class("tg-main", true);
+    if let Some(f) = get(&button, "setParams").and_then(|f| f.dyn_into::<js_sys::Function>().ok()) {
+        let _ = f.call1(&button, &params);
+    }
+}
+
+/// Hides the native main button and forgets its handler.
+pub fn hide_main_button() {
+    if let Some(closure) = MAIN.with(|m| m.borrow_mut().take()) {
+        call(&["MainButton"], "offClick", &[closure.as_ref().clone()]);
+    }
+    call(&["MainButton"], "hide", &[]);
+    set_root_class("tg-main", false);
+}
+
+/// Adds or removes a class on `<html>`; the stylesheet reacts to it.
+fn set_root_class(name: &str, on: bool) {
+    if let Some(root) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+    {
+        let classes = root.class_list();
+        let _ = if on {
+            classes.add_1(name)
+        } else {
+            classes.remove_1(name)
+        };
+    }
+}
+
+/// Brand red, as in the stylesheet.
+const ACCENT: &str = "#e5484d";
+
+// --- Haptics -----------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+pub enum Haptic {
+    /// A tap on a tab or a button.
+    Tap,
+    /// A choice changed (status, rating, track).
+    Select,
+    /// Something started or finished well.
+    Success,
+}
+
+/// A short vibration on phones; nothing elsewhere.
+pub fn haptic(kind: Haptic) {
+    let path = ["HapticFeedback"];
+    match kind {
+        Haptic::Tap => call(&path, "impactOccurred", &["light".into()]),
+        Haptic::Select => call(&path, "selectionChanged", &[]),
+        Haptic::Success => call(&path, "notificationOccurred", &["success".into()]),
+    }
+}
+
+// --- Full screen for the player ----------------------------------------------
+
+/// Whether Telegram can show the app full screen (Bot API 8.0+).
+pub fn can_fullscreen() -> bool {
+    let Some(w) = web_app() else { return false };
+    get(&w, "isVersionAtLeast")
+        .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+        .and_then(|f| f.call1(&w, &"8.0".into()).ok())
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Enters or leaves Telegram's full screen; true if it handled the request.
+pub fn set_fullscreen(on: bool) -> bool {
+    if !can_fullscreen() {
+        return false;
+    }
+    call(&[], if on { "requestFullscreen" } else { "exitFullscreen" }, &[]);
+    true
+}
+
+/// Telegram on a phone or tablet (the player then fills the whole screen by itself).
+pub fn is_mobile() -> bool {
+    web_app()
+        .and_then(|w| get(&w, "platform"))
+        .and_then(|v| v.as_string())
+        .is_some_and(|p| p == "android" || p == "ios")
+}
+
+/// Whether Telegram is showing the app full screen now.
+pub fn is_fullscreen() -> bool {
+    web_app()
+        .and_then(|w| get(&w, "isFullscreen"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+// --- Deep links ----------------------------------------------------------------
+
+/// A title to open at start: `?open=tv_1396` or `startapp=tv_1396` (movie_<id> likewise).
+pub fn open_target() -> Option<(kino_core::MediaKind, i64)> {
+    let raw = query().get("open").cloned().or_else(start_param)?;
+    let (kind, id) = raw.split_once('_')?;
+    let kind = match kind {
+        "movie" => kino_core::MediaKind::Movie,
+        "tv" => kino_core::MediaKind::Tv,
+        _ => return None,
+    };
+    Some((kind, id.parse().ok()?))
+}
 
 /// All query parameters of the current page.
 pub fn query() -> BTreeMap<String, String> {
@@ -100,35 +351,4 @@ pub fn clean_url() {
             let _ = history.replace_state_with_url(&JsValue::NULL, "", Some(&path));
         }
     }
-}
-
-/// Inserts the Telegram Login Widget into the element with `container_id`.
-/// After login Telegram redirects back to this page with the signed fields.
-pub fn mount_login_widget(container_id: &str, bot_username: &str) {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
-    let Some(container) = doc.get_element_by_id(container_id) else {
-        return;
-    };
-    if container.child_element_count() > 0 {
-        return;
-    }
-    let Ok(script) = doc.create_element("script") else {
-        return;
-    };
-    let here = web_sys::window()
-        .and_then(|w| w.location().href().ok())
-        .unwrap_or_default();
-    for (k, v) in [
-        ("src", "https://telegram.org/js/telegram-widget.js?22"),
-        ("data-telegram-login", bot_username),
-        ("data-size", "large"),
-        ("data-auth-url", here.as_str()),
-        ("data-request-access", "write"),
-    ] {
-        let _ = script.set_attribute(k, v);
-    }
-    let _ = script.set_attribute("async", "");
-    let _ = container.append_child(&script);
 }

@@ -11,7 +11,8 @@ use std::{
 
 use async_trait::async_trait;
 use kino_core::{
-    CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails, TitleSummary,
+    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails,
+    TitleExtras, TitleSummary,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -22,6 +23,18 @@ const IMAGES: &str = "https://image.tmdb.org/t/p";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 const ALLOWED_SIZES: [&str; 5] = ["w185", "w300", "w342", "w780", "w1280"];
 
+/// A network error without the request URL, which carries the API key.
+fn net_error(e: reqwest::Error) -> CatalogError {
+    let mut causes = String::new();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        causes.push_str(": ");
+        causes.push_str(&s.to_string());
+        source = s.source();
+    }
+    CatalogError::Upstream(format!("{}{causes}", e.without_url()))
+}
+
 pub struct TmdbCatalog {
     http: reqwest::Client,
     /// v3 API key or v4 read access token (starts with `eyJ`).
@@ -31,18 +44,15 @@ pub struct TmdbCatalog {
 }
 
 impl TmdbCatalog {
-    pub fn new(key: String, language: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("kino-server")
-            .build()
-            .expect("reqwest client builds");
-        Self {
+    /// `proxy`, when given, carries all TMDB traffic (API and images).
+    pub fn new(key: String, language: String, proxy: Option<&str>) -> anyhow::Result<Self> {
+        let http = crate::config::http_client(proxy, Duration::from_secs(15))?;
+        Ok(Self {
             http,
             key,
             language,
             cache: Mutex::default(),
-        }
+        })
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, CatalogError> {
@@ -61,14 +71,14 @@ impl TmdbCatalog {
         } else {
             req.query(&[("api_key", &self.key)])
         };
-        let resp = req.send().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let resp = req.send().await.map_err(net_error)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(CatalogError::NotFound);
         }
         if !resp.status().is_success() {
             return Err(CatalogError::Upstream(format!("TMDB answered {}", resp.status())));
         }
-        let value: serde_json::Value = resp.json().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let value: serde_json::Value = resp.json().await.map_err(net_error)?;
         let parsed = serde_json::from_value(value.clone()).map_err(|e| CatalogError::Upstream(e.to_string()))?;
         self.cache
             .lock()
@@ -145,6 +155,70 @@ struct Details {
     seasons: Vec<RawSeason>,
     external_ids: Option<ExternalIds>,
     last_episode_to_air: Option<RawEpisodeRef>,
+}
+
+/// `credits`, `recommendations` and `similar` of a title, as `append_to_response` returns them.
+#[derive(Deserialize)]
+struct RawExtras {
+    credits: Option<RawCredits>,
+    recommendations: Option<Page>,
+    similar: Option<Page>,
+}
+
+#[derive(Deserialize)]
+struct RawCredits {
+    #[serde(default)]
+    cast: Vec<RawCast>,
+}
+
+#[derive(Deserialize)]
+struct RawCast {
+    id: i64,
+    name: String,
+    character: Option<String>,
+    profile_path: Option<String>,
+    #[serde(default)]
+    order: i32,
+}
+
+/// How many actors and titles per row the page shows.
+const MAX_CAST: usize = 20;
+const MAX_TITLES: usize = 20;
+
+pub(crate) fn extras_from(raw: serde_json::Value, kind: MediaKind, own_id: i64) -> Result<TitleExtras, CatalogError> {
+    let r: RawExtras = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
+    let mut cast = r.credits.map(|c| c.cast).unwrap_or_default();
+    cast.sort_by_key(|c| c.order);
+    let cast = cast
+        .into_iter()
+        .take(MAX_CAST)
+        .map(|c| CastMember {
+            id: c.id,
+            name: c.name,
+            character: c.character.filter(|c| !c.is_empty()),
+            profile_path: c.profile_path,
+        })
+        .collect();
+    // Only titles with a poster: a row of grey tiles is no use.
+    let titles = |p: Option<Page>| -> Vec<TitleSummary> {
+        p.map(|p| p.results)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|i| i.into_summary(Some(kind)))
+            .filter(|t| t.poster_path.is_some() && t.tmdb_id != own_id)
+            .collect()
+    };
+    let recommendations: Vec<_> = titles(r.recommendations).into_iter().take(MAX_TITLES).collect();
+    let similar = titles(r.similar)
+        .into_iter()
+        .filter(|t| !recommendations.iter().any(|r| r.tmdb_id == t.tmdb_id))
+        .take(MAX_TITLES)
+        .collect();
+    Ok(TitleExtras {
+        cast,
+        recommendations,
+        similar,
+    })
 }
 
 #[derive(Deserialize)]
@@ -261,6 +335,14 @@ impl Catalog for TmdbCatalog {
         details_from(raw, kind)
     }
 
+    async fn extras(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleExtras, CatalogError> {
+        let path = format!("/{}/{tmdb_id}", kind.as_str());
+        let raw: serde_json::Value = self
+            .get(&path, &[("append_to_response", "credits,recommendations,similar")])
+            .await?;
+        extras_from(raw, kind, tmdb_id)
+    }
+
     async fn season(&self, tmdb_id: i64, number: i32) -> Result<Season, CatalogError> {
         let raw: RawSeasonDetails = self.get(&format!("/tv/{tmdb_id}/season/{number}"), &[]).await?;
         Ok(Season {
@@ -293,7 +375,7 @@ impl Catalog for TmdbCatalog {
             .get(format!("{IMAGES}/{size}/{file}"))
             .send()
             .await
-            .map_err(|e| CatalogError::Upstream(e.to_string()))?;
+            .map_err(net_error)?;
         if !resp.status().is_success() {
             return Err(CatalogError::NotFound);
         }
@@ -303,7 +385,7 @@ impl Catalog for TmdbCatalog {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_owned();
-        let bytes = resp.bytes().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(net_error)?;
         Ok((bytes.to_vec(), ctype))
     }
 }
@@ -352,6 +434,46 @@ mod tests {
             "specials last"
         );
         assert_eq!(d.imdb_id.as_deref(), Some("tt0903747"));
+    }
+
+    #[test]
+    fn parses_cast_and_suggestions() {
+        let raw = json!({
+            "id": 1396,
+            "credits": { "cast": [
+                {"id": 3, "name": "Аарон Пол", "character": "Джесси Пинкман", "profile_path": "/b.jpg", "order": 1},
+                {"id": 2, "name": "Брайан Крэнстон", "character": "Уолтер Уайт", "profile_path": "/a.jpg", "order": 0},
+                {"id": 4, "name": "Без фото", "character": "", "profile_path": null, "order": 2}
+            ]},
+            "recommendations": { "results": [
+                {"id": 60059, "name": "Лучше звоните Солу", "first_air_date": "2015-02-08", "poster_path": "/s.jpg"},
+                {"id": 1, "name": "Без постера", "poster_path": null},
+                {"id": 1396, "name": "Он сам", "poster_path": "/x.jpg"}
+            ]},
+            "similar": { "results": [
+                {"id": 60059, "name": "Лучше звоните Солу", "first_air_date": "2015-02-08", "poster_path": "/s.jpg"},
+                {"id": 46648, "name": "Настоящий детектив", "first_air_date": "2014-01-12", "poster_path": "/t.jpg"}
+            ]}
+        });
+        let e = extras_from(raw, MediaKind::Tv, 1396).unwrap();
+        assert_eq!(
+            e.cast.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            ["Брайан Крэнстон", "Аарон Пол", "Без фото"],
+            "billing order"
+        );
+        assert_eq!(e.cast[2].character, None, "empty role is dropped");
+        assert_eq!(e.cast[2].profile_path, None);
+        assert_eq!(e.recommendations.len(), 1, "no poster and the title itself are dropped");
+        assert_eq!(e.recommendations[0].kind, MediaKind::Tv);
+        assert_eq!(e.recommendations[0].year, Some(2015));
+        assert_eq!(
+            e.similar.iter().map(|t| t.tmdb_id).collect::<Vec<_>>(),
+            [46648],
+            "what is already recommended is not repeated"
+        );
+        // A title TMDB knows nothing more about still works.
+        let empty = extras_from(json!({ "id": 5 }), MediaKind::Movie, 5).unwrap();
+        assert_eq!(empty, TitleExtras::default());
     }
 
     #[test]

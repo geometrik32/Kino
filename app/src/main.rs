@@ -4,6 +4,7 @@
 //! The screens live in `kino-ui`; this crate fetches data and handles clicks.
 
 mod api;
+mod native;
 mod platform;
 mod player;
 mod telegram;
@@ -12,19 +13,16 @@ use player::{PlayStart, Player};
 
 use dioxus::prelude::*;
 use kino_core::{
-    image_url, AuthResponse, ImageSize, LoginPoll, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate,
-    TitleStatus, TitleSummary, UserPrefs, WidgetAuthRequest,
+    image_url, AuthResponse, ImageSize, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate, TitleStatus,
+    TitleSummary, UserPrefs, WidgetAuthRequest,
 };
 use kino_ui::{
     play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption,
-    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
+    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView, STYLE,
 };
 
 fn main() {
-    #[cfg(target_arch = "wasm32")]
-    dioxus::launch(App);
-
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(any(feature = "mobile", feature = "desktop"))]
     {
         // The WebView's own page: let the picture go under the notch and system bars
         // (the screens add the safe-area padding themselves).
@@ -40,6 +38,9 @@ fn main() {
             .with_cfg(Config::new().with_custom_head(HEAD.to_owned()))
             .launch(App);
     }
+
+    #[cfg(not(any(feature = "mobile", feature = "desktop")))]
+    dioxus::launch(App);
 }
 
 #[derive(Clone, PartialEq)]
@@ -99,7 +100,7 @@ async fn establish() -> Session {
 fn App() -> Element {
     let mut session = use_signal(|| Session::Checking);
     use_effect(move || {
-        telegram::ready();
+        telegram::init();
         spawn(async move { session.set(establish().await) });
     });
 
@@ -107,18 +108,7 @@ fn App() -> Element {
         style { "{STYLE}" }
         match session() {
             Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
-            Session::LoggedOut { error } => rsx! {
-                Login {
-                    error,
-                    on_done: move |auth: AuthResponse| {
-                        api::save_token(&auth.token);
-                        session.set(Session::LoggedIn {
-                            token: auth.token,
-                            name: auth.me.first_name.unwrap_or_default(),
-                        });
-                    },
-                }
-            },
+            Session::LoggedOut { error } => rsx! { Login { error, on_login: move |s| session.set(s) } },
             Session::LoggedIn { token, name } => rsx! {
                 Main {
                     token,
@@ -133,97 +123,108 @@ fn App() -> Element {
     }
 }
 
-#[component]
-fn Login(error: Option<String>, on_done: EventHandler<AuthResponse>) -> Element {
+/// Where logging in through the Telegram app stands.
+#[derive(Clone, PartialEq)]
+enum LinkLogin {
+    Idle,
+    /// The bot is open in Telegram, waiting for the button press there.
+    Waiting,
+    Failed(String),
+}
+
+/// In the apps a link must be handed to the system; a page opens it by itself.
+fn open_link(e: &Event<MouseData>, url: &str) {
     if !platform::is_web() {
-        return rsx! { AppLogin { error, on_done } };
-    }
-    let config = use_resource(api::public_config);
-    use_effect(move || {
-        if let Some(Ok(cfg)) = &*config.read() {
-            if let Some(bot) = &cfg.bot_username {
-                telegram::mount_login_widget("tg-login", bot);
-            }
-        }
-    });
-    rsx! {
-        LoginView { invite: telegram::invite(), error,
-            div { id: "tg-login" }
-        }
+        e.prevent_default();
+        platform::open_external(url);
     }
 }
 
-/// Login of the phone and desktop apps: confirm in the Telegram bot, then pick up the session.
 #[component]
-fn AppLogin(error: Option<String>, on_done: EventHandler<AuthResponse>) -> Element {
-    let mut invite = use_signal(String::new);
-    let mut waiting = use_signal(|| false);
-    let mut failure = use_signal(|| error.clone());
-    let mut link = use_signal(|| None::<kino_core::LoginLink>);
-
-    let start = move |_| {
+fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
+    let mut state = use_signal(|| LinkLogin::Idle);
+    // Made in advance so the button is a plain link: browsers block pop-ups
+    // opened after a network round trip.
+    let mut invite = use_signal(telegram::invite);
+    let mut link = use_resource(move || api::start_login_link(invite()));
+    let mut wait = move |token: String| {
+        state.set(LinkLogin::Waiting);
         spawn(async move {
-            failure.set(None);
-            waiting.set(true);
-            let code = invite().trim().to_owned();
-            let l = match api::login_link((!code.is_empty()).then_some(code)).await {
-                Ok(l) => l,
-                Err(e) => {
-                    failure.set(Some(e.message));
-                    waiting.set(false);
+            // The link lives 10 minutes; ask every 2 seconds.
+            for _ in 0..300 {
+                platform::sleep(2_000).await;
+                if *state.peek() != LinkLogin::Waiting {
                     return;
                 }
-            };
-            platform::open_external(&l.url);
-            let code = l.code.clone();
-            let ttl = l.expires_in;
-            link.set(Some(l));
-            let mut waited = 0;
-            while waited < ttl * 1000 {
-                platform::sleep(2000).await;
-                waited += 2000;
-                match api::login_poll(&code).await {
-                    Ok(LoginPoll::Pending) => {}
-                    Ok(LoginPoll::Done(auth)) => {
-                        waiting.set(false);
-                        link.set(None);
-                        on_done.call(auth);
+                match api::poll_login_link(&token).await {
+                    Ok(kino_core::LoginLinkStatus::Pending) => {}
+                    Ok(kino_core::LoginLinkStatus::Done { auth }) => {
+                        api::save_token(&auth.token);
+                        on_login.call(Session::LoggedIn {
+                            token: auth.token,
+                            name: auth.me.first_name.unwrap_or_default(),
+                        });
                         return;
                     }
-                    Ok(LoginPoll::NotInvited) => {
-                        failure.set(Some(
-                            "Доступ только по приглашению. Введите код приглашения выше или попросите его у администратора.".into(),
-                        ));
-                        break;
+                    Ok(kino_core::LoginLinkStatus::Expired) => break,
+                    Err(f) if f.code == "not_invited" => {
+                        link.restart();
+                        return state.set(LinkLogin::Failed(f.message));
                     }
-                    Err(e) if e.code == "network" => {}
-                    Err(e) => {
-                        failure.set(Some(e.message));
-                        break;
-                    }
+                    // A dropped request; try again on the next tick.
+                    Err(_) => {}
                 }
             }
-            waiting.set(false);
-            link.set(None);
+            link.restart();
+            state.set(LinkLogin::Failed("Время на вход вышло. Нажмите кнопку ещё раз.".into()));
         });
     };
-
+    let link_error = match &*link.read() {
+        Some(Err(f)) => Some(f.message.clone()),
+        _ => None,
+    };
+    let shown_error = match state() {
+        LinkLogin::Failed(e) => Some(e),
+        _ => link_error.or(error),
+    };
+    let ready = match &*link.read() {
+        Some(Ok(l)) => Some(l.clone()),
+        _ => None,
+    };
     rsx! {
-        LoginView { invite: None, error: failure(),
-            if waiting() {
-                p { class: "muted", "Откройте бота в Telegram и нажмите «Запустить» (Start). Приложение войдёт само." }
-                if let Some(l) = link() {
-                    button { class: "btn primary", onclick: move |_| platform::open_external(&l.url), "Открыть Telegram ещё раз" }
-                }
-                div { class: "spinner" }
-            } else {
-                input {
-                    class: "field",
-                    placeholder: "Код приглашения (если есть)",
-                    value: "{invite}",
-                    oninput: move |e| invite.set(e.value()),
-                }
-                button { class: "btn primary", onclick: start, "Войти через Telegram" }
+        LoginView { invite: telegram::invite(), error: shown_error,
+            match (state(), ready) {
+                (LinkLogin::Waiting, Some(l)) => rsx! {
+                    p { "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
+                    a {
+                        class: "btn ghost",
+                        href: "{l.url}",
+                        target: "_blank",
+                        rel: "noopener",
+                        onclick: move |e: Event<MouseData>| open_link(&e, &l.url),
+                        "Открыть Telegram ещё раз"
+                    }
+                    p {
+                        a { href: "#", onclick: move |e: Event<MouseData>| { e.prevent_default(); state.set(LinkLogin::Idle) }, "Отмена" }
+                    }
+                },
+                (_, Some(l)) => rsx! {
+                    a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener",
+                        onclick: move |e: Event<MouseData>| {
+                            open_link(&e, &l.url);
+                            wait(l.token.clone());
+                        },
+                        "Войти через Telegram"
+                    }
+                    if !platform::is_web() {
+                        input {
+                            class: "field",
+                            placeholder: "Код приглашения (если есть)",
+                            oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
+                        }
+                    }
+                },
+                (_, None) => rsx! { p { class: "muted", "Готовим вход…" } },
             }
         }
     }
@@ -238,7 +239,14 @@ enum View {
 
 #[component]
 fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
-    let mut view = use_signal(|| View::Tab(Tab::Home));
+    // A link to a title (from a bot message) opens it, with Home behind it.
+    let link = use_hook(telegram::open_target);
+    let mut view = use_signal(|| match link {
+        Some((kind, id)) => View::Title(kind, id),
+        None => View::Tab(Tab::Home),
+    });
+    // Where "Back" goes from a title page.
+    let mut trail = use_signal(|| link.map(|_| vec![View::Tab(Tab::Home)]).unwrap_or_default());
     let mut query = use_signal(String::new);
     let initial = name
         .chars()
@@ -249,15 +257,34 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
         View::Tab(t) => Some(t),
         View::Title(..) => None,
     };
-    let open = move |t: TitleSummary| view.set(View::Title(t.kind, t.tmdb_id));
+    let mut open_title = move |kind: MediaKind, id: i64| {
+        trail.with_mut(|t| t.push(view()));
+        view.set(View::Title(kind, id));
+    };
+    let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id);
     rsx! {
+        if !trail().is_empty() {
+            native::BackButton {
+                on_back: move |_| {
+                    telegram::haptic(telegram::Haptic::Tap);
+                    if let Some(prev) = trail.with_mut(|t| t.pop()) {
+                        view.set(prev);
+                    }
+                },
+            }
+        }
         Shell {
             tab,
             query: query(),
             user_initial: initial,
-            on_tab: move |t| view.set(View::Tab(t)),
+            on_tab: move |t| {
+                telegram::haptic(telegram::Haptic::Tap);
+                trail.set(Vec::new());
+                view.set(View::Tab(t));
+            },
             on_query: move |q: String| {
                 query.set(q);
+                trail.set(Vec::new());
                 view.set(View::Tab(Tab::Search));
             },
             match view() {
@@ -268,11 +295,11 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
                     Profile {
                         token: token.clone(),
                         name: name.clone(),
-                        on_open: move |(k, id)| view.set(View::Title(k, id)),
+                        on_open: move |(k, id)| open_title(k, id),
                         on_logout,
                     }
                 },
-                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id } },
+                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id, on_open: open } },
             }
         }
     }
@@ -430,7 +457,7 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
 }
 
 #[component]
-fn Title(token: String, kind: MediaKind, id: i64) -> Element {
+fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -441,6 +468,12 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             let choices = api::release_choices(&t, kind, id).await?;
             Ok::<_, api::Failure>((details, progress, st, choices))
         }
+    });
+    // Cast and suggestions come apart from the title: if TMDB is slow or fails, the page still works.
+    let t_extras = token.clone();
+    let extras = use_resource(move || {
+        let t = t_extras.clone();
+        async move { api::extras(&t, kind, id).await.ok() }
     });
     let mut chosen_season = use_signal(|| None::<i32>);
     let t2 = token.clone();
@@ -501,7 +534,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         move |s: i32| choices.iter().find(|c| c.season == s).cloned()
     };
     let latest = choices.first().cloned();
-    let (target, _) = play_target(&details, &progress);
+    let (target, play_label) = play_target(&details, &progress);
     let release_label = choice_for(season_key(&target)).map(|c| choice_label(&c));
     let watched: Vec<String> = progress
         .iter()
@@ -522,14 +555,17 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             picker.set(Some(t));
         }
     };
-    let on_play = {
+    let on_play = Callback::new({
         let choice_for = choice_for.clone();
         let mut open_picker = open_picker.clone();
-        move |t: PlayTarget| match choice_for(season_key(&t)) {
-            Some(c) => playing.set(Some((t, c))),
-            None => open_picker(t),
+        move |t: PlayTarget| {
+            telegram::haptic(telegram::Haptic::Tap);
+            match choice_for(season_key(&t)) {
+                Some(c) => playing.set(Some((t, c))),
+                None => open_picker(t),
+            }
         }
-    };
+    });
 
     let heading = picker().map(|p| {
         let mut h = details.summary.title.clone();
@@ -545,7 +581,19 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let chosen_hash = picker_season.and_then(&choice_for).map(|c| c.infohash);
     let summary = details.summary.clone();
     let t3 = token.clone();
+    let main_label = format!("▶ {play_label}");
+    let main_target = target.clone();
     rsx! {
+        // Inside Telegram: the native big button plays, the native Back closes what is open.
+        if playing().is_none() && picker().is_none() && notice().is_none() {
+            native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
+        }
+        if picker().is_some() {
+            native::BackButton { on_back: move |_| picker.set(None) }
+        }
+        if notice().is_some() {
+            native::BackButton { on_back: move |_| notice.set(None) }
+        }
         TitleView {
             details: details.clone(),
             season: season.read().clone().flatten(),
@@ -558,6 +606,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_status: {
                 let token = token.clone();
                 move |s: Option<TitleStatus>| {
+                    telegram::haptic(telegram::Haptic::Select);
                     status_now.set(Some(s));
                     let t = token.clone();
                     spawn(async move {
@@ -572,6 +621,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_rate: {
                 let token = token.clone();
                 move |r: Option<i16>| {
+                    telegram::haptic(telegram::Haptic::Select);
                     rating_now.set(Some(r));
                     let t = token.clone();
                     spawn(async move {
@@ -582,6 +632,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_mark: {
                 let token = token.clone();
                 move |(season, episodes, watched): (i32, Vec<i32>, bool)| {
+                    telegram::haptic(telegram::Haptic::Select);
                     let t = token.clone();
                     let m = MarkWatched { kind, tmdb_id: id, season, episodes, watched };
                     spawn(async move {
@@ -593,6 +644,9 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                 }
             },
             on_season: move |n| chosen_season.set(Some(n)),
+        }
+        if let Some(Some(extras)) = extras.read().clone() {
+            TitleExtrasView { extras, on_open }
         }
         if let (Some(heading), Some(target)) = (heading, picker()) {
             match releases.read().clone().flatten() {
@@ -653,6 +707,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                         };
                         let t = t4.clone();
                         let name = summary.title.clone();
+                        telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
                             notice.set(Some(match api::add_preload(&t, &req).await {
                                 Ok(_) => format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки»."),

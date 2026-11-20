@@ -38,6 +38,34 @@ pub struct ReleaseOption {
     /// Video codec when known, e.g. "HEVC" or "H.264".
     #[serde(default)]
     pub codec: Option<String>,
+    /// Bitrate in kbit/s: as written in the release name, else worked out from
+    /// the size and the running time.
+    #[serde(default)]
+    pub bitrate_kbps: Option<u32>,
+    /// `bitrate_kbps` is an estimate (size ÷ running time, so it includes the sound).
+    #[serde(default)]
+    pub bitrate_approx: bool,
+}
+
+/// Average bitrate of a file of `size_bytes` that runs `minutes`, in kbit/s.
+pub fn estimate_bitrate_kbps(size_bytes: u64, minutes: f64) -> Option<u32> {
+    if size_bytes == 0 || minutes < 1.0 {
+        return None;
+    }
+    let kbps = size_bytes as f64 * 8.0 / 1000.0 / (minutes * 60.0);
+    (kbps >= 1.0 && kbps < f64::from(u32::MAX)).then_some(kbps.round() as u32)
+}
+
+/// "8.4 Мбит/с", "12 Мбит/с", "640 Кбит/с".
+pub fn format_bitrate(kbps: u32) -> String {
+    let mbps = f64::from(kbps) / 1000.0;
+    if kbps < 1000 {
+        format!("{kbps} Кбит/с")
+    } else if mbps >= 10.0 {
+        format!("{mbps:.0} Мбит/с")
+    } else {
+        format!("{mbps:.1} Мбит/с")
+    }
 }
 
 impl ReleaseOption {
@@ -280,11 +308,12 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     Some(s) => format!("S{s:02}"),
                     None => year.map(|y| y.to_string()).unwrap_or_default(),
                 };
+                let size_bytes = ((if tv { gb } else { gb / 2.6 }) * 1e9) as u64;
                 ReleaseOption {
                     infohash: h.to_string().repeat(40),
                     title: format!("{} / {original} ({what}) {q} {rip} | {voice}", title.title),
                     quality: q.into(),
-                    size_bytes: ((if tv { gb } else { gb / 2.6 }) * 1e9) as u64,
+                    size_bytes,
                     seeders: seeds,
                     voice: voice.into(),
                     language: lang.into(),
@@ -297,6 +326,10 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     subtitles: subs,
                     direct_play: direct,
                     codec: Some(if direct { "H.264" } else { "HEVC" }.into()),
+                    // A film runs about 140 minutes, a season about ten 50-minute episodes.
+                    bitrate_kbps: estimate_bitrate_kbps(size_bytes, if tv { 500.0 } else { 140.0 }),
+                    // A few releases state the bitrate in their name; the rest are estimated.
+                    bitrate_approx: !matches!(h, 'b' | 'g'),
                 }
             },
         )
@@ -474,5 +507,21 @@ mod tests {
         assert!(!info.plays_directly(None));
         assert!(is_release_key(&format!("u{}", "0".repeat(39))));
         assert!(!is_release_key("x"));
+    }
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::*;
+
+    #[test]
+    fn estimates_and_formats() {
+        // 10 GB in two hours is about 11.1 Мбит/с.
+        assert_eq!(estimate_bitrate_kbps(10_000_000_000, 120.0), Some(11_111));
+        assert_eq!(estimate_bitrate_kbps(0, 120.0), None);
+        assert_eq!(estimate_bitrate_kbps(1_000_000, 0.0), None);
+        assert_eq!(format_bitrate(11_111), "11 Мбит/с");
+        assert_eq!(format_bitrate(8_400), "8.4 Мбит/с");
+        assert_eq!(format_bitrate(640), "640 Кбит/с");
     }
 }

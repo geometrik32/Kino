@@ -20,7 +20,6 @@ use tower_http::{
 };
 
 pub use api::AppState;
-pub use kino_core::LOGIN_PREFIX;
 
 /// The whole HTTP app: `/api/*` plus, when configured, the web app at `/`.
 pub fn app(state: AppState) -> Router {

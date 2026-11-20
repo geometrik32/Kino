@@ -1,9 +1,12 @@
--- Login of the phone and desktop apps through the Telegram bot: the app creates a
--- one-time code, the user presses Start in the bot with it, the app picks up the session.
+-- Logging in on the website through the Telegram app: the site creates a link,
+-- the bot fills in who confirmed it, the site picks the session up.
 CREATE TABLE login_link (
-    code        TEXT PRIMARY KEY,
-    invite      TEXT,
-    user_id     BIGINT REFERENCES users (id) ON DELETE CASCADE,
-    not_invited BOOLEAN     NOT NULL DEFAULT false,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    token        TEXT PRIMARY KEY,
+    invite       TEXT,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    telegram_id  BIGINT,
+    first_name   TEXT,
+    last_name    TEXT,
+    username     TEXT,
+    confirmed_at TIMESTAMPTZ
 );

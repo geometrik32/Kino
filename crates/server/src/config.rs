@@ -23,6 +23,10 @@ pub struct Config {
     pub public_url: String,
     /// TMDB API key (v3) or read access token (v4). Without it the demo catalog is used.
     pub tmdb_api_key: Option<String>,
+    /// Proxy for Telegram Bot API calls only, e.g. `socks5h://xray:1080`.
+    pub telegram_proxy: Option<String>,
+    /// Proxy for TMDB (API and images) only.
+    pub tmdb_proxy: Option<String>,
     /// Language for titles and descriptions, e.g. `ru-RU`.
     pub tmdb_language: String,
     /// Directory with the built Dioxus web app; served at `/` when set.
@@ -95,6 +99,8 @@ impl std::fmt::Debug for Config {
                 "tmdb",
                 &self.tmdb_api_key.as_ref().map(|_| "set").unwrap_or("demo catalog"),
             )
+            .field("telegram_proxy", &self.telegram_proxy.as_deref().map(redact_proxy))
+            .field("tmdb_proxy", &self.tmdb_proxy.as_deref().map(redact_proxy))
             .field("static_dir", &self.static_dir)
             .field("jackett", &self.torrents.jackett_url)
             .field("torrserver", &self.torrents.torrserver_url)
@@ -137,7 +143,9 @@ impl Config {
             public_url: var_or("PUBLIC_URL", "http://localhost:8080")
                 .trim_end_matches('/')
                 .to_owned(),
-            tmdb_api_key: std::env::var("TMDB_API_KEY").ok().filter(|s| !s.trim().is_empty()),
+            tmdb_api_key: env_value("TMDB_API_KEY"),
+            telegram_proxy: env_value("TELEGRAM_PROXY"),
+            tmdb_proxy: env_value("TMDB_PROXY"),
             tmdb_language: var_or("TMDB_LANGUAGE", "ru-RU"),
             static_dir: std::env::var("STATIC_DIR").ok().map(PathBuf::from),
             notify_every: std::time::Duration::from_secs(
@@ -156,6 +164,43 @@ impl Config {
     }
 }
 
+/// A trimmed, non-empty variable, without quotes someone put around it in `.env`.
+pub fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().and_then(|v| clean_value(&v))
+}
+
+fn clean_value(v: &str) -> Option<String> {
+    let v = v.trim();
+    let v = v
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .or_else(|| v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
+        .unwrap_or(v)
+        .trim();
+    (!v.is_empty()).then(|| v.to_owned())
+}
+
+/// The proxy address without a password, for logs.
+fn redact_proxy(p: &str) -> String {
+    match p
+        .split_once("://")
+        .and_then(|(scheme, rest)| rest.rsplit_once('@').map(|(_, host)| (scheme, host)))
+    {
+        Some((scheme, host)) => format!("{scheme}://***@{host}"),
+        None => p.to_owned(),
+    }
+}
+
+/// An HTTP client that goes through `proxy` when one is given (`http://`,
+/// `https://`, `socks5://` or `socks5h://`), and directly otherwise.
+pub fn http_client(proxy: Option<&str>, timeout: std::time::Duration) -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder().timeout(timeout).user_agent("kino-server");
+    if let Some(p) = proxy {
+        b = b.proxy(reqwest::Proxy::all(p).with_context(|| format!("bad proxy address {}", redact_proxy(p)))?);
+    }
+    Ok(b.build()?)
+}
+
 pub fn parse_ids(s: &str) -> Result<Vec<i64>, std::num::ParseIntError> {
     s.split(',')
         .map(str::trim)
@@ -166,7 +211,17 @@ pub fn parse_ids(s: &str) -> Result<Vec<i64>, std::num::ParseIntError> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ids;
+    use super::{clean_value, parse_ids, redact_proxy};
+
+    #[test]
+    fn values() {
+        assert_eq!(clean_value("  abc\r"), Some("abc".into()));
+        assert_eq!(clean_value("\"abc\""), Some("abc".into()));
+        assert_eq!(clean_value("'abc'"), Some("abc".into()));
+        assert_eq!(clean_value(" \"\" "), None);
+        assert_eq!(redact_proxy("socks5h://u:p@xray:1080"), "socks5h://***@xray:1080");
+        assert_eq!(redact_proxy("http://xray:8080"), "http://xray:8080");
+    }
 
     #[test]
     fn ids() {

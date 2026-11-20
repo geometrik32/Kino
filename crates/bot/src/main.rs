@@ -4,11 +4,15 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use kino_server::{config::parse_ids, db, telegram_auth::TelegramUser};
+use kino_server::{
+    config::{env_value, parse_ids},
+    db,
+    telegram_auth::TelegramUser,
+};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use teloxide::{
     prelude::*,
-    types::{InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo},
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MenuButton, WebAppInfo},
     utils::command::BotCommands,
 };
 use tracing_subscriber::EnvFilter;
@@ -70,39 +74,62 @@ async fn is_admin(state: &BotState, telegram_id: i64) -> anyhow::Result<bool> {
     Ok(row.map(|r| r.get::<String, _>("role") == "admin").unwrap_or(false))
 }
 
-/// `/start login_<code>`: the user logs in an app (phone, desktop) from this chat.
-async fn confirm_app_login(state: &BotState, msg: &Message, code: &str) -> String {
-    let Some(user) = msg.from.as_ref() else {
-        return "Не удалось узнать ваш аккаунт.".to_owned();
+/// Callback data of the "confirm website login" button.
+const LOGIN_CALLBACK: &str = "login:";
+
+/// `/start login_<token>`: ask before logging the website in, so a link someone
+/// else made can't silently log them in as you.
+async fn ask_login(bot: &Bot, msg: &Message, token: &str, state: &BotState) -> ResponseResult<()> {
+    let site = state.public_url.host_str().unwrap_or("сайт").to_owned();
+    let button = InlineKeyboardButton::callback("Войти на сайт", format!("{LOGIN_CALLBACK}{token}"));
+    bot.send_message(
+        msg.chat.id,
+        format!(
+            "Вход на {site}.\nНажмите кнопку, и сайт откроется уже с вашим аккаунтом. \
+             Если вы сейчас не входили на сайт, ничего не нажимайте."
+        ),
+    )
+    .reply_markup(InlineKeyboardMarkup::new([[button]]))
+    .await?;
+    Ok(())
+}
+
+async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> ResponseResult<()> {
+    let Some(token) = q.data.as_deref().and_then(|d| d.strip_prefix(LOGIN_CALLBACK)) else {
+        bot.answer_callback_query(q.id).await?;
+        return Ok(());
     };
     let tg = TelegramUser {
-        id: user.id.0 as i64,
-        first_name: Some(user.first_name.clone()),
-        last_name: user.last_name.clone(),
-        username: user.username.clone(),
+        id: q.from.id.0 as i64,
+        first_name: Some(q.from.first_name.clone()),
+        last_name: q.from.last_name.clone(),
+        username: q.from.username.clone(),
         photo_url: None,
     };
-    match db::confirm_login_link(&state.pool, code, &tg, &state.admin_ids).await {
-        Ok(db::LinkConfirm::Confirmed) => "Готово! Вернитесь в приложение: вход выполнен.".to_owned(),
-        Ok(db::LinkConfirm::NotInvited) => {
-            "Доступ только по приглашению. Попросите у администратора ссылку-приглашение.".to_owned()
-        }
-        Ok(db::LinkConfirm::Unknown) => "Код входа устарел. Нажмите «Войти» в приложении ещё раз.".to_owned(),
+    let text = match db::confirm_login_link(&state.pool, token, &tg).await {
+        Ok(true) => "Готово, вы вошли. Вернитесь на сайт.",
+        Ok(false) => "Эта ссылка для входа устарела. Нажмите «Войти через Telegram» на сайте ещё раз.",
         Err(e) => {
-            tracing::error!(error = %e, "app login failed");
-            "Что-то пошло не так, попробуйте позже.".to_owned()
+            tracing::error!(error = %e, "confirming login failed");
+            "Что-то пошло не так, попробуйте ещё раз."
         }
+    };
+    bot.answer_callback_query(q.id.clone()).await?;
+    if let Some(message) = q.regular_message() {
+        bot.edit_message_text(message.chat.id, message.id, text).await?;
+    } else {
+        bot.send_message(q.from.id, text).await?;
     }
+    Ok(())
 }
 
 async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> ResponseResult<()> {
     match cmd {
+        Command::Start(payload) if payload.trim().starts_with(db::LOGIN_PREFIX) => {
+            let token = payload.trim()[db::LOGIN_PREFIX.len()..].to_owned();
+            ask_login(&bot, &msg, &token, &state).await?;
+        }
         Command::Start(payload) => {
-            if let Some(code) = payload.trim().strip_prefix(kino_server::LOGIN_PREFIX) {
-                let reply = confirm_app_login(&state, &msg, code).await;
-                bot.send_message(msg.chat.id, reply).await?;
-                return Ok(());
-            }
             bot.send_message(
                 msg.chat.id,
                 "Привет! Здесь можно найти фильм или сериал и смотреть его с того места, где остановились.",
@@ -159,12 +186,28 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("connecting to PostgreSQL")?;
 
-    let bot = Bot::new(token);
+    // Only Telegram goes through the proxy; everything else stays direct.
+    let mut http = teloxide::net::default_reqwest_settings();
+    if let Some(proxy) = env_value("TELEGRAM_PROXY") {
+        http = http.proxy(reqwest::Proxy::all(&proxy).context("TELEGRAM_PROXY is not a valid proxy address")?);
+        tracing::info!("talking to Telegram through TELEGRAM_PROXY");
+    }
+    let bot = Bot::with_client(token, http.build().context("building the HTTP client")?);
     let me = bot.get_me().await.context("calling getMe, is BOT_TOKEN right?")?;
     let bot_username = me.username.clone().unwrap_or_default();
     bot.set_my_commands(Command::bot_commands())
         .await
         .context("setting bot commands")?;
+    // The blue button next to the message field opens the app in every private chat.
+    bot.set_chat_menu_button()
+        .menu_button(MenuButton::WebApp {
+            text: "Кино".into(),
+            web_app: WebAppInfo {
+                url: public_url.clone(),
+            },
+        })
+        .await
+        .context("setting the menu button")?;
     tracing::info!(%bot_username, "bot started");
 
     let state = Arc::new(BotState {
@@ -173,7 +216,9 @@ async fn main() -> anyhow::Result<()> {
         admin_ids,
         bot_username,
     });
-    let handler = Update::filter_message().filter_command::<Command>().endpoint(handle);
+    let handler = dptree::entry()
+        .branch(Update::filter_message().filter_command::<Command>().endpoint(handle))
+        .branch(Update::filter_callback_query().endpoint(handle_callback));
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()

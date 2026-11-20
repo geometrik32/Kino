@@ -8,8 +8,8 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, image_url, ContinueItem, HomeFeed, ImageSize, MediaKind, Progress, SearchResults, Season,
-    TitleDetails, TitleStatus, TitleSummary,
+    clock, episode_code, image_url, CastMember, ContinueItem, HomeFeed, ImageSize, MediaKind, Progress, SearchResults,
+    Season, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
 };
 
 /// The stylesheet all components rely on.
@@ -592,6 +592,56 @@ pub fn TitleView(
     }
 }
 
+/// What goes below the description: the cast, then what to watch next.
+/// Loaded apart from the title, so a slow or failing TMDB never blanks the page.
+#[component]
+pub fn TitleExtrasView(extras: TitleExtras, on_open: EventHandler<TitleSummary>) -> Element {
+    rsx! {
+        if !extras.cast.is_empty() {
+            section { class: "section",
+                h2 { "В ролях" }
+                div { class: "row cast",
+                    for c in extras.cast {
+                        CastCard { key: "{c.id}", person: c }
+                    }
+                }
+            }
+        }
+        if !extras.recommendations.is_empty() {
+            PosterRow { title: "Рекомендации", items: extras.recommendations, on_open }
+        }
+        if !extras.similar.is_empty() {
+            PosterRow { title: "Похожие", items: extras.similar, on_open }
+        }
+    }
+}
+
+#[component]
+fn CastCard(person: CastMember) -> Element {
+    rsx! {
+        div { class: "cast-card",
+            div { class: "avatar",
+                if let Some(p) = &person.profile_path {
+                    img { src: image_url(p, ImageSize::Profile), alt: "{person.name}", loading: "lazy" }
+                } else {
+                    div { class: "placeholder", style: "background: {fallback_bg(person.id)}", "{initials(&person.name)}" }
+                }
+            }
+            div { class: "who", "{person.name}" }
+            if let Some(role) = &person.character { div { class: "role", "{role}" } }
+        }
+    }
+}
+
+/// "Брайан Крэнстон" → "БК".
+fn initials(name: &str) -> String {
+    name.split_whitespace()
+        .filter_map(|w| w.chars().next())
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
 #[component]
 fn EpisodeRow(
     season: i32,
@@ -729,6 +779,13 @@ fn ru_date(d: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn initials_of_names() {
+        assert_eq!(initials("Брайан Крэнстон"), "БК");
+        assert_eq!(initials("cher"), "C");
+        assert_eq!(initials(""), "");
+    }
 
     #[test]
     fn plurals_and_dates() {

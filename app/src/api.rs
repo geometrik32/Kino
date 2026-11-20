@@ -1,16 +1,15 @@
-//! Talks to the Kino server. The website is served by the same server; the apps
-//! reach it at the address from [`platform::server_base`]. One client for both.
+//! Talks to the Kino server. The app is served by the same server, so URLs are relative.
 
 use std::sync::LazyLock;
 
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginPoll, MarkWatched,
-    Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
-    ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails, TitleState,
-    TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
+    MarkWatched, Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate,
+    RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, StreamProgress,
+    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 
 use crate::platform;
 
@@ -80,19 +79,6 @@ async fn get<T: DeserializeOwned>(path: &str, token: &str) -> Result<T, Failure>
     decode(resp).await
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PublicConfig {
-    pub bot_username: Option<String>,
-}
-
-pub async fn public_config() -> Result<PublicConfig, Failure> {
-    let resp = request(reqwest::Method::GET, "/api/public-config", None)
-        .send()
-        .await
-        .map_err(Failure::network)?;
-    decode(resp).await
-}
-
 pub async fn login_webapp(init_data: String, invite: Option<String>) -> Result<AuthResponse, Failure> {
     let req = request(reqwest::Method::POST, "/api/auth/webapp", None).json(&WebAppAuthRequest { init_data, invite });
     decode(req.send().await.map_err(Failure::network)?).await
@@ -103,15 +89,14 @@ pub async fn login_widget(req: WidgetAuthRequest) -> Result<AuthResponse, Failur
     decode(req.send().await.map_err(Failure::network)?).await
 }
 
-/// Apps: asks for a one-time code to confirm in the bot.
-pub async fn login_link(invite: Option<String>) -> Result<LoginLink, Failure> {
+/// Starts logging in through the Telegram app.
+pub async fn start_login_link(invite: Option<String>) -> Result<LoginLink, Failure> {
     let req = request(reqwest::Method::POST, "/api/auth/link", None).json(&LoginLinkRequest { invite });
     decode(req.send().await.map_err(Failure::network)?).await
 }
 
-/// Apps: has the user pressed Start in the bot yet?
-pub async fn login_poll(code: &str) -> Result<LoginPoll, Failure> {
-    let resp = request(reqwest::Method::GET, &format!("/api/auth/link/{code}"), None)
+pub async fn poll_login_link(token: &str) -> Result<LoginLinkStatus, Failure> {
+    let resp = request(reqwest::Method::GET, &format!("/api/auth/link/{token}"), None)
         .send()
         .await
         .map_err(Failure::network)?;
@@ -137,6 +122,11 @@ pub async fn search(token: &str, q: &str) -> Result<SearchResults, Failure> {
 
 pub async fn details(token: &str, kind: MediaKind, id: i64) -> Result<TitleDetails, Failure> {
     get(&format!("/api/catalog/{}/{id}", kind.as_str()), token).await
+}
+
+/// Cast, recommendations and similar titles; loaded apart so the page shows at once.
+pub async fn extras(token: &str, kind: MediaKind, id: i64) -> Result<TitleExtras, Failure> {
+    get(&format!("/api/catalog/{}/{id}/extras", kind.as_str()), token).await
 }
 
 pub async fn season(token: &str, id: i64, number: i32) -> Result<Season, Failure> {
@@ -242,6 +232,11 @@ pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {
     // The server answers with a path; the player needs a full address in the apps.
     info.stream = platform::abs(&info.stream);
     Ok(info)
+}
+
+/// How far connecting to a release has got.
+pub async fn play_progress(token: &str, release: &str) -> Result<StreamProgress, Failure> {
+    get(&format!("/api/play/progress/{release}"), token).await
 }
 
 pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, Failure> {

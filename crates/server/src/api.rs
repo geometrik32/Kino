@@ -10,10 +10,10 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginPoll, MarkWatched, Me,
+    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me,
     MediaKind, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
-    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate,
+    UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/public-config", get(public_config))
         .route("/auth/webapp", post(auth_webapp))
         .route("/auth/widget", post(auth_widget))
-        .route("/auth/link", post(auth_link_start))
-        .route("/auth/link/{code}", get(auth_link_poll))
+        .route("/auth/link", post(start_login_link))
+        .route("/auth/link/{token}", get(poll_login_link))
         .route("/me", get(me))
         .route("/continue", get(continue_watching))
         .route("/progress", put(save_progress))
@@ -68,6 +68,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalog/home", get(catalog_home))
         .route("/catalog/search", get(catalog_search))
         .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
+        .route("/catalog/{kind}/{tmdb_id}/extras", get(catalog_extras))
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
         .merge(crate::play::routes())
@@ -137,46 +138,37 @@ async fn auth_widget(
     finish_login(&state, tg, req.invite).await
 }
 
-/// Starts a login of an app through the bot.
-async fn auth_link_start(
+/// Starts logging in through the Telegram app: the site opens `url`, the user
+/// presses the button in the bot, and the site's poll gets the session.
+async fn start_login_link(
     State(state): State<AppState>,
-    body: Option<Json<LoginLinkRequest>>,
+    Json(req): Json<LoginLinkRequest>,
 ) -> Result<Json<LoginLink>, AppError> {
-    let bot = state
-        .config
-        .bot_username
-        .clone()
-        .ok_or_else(|| AppError::bad_request("BOT_USERNAME is not set on the server"))?;
-    let invite = body
-        .and_then(|b| b.0.invite)
-        .filter(|c| !c.is_empty() && c.chars().all(|c| c.is_ascii_alphanumeric()));
-    let code = db::create_login_link(&state.pool, invite.as_deref()).await?;
-    let payload = format!("{}{code}", kino_core::LOGIN_PREFIX);
-    Ok(Json(LoginLink {
-        url: format!("https://t.me/{bot}?start={payload}"),
-        app_url: format!("tg://resolve?domain={bot}&start={payload}"),
-        code,
-        expires_in: db::LOGIN_LINK_TTL_SECS,
-    }))
+    let Some(bot) = &state.config.bot_username else {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_bot",
+            "Вход через Telegram не настроен: не указан BOT_USERNAME.",
+        ));
+    };
+    let token = db::create_login_link(&state.pool, req.invite.as_deref()).await?;
+    let url = format!("https://t.me/{bot}?start={}{token}", db::LOGIN_PREFIX);
+    Ok(Json(LoginLink { token, url }))
 }
 
-/// The app asks whether the user has pressed Start in the bot.
-async fn auth_link_poll(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<LoginPoll>, AppError> {
-    match db::poll_login_link(&state.pool, &code).await? {
-        db::LinkState::Pending => Ok(Json(LoginPoll::Pending)),
-        db::LinkState::NotInvited => Ok(Json(LoginPoll::NotInvited)),
-        db::LinkState::Unknown => Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            "link_expired",
-            "Код входа устарел. Нажмите «Войти» ещё раз.",
-        )),
-        db::LinkState::User(id) => {
-            let me = db::get_user(&state.pool, id)
-                .await?
-                .ok_or_else(|| AppError::unauthorized("user no longer exists"))?;
-            let expires_at = Utc::now() + state.config.session_ttl;
-            let token = session::issue(&state.config.session_secret, me.id, expires_at);
-            Ok(Json(LoginPoll::Done(AuthResponse { token, expires_at, me })))
+async fn poll_login_link(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<LoginLinkStatus>, AppError> {
+    if token.len() > 64 || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Ok(Json(LoginLinkStatus::Expired));
+    }
+    match db::take_login_link(&state.pool, &token).await? {
+        db::LoginLinkState::Pending => Ok(Json(LoginLinkStatus::Pending)),
+        db::LoginLinkState::Expired => Ok(Json(LoginLinkStatus::Expired)),
+        db::LoginLinkState::Confirmed(tg, invite) => {
+            let Json(auth) = finish_login(&state, tg, invite).await?;
+            Ok(Json(LoginLinkStatus::Done { auth }))
         }
     }
 }
@@ -627,6 +619,16 @@ async fn catalog_details(
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleDetails>, AppError> {
     Ok(Json(state.catalog.details(parse_kind(&kind)?, tmdb_id).await?))
+}
+
+/// Cast, recommendations and similar titles. A failure here must not spoil the
+/// title page, so the client asks for it separately.
+async fn catalog_extras(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+) -> Result<Json<TitleExtras>, AppError> {
+    Ok(Json(state.catalog.extras(parse_kind(&kind)?, tmdb_id).await?))
 }
 
 async fn catalog_season(

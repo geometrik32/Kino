@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 
 mod release;
 pub use release::*;
+mod stream;
+pub use stream::*;
 
 /// A film or a series, as TMDB distinguishes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -149,6 +151,32 @@ pub struct WidgetAuthRequest {
     pub invite: Option<String>,
 }
 
+/// Body of `POST /api/auth/link`: start logging in through the Telegram app.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoginLinkRequest {
+    pub invite: Option<String>,
+}
+
+/// Answer of `POST /api/auth/link`: open `url` (the bot in Telegram), then poll
+/// `GET /api/auth/link/{token}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginLink {
+    pub token: String,
+    pub url: String,
+}
+
+/// Answer of `GET /api/auth/link/{token}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum LoginLinkStatus {
+    /// Not confirmed in Telegram yet.
+    Pending,
+    /// Confirmed; the link is used up.
+    Done { auth: AuthResponse },
+    /// Too old or unknown; start again.
+    Expired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -172,41 +200,6 @@ pub struct AuthResponse {
     pub expires_at: DateTime<Utc>,
     pub me: Me,
 }
-
-/// Answer of `POST /api/auth/link`: the phone and desktop apps log in through the bot.
-/// The app opens `url`, the user presses Start there, and the app polls
-/// `GET /api/auth/link/{code}` until it gets the session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LoginLink {
-    pub code: String,
-    /// `https://t.me/<bot>?start=login_<code>`: works with or without the Telegram app.
-    pub url: String,
-    /// `tg://resolve?...`: opens the Telegram app directly.
-    pub app_url: String,
-    /// How long the code lives, seconds.
-    pub expires_in: i64,
-}
-
-/// Body of `POST /api/auth/link`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct LoginLinkRequest {
-    /// Invite code, for a first login.
-    pub invite: Option<String>,
-}
-
-/// Answer of `GET /api/auth/link/{code}`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum LoginPoll {
-    /// The user has not pressed Start yet.
-    Pending,
-    /// The Telegram user has no invite.
-    NotInvited,
-    Done(AuthResponse),
-}
-
-/// Prefix of the bot's `/start` payload for app logins.
-pub const LOGIN_PREFIX: &str = "login_";
 
 /// Error body returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +292,28 @@ pub struct Season {
     pub episodes: Vec<Episode>,
 }
 
+/// An actor in the cast of a title.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CastMember {
+    pub id: i64,
+    pub name: String,
+    /// The role played, e.g. "Уолтер Уайт".
+    pub character: Option<String>,
+    /// TMDB image path of the photo; see [`image_url`] with [`ImageSize::Profile`].
+    pub profile_path: Option<String>,
+}
+
+/// What the title page shows below the description: `GET /api/catalog/{kind}/{id}/extras`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TitleExtras {
+    /// Billing order, the first ones are the leads.
+    pub cast: Vec<CastMember>,
+    /// "Рекомендации": what TMDB suggests to those who liked the title.
+    pub recommendations: Vec<TitleSummary>,
+    /// "Похожие": alike by genre and keywords.
+    pub similar: Vec<TitleSummary>,
+}
+
 /// A named row of posters on the home screen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogRow {
@@ -325,6 +340,8 @@ pub enum ImageSize {
     Poster,
     Backdrop,
     Still,
+    /// Photo of an actor.
+    Profile,
 }
 
 impl ImageSize {
@@ -333,6 +350,7 @@ impl ImageSize {
             ImageSize::Poster => "w342",
             ImageSize::Backdrop => "w1280",
             ImageSize::Still => "w300",
+            ImageSize::Profile => "w185",
         }
     }
 }
