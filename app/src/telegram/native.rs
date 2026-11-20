@@ -36,6 +36,9 @@ pub fn open_target() -> Option<(kino_core::MediaKind, i64)> {
 pub fn invite() -> Option<String> {
     None
 }
+pub fn login_token() -> Option<String> {
+    None
+}
 pub fn widget_fields() -> Option<BTreeMap<String, String>> {
     None
 }
