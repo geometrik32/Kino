@@ -5,10 +5,9 @@ use dioxus::prelude::*;
 use kino_core::{
     episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, TracksUpdate,
 };
-use kino_ui::{PlayerMenu, PlayerState, PlayerView, VIDEO_ID};
-use wasm_bindgen::JsCast;
+use kino_ui::{PlayerMenu, PlayerState, PlayerView};
 
-use crate::api;
+use crate::{api, platform, platform::video::video};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,36 +27,7 @@ pub struct PlayStart {
 /// How often the position is saved while playing, seconds of video.
 const SAVE_EVERY: f64 = 10.0;
 
-fn video() -> Option<web_sys::HtmlVideoElement> {
-    web_sys::window()?
-        .document()?
-        .get_element_by_id(VIDEO_ID)?
-        .dyn_into()
-        .ok()
-}
-
-/// "Android", "iPhone", "Windows", ... for the watch history.
-pub fn device_name() -> String {
-    if crate::telegram::init_data().is_some() {
-        return "Telegram".into();
-    }
-    let ua = web_sys::window()
-        .and_then(|w| w.navigator().user_agent().ok())
-        .unwrap_or_default();
-    let os = [
-        ("iPhone", "iPhone"),
-        ("iPad", "iPad"),
-        ("Android", "Android"),
-        ("Windows", "Windows"),
-        ("Mac OS", "Mac"),
-        ("Linux", "Linux"),
-    ]
-    .iter()
-    .find(|(k, _)| ua.contains(k))
-    .map(|(_, v)| *v)
-    .unwrap_or("Браузер");
-    format!("Браузер, {os}")
-}
+pub use crate::platform::device_name;
 
 fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
@@ -92,6 +62,7 @@ pub fn Player(
     let mut force_transcode = use_signal(|| false);
     let mut last_saved = use_signal(|| 0.0_f64);
     let device = use_hook(device_name);
+    platform::video::use_bridge();
 
     // Points the video at the right source for the given audio track and second.
     let mut load_source = move |at: f64| {
@@ -306,7 +277,7 @@ pub fn Player(
         move |_| {
             save(false);
             if let Some(v) = video() {
-                let _ = v.pause();
+                v.pause();
             }
             on_close.call(());
         }
@@ -318,9 +289,9 @@ pub fn Player(
             on_toggle: move |_| {
                 if let Some(v) = video() {
                     if v.paused() {
-                        let _ = v.play();
+                        v.play();
                     } else {
-                        let _ = v.pause();
+                        v.pause();
                     }
                 }
             },
@@ -364,15 +335,7 @@ pub fn Player(
                 }
             },
             on_next: move |_| go_next(),
-            on_fullscreen: move |_| {
-                if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                    if doc.fullscreen_element().is_some() {
-                        doc.exit_fullscreen();
-                    } else if let Some(el) = doc.document_element() {
-                        let _ = el.request_fullscreen();
-                    }
-                }
-            },
+            on_fullscreen: move |_| platform::toggle_fullscreen(),
             on_close: close,
             on_video,
         }

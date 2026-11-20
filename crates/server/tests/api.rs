@@ -364,3 +364,69 @@ async fn release_choice_is_remembered_per_season(pool: PgPool) {
     .await;
     assert_eq!(body, json!([]), "choices are per user");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn app_login_through_the_bot(pool: PgPool) {
+    let app = test_app(pool.clone());
+
+    // The app asks for a code and gets links to the bot.
+    let (status, link) = call(&app, Method::POST, "/api/auth/link", None, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{link}");
+    let code = link["code"].as_str().unwrap().to_owned();
+    assert_eq!(link["url"], format!("https://t.me/kino_test_bot?start=login_{code}"));
+    assert!(link["app_url"]
+        .as_str()
+        .unwrap()
+        .starts_with("tg://resolve?domain=kino_test_bot"));
+
+    // Nothing yet while the user has not pressed Start.
+    let (status, body) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!((status, body["status"].as_str()), (StatusCode::OK, Some("pending")));
+
+    // The bot confirms an admin, who needs no invite.
+    let admin = telegram_auth::TelegramUser {
+        id: ADMIN_TG,
+        first_name: Some("Админ".into()),
+        last_name: None,
+        username: None,
+        photo_url: None,
+    };
+    let admins = [ADMIN_TG];
+    let r = kino_server::db::confirm_login_link(&pool, &code, &admin, &admins)
+        .await
+        .unwrap();
+    assert_eq!(r, kino_server::db::LinkConfirm::Confirmed);
+
+    // The app gets a working session, once.
+    let (status, body) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "done");
+    let token = body["token"].as_str().unwrap().to_owned();
+    let (status, me) = call(&app, Method::GET, "/api/me", Some(&token), None).await;
+    assert_eq!((status, me["first_name"].as_str()), (StatusCode::OK, Some("Админ")));
+    let (status, body) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("link_expired"))
+    );
+
+    // A stranger without an invite is told so.
+    let (_, link) = call(&app, Method::POST, "/api/auth/link", None, None).await;
+    let code = link["code"].as_str().unwrap().to_owned();
+    let stranger = telegram_auth::TelegramUser {
+        id: 77,
+        ..admin.clone()
+    };
+    let r = kino_server::db::confirm_login_link(&pool, &code, &stranger, &admins)
+        .await
+        .unwrap();
+    assert_eq!(r, kino_server::db::LinkConfirm::NotInvited);
+    let (_, body) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!(body["status"], "not_invited");
+
+    // An unknown code can't be confirmed.
+    let r = kino_server::db::confirm_login_link(&pool, "nope", &admin, &admins)
+        .await
+        .unwrap();
+    assert_eq!(r, kino_server::db::LinkConfirm::Unknown);
+}

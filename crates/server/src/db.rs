@@ -127,6 +127,112 @@ pub async fn create_invite(pool: &PgPool, created_by: Option<i64>) -> Result<Str
     Ok(code)
 }
 
+/// How long a login code from an app stays valid.
+pub const LOGIN_LINK_TTL_SECS: i64 = 600;
+
+/// Creates a one-time login code for an app.
+pub async fn create_login_link(pool: &PgPool, invite: Option<&str>) -> Result<String, sqlx::Error> {
+    sqlx::query("DELETE FROM login_link WHERE created_at < now() - interval '1 hour'")
+        .execute(pool)
+        .await?;
+    let code: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(24)
+        .map(char::from)
+        .collect();
+    sqlx::query("INSERT INTO login_link (code, invite) VALUES ($1, $2)")
+        .bind(&code)
+        .bind(invite)
+        .execute(pool)
+        .await?;
+    Ok(code)
+}
+
+/// What the bot learns when a user presses Start with a login code.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkConfirm {
+    Confirmed,
+    NotInvited,
+    /// Unknown, expired or already used code.
+    Unknown,
+}
+
+/// Called by the bot: logs the Telegram user in and attaches them to the code.
+pub async fn confirm_login_link(
+    pool: &PgPool,
+    code: &str,
+    tg: &TelegramUser,
+    admins: &[i64],
+) -> Result<LinkConfirm, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT invite FROM login_link
+         WHERE code = $1 AND user_id IS NULL AND NOT not_invited
+           AND created_at > now() - make_interval(secs => $2)",
+    )
+    .bind(code)
+    .bind(LOGIN_LINK_TTL_SECS as f64)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(LinkConfirm::Unknown);
+    };
+    let invite: Option<String> = row.try_get("invite")?;
+    match login(pool, tg, invite.as_deref(), admins).await? {
+        LoginOutcome::LoggedIn(me) => {
+            sqlx::query("UPDATE login_link SET user_id = $2 WHERE code = $1")
+                .bind(code)
+                .bind(me.id)
+                .execute(pool)
+                .await?;
+            Ok(LinkConfirm::Confirmed)
+        }
+        LoginOutcome::NotInvited => {
+            sqlx::query("UPDATE login_link SET not_invited = true WHERE code = $1")
+                .bind(code)
+                .execute(pool)
+                .await?;
+            Ok(LinkConfirm::NotInvited)
+        }
+    }
+}
+
+/// State of a login code, seen by the app.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LinkState {
+    Pending,
+    NotInvited,
+    User(i64),
+    Unknown,
+}
+
+/// Called by the app while it waits. A finished code is deleted: it works once.
+pub async fn poll_login_link(pool: &PgPool, code: &str) -> Result<LinkState, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT user_id, not_invited FROM login_link
+         WHERE code = $1 AND created_at > now() - make_interval(secs => $2)",
+    )
+    .bind(code)
+    .bind(LOGIN_LINK_TTL_SECS as f64)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(LinkState::Unknown) };
+    let user_id: Option<i64> = row.try_get("user_id")?;
+    let not_invited: bool = row.try_get("not_invited")?;
+    if user_id.is_none() && !not_invited {
+        return Ok(LinkState::Pending);
+    }
+    let deleted = sqlx::query("DELETE FROM login_link WHERE code = $1")
+        .bind(code)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    Ok(match (deleted, user_id) {
+        (0, _) => LinkState::Unknown,
+        (_, Some(id)) => LinkState::User(id),
+        _ => LinkState::NotInvited,
+    })
+}
+
 const PROGRESS_COLUMNS: &str = "media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished,
      release_infohash, release_file, release_title, updated_at";
 

@@ -173,6 +173,41 @@ pub struct AuthResponse {
     pub me: Me,
 }
 
+/// Answer of `POST /api/auth/link`: the phone and desktop apps log in through the bot.
+/// The app opens `url`, the user presses Start there, and the app polls
+/// `GET /api/auth/link/{code}` until it gets the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginLink {
+    pub code: String,
+    /// `https://t.me/<bot>?start=login_<code>`: works with or without the Telegram app.
+    pub url: String,
+    /// `tg://resolve?...`: opens the Telegram app directly.
+    pub app_url: String,
+    /// How long the code lives, seconds.
+    pub expires_in: i64,
+}
+
+/// Body of `POST /api/auth/link`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoginLinkRequest {
+    /// Invite code, for a first login.
+    pub invite: Option<String>,
+}
+
+/// Answer of `GET /api/auth/link/{code}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LoginPoll {
+    /// The user has not pressed Start yet.
+    Pending,
+    /// The Telegram user has no invite.
+    NotInvited,
+    Done(AuthResponse),
+}
+
+/// Prefix of the bot's `/start` payload for app logins.
+pub const LOGIN_PREFIX: &str = "login_";
+
 /// Error body returned by the API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiError {
@@ -302,10 +337,24 @@ impl ImageSize {
     }
 }
 
+static ASSET_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Where the server lives, for clients that are not served by it (the phone and
+/// desktop apps). The website leaves it unset and keeps using relative URLs.
+/// Set it once at startup, before the first screen is drawn.
+pub fn set_asset_base(base: impl Into<String>) {
+    let _ = ASSET_BASE.set(base.into().trim_end_matches('/').to_owned());
+}
+
+/// `path` (starting with `/`) as a URL the current client can load.
+pub fn asset_url(path: &str) -> String {
+    format!("{}{}", ASSET_BASE.get().map(String::as_str).unwrap_or(""), path)
+}
+
 /// URL of a TMDB image through the server's image proxy (TMDB's CDN is not
 /// reachable everywhere, so the server fetches and caches it).
 pub fn image_url(path: &str, size: ImageSize) -> String {
-    format!("/api/img/{}{}", size.tmdb(), path)
+    asset_url(&format!("/api/img/{}{}", size.tmdb(), path))
 }
 
 /// "S02E06".

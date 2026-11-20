@@ -1,33 +1,41 @@
-//! Talks to the Kino server. The app is served by the same server, so URLs are relative.
+//! Talks to the Kino server. The website is served by the same server; the apps
+//! reach it at the address from [`platform::server_base`]. One client for both.
 
-use gloo_net::http::{Request, Response};
+use std::sync::LazyLock;
+
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PlayInfo, PlayRequest,
-    PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
-    WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginPoll, MarkWatched,
+    Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
+    ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails, TitleState,
+    TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
+use reqwest::{Client, RequestBuilder, Response};
 use serde::{de::DeserializeOwned, Deserialize};
+
+use crate::platform;
 
 const TOKEN_KEY: &str = "kino.token";
 
-fn storage() -> Option<web_sys::Storage> {
-    web_sys::window()?.local_storage().ok()?
-}
-
-pub fn saved_token() -> Option<String> {
-    storage()?.get_item(TOKEN_KEY).ok()?
+pub async fn saved_token() -> Option<String> {
+    platform::storage_get(TOKEN_KEY).await
 }
 
 pub fn save_token(token: &str) {
-    if let Some(s) = storage() {
-        let _ = s.set_item(TOKEN_KEY, token);
-    }
+    platform::storage_set(TOKEN_KEY, token);
 }
 
 pub fn forget_token() {
-    if let Some(s) = storage() {
-        let _ = s.remove_item(TOKEN_KEY);
+    platform::storage_remove(TOKEN_KEY);
+}
+
+static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
+
+/// A request to `path` (e.g. `/api/me`), with the user's token when there is one.
+fn request(method: reqwest::Method, path: &str, token: Option<&str>) -> RequestBuilder {
+    let r = CLIENT.request(method, platform::abs(path));
+    match token {
+        Some(t) => r.bearer_auth(t),
+        None => r,
     }
 }
 
@@ -42,13 +50,14 @@ impl Failure {
     fn network(e: impl std::fmt::Display) -> Self {
         Self {
             code: "network".into(),
-            message: e.to_string(),
+            message: format!("Нет связи с сервером: {e}"),
         }
     }
 }
 
 async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, Failure> {
-    if resp.ok() {
+    let status = resp.status();
+    if status.is_success() {
         return resp.json().await.map_err(Failure::network);
     }
     match resp.json::<ApiError>().await {
@@ -58,14 +67,13 @@ async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, Failure> {
         }),
         Err(_) => Err(Failure {
             code: "http".into(),
-            message: format!("HTTP {}", resp.status()),
+            message: format!("HTTP {}", status.as_u16()),
         }),
     }
 }
 
 async fn get<T: DeserializeOwned>(path: &str, token: &str) -> Result<T, Failure> {
-    let resp = Request::get(path)
-        .header("Authorization", &format!("Bearer {token}"))
+    let resp = request(reqwest::Method::GET, path, Some(token))
         .send()
         .await
         .map_err(Failure::network)?;
@@ -78,25 +86,36 @@ pub struct PublicConfig {
 }
 
 pub async fn public_config() -> Result<PublicConfig, Failure> {
-    decode(
-        Request::get("/api/public-config")
-            .send()
-            .await
-            .map_err(Failure::network)?,
-    )
-    .await
+    let resp = request(reqwest::Method::GET, "/api/public-config", None)
+        .send()
+        .await
+        .map_err(Failure::network)?;
+    decode(resp).await
 }
 
 pub async fn login_webapp(init_data: String, invite: Option<String>) -> Result<AuthResponse, Failure> {
-    let req = Request::post("/api/auth/webapp")
-        .json(&WebAppAuthRequest { init_data, invite })
-        .map_err(Failure::network)?;
+    let req = request(reqwest::Method::POST, "/api/auth/webapp", None).json(&WebAppAuthRequest { init_data, invite });
     decode(req.send().await.map_err(Failure::network)?).await
 }
 
 pub async fn login_widget(req: WidgetAuthRequest) -> Result<AuthResponse, Failure> {
-    let req = Request::post("/api/auth/widget").json(&req).map_err(Failure::network)?;
+    let req = request(reqwest::Method::POST, "/api/auth/widget", None).json(&req);
     decode(req.send().await.map_err(Failure::network)?).await
+}
+
+/// Apps: asks for a one-time code to confirm in the bot.
+pub async fn login_link(invite: Option<String>) -> Result<LoginLink, Failure> {
+    let req = request(reqwest::Method::POST, "/api/auth/link", None).json(&LoginLinkRequest { invite });
+    decode(req.send().await.map_err(Failure::network)?).await
+}
+
+/// Apps: has the user pressed Start in the bot yet?
+pub async fn login_poll(code: &str) -> Result<LoginPoll, Failure> {
+    let resp = request(reqwest::Method::GET, &format!("/api/auth/link/{code}"), None)
+        .send()
+        .await
+        .map_err(Failure::network)?;
+    decode(resp).await
 }
 
 pub async fn me(token: &str) -> Result<Me, Failure> {
@@ -112,7 +131,7 @@ pub async fn home(token: &str) -> Result<HomeFeed, Failure> {
 }
 
 pub async fn search(token: &str, q: &str) -> Result<SearchResults, Failure> {
-    let q = js_sys::encode_uri_component(q);
+    let q = urlencoding::encode(q);
     get(&format!("/api/catalog/search?q={q}"), token).await
 }
 
@@ -134,10 +153,7 @@ pub async fn release_choices(token: &str, kind: MediaKind, id: i64) -> Result<Ve
 
 /// Remembers the release picked for a film or a season.
 pub async fn save_release_choice(token: &str, choice: &ReleaseChoiceUpdate) -> Result<ReleaseChoice, Failure> {
-    let req = Request::put("/api/release-choice")
-        .header("Authorization", &format!("Bearer {token}"))
-        .json(choice)
-        .map_err(Failure::network)?;
+    let req = request(reqwest::Method::PUT, "/api/release-choice", Some(token)).json(choice);
     decode(req.send().await.map_err(Failure::network)?).await
 }
 
@@ -148,19 +164,18 @@ async fn send<T: DeserializeOwned>(
     token: &str,
     body: Option<&impl serde::Serialize>,
 ) -> Result<T, Failure> {
-    let auth = format!("Bearer {token}");
-    let builder = match method {
-        "PUT" => Request::put(path),
-        "POST" => Request::post(path),
-        _ => Request::delete(path),
-    }
-    .header("Authorization", &auth);
+    let method = match method {
+        "PUT" => reqwest::Method::PUT,
+        "POST" => reqwest::Method::POST,
+        _ => reqwest::Method::DELETE,
+    };
+    let builder = request(method, path, Some(token));
     let req = match body {
-        Some(b) => builder.json(b).map_err(Failure::network)?,
-        None => builder.build().map_err(Failure::network)?,
+        Some(b) => builder.json(b),
+        None => builder,
     };
     let resp = req.send().await.map_err(Failure::network)?;
-    if resp.status() == 204 {
+    if resp.status().as_u16() == 204 {
         // No body: decode `null` into `()` (or any type that accepts it).
         return serde_json::from_str("null").map_err(Failure::network);
     }
@@ -223,7 +238,10 @@ pub async fn releases(token: &str, kind: MediaKind, id: i64, season: i32) -> Res
 }
 
 pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {
-    send("POST", "/api/play", token, Some(r)).await
+    let mut info: PlayInfo = send("POST", "/api/play", token, Some(r)).await?;
+    // The server answers with a path; the player needs a full address in the apps.
+    info.stream = platform::abs(&info.stream);
+    Ok(info)
 }
 
 pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, Failure> {

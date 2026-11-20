@@ -10,10 +10,10 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PreloadItem, PreloadRequest,
-    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role, SearchResults, Season,
-    StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest,
-    WidgetAuthRequest,
+    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginPoll, MarkWatched, Me,
+    MediaKind, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
+    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
+    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/public-config", get(public_config))
         .route("/auth/webapp", post(auth_webapp))
         .route("/auth/widget", post(auth_widget))
+        .route("/auth/link", post(auth_link_start))
+        .route("/auth/link/{code}", get(auth_link_poll))
         .route("/me", get(me))
         .route("/continue", get(continue_watching))
         .route("/progress", put(save_progress))
@@ -133,6 +135,50 @@ async fn auth_widget(
     let tg =
         telegram_auth::verify_widget(&req.fields, &cfg.bot_token, Utc::now(), cfg.auth_max_age).map_err(auth_failed)?;
     finish_login(&state, tg, req.invite).await
+}
+
+/// Starts a login of an app through the bot.
+async fn auth_link_start(
+    State(state): State<AppState>,
+    body: Option<Json<LoginLinkRequest>>,
+) -> Result<Json<LoginLink>, AppError> {
+    let bot = state
+        .config
+        .bot_username
+        .clone()
+        .ok_or_else(|| AppError::bad_request("BOT_USERNAME is not set on the server"))?;
+    let invite = body
+        .and_then(|b| b.0.invite)
+        .filter(|c| !c.is_empty() && c.chars().all(|c| c.is_ascii_alphanumeric()));
+    let code = db::create_login_link(&state.pool, invite.as_deref()).await?;
+    let payload = format!("{}{code}", kino_core::LOGIN_PREFIX);
+    Ok(Json(LoginLink {
+        url: format!("https://t.me/{bot}?start={payload}"),
+        app_url: format!("tg://resolve?domain={bot}&start={payload}"),
+        code,
+        expires_in: db::LOGIN_LINK_TTL_SECS,
+    }))
+}
+
+/// The app asks whether the user has pressed Start in the bot.
+async fn auth_link_poll(State(state): State<AppState>, Path(code): Path<String>) -> Result<Json<LoginPoll>, AppError> {
+    match db::poll_login_link(&state.pool, &code).await? {
+        db::LinkState::Pending => Ok(Json(LoginPoll::Pending)),
+        db::LinkState::NotInvited => Ok(Json(LoginPoll::NotInvited)),
+        db::LinkState::Unknown => Err(AppError::new(
+            StatusCode::NOT_FOUND,
+            "link_expired",
+            "Код входа устарел. Нажмите «Войти» ещё раз.",
+        )),
+        db::LinkState::User(id) => {
+            let me = db::get_user(&state.pool, id)
+                .await?
+                .ok_or_else(|| AppError::unauthorized("user no longer exists"))?;
+            let expires_at = Utc::now() + state.config.session_ttl;
+            let token = session::issue(&state.config.session_secret, me.id, expires_at);
+            Ok(Json(LoginPoll::Done(AuthResponse { token, expires_at, me })))
+        }
+    }
 }
 
 async fn load_me(state: &AppState, user: &CurrentUser) -> Result<Me, AppError> {

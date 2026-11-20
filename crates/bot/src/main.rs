@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use kino_server::{config::parse_ids, db};
+use kino_server::{config::parse_ids, db, telegram_auth::TelegramUser};
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use teloxide::{
     prelude::*,
@@ -70,9 +70,39 @@ async fn is_admin(state: &BotState, telegram_id: i64) -> anyhow::Result<bool> {
     Ok(row.map(|r| r.get::<String, _>("role") == "admin").unwrap_or(false))
 }
 
+/// `/start login_<code>`: the user logs in an app (phone, desktop) from this chat.
+async fn confirm_app_login(state: &BotState, msg: &Message, code: &str) -> String {
+    let Some(user) = msg.from.as_ref() else {
+        return "Не удалось узнать ваш аккаунт.".to_owned();
+    };
+    let tg = TelegramUser {
+        id: user.id.0 as i64,
+        first_name: Some(user.first_name.clone()),
+        last_name: user.last_name.clone(),
+        username: user.username.clone(),
+        photo_url: None,
+    };
+    match db::confirm_login_link(&state.pool, code, &tg, &state.admin_ids).await {
+        Ok(db::LinkConfirm::Confirmed) => "Готово! Вернитесь в приложение: вход выполнен.".to_owned(),
+        Ok(db::LinkConfirm::NotInvited) => {
+            "Доступ только по приглашению. Попросите у администратора ссылку-приглашение.".to_owned()
+        }
+        Ok(db::LinkConfirm::Unknown) => "Код входа устарел. Нажмите «Войти» в приложении ещё раз.".to_owned(),
+        Err(e) => {
+            tracing::error!(error = %e, "app login failed");
+            "Что-то пошло не так, попробуйте позже.".to_owned()
+        }
+    }
+}
+
 async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> ResponseResult<()> {
     match cmd {
         Command::Start(payload) => {
+            if let Some(code) = payload.trim().strip_prefix(kino_server::LOGIN_PREFIX) {
+                let reply = confirm_app_login(&state, &msg, code).await;
+                bot.send_message(msg.chat.id, reply).await?;
+                return Ok(());
+            }
             bot.send_message(
                 msg.chat.id,
                 "Привет! Здесь можно найти фильм или сериал и смотреть его с того места, где остановились.",
