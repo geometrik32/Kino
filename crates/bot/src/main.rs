@@ -453,6 +453,18 @@ async fn main() -> anyhow::Result<()> {
             tracing::debug!(admin = id, error = %e, "admin command menu not set");
         }
     }
+    // The text people see before they press "Начать", and on the bot's profile.
+    // Cosmetic, so a failure only gets a warning.
+    if let Err(e) = bot.set_my_description().description(screens::BOT_DESCRIPTION).await {
+        tracing::warn!(error = %e, "setting the bot description failed");
+    }
+    if let Err(e) = bot
+        .set_my_short_description()
+        .short_description(screens::BOT_SHORT_DESCRIPTION)
+        .await
+    {
+        tracing::warn!(error = %e, "setting the short description failed");
+    }
     // The blue button next to the message field opens the app in every private chat.
     bot.set_chat_menu_button()
         .menu_button(MenuButton::WebApp {

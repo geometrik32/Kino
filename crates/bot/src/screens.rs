@@ -64,6 +64,15 @@ fn name_with_year(t: &TitleSummary) -> String {
     }
 }
 
+/// Shown in an empty chat with the bot, above the "Начать" button (Telegram allows 512 characters).
+pub const BOT_DESCRIPTION: &str = "Орловский кинопоказ: ваш личный кинотеатр.\n\n\
+    Ищите фильмы и сериалы, смотрите в Telegram, на сайте и в приложении и продолжайте с того же места на любом устройстве.\n\n\
+    Нажмите «Начать».";
+
+/// Shown on the bot's profile and when it is shared (Telegram allows 120 characters).
+pub const BOT_SHORT_DESCRIPTION: &str =
+    "Личный кинотеатр: поиск, просмотр и продолжение с того же места на любом устройстве.";
+
 pub fn help(base: &Url, is_admin: bool) -> Screen {
     let mut text = String::from(
         "<b>Орловский кинопоказ</b>\n\
@@ -397,6 +406,12 @@ mod tests {
             InlineKeyboardButtonKind::Url(u) => assert_eq!(u.as_str(), "https://kino.example.com/?login=abc123"),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn profile_texts_fit_telegram_limits() {
+        assert!(BOT_DESCRIPTION.chars().count() <= 512);
+        assert!(BOT_SHORT_DESCRIPTION.chars().count() <= 120);
     }
 
     #[test]
