@@ -101,34 +101,3 @@ pub fn clean_url() {
         }
     }
 }
-
-/// Inserts the Telegram Login Widget into the element with `container_id`.
-/// After login Telegram redirects back to this page with the signed fields.
-pub fn mount_login_widget(container_id: &str, bot_username: &str) {
-    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
-        return;
-    };
-    let Some(container) = doc.get_element_by_id(container_id) else {
-        return;
-    };
-    if container.child_element_count() > 0 {
-        return;
-    }
-    let Ok(script) = doc.create_element("script") else {
-        return;
-    };
-    let here = web_sys::window()
-        .and_then(|w| w.location().href().ok())
-        .unwrap_or_default();
-    for (k, v) in [
-        ("src", "https://telegram.org/js/telegram-widget.js?22"),
-        ("data-telegram-login", bot_username),
-        ("data-size", "large"),
-        ("data-auth-url", here.as_str()),
-        ("data-request-access", "write"),
-    ] {
-        let _ = script.set_attribute(k, v);
-    }
-    let _ = script.set_attribute("async", "");
-    let _ = container.append_child(&script);
-}

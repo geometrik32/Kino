@@ -32,7 +32,11 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("listening on {}", config.bind_addr);
 
     let catalog: Arc<dyn Catalog> = match &config.tmdb_api_key {
-        Some(key) => Arc::new(TmdbCatalog::new(key.clone(), config.tmdb_language.clone())),
+        Some(key) => Arc::new(TmdbCatalog::new(
+            key.clone(),
+            config.tmdb_language.clone(),
+            config.tmdb_proxy.as_deref(),
+        )?),
         None => {
             tracing::warn!("TMDB_API_KEY is not set: serving the built-in demo catalog");
             Arc::new(DemoCatalog)

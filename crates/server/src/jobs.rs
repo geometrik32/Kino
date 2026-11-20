@@ -113,7 +113,11 @@ pub async fn telegram_send(client: &reqwest::Client, token: &str, chat_id: i64, 
 
 /// Runs the jobs forever: preload expiry hourly, the episode check every `every`.
 pub fn spawn(state: AppState, every: Duration) {
-    let client = reqwest::Client::new();
+    let client = crate::config::http_client(state.config.telegram_proxy.as_deref(), Duration::from_secs(30))
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "TELEGRAM_PROXY is wrong, sending to Telegram directly");
+            reqwest::Client::new()
+        });
     let token = Arc::new(state.config.bot_token.clone());
     let sync_state = state.clone();
     tokio::spawn(async move {

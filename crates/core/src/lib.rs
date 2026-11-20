@@ -149,6 +149,32 @@ pub struct WidgetAuthRequest {
     pub invite: Option<String>,
 }
 
+/// Body of `POST /api/auth/link`: start logging in through the Telegram app.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LoginLinkRequest {
+    pub invite: Option<String>,
+}
+
+/// Answer of `POST /api/auth/link`: open `url` (the bot in Telegram), then poll
+/// `GET /api/auth/link/{token}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoginLink {
+    pub token: String,
+    pub url: String,
+}
+
+/// Answer of `GET /api/auth/link/{token}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum LoginLinkStatus {
+    /// Not confirmed in Telegram yet.
+    Pending,
+    /// Confirmed; the link is used up.
+    Done { auth: AuthResponse },
+    /// Too old or unknown; start again.
+    Expired,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {

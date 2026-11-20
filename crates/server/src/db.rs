@@ -127,6 +127,95 @@ pub async fn create_invite(pool: &PgPool, created_by: Option<i64>) -> Result<Str
     Ok(code)
 }
 
+/// How long a "log in through Telegram" link stays valid.
+pub const LOGIN_LINK_MINUTES: i32 = 10;
+
+/// `/start` payload prefix for website logins: `t.me/<bot>?start=login_<token>`.
+pub const LOGIN_PREFIX: &str = "login_";
+
+/// Creates a login link token (43 URL-safe characters, fits a `/start` payload).
+pub async fn create_login_link(pool: &PgPool, invite: Option<&str>) -> Result<String, sqlx::Error> {
+    sqlx::query("DELETE FROM login_link WHERE created_at < now() - make_interval(mins => $1)")
+        .bind(LOGIN_LINK_MINUTES * 6)
+        .execute(pool)
+        .await?;
+    let token: String = rand::rng()
+        .sample_iter(&Alphanumeric)
+        .take(43)
+        .map(char::from)
+        .collect();
+    sqlx::query("INSERT INTO login_link (token, invite) VALUES ($1, $2)")
+        .bind(&token)
+        .bind(invite)
+        .execute(pool)
+        .await?;
+    Ok(token)
+}
+
+/// Marks a login link as confirmed by this Telegram user. False when the link
+/// is unknown, already used or too old.
+pub async fn confirm_login_link(pool: &PgPool, token: &str, tg: &TelegramUser) -> Result<bool, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE login_link SET telegram_id = $2, first_name = $3, last_name = $4, username = $5, confirmed_at = now()
+         WHERE token = $1 AND confirmed_at IS NULL AND created_at > now() - make_interval(mins => $6)",
+    )
+    .bind(token)
+    .bind(tg.id)
+    .bind(&tg.first_name)
+    .bind(&tg.last_name)
+    .bind(&tg.username)
+    .bind(LOGIN_LINK_MINUTES)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+pub enum LoginLinkState {
+    Pending,
+    Expired,
+    /// Confirmed: who it was and the invite the site passed. The link is deleted.
+    Confirmed(TelegramUser, Option<String>),
+}
+
+/// Looks at a login link; a confirmed one is used up by this call.
+pub async fn take_login_link(pool: &PgPool, token: &str) -> Result<LoginLinkState, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT telegram_id, first_name, last_name, username, invite,
+                created_at > now() - make_interval(mins => $2) AS fresh
+         FROM login_link WHERE token = $1",
+    )
+    .bind(token)
+    .bind(LOGIN_LINK_MINUTES)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(LoginLinkState::Expired);
+    };
+    let telegram_id: Option<i64> = row.try_get("telegram_id")?;
+    match telegram_id {
+        Some(id) => {
+            let deleted = sqlx::query("DELETE FROM login_link WHERE token = $1")
+                .bind(token)
+                .execute(pool)
+                .await?;
+            if deleted.rows_affected() != 1 {
+                // Someone else picked it up at the same moment.
+                return Ok(LoginLinkState::Expired);
+            }
+            let tg = TelegramUser {
+                id,
+                first_name: row.try_get("first_name")?,
+                last_name: row.try_get("last_name")?,
+                username: row.try_get("username")?,
+                photo_url: None,
+            };
+            Ok(LoginLinkState::Confirmed(tg, row.try_get("invite")?))
+        }
+        None if row.try_get::<bool, _>("fresh")? => Ok(LoginLinkState::Pending),
+        None => Ok(LoginLinkState::Expired),
+    }
+}
+
 const PROGRESS_COLUMNS: &str = "media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished,
      release_infohash, release_file, release_title, updated_at";
 
