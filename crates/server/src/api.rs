@@ -10,8 +10,10 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    Role, SearchResults, Season, TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PreloadItem, PreloadRequest,
+    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role, SearchResults, Season,
+    StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest,
+    WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +24,7 @@ use crate::{
     error::AppError,
     session,
     telegram_auth::{self, TelegramUser},
+    userdata,
 };
 
 #[derive(Clone)]
@@ -43,6 +46,16 @@ pub fn router() -> Router<AppState> {
         .route("/progress/{kind}/{tmdb_id}", get(title_progress))
         .route("/release-choice", put(save_release_choice))
         .route("/release-choice/{kind}/{tmdb_id}", get(release_choices))
+        .route("/title/{kind}/{tmdb_id}/state", get(title_state))
+        .route("/title/{kind}/{tmdb_id}/status", put(put_status))
+        .route("/title/{kind}/{tmdb_id}/rating", put(put_rating))
+        .route("/title/{kind}/{tmdb_id}/tracks", put(put_tracks))
+        .route("/my", get(my_titles))
+        .route("/marks", post(post_marks))
+        .route("/history", get(history))
+        .route("/prefs", get(get_prefs).put(put_prefs))
+        .route("/preload", get(preloads).post(add_preload))
+        .route("/preload/{id}", axum::routing::delete(delete_preload))
         .route("/watchlist", get(watchlist))
         .route(
             "/watchlist/{kind}/{tmdb_id}",
@@ -187,7 +200,37 @@ async fn save_progress(
     if let Some(r) = &mut u.release {
         r.infohash.make_ascii_lowercase();
     }
-    Ok(Json(db::save_progress(&state.pool, user.0, &u).await?))
+    let p = db::save_progress(&state.pool, user.0, &u).await?;
+    userdata::refresh_status(&state.pool, &*state.catalog, user.0, p.kind, p.tmdb_id, true).await?;
+    if p.finished {
+        after_finished(&state, user.0, p.kind, p.tmdb_id, p.season, p.episode).await?;
+    }
+    Ok(Json(p))
+}
+
+/// A film, or the last episode of a season, is watched: its preload goes after a while.
+async fn after_finished(
+    state: &AppState,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+) -> Result<(), AppError> {
+    let season_done = match kind {
+        MediaKind::Movie => true,
+        MediaKind::Tv => state
+            .catalog
+            .season(tmdb_id, season)
+            .await
+            .map(|s| s.episodes.iter().map(|e| e.number).max() == Some(episode))
+            .unwrap_or(false),
+    };
+    if season_done {
+        let at = Utc::now() + state.config.preload_keep;
+        userdata::preload_schedule_removal(&state.pool, user_id, kind, tmdb_id, season, at).await?;
+    }
+    Ok(())
 }
 
 async fn save_release_choice(
@@ -215,6 +258,195 @@ async fn release_choices(
     Ok(Json(
         db::release_choices(&state.pool, user.0, parse_kind(&kind)?, tmdb_id).await?,
     ))
+}
+
+/// Fills in names and posters; titles the catalog can't resolve stay without them.
+async fn summary_of(state: &AppState, kind: MediaKind, tmdb_id: i64) -> Option<kino_core::TitleSummary> {
+    state.catalog.details(kind, tmdb_id).await.ok().map(|d| d.summary)
+}
+
+async fn title_state(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+) -> Result<Json<TitleState>, AppError> {
+    Ok(Json(
+        userdata::get_state(&state.pool, user.0, parse_kind(&kind)?, tmdb_id).await?,
+    ))
+}
+
+async fn put_status(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Json(u): Json<StatusUpdate>,
+) -> Result<Json<TitleState>, AppError> {
+    let kind = parse_kind(&kind)?;
+    let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, u.status).await?;
+    // Marking a film "Просмотрено" by hand also marks it watched for "Continue watching".
+    if u.status == Some(TitleStatus::Watched) && kind == MediaKind::Movie {
+        let m = MarkWatched {
+            kind,
+            tmdb_id,
+            season: 0,
+            episodes: vec![],
+            watched: true,
+        };
+        userdata::mark(&state.pool, user.0, &m).await?;
+        st = userdata::get_state(&state.pool, user.0, kind, tmdb_id).await?;
+    }
+    Ok(Json(st))
+}
+
+async fn put_rating(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Json(u): Json<RatingUpdate>,
+) -> Result<Json<TitleState>, AppError> {
+    if u.rating.is_some_and(|r| !(1..=5).contains(&r)) {
+        return Err(AppError::bad_request("rating must be 1 to 5"));
+    }
+    Ok(Json(
+        userdata::set_rating(&state.pool, user.0, parse_kind(&kind)?, tmdb_id, u.rating).await?,
+    ))
+}
+
+async fn put_tracks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Json(u): Json<TracksUpdate>,
+) -> Result<Json<TitleState>, AppError> {
+    let too_long = |t: &Option<String>| t.as_ref().is_some_and(|t| t.chars().count() > 200);
+    if too_long(&u.audio_track) || too_long(&u.subtitle_track) {
+        return Err(AppError::bad_request("track names must be at most 200 characters"));
+    }
+    Ok(Json(
+        userdata::set_tracks(
+            &state.pool,
+            user.0,
+            parse_kind(&kind)?,
+            tmdb_id,
+            u.audio_track,
+            u.subtitle_track,
+        )
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct MyQuery {
+    status: Option<String>,
+}
+
+/// "Мои": titles by status, with names and posters.
+async fn my_titles(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<MyQuery>,
+) -> Result<Json<Vec<TitleState>>, AppError> {
+    let status = match q.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => Some(TitleStatus::parse(s).ok_or_else(|| AppError::bad_request("unknown status"))?),
+    };
+    let mut list = userdata::list_states(&state.pool, user.0, status).await?;
+    for item in &mut list {
+        item.title = summary_of(&state, item.kind, item.tmdb_id).await;
+    }
+    Ok(Json(list))
+}
+
+async fn post_marks(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(m): Json<MarkWatched>,
+) -> Result<StatusCode, AppError> {
+    if m.tmdb_id <= 0 || (m.kind == MediaKind::Tv && (m.season < 0 || m.episodes.is_empty())) {
+        return Err(AppError::bad_request(
+            "a series needs a season and at least one episode",
+        ));
+    }
+    if m.episodes.len() > 500 || m.episodes.iter().any(|e| *e < 1) {
+        return Err(AppError::bad_request("episodes must be numbers from 1"));
+    }
+    userdata::mark(&state.pool, user.0, &m).await?;
+    userdata::refresh_status(&state.pool, &*state.catalog, user.0, m.kind, m.tmdb_id, false).await?;
+    if m.watched {
+        let last = m.episodes.iter().copied().max().unwrap_or(0);
+        after_finished(&state, user.0, m.kind, m.tmdb_id, m.season, last).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    limit: Option<i64>,
+}
+
+async fn history(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
+) -> Result<Json<Vec<HistoryEntry>>, AppError> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let mut list = userdata::history(&state.pool, user.0, limit).await?;
+    let mut cache = std::collections::HashMap::new();
+    for item in &mut list {
+        let key = (item.kind, item.tmdb_id);
+        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
+            e.insert(summary_of(&state, item.kind, item.tmdb_id).await);
+        }
+        item.title = cache[&key].clone();
+    }
+    Ok(Json(list))
+}
+
+async fn get_prefs(State(state): State<AppState>, user: CurrentUser) -> Result<Json<UserPrefs>, AppError> {
+    Ok(Json(userdata::get_prefs(&state.pool, user.0).await?))
+}
+
+async fn put_prefs(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(p): Json<UserPrefs>,
+) -> Result<Json<UserPrefs>, AppError> {
+    let long = |v: &Option<String>| v.as_ref().is_some_and(|v| v.chars().count() > 100);
+    if long(&p.quality) || long(&p.voice) || long(&p.subtitle_lang) {
+        return Err(AppError::bad_request("values must be at most 100 characters"));
+    }
+    userdata::set_prefs(&state.pool, user.0, &p).await?;
+    Ok(Json(p))
+}
+
+async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Vec<PreloadItem>>, AppError> {
+    Ok(Json(userdata::preloads(&state.pool, user.0).await?))
+}
+
+async fn add_preload(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(mut r): Json<PreloadRequest>,
+) -> Result<Json<PreloadItem>, AppError> {
+    if !infohash_ok(&r.infohash) || r.tmdb_id <= 0 || r.season < 0 {
+        return Err(AppError::bad_request(
+            "need a hex infohash, a positive tmdb_id and season >= 0",
+        ));
+    }
+    r.infohash.make_ascii_lowercase();
+    Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?))
+}
+
+async fn delete_preload(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<StatusCode, AppError> {
+    if userdata::preload_delete(&state.pool, user.0, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(AppError::not_found())
+    }
 }
 
 fn parse_kind(kind: &str) -> Result<MediaKind, AppError> {

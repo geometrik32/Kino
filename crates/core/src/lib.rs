@@ -64,6 +64,9 @@ pub struct ProgressUpdate {
     pub position_sec: f64,
     pub duration_sec: f64,
     pub release: Option<ReleaseRef>,
+    /// Device name for the watch history, e.g. "Телефон" or "Chrome на Windows".
+    #[serde(default)]
+    pub device: Option<String>,
 }
 
 /// One saved position.
@@ -91,6 +94,9 @@ pub struct ContinueItem {
     /// Name and poster, filled in by the server from the catalog.
     #[serde(default)]
     pub title: Option<TitleSummary>,
+    /// Not touched for a long time: the UI offers to mark it "Брошено".
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// An entry of the "Want to watch" list.
@@ -232,6 +238,9 @@ pub struct TitleDetails {
     /// Empty for films. Season 0 ("Specials") comes last if present.
     pub seasons: Vec<SeasonSummary>,
     pub imdb_id: Option<String>,
+    /// Latest aired episode `(season, episode)` of a series.
+    #[serde(default)]
+    pub last_episode: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -309,6 +318,209 @@ pub fn clock(sec: f64) -> String {
     } else {
         format!("{}:{:02}", s / 60, s % 60)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-user state of a title
+// ---------------------------------------------------------------------------
+
+/// Where a title is for a user. Changes automatically while watching; the
+/// user can also set it by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TitleStatus {
+    /// Started: set on the first play.
+    Watching,
+    /// The film, or every aired episode, is watched.
+    Watched,
+    /// "Хочу посмотреть"; cleared when playback starts.
+    Want,
+    /// Given up; hidden from "Continue watching".
+    Dropped,
+}
+
+impl TitleStatus {
+    pub const ALL: [TitleStatus; 4] = [
+        TitleStatus::Watching,
+        TitleStatus::Want,
+        TitleStatus::Watched,
+        TitleStatus::Dropped,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TitleStatus::Watching => "watching",
+            TitleStatus::Watched => "watched",
+            TitleStatus::Want => "want",
+            TitleStatus::Dropped => "dropped",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.as_str() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TitleStatus::Watching => "Смотрю",
+            TitleStatus::Watched => "Просмотрено",
+            TitleStatus::Want => "Хочу посмотреть",
+            TitleStatus::Dropped => "Брошено",
+        }
+    }
+}
+
+/// Everything the user has set or the server has derived for one title.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TitleState {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub status: Option<TitleStatus>,
+    /// 1–5 stars.
+    pub rating: Option<i16>,
+    /// Audio and subtitle tracks picked in the player, restored next time.
+    pub audio_track: Option<String>,
+    pub subtitle_track: Option<String>,
+    pub updated_at: DateTime<Utc>,
+    /// Name and poster, filled in by the server for lists.
+    #[serde(default)]
+    pub title: Option<TitleSummary>,
+}
+
+/// Body of `PUT /api/title/{kind}/{id}/status`; `null` clears it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusUpdate {
+    pub status: Option<TitleStatus>,
+}
+
+/// Body of `PUT /api/title/{kind}/{id}/rating`: 1–5, or `null` to remove.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RatingUpdate {
+    pub rating: Option<i16>,
+}
+
+/// Body of `PUT /api/title/{kind}/{id}/tracks`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TracksUpdate {
+    pub audio_track: Option<String>,
+    pub subtitle_track: Option<String>,
+}
+
+/// Body of `POST /api/marks`: mark episodes (or a film) watched or not,
+/// e.g. when they were watched somewhere else.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkWatched {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    /// 0 for films.
+    #[serde(default)]
+    pub season: i32,
+    /// Episode numbers; ignored for films.
+    #[serde(default)]
+    pub episodes: Vec<i32>,
+    pub watched: bool,
+}
+
+/// One viewing session in the history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub season: i32,
+    pub episode: i32,
+    pub started_at: DateTime<Utc>,
+    pub last_at: DateTime<Utc>,
+    pub position_from: f64,
+    pub position_to: f64,
+    pub device: Option<String>,
+    #[serde(default)]
+    pub title: Option<TitleSummary>,
+}
+
+/// Defaults used when picking releases and tracks.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UserPrefs {
+    /// "1080p", "2160p", ...
+    pub quality: Option<String>,
+    /// Preferred voice-over, e.g. "LostFilm".
+    pub voice: Option<String>,
+    /// Subtitle language, e.g. "Русский"; `None` means no subtitles.
+    pub subtitle_lang: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PreloadState {
+    Queued,
+    Downloading,
+    Ready,
+    Failed,
+    /// Removed from the server's disk (after it was watched, or by hand).
+    Deleted,
+}
+
+impl PreloadState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PreloadState::Queued => "queued",
+            PreloadState::Downloading => "downloading",
+            PreloadState::Ready => "ready",
+            PreloadState::Failed => "failed",
+            PreloadState::Deleted => "deleted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        [
+            PreloadState::Queued,
+            PreloadState::Downloading,
+            PreloadState::Ready,
+            PreloadState::Failed,
+            PreloadState::Deleted,
+        ]
+        .into_iter()
+        .find(|p| p.as_str() == s)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PreloadState::Queued => "В очереди",
+            PreloadState::Downloading => "Скачивается",
+            PreloadState::Ready => "Готово",
+            PreloadState::Failed => "Ошибка",
+            PreloadState::Deleted => "Удалено",
+        }
+    }
+}
+
+/// Body of `POST /api/preload`: download a release to the server in advance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreloadRequest {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    /// 0 for films.
+    #[serde(default)]
+    pub season: i32,
+    pub infohash: String,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreloadItem {
+    pub id: i64,
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub season: i32,
+    pub infohash: String,
+    pub title: Option<String>,
+    pub state: PreloadState,
+    /// 0.0–1.0 while downloading.
+    pub progress: f32,
+    pub size_bytes: Option<i64>,
+    pub requested_at: DateTime<Utc>,
+    pub ready_at: Option<DateTime<Utc>>,
+    /// Set once watched: the files are removed after this moment.
+    pub delete_after: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]

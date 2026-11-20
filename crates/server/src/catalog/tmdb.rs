@@ -144,6 +144,13 @@ struct Details {
     #[serde(default)]
     seasons: Vec<RawSeason>,
     external_ids: Option<ExternalIds>,
+    last_episode_to_air: Option<RawEpisodeRef>,
+}
+
+#[derive(Deserialize)]
+struct RawEpisodeRef {
+    season_number: i32,
+    episode_number: i32,
 }
 
 #[derive(Deserialize)]
@@ -202,6 +209,7 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
         tagline: d.tagline.filter(|t| !t.is_empty()),
         seasons,
         imdb_id: d.imdb_id.or(d.external_ids.and_then(|e| e.imdb_id)),
+        last_episode: d.last_episode_to_air.map(|e| (e.season_number, e.episode_number)),
     })
 }
 

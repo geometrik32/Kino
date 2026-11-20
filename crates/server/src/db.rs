@@ -190,7 +190,51 @@ pub async fn save_progress(pool: &PgPool, user_id: i64, u: &ProgressUpdate) -> R
     .bind(u.release.as_ref().and_then(|r| r.title.as_deref()))
     .fetch_one(pool)
     .await?;
+    record_history(pool, user_id, u, season, episode).await?;
     progress_from_row(&row)
+}
+
+/// Extends the current viewing session, or starts a new one after a 30-minute break.
+async fn record_history(
+    pool: &PgPool,
+    user_id: i64,
+    u: &ProgressUpdate,
+    season: i32,
+    episode: i32,
+) -> Result<(), sqlx::Error> {
+    let updated = sqlx::query(
+        "UPDATE watch_history SET last_at = now(), position_to = $6, device = COALESCE($7, device)
+         WHERE id = (SELECT id FROM watch_history
+                     WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND season = $4 AND episode = $5
+                       AND last_at > now() - interval '30 minutes'
+                     ORDER BY last_at DESC LIMIT 1)",
+    )
+    .bind(user_id)
+    .bind(u.kind.as_str())
+    .bind(u.tmdb_id)
+    .bind(season)
+    .bind(episode)
+    .bind(u.position_sec)
+    .bind(u.device.as_deref())
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        sqlx::query(
+            "INSERT INTO watch_history
+               (user_id, media_kind, tmdb_id, season, episode, position_from, position_to, device)
+             VALUES ($1, $2, $3, $4, $5, $6, $6, $7)",
+        )
+        .bind(user_id)
+        .bind(u.kind.as_str())
+        .bind(u.tmdb_id)
+        .bind(season)
+        .bind(episode)
+        .bind(u.position_sec)
+        .bind(u.device.as_deref())
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// All saved positions for one title (every episode of a series).
@@ -212,6 +256,9 @@ pub async fn title_progress(
     rows.iter().map(progress_from_row).collect()
 }
 
+/// A title not touched for this long is offered to be marked "Брошено".
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::days(60);
+
 /// "Continue watching": the latest position per title, newest first.
 /// Finished films drop out; a finished episode points at the next one.
 pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Result<Vec<ContinueItem>, sqlx::Error> {
@@ -222,6 +269,10 @@ pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Resul
            ORDER BY media_kind, tmdb_id, updated_at DESC
          ) latest
          WHERE NOT (media_kind = 'movie' AND finished)
+           AND NOT EXISTS (
+             SELECT 1 FROM title_state ts
+             WHERE ts.user_id = $1 AND ts.media_kind = latest.media_kind AND ts.tmdb_id = latest.tmdb_id
+               AND ts.status IN ('dropped', 'watched'))
          ORDER BY updated_at DESC LIMIT $2"
     ))
     .bind(user_id)
@@ -231,22 +282,27 @@ pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Resul
     rows.iter()
         .map(|row| {
             let last = progress_from_row(row)?;
+            let stale = last.updated_at < Utc::now() - STALE_AFTER;
             let next_episode = (last.kind == MediaKind::Tv && last.finished).then_some((last.season, last.episode + 1));
             Ok(ContinueItem {
                 last,
                 next_episode,
                 title: None,
+                stale,
             })
         })
         .collect()
 }
 
+/// "Хочу посмотреть": titles with status `want`.
 pub async fn watchlist(pool: &PgPool, user_id: i64) -> Result<Vec<WatchlistItem>, sqlx::Error> {
-    let rows =
-        sqlx::query("SELECT media_kind, tmdb_id, added_at FROM watchlist WHERE user_id = $1 ORDER BY added_at DESC")
-            .bind(user_id)
-            .fetch_all(pool)
-            .await?;
+    let rows = sqlx::query(
+        "SELECT media_kind, tmdb_id, updated_at FROM title_state
+         WHERE user_id = $1 AND status = 'want' ORDER BY updated_at DESC",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
     rows.iter()
         .map(|row| {
             let kind: String = row.try_get("media_kind")?;
@@ -254,29 +310,36 @@ pub async fn watchlist(pool: &PgPool, user_id: i64) -> Result<Vec<WatchlistItem>
                 kind: MediaKind::parse(&kind)
                     .ok_or_else(|| sqlx::Error::Decode(format!("bad media_kind {kind}").into()))?,
                 tmdb_id: row.try_get("tmdb_id")?,
-                added_at: row.try_get("added_at")?,
+                added_at: row.try_get("updated_at")?,
             })
         })
         .collect()
 }
 
 pub async fn watchlist_add(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO watchlist (user_id, media_kind, tmdb_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING")
-        .bind(user_id)
-        .bind(kind.as_str())
-        .bind(tmdb_id)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "INSERT INTO title_state (user_id, media_kind, tmdb_id, status) VALUES ($1, $2, $3, 'want')
+         ON CONFLICT (user_id, media_kind, tmdb_id) DO UPDATE SET status = 'want', updated_at = now()
+         WHERE title_state.status IS DISTINCT FROM 'want'",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
 pub async fn watchlist_remove(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i64) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query("DELETE FROM watchlist WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3")
-        .bind(user_id)
-        .bind(kind.as_str())
-        .bind(tmdb_id)
-        .execute(pool)
-        .await?;
+    let r = sqlx::query(
+        "UPDATE title_state SET status = NULL, updated_at = now()
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND status = 'want'",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .execute(pool)
+    .await?;
     Ok(r.rows_affected() > 0)
 }
 

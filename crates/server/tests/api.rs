@@ -1,96 +1,17 @@
 //! End-to-end API tests against a real PostgreSQL.
 //! Needs `DATABASE_URL` (each test gets a fresh database from `sqlx::test`).
 
-use std::{collections::BTreeMap, sync::Arc};
+#[path = "common/mod.rs"]
+mod common;
 
-use axum::{
-    body::Body,
-    http::{Method, Request, StatusCode},
-    Router,
-};
-use http_body_util::BodyExt;
-use kino_core::{AuthResponse, ContinueItem, Me, Progress, ReleaseChoice, Role, WatchlistItem};
-use kino_server::{app, catalog::DemoCatalog, config::Config, telegram_auth, AppState};
-use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+use axum::http::{Method, StatusCode};
+use common::*;
+use kino_core::{ContinueItem, Me, Progress, ReleaseChoice, Role, WatchlistItem};
+use kino_server::telegram_auth;
+use serde_json::json;
 use sqlx::PgPool;
-use tower::ServiceExt;
-
-const BOT_TOKEN: &str = "123456:TEST-token";
-const ADMIN_TG: i64 = 1000;
-
-fn test_app(pool: PgPool) -> Router {
-    let config = Config {
-        database_url: String::new(),
-        bind_addr: "127.0.0.1:0".parse().unwrap(),
-        bot_token: BOT_TOKEN.into(),
-        session_secret: b"test-secret-test-secret-test-secret".to_vec(),
-        session_ttl: chrono::Duration::days(1),
-        auth_max_age: chrono::Duration::days(1),
-        admin_telegram_ids: vec![ADMIN_TG],
-        bot_username: Some("kino_test_bot".into()),
-        public_url: "https://kino.example.com".into(),
-        tmdb_api_key: None,
-        tmdb_language: "ru-RU".into(),
-        static_dir: None,
-    };
-    app(AppState {
-        pool,
-        config: Arc::new(config),
-        catalog: Arc::new(DemoCatalog),
-    })
-}
-
-async fn call(
-    app: &Router,
-    method: Method,
-    path: &str,
-    token: Option<&str>,
-    body: Option<Value>,
-) -> (StatusCode, Value) {
-    let mut req = Request::builder().method(method).uri(path);
-    if let Some(t) = token {
-        req = req.header("Authorization", format!("Bearer {t}"));
-    }
-    let req = match body {
-        Some(b) => req
-            .header("Content-Type", "application/json")
-            .body(Body::from(b.to_string())),
-        None => req.body(Body::empty()),
-    }
-    .unwrap();
-    let resp = app.clone().oneshot(req).await.unwrap();
-    let status = resp.status();
-    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    let value = if bytes.is_empty() {
-        Value::Null
-    } else {
-        serde_json::from_slice(&bytes).unwrap()
-    };
-    (status, value)
-}
-
-fn init_data(tg_id: i64, name: &str) -> String {
-    let user = json!({ "id": tg_id, "first_name": name }).to_string();
-    let now = chrono::Utc::now().timestamp().to_string();
-    telegram_auth::sign_webapp(&[("auth_date", &now), ("user", &user)], BOT_TOKEN)
-}
-
-async fn login(app: &Router, tg_id: i64, invite: Option<&str>) -> (StatusCode, Value) {
-    call(
-        app,
-        Method::POST,
-        "/api/auth/webapp",
-        None,
-        Some(json!({ "init_data": init_data(tg_id, "Тест"), "invite": invite })),
-    )
-    .await
-}
-
-async fn login_ok(app: &Router, tg_id: i64, invite: Option<&str>) -> AuthResponse {
-    let (status, body) = login(app, tg_id, invite).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    serde_json::from_value(body).unwrap()
-}
 
 #[sqlx::test(migrations = "./migrations")]
 async fn invite_only_access(pool: PgPool) {

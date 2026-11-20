@@ -43,6 +43,7 @@ async fn main() -> anyhow::Result<()> {
         config: Arc::new(config),
         catalog,
     };
+    kino_server::jobs::spawn(state.clone(), state.config.notify_every);
     axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;

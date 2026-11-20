@@ -142,6 +142,7 @@ impl Catalog for DemoCatalog {
             tagline: None,
             seasons,
             imdb_id: None,
+            last_episode: t.seasons.last().map(|&n| (t.seasons.len() as i32, n)),
         })
     }
 

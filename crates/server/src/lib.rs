@@ -6,8 +6,10 @@ pub mod catalog;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod jobs;
 pub mod session;
 pub mod telegram_auth;
+pub mod userdata;
 
 use axum::Router;
 use tower_http::{

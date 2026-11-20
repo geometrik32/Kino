@@ -27,6 +27,10 @@ pub struct Config {
     pub tmdb_language: String,
     /// Directory with the built Dioxus web app; served at `/` when set.
     pub static_dir: Option<PathBuf>,
+    /// How often to look for new episodes of followed series.
+    pub notify_every: std::time::Duration,
+    /// How long a preloaded release is kept after it was watched.
+    pub preload_keep: chrono::Duration,
 }
 
 impl std::fmt::Debug for Config {
@@ -81,6 +85,17 @@ impl Config {
             tmdb_api_key: std::env::var("TMDB_API_KEY").ok().filter(|s| !s.trim().is_empty()),
             tmdb_language: var_or("TMDB_LANGUAGE", "ru-RU"),
             static_dir: std::env::var("STATIC_DIR").ok().map(PathBuf::from),
+            notify_every: std::time::Duration::from_secs(
+                3600 * var_or("NOTIFY_INTERVAL_HOURS", "6")
+                    .parse::<u64>()
+                    .context("NOTIFY_INTERVAL_HOURS must be a number")?
+                    .max(1),
+            ),
+            preload_keep: chrono::Duration::days(
+                var_or("PRELOAD_KEEP_DAYS", "7")
+                    .parse()
+                    .context("PRELOAD_KEEP_DAYS must be a number")?,
+            ),
         })
     }
 }
