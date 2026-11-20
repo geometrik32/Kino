@@ -3291,6 +3291,7 @@ dependencies = [
  "chrono",
  "dioxus",
  "gloo-net",
+ "gloo-timers",
  "js-sys",
  "kino-core",
  "kino-ui",
@@ -3306,6 +3307,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "kino-server",
+ "reqwest",
  "sqlx",
  "teloxide",
  "tokio",

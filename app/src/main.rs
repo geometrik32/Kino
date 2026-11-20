@@ -87,7 +87,7 @@ fn App() -> Element {
         style { "{STYLE}" }
         match session() {
             Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
-            Session::LoggedOut { error } => rsx! { Login { error } },
+            Session::LoggedOut { error } => rsx! { Login { error, on_login: move |s| session.set(s) } },
             Session::LoggedIn { token, name } => rsx! {
                 Main {
                     token,
@@ -102,19 +102,83 @@ fn App() -> Element {
     }
 }
 
+/// Where logging in through the Telegram app stands.
+#[derive(Clone, PartialEq)]
+enum LinkLogin {
+    Idle,
+    /// The bot is open in Telegram, waiting for the button press there.
+    Waiting,
+    Failed(String),
+}
+
 #[component]
-fn Login(error: Option<String>) -> Element {
-    let config = use_resource(api::public_config);
-    use_effect(move || {
-        if let Some(Ok(cfg)) = &*config.read() {
-            if let Some(bot) = &cfg.bot_username {
-                telegram::mount_login_widget("tg-login", bot);
+fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
+    let mut state = use_signal(|| LinkLogin::Idle);
+    // Made in advance so the button is a plain link: browsers block pop-ups
+    // opened after a network round trip.
+    let mut link = use_resource(move || api::start_login_link(telegram::invite()));
+    let mut wait = move |token: String| {
+        state.set(LinkLogin::Waiting);
+        spawn(async move {
+            // The link lives 10 minutes; ask every 2 seconds.
+            for _ in 0..300 {
+                gloo_timers::future::TimeoutFuture::new(2_000).await;
+                if *state.peek() != LinkLogin::Waiting {
+                    return;
+                }
+                match api::poll_login_link(&token).await {
+                    Ok(kino_core::LoginLinkStatus::Pending) => {}
+                    Ok(kino_core::LoginLinkStatus::Done { auth }) => {
+                        api::save_token(&auth.token);
+                        on_login.call(Session::LoggedIn {
+                            token: auth.token,
+                            name: auth.me.first_name.unwrap_or_default(),
+                        });
+                        return;
+                    }
+                    Ok(kino_core::LoginLinkStatus::Expired) => break,
+                    Err(f) if f.code == "not_invited" => {
+                        link.restart();
+                        return state.set(LinkLogin::Failed(f.message));
+                    }
+                    // A dropped request; try again on the next tick.
+                    Err(_) => {}
+                }
             }
-        }
-    });
+            link.restart();
+            state.set(LinkLogin::Failed("Время на вход вышло. Нажмите кнопку ещё раз.".into()));
+        });
+    };
+    let link_error = match &*link.read() {
+        Some(Err(f)) => Some(f.message.clone()),
+        _ => None,
+    };
+    let shown_error = match state() {
+        LinkLogin::Failed(e) => Some(e),
+        _ => link_error.or(error),
+    };
+    let ready = match &*link.read() {
+        Some(Ok(l)) => Some(l.clone()),
+        _ => None,
+    };
     rsx! {
-        LoginView { invite: telegram::invite(), error,
-            div { id: "tg-login" }
+        LoginView { invite: telegram::invite(), error: shown_error,
+            match (state(), ready) {
+                (LinkLogin::Waiting, Some(l)) => rsx! {
+                    p { "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
+                    a { class: "btn ghost", href: "{l.url}", target: "_blank", rel: "noopener", "Открыть Telegram ещё раз" }
+                    p {
+                        a { href: "#", onclick: move |e: Event<MouseData>| { e.prevent_default(); state.set(LinkLogin::Idle) }, "Отмена" }
+                    }
+                },
+                (_, Some(l)) => rsx! {
+                    a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener",
+                        onclick: move |_| wait(l.token.clone()),
+                        "Войти через Telegram"
+                    }
+                },
+                (_, None) => rsx! { p { class: "muted", "Готовим вход…" } },
+            }
         }
     }
 }

@@ -364,3 +364,69 @@ async fn release_choice_is_remembered_per_season(pool: PgPool) {
     .await;
     assert_eq!(body, json!([]), "choices are per user");
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn login_through_telegram_app(pool: PgPool) {
+    use kino_server::telegram_auth::TelegramUser;
+    let app = test_app(pool.clone());
+
+    let (status, link) = call(&app, Method::POST, "/api/auth/link", None, Some(json!({}))).await;
+    assert_eq!(status, StatusCode::OK);
+    let token = link["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        link["url"].as_str().unwrap(),
+        format!("https://t.me/kino_test_bot?start=login_{token}")
+    );
+    // Telegram's /start payload allows at most 64 characters.
+    assert!(format!("login_{token}").len() <= 64);
+
+    let (_, s) = call(&app, Method::GET, &format!("/api/auth/link/{token}"), None, None).await;
+    assert_eq!(s["status"], "pending");
+
+    // The bot confirms it for the admin.
+    let tg = TelegramUser {
+        id: ADMIN_TG,
+        first_name: Some("Daniil".into()),
+        last_name: None,
+        username: Some("dan".into()),
+        photo_url: None,
+    };
+    assert!(kino_server::db::confirm_login_link(&pool, &token, &tg).await.unwrap());
+    // A second press does nothing.
+    assert!(!kino_server::db::confirm_login_link(&pool, &token, &tg).await.unwrap());
+
+    let (status, s) = call(&app, Method::GET, &format!("/api/auth/link/{token}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(s["status"], "done");
+    let session = s["auth"]["token"].as_str().unwrap();
+    let (status, me) = call(&app, Method::GET, "/api/me", Some(session), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(me["first_name"], "Daniil");
+
+    // Used up.
+    let (_, s) = call(&app, Method::GET, &format!("/api/auth/link/{token}"), None, None).await;
+    assert_eq!(s["status"], "expired");
+    let (_, s) = call(&app, Method::GET, "/api/auth/link/not-a-token!", None, None).await;
+    assert_eq!(s["status"], "expired");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn telegram_app_login_still_needs_an_invite(pool: PgPool) {
+    use kino_server::telegram_auth::TelegramUser;
+    let app = test_app(pool.clone());
+    let (_, link) = call(&app, Method::POST, "/api/auth/link", None, Some(json!({}))).await;
+    let token = link["token"].as_str().unwrap();
+    let stranger = TelegramUser {
+        id: 777,
+        first_name: Some("X".into()),
+        last_name: None,
+        username: None,
+        photo_url: None,
+    };
+    assert!(kino_server::db::confirm_login_link(&pool, token, &stranger)
+        .await
+        .unwrap());
+    let (status, body) = call(&app, Method::GET, &format!("/api/auth/link/{token}"), None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "not_invited");
+}
