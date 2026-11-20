@@ -3307,6 +3307,8 @@ name = "kino-bot"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "kino-core",
  "kino-server",
  "reqwest",
  "sqlx",

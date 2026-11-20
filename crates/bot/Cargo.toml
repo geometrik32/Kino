@@ -1,12 +1,13 @@
 [package]
 name = "kino-bot"
-description = "Kino Telegram bot: opens the app, hands out invites"
+description = "Kino Telegram bot: search, continue watching, lists, site login, invites"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+kino-core.workspace = true
 kino-server.workspace = true
 anyhow.workspace = true
 sqlx.workspace = true
@@ -16,3 +17,6 @@ tracing-subscriber.workspace = true
 teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
+
+[dev-dependencies]
+chrono.workspace = true
