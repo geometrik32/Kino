@@ -1,8 +1,12 @@
-# Kino on TrueNAS: put this folder next to the other compose projects
-# (e.g. /mnt/M2_Apps/arcane/projects/kino), copy .env.example to .env, fill it in,
-# then `docker compose up -d`.
+# «Орловский кинопоказ» (кино «Орёл») on TrueNAS: a stack of its own, with every
+# module it needs. Nothing from the Lampa stack is shared or touched.
+# Put this folder next to the other compose projects
+# (e.g. /mnt/M2_Apps/arcane/projects/orel-kino), copy .env.example to .env,
+# fill it in, then `docker compose up -d`.
 #
 # HTTPS comes from the Traefik that already runs on the server (network "proxy").
+
+name: orel-kino
 
 services:
   kino-db:
@@ -39,9 +43,6 @@ services:
     volumes:
       # Preloaded releases, the same folder qBittorrent downloads into.
       - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads:ro
-    extra_hosts:
-      # TorrServer already runs on the host network (port 5665).
-      - host.docker.internal:host-gateway
     networks: [kino, proxy]
     labels:
       traefik.enable: "true"
@@ -62,6 +63,24 @@ services:
       kino-server:
         condition: service_started
     mem_limit: 64m
+    networks: [kino]
+
+  # Our own TorrServer, separate from Lampa's: streams torrents while they download.
+  # Reachable only inside this stack.
+  torrserver:
+    image: ghcr.io/yourok/torrserver:MatriX.141.5
+    restart: unless-stopped
+    environment:
+      TS_PORT: "8090"
+      TS_CONF_PATH: /opt/ts/config
+      TS_TORR_DIR: /opt/ts/torrents
+    volumes:
+      - ./data/torrserver:/opt/ts
+    ports:
+      # BitTorrent peers.
+      - "${TORRSERVER_PEER_PORT:-32000}:${TORRSERVER_PEER_PORT:-32000}"
+      - "${TORRSERVER_PEER_PORT:-32000}:${TORRSERVER_PEER_PORT:-32000}/udp"
+    mem_limit: 512m
     networks: [kino]
 
   # Searches all trackers at once. Add trackers in its web UI (LAN only):
@@ -88,14 +107,14 @@ services:
       PUID: "${PUID:-568}"
       PGID: "${PGID:-568}"
       TZ: Europe/Moscow
-      WEBUI_PORT: "8090"
+      WEBUI_PORT: "8085"
     volumes:
       - ./data/qbittorrent:/config
       - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads
     ports:
-      - "8090:8090"
-      - "6881:6881"
-      - "6881:6881/udp"
+      - "8085:8085"
+      - "6882:6882"
+      - "6882:6882/udp"
     mem_limit: 384m
     networks: [kino]
 

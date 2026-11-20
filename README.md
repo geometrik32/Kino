@@ -88,5 +88,5 @@ cd app && dx bundle --web --release
 3. В @BotFather: `/setdomain` → ваш `KINO_HOST` (для входа на сайте).
 4. `docker compose up -d`. Сайт откроется на `https://KINO_HOST` через уже работающий Traefik.
 5. Jackett (`http://<сервер>:9117`, только в локальной сети): добавить трекеры, API-ключ — в `.env`.
-   TorrServer используется уже установленный (логин и пароль — в `.env`).
-   qBittorrent (`http://<сервер>:8090`): пароль из логов первого запуска сменить и записать в `.env`.
+   TorrServer свой, внутри стека `orel-kino` (Lampa и её TorrServer не затрагиваются).
+   qBittorrent (`http://<сервер>:8085`): пароль из логов первого запуска сменить и записать в `.env`.
