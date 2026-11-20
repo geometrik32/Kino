@@ -49,7 +49,7 @@ services:
       traefik.docker.network: proxy
       traefik.http.routers.kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
       traefik.http.routers.kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
-      traefik.http.routers.kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.routers.kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
       traefik.http.services.kino.loadbalancer.server.port: "8080"
 
   kino-bot:
@@ -70,16 +70,20 @@ services:
   torrserver:
     image: ghcr.io/yourok/torrserver:MatriX.141.5
     restart: unless-stopped
+    # Settings copied from the Lampa TorrServer (64 MB RAM cache, 25 connections),
+    # except a fixed peer port: put deploy/torrserver/settings.json into
+    # data/torrserver/config/ before the first start.
     environment:
       TS_PORT: "8090"
+      TS_DONTKILL: "1"
       TS_CONF_PATH: /opt/ts/config
       TS_TORR_DIR: /opt/ts/torrents
     volumes:
       - ./data/torrserver:/opt/ts
     ports:
       # BitTorrent peers.
-      - "${TORRSERVER_PEER_PORT:-32000}:${TORRSERVER_PEER_PORT:-32000}"
-      - "${TORRSERVER_PEER_PORT:-32000}:${TORRSERVER_PEER_PORT:-32000}/udp"
+      - "32000:32000"
+      - "32000:32000/udp"
     mem_limit: 512m
     networks: [kino]
 
