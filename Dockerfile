@@ -1,6 +1,7 @@
 # One image with both binaries (kino-server, kino-bot) and the built web app.
 
-FROM rust:1-bookworm AS build
+# dx needs glibc 2.39+, so Debian 13 (trixie).
+FROM rust:1-trixie AS build
 ARG DX_VERSION=0.7.10
 RUN rustup target add wasm32-unknown-unknown \
  && curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v${DX_VERSION}/dx-x86_64-unknown-linux-gnu.tar.gz" \
@@ -12,8 +13,12 @@ RUN cd app && dx bundle --web --release \
  && mkdir -p /out \
  && cp -r "$(dirname "$(find /src/target/dx -path '*release/web/public/index.html' | head -n1)")" /out/web
 
-FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+FROM debian:trixie-slim
+# ffmpeg/ffprobe for transcoding and subtitles; Intel VAAPI driver for hardware encoding.
+RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates ffmpeg intel-media-va-driver-non-free \
+ && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/kino-server /src/target/release/kino-bot /usr/local/bin/
 COPY --from=build /out/web /srv/web
 ENV STATIC_DIR=/srv/web BIND_ADDR=0.0.0.0:8080
