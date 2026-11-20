@@ -18,6 +18,10 @@ pub struct ParsedTitle {
     /// Single season; `None` for films and multi-season packs.
     pub season: Option<i32>,
     pub year: Option<i32>,
+    /// Bitrate in kbit/s when the name states it, e.g. "25.4 Mbps".
+    pub bitrate_kbps: Option<u32>,
+    /// One episode of a series, not a whole season.
+    pub single_episode: bool,
 }
 
 /// Studios recognised by name, in the spelling shown to the user.
@@ -64,6 +68,9 @@ struct Regexes {
     avo: Regex,
     sub: Regex,
     ukr_only: Regex,
+    mbps: Regex,
+    kbps: Regex,
+    episode: Regex,
 }
 
 impl Regexes {
@@ -86,6 +93,11 @@ impl Regexes {
             avo: re(r"(?i)\b(avo|авторский|ао|ап)\b"),
             sub: re(r"(?i)\b(sub|subs|субтитры|ст)\b"),
             ukr_only: re(r"(?i)\b(ukr|укр)\b"),
+            mbps: re(r"(?i)(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:mbps|mbit/s|mbit|мбит/с|мбит/сек|мбит)"),
+            kbps: re(r"(?i)(\d{3,6})\s*(?:kbps|kbit/s|kbit|кбит/с|кбит/сек|кбит)"),
+            episode: re(
+                r"(?i)(?:\bs\d{1,2}e\d{1,3}(\s*[-–]\s*e?\d{1,3})?)|(?:\bсери[яи][:\s]*\d{1,3}(\s*[-–]\s*\d{1,3})?)",
+            ),
         }
     }
 }
@@ -155,7 +167,25 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         subtitles: re.sub.is_match(name),
         season: season.flatten(),
         year: re.year.captures(name).and_then(|c| c[1].parse().ok()),
+        bitrate_kbps: bitrate_in(name),
+        single_episode: re
+            .episode
+            .captures(name)
+            .is_some_and(|c| c.get(1).is_none() && c.get(2).is_none()),
     }
+}
+
+/// A bitrate written in the name, as kbit/s. Values outside what a video can
+/// plausibly have (0.3–400 Мбит/с) are ignored.
+fn bitrate_in(name: &str) -> Option<u32> {
+    let re = &*RE;
+    let kbps = re
+        .mbps
+        .captures(name)
+        .and_then(|c| c[1].replace(',', ".").parse::<f64>().ok())
+        .map(|m| m * 1000.0)
+        .or_else(|| re.kbps.captures(name).and_then(|c| c[1].parse::<f64>().ok()))?;
+    (300.0..=400_000.0).contains(&kbps).then_some(kbps.round() as u32)
 }
 
 fn has_cyrillic(s: &str) -> bool {
@@ -220,6 +250,24 @@ mod tests {
         let p = parse_title("Сериал / Сезоны: 1-3 [2020] DVDRip");
         assert_eq!(p.season, None);
         assert_eq!(p.quality, "SD");
+    }
+
+    #[test]
+    fn bitrate_from_the_name() {
+        let b = |n: &str| parse_title(n).bitrate_kbps;
+        assert_eq!(b("Дюна / 2024 / WEB-DL (2160p) / HEVC / 25,4 Mbps"), Some(25_400));
+        assert_eq!(b("Фильм [2020, BDRip 1080p, 8500 kbps]"), Some(8_500));
+        assert_eq!(b("Фильм [2020, 1080p, 12 Мбит/с]"), Some(12_000));
+        assert_eq!(b("Фильм [2020, 1080p]"), None);
+        assert_eq!(b("Фильм 2020 999 Mbps"), None, "not a believable bitrate");
+    }
+
+    #[test]
+    fn single_episodes_and_packs() {
+        assert!(parse_title("Breaking.Bad.S03E01.1080p.WEB-DL").single_episode);
+        assert!(!parse_title("Breaking.Bad.S03E01-E13.1080p").single_episode);
+        assert!(!parse_title("Во все тяжкие / Сезон: 2 / Серии: 1-13 из 13 [BDRip 1080p]").single_episode);
+        assert!(!parse_title("Тед Лассо (3 сезон) 4K UHD").single_episode);
     }
 
     #[test]

@@ -4,8 +4,8 @@ use gloo_net::http::{Request, Response};
 use kino_core::{
     ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
     MarkWatched, Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate,
-    RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails,
-    TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, StreamProgress,
+    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::de::DeserializeOwned;
 
@@ -123,6 +123,11 @@ pub async fn details(token: &str, kind: MediaKind, id: i64) -> Result<TitleDetai
     get(&format!("/api/catalog/{}/{id}", kind.as_str()), token).await
 }
 
+/// Cast, recommendations and similar titles; loaded apart so the page shows at once.
+pub async fn extras(token: &str, kind: MediaKind, id: i64) -> Result<TitleExtras, Failure> {
+    get(&format!("/api/catalog/{}/{id}/extras", kind.as_str()), token).await
+}
+
 pub async fn season(token: &str, id: i64, number: i32) -> Result<Season, Failure> {
     get(&format!("/api/catalog/tv/{id}/season/{number}"), token).await
 }
@@ -227,6 +232,11 @@ pub async fn releases(token: &str, kind: MediaKind, id: i64, season: i32) -> Res
 
 pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {
     send("POST", "/api/play", token, Some(r)).await
+}
+
+/// How far connecting to a release has got.
+pub async fn play_progress(token: &str, release: &str) -> Result<StreamProgress, Failure> {
+    get(&format!("/api/play/progress/{release}"), token).await
 }
 
 pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, Failure> {

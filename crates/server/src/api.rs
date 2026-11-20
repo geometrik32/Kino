@@ -12,8 +12,8 @@ use chrono::Utc;
 use kino_core::{
     AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me,
     MediaKind, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
-    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate,
+    UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -68,6 +68,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalog/home", get(catalog_home))
         .route("/catalog/search", get(catalog_search))
         .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
+        .route("/catalog/{kind}/{tmdb_id}/extras", get(catalog_extras))
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
         .merge(crate::play::routes())
@@ -618,6 +619,16 @@ async fn catalog_details(
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleDetails>, AppError> {
     Ok(Json(state.catalog.details(parse_kind(&kind)?, tmdb_id).await?))
+}
+
+/// Cast, recommendations and similar titles. A failure here must not spoil the
+/// title page, so the client asks for it separately.
+async fn catalog_extras(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+) -> Result<Json<TitleExtras>, AppError> {
+    Ok(Json(state.catalog.extras(parse_kind(&kind)?, tmdb_id).await?))
 }
 
 async fn catalog_season(

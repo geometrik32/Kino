@@ -2,7 +2,7 @@
 //! same whether the browser plays the file itself or the server re-encodes it.
 
 use dioxus::prelude::*;
-use kino_core::{clock, MediaTrack};
+use kino_core::{clock, MediaTrack, StreamProgress};
 
 /// `id` of the `<video>` element; the app drives it through the DOM.
 pub const VIDEO_ID: &str = "kino-video";
@@ -37,6 +37,8 @@ pub struct PlayerState {
     pub waiting: bool,
     /// What is happening while there is no picture yet.
     pub status: Option<String>,
+    /// How far the torrent is from playing; shown instead of a bare spinner.
+    pub progress: Option<StreamProgress>,
     pub error: Option<String>,
     pub audio: Vec<MediaTrack>,
     pub subtitle_tracks: Vec<MediaTrack>,
@@ -59,6 +61,26 @@ fn track_name(list: &[MediaTrack], index: Option<i32>, none: &str) -> String {
         .and_then(|i| list.iter().find(|t| t.index == i))
         .map(|t| t.label())
         .unwrap_or_else(|| none.to_owned())
+}
+
+/// The bar shown while connecting to a release: a percentage when it is
+/// known, else a moving bar with what we do know (peers, speed).
+#[component]
+pub fn ConnectProgress(progress: StreamProgress) -> Element {
+    let percent = progress.percent();
+    let details = progress.details();
+    rsx! {
+        div { class: "connect",
+            div { class: "connect-head",
+                span { "{progress.headline()}" }
+                if let Some(p) = percent { b { "{p}%" } }
+            }
+            div { class: if percent.is_some() { "bar" } else { "bar wait" },
+                div { class: "fill", style: "width: {percent.unwrap_or(0)}%" }
+            }
+            if !details.is_empty() { div { class: "connect-sub", "{details}" } }
+        }
+    }
 }
 
 #[component]
@@ -120,8 +142,12 @@ pub fn PlayerView(
             }
             if s.waiting || s.status.is_some() {
                 div { class: "p-center",
-                    div { class: "spinner" }
-                    if let Some(st) = &s.status { p { "{st}" } }
+                    if let Some(pr) = &s.progress {
+                        ConnectProgress { progress: pr.clone() }
+                    } else {
+                        div { class: "spinner" }
+                        if let Some(st) = &s.status { p { "{st}" } }
+                    }
                 }
             } else if s.paused && s.menu.is_none() {
                 button { class: "p-center p-big", onclick: move |_| on_toggle.call(()), "▶" }

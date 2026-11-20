@@ -5,7 +5,7 @@ mod demo;
 mod tmdb;
 
 use async_trait::async_trait;
-use kino_core::{HomeFeed, MediaKind, SearchResults, Season, TitleDetails};
+use kino_core::{HomeFeed, MediaKind, SearchResults, Season, TitleDetails, TitleExtras};
 
 pub use demo::DemoCatalog;
 pub use tmdb::TmdbCatalog;
@@ -23,6 +23,8 @@ pub trait Catalog: Send + Sync {
     async fn home(&self) -> Result<HomeFeed, CatalogError>;
     async fn search(&self, query: &str) -> Result<SearchResults, CatalogError>;
     async fn details(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleDetails, CatalogError>;
+    /// Cast, recommendations and similar titles.
+    async fn extras(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleExtras, CatalogError>;
     async fn season(&self, tmdb_id: i64, number: i32) -> Result<Season, CatalogError>;
     /// Raw image bytes and content type for `/api/img/{size}/{file}`.
     async fn image(&self, size: &str, file: &str) -> Result<(Vec<u8>, String), CatalogError>;

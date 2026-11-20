@@ -3,12 +3,13 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, TracksUpdate,
+    episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
+    TracksUpdate,
 };
 use kino_ui::{PlayerMenu, PlayerState, PlayerView, VIDEO_ID};
 use wasm_bindgen::JsCast;
 
-use crate::api;
+use crate::{api, native, telegram};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +64,17 @@ fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
         (Some(v), Some(q)) => format!("{v} · {q}"),
         _ => r.title.clone().unwrap_or_default(),
+    }
+}
+
+/// Leaves Telegram's full screen when the player goes away.
+struct FullscreenGuard;
+
+impl Drop for FullscreenGuard {
+    fn drop(&mut self) {
+        if telegram::is_fullscreen() {
+            telegram::set_fullscreen(false);
+        }
     }
 }
 
@@ -149,6 +161,42 @@ pub fn Player(
         }
     };
 
+    // While connecting or buffering, shows how far the torrent has got instead of a bare spinner.
+    {
+        let token = token.clone();
+        use_future(move || {
+            let token = token.clone();
+            async move {
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(1_000).await;
+                    let busy = {
+                        let s = ui.peek();
+                        s.error.is_none() && (s.status.is_some() || s.waiting)
+                    };
+                    if !busy {
+                        if ui.peek().progress.is_some() {
+                            ui.with_mut(|s| s.progress = None);
+                        }
+                        continue;
+                    }
+                    let key = release.peek().infohash.clone();
+                    if let Ok(p) = api::play_progress(&token, &key).await {
+                        // The answer may arrive after playback began.
+                        let (connecting, waiting) = {
+                            let s = ui.peek();
+                            (s.status.is_some(), s.waiting)
+                        };
+                        if connecting || waiting {
+                            // Stalling in the middle of a film is not "starting": plain spinner.
+                            let shown = (connecting || p.phase != StreamPhase::Ready).then_some(p);
+                            ui.with_mut(|s| s.progress = shown);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Asks the server for the stream of the current target.
     let begin = {
         let token = token.clone();
@@ -167,6 +215,7 @@ pub fn Player(
                 s.release = release_label(&rel);
                 s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
                 s.status = Some("Подключаемся к раздаче…".into());
+                s.progress = None;
             });
             spawn(async move {
                 let req = PlayRequest {
@@ -301,18 +350,26 @@ pub fn Player(
         }
     };
 
-    let close = {
+    let close = Callback::new({
         let mut save = save.clone();
-        move |_| {
+        move |_: ()| {
             save(false);
             if let Some(v) = video() {
                 let _ = v.pause();
             }
             on_close.call(());
         }
-    };
+    });
+    // On a phone in Telegram the film takes the whole screen, and Telegram's Back closes it.
+    use_hook(|| {
+        if telegram::is_mobile() {
+            telegram::set_fullscreen(true);
+        }
+        std::rc::Rc::new(FullscreenGuard)
+    });
 
     rsx! {
+        native::BackButton { on_back: move |_| close.call(()) }
         PlayerView {
             state: ui(),
             on_toggle: move |_| {
@@ -365,6 +422,9 @@ pub fn Player(
             },
             on_next: move |_| go_next(),
             on_fullscreen: move |_| {
+                if telegram::set_fullscreen(!telegram::is_fullscreen()) {
+                    return;
+                }
                 if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
                     if doc.fullscreen_element().is_some() {
                         doc.exit_fullscreen();

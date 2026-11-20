@@ -307,6 +307,31 @@ async fn catalog_browse_and_continue_has_titles(pool: PgPool) {
     let (status, _) = call(&app, Method::GET, "/api/catalog/movie/999999", Some(&u.token), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    // Cast and suggestions come separately and never include the title itself.
+    let (status, extras) = call(&app, Method::GET, "/api/catalog/tv/1396/extras", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!extras["cast"].as_array().unwrap().is_empty());
+    for row in ["recommendations", "similar"] {
+        let ids: Vec<_> = extras[row]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["tmdb_id"].clone())
+            .collect();
+        assert!(!ids.contains(&json!(1396)), "{row}: {ids:?}");
+    }
+    let (status, _) = call(&app, Method::GET, "/api/catalog/tv/1396/extras", None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/catalog/movie/999999/extras",
+        Some(&u.token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
     call(
         &app,
         Method::PUT,
