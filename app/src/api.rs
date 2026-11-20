@@ -2,8 +2,8 @@
 
 use gloo_net::http::{Request, Response};
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, SearchResults, Season, TitleDetails,
-    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ReleaseChoice, ReleaseChoiceUpdate,
+    SearchResults, Season, TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -149,4 +149,17 @@ pub async fn set_watchlist(token: &str, kind: MediaKind, id: i64, on: bool) -> R
     } else {
         decode::<serde_json::Value>(resp).await.map(|_| ())
     }
+}
+
+pub async fn release_choices(token: &str, kind: MediaKind, id: i64) -> Result<Vec<ReleaseChoice>, Failure> {
+    get(&format!("/api/release-choice/{}/{id}", kind.as_str()), token).await
+}
+
+/// Remembers the release picked for a film or a season.
+pub async fn save_release_choice(token: &str, choice: &ReleaseChoiceUpdate) -> Result<ReleaseChoice, Failure> {
+    let req = Request::put("/api/release-choice")
+        .header("Authorization", &format!("Bearer {token}"))
+        .json(choice)
+        .map_err(Failure::network)?;
+    decode(req.send().await.map_err(Failure::network)?).await
 }

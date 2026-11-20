@@ -101,6 +101,30 @@ pub struct WatchlistItem {
     pub added_at: DateTime<Utc>,
 }
 
+/// Body of `PUT /api/release-choice`: the release picked for a film or a season.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseChoiceUpdate {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    /// 0 for films.
+    #[serde(default)]
+    pub season: i32,
+    pub infohash: String,
+    pub title: Option<String>,
+    /// "1080p", "2160p", ...
+    pub quality: Option<String>,
+    /// Voice-over, e.g. "LostFilm".
+    pub voice: Option<String>,
+}
+
+/// A remembered release choice: "Смотреть" uses it without asking again.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReleaseChoice {
+    #[serde(flatten)]
+    pub release: ReleaseChoiceUpdate,
+    pub chosen_at: DateTime<Utc>,
+}
+
 /// Body of `POST /api/auth/webapp`: the raw `Telegram.WebApp.initData` string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebAppAuthRequest {

@@ -102,7 +102,21 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .sheet { background: var(--bg2); border: 1px solid var(--line); border-radius: 16px; width: min(720px, 100%); max-height: 90vh; overflow: auto; padding: 22px; }
 .sheet h3 { margin: 0 0 2px; font-size: 20px; }
 .sheet .hint { color: var(--muted); font-size: 14px; margin-bottom: 14px; }
-.filters { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
+.toolbar .count { margin-left: auto; color: var(--muted); font-size: 13px; }
+.chip.sm { padding: 5px 11px; font-size: 13px; }
+.panel { background: var(--card); border-radius: 12px; padding: 6px 14px; margin-bottom: 12px; }
+.panel .opt { display: flex; width: 100%; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--line); font-weight: 600; text-align: left; }
+.panel .opt:last-child { border-bottom: 0; }
+.panel .opt.on { color: var(--ok); }
+.frow { display: grid; grid-template-columns: 120px 1fr; gap: 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid var(--line); }
+.frow:last-child { border-bottom: 0; }
+.fname { font-weight: 600; }
+.fopts { display: flex; gap: 6px; flex-wrap: wrap; }
+.link { color: var(--accent); font-weight: 600; padding: 0; }
+.panel .reset { display: block; padding: 10px 0 4px; }
+.chosen-rel { margin-top: 14px; font-size: 14px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
+.chosen-rel .link { margin-left: 6px; }
 .rel { display: grid; grid-template-columns: 1fr auto; gap: 6px 16px; padding: 14px; border-radius: 12px; background: var(--card); margin-bottom: 8px; text-align: left; width: 100%; }
 .rel .rt { font-weight: 600; }
 .rel .tags { display: flex; gap: 6px; flex-wrap: wrap; font-size: 12px; }
@@ -148,6 +162,7 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
   .ep .mini { width: 100%; }
   .sheet-bg { align-items: flex-end; }
   .sheet { border-radius: 16px 16px 0 0; padding: 18px 16px 28px; }
+  .frow { grid-template-columns: 1fr; gap: 6px; }
   .msearch { display: flex; }
 }
 .msearch { display: none; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin: 8px 0 4px; }

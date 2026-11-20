@@ -15,8 +15,20 @@ use kino_core::{
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    HomeView, LoginView, ReleaseOption, ReleasePicker, SearchView, Shell, Tab, TitleView, WatchlistView, STYLE,
+    mock_releases, HomeView, LoginView, PickerPanel, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
+    SearchView, Shell, Tab, TitleView, WatchlistView, STYLE,
 };
+
+#[derive(Clone, PartialEq)]
+struct Picker {
+    heading: String,
+    releases: Vec<ReleaseOption>,
+    chosen: Option<String>,
+    watched: Vec<String>,
+    filter: ReleaseFilter,
+    sort: ReleaseSort,
+    panel: Option<PickerPanel>,
+}
 
 #[derive(Clone, PartialEq)]
 enum Screen {
@@ -27,7 +39,8 @@ enum Screen {
         season: Option<Season>,
         progress: Vec<Progress>,
         in_watchlist: bool,
-        releases: Option<(String, Vec<ReleaseOption>, Option<String>)>,
+        release_label: Option<String>,
+        picker: Option<Picker>,
     },
     Watchlist(Vec<TitleSummary>),
     Login,
@@ -65,27 +78,39 @@ fn Page(props: PageProps) -> Element {
             season,
             progress,
             in_watchlist,
-            releases,
-        } => {
-            let last = progress
-                .iter()
-                .max_by_key(|p| p.updated_at)
-                .and_then(|p| p.release.clone());
-            rsx! {
-                TitleView { details, season, progress, in_watchlist, on_play: |_| {}, on_toggle_watchlist: |_| {}, on_season: |_| {} }
-                if let Some((heading, list, _)) = releases {
-                    ReleasePicker {
-                        heading,
-                        releases: list,
-                        last_infohash: last.map(|r| r.infohash),
-                        mock: true,
-                        on_pick: |_| {},
-                        on_preload: |_| {},
-                        on_close: |_| {},
-                    }
+            release_label,
+            picker,
+        } => rsx! {
+            TitleView {
+                details,
+                season,
+                progress,
+                in_watchlist,
+                release_label,
+                on_play: |_| {},
+                on_change_release: |_| {},
+                on_toggle_watchlist: |_| {},
+                on_season: |_| {},
+            }
+            if let Some(p) = picker {
+                ReleasePicker {
+                    heading: p.heading,
+                    releases: p.releases,
+                    chosen: p.chosen,
+                    watched: p.watched,
+                    filter: p.filter,
+                    sort: p.sort,
+                    panel: p.panel,
+                    mock: true,
+                    on_filter: |_| {},
+                    on_sort: |_| {},
+                    on_panel: |_| {},
+                    on_pick: |_| {},
+                    on_preload: |_| {},
+                    on_close: |_| {},
                 }
             }
-        }
+        },
     };
     rsx! {
         Shell { tab, query, user_initial: "Д", on_tab: |_| {}, on_query: |_| {}, {body} }
@@ -222,12 +247,29 @@ async fn main() -> anyhow::Result<()> {
         watchlist.extend(title_of(k, id).await);
     }
 
-    let bb_screen = |releases| Screen::Title {
+    let bb_releases = mock_releases(&bb.summary, Some(2));
+    let chosen = bb_releases[0].clone();
+    let bb_picker = |filter, sort, panel| Picker {
+        heading: "Во все тяжкие · S02E06 · продолжить с 41:12".to_string(),
+        releases: bb_releases.clone(),
+        chosen: Some(chosen.infohash.clone()),
+        watched: vec![chosen.infohash.clone()],
+        filter,
+        sort,
+        panel,
+    };
+    let bb_screen = |picker| Screen::Title {
         details: bb.clone(),
         season: Some(bb_s2.clone()),
         progress: bb_progress.clone(),
         in_watchlist: false,
-        releases,
+        release_label: Some(chosen.label()),
+        picker,
+    };
+    let filtered = ReleaseFilter {
+        quality: Some("2160p".into()),
+        language: Some("Русский".into()),
+        ..Default::default()
     };
     let pages = [
         ("home", "Главная", Screen::Home(cat.home().await?, cont)),
@@ -240,10 +282,24 @@ async fn main() -> anyhow::Result<()> {
         (
             "releases",
             "Выбор раздачи",
-            bb_screen(Some((
-                "Во все тяжкие · S02E06 · продолжить с 41:12".to_string(),
-                kino_ui::mock_releases(&bb.summary, Some(2)),
-                None,
+            bb_screen(Some(bb_picker(ReleaseFilter::default(), ReleaseSort::Seeders, None))),
+        ),
+        (
+            "releases-filter",
+            "Фильтр раздач",
+            bb_screen(Some(bb_picker(
+                filtered,
+                ReleaseSort::Seeders,
+                Some(PickerPanel::Filter),
+            ))),
+        ),
+        (
+            "releases-sort",
+            "Сортировка раздач",
+            bb_screen(Some(bb_picker(
+                ReleaseFilter::default(),
+                ReleaseSort::Size,
+                Some(PickerPanel::Sort),
             ))),
         ),
         (
@@ -254,7 +310,8 @@ async fn main() -> anyhow::Result<()> {
                 season: None,
                 progress: inc_progress,
                 in_watchlist: true,
-                releases: None,
+                release_label: Some("NewStudio · 1080p · RuTor".into()),
+                picker: None,
             },
         ),
         ("watchlist", "Хочу посмотреть", Screen::Watchlist(watchlist)),

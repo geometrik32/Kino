@@ -43,92 +43,8 @@ impl Tab {
 
 const TABS: [Tab; 3] = [Tab::Home, Tab::Search, Tab::Watchlist];
 
-/// A torrent release offered for a title.
-///
-/// Stage 2 shows these on mock data; stage 3 fills them from the indexer.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReleaseOption {
-    pub infohash: String,
-    pub title: String,
-    /// "2160p", "1080p", ...
-    pub quality: String,
-    pub size: String,
-    pub seeders: u32,
-    /// Voice-over / dubbing, e.g. "LostFilm".
-    pub voice: String,
-    /// Whether a browser can play it as-is (H.264/AAC in MP4/MKV); otherwise
-    /// the server has to transcode.
-    pub direct_play: bool,
-}
-
-/// Sample releases for the picker until the indexer is connected (stage 3).
-pub fn mock_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOption> {
-    let original = title.original_title.clone().unwrap_or_else(|| title.title.clone());
-    let what = match season {
-        Some(s) => format!("S{s:02}"),
-        None => title.year.map(|y| y.to_string()).unwrap_or_default(),
-    };
-    let tv = season.is_some();
-    let r = |h: char, q: &str, extra: &str, size: (&str, &str), seeds: u32, voice: &str, direct: bool| ReleaseOption {
-        infohash: h.to_string().repeat(40),
-        title: format!("{} / {original} ({what}) {extra}", title.title),
-        quality: q.into(),
-        size: if tv { size.0 } else { size.1 }.into(),
-        seeders: seeds,
-        voice: voice.into(),
-        direct_play: direct,
-    };
-    vec![
-        r(
-            'a',
-            "1080p",
-            "WEB-DL 1080p | LostFilm",
-            ("28.4 ГБ", "9.8 ГБ"),
-            214,
-            "LostFilm",
-            true,
-        ),
-        r(
-            'b',
-            "2160p",
-            "WEB-DL 2160p HDR | HEVC",
-            ("96.1 ГБ", "38.2 ГБ"),
-            41,
-            "Дубляж",
-            false,
-        ),
-        r(
-            'c',
-            "1080p",
-            "BDRip 1080p | x264",
-            ("21.7 ГБ", "12.4 ГБ"),
-            87,
-            "NewStudio",
-            true,
-        ),
-        r(
-            'd',
-            "720p",
-            "HDTVRip 720p",
-            ("11.0 ГБ", "4.4 ГБ"),
-            3,
-            "Кубик в Кубе",
-            true,
-        ),
-        r(
-            'e',
-            "2160p",
-            "BDRemux 2160p | Atmos",
-            ("214 ГБ", "61.0 ГБ"),
-            2,
-            "Оригинал + субтитры",
-            false,
-        ),
-    ]
-}
-
-/// Seeds below this count make streaming unreliable; offer preloading instead.
-pub const LOW_SEEDS: u32 = 5;
+mod releases;
+pub use releases::*;
 
 fn hue(id: i64) -> i64 {
     (id.wrapping_mul(47)).rem_euclid(360)
@@ -536,7 +452,11 @@ pub fn TitleView(
     season: Option<Season>,
     progress: Vec<Progress>,
     in_watchlist: bool,
+    /// The remembered release for the season about to play, e.g. "LostFilm · 1080p".
+    /// "Смотреть" uses it without asking; `None` means the picker opens.
+    release_label: Option<String>,
     on_play: EventHandler<PlayTarget>,
+    on_change_release: EventHandler<PlayTarget>,
     on_toggle_watchlist: EventHandler<bool>,
     on_season: EventHandler<i32>,
 ) -> Element {
@@ -593,12 +513,24 @@ pub fn TitleView(
                         }
                     }
                     div { class: "btns",
-                        button { class: "btn primary", onclick: move |_| on_play.call(target.clone()), "▶ {play_label}" }
+                        button { class: "btn primary", onclick: {
+                            let t = target.clone();
+                            move |_| on_play.call(t.clone())
+                        }, "▶ {play_label}" }
                         button {
                             class: if in_watchlist { "btn ghost on" } else { "btn ghost" },
                             onclick: move |_| on_toggle_watchlist.call(!in_watchlist),
                             if in_watchlist { "✓ В списке" } else { "+ Хочу посмотреть" }
                         }
+                    }
+                    div { class: "chosen-rel",
+                        if let Some(l) = release_label {
+                            span { class: "muted", "Раздача: " }
+                            span { "{l}" }
+                        } else {
+                            span { class: "muted", "Раздача будет выбрана при первом просмотре" }
+                        }
+                        button { class: "link", onclick: move |_| on_change_release.call(target.clone()), "Сменить" }
                     }
                     if let Some(orig) = &s.original_title {
                         dl { class: "facts",
@@ -684,86 +616,6 @@ fn EpisodeRow(
                 Some(p) if p.finished => rsx! { div { class: "state done", "✓ Просмотрено" } },
                 Some(p) => rsx! { div { class: "state", "{clock(p.position_sec)} из {clock(p.duration_sec)}" } },
                 None => rsx! { div { class: "state" } },
-            }
-        }
-    }
-}
-
-/// Release picker shown after "Смотреть".
-#[component]
-pub fn ReleasePicker(
-    heading: String,
-    releases: Vec<ReleaseOption>,
-    /// Release the user played last time, highlighted and listed first.
-    last_infohash: Option<String>,
-    /// Marks the list as mock data (stage 2).
-    mock: bool,
-    on_pick: EventHandler<ReleaseOption>,
-    on_preload: EventHandler<ReleaseOption>,
-    on_close: EventHandler<()>,
-) -> Element {
-    let mut releases = releases;
-    releases.sort_by_key(|r| {
-        (
-            Some(&r.infohash) != last_infohash.as_ref(),
-            std::cmp::Reverse(r.seeders),
-        )
-    });
-    rsx! {
-        div { class: "sheet-bg", onclick: move |_| on_close.call(()),
-            div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                h3 {
-                    "Выбор раздачи"
-                    if mock { span { class: "mock", "макет" } }
-                }
-                div { class: "hint", "{heading}" }
-                div { class: "filters",
-                    span { class: "chip active", "Все" }
-                    span { class: "chip", "2160p" }
-                    span { class: "chip", "1080p" }
-                    span { class: "chip", "720p" }
-                }
-                for r in releases {
-                    ReleaseRow { key: "{r.infohash}", last: Some(&r.infohash) == last_infohash.as_ref(), release: r, on_pick, on_preload }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn ReleaseRow(
-    release: ReleaseOption,
-    last: bool,
-    on_pick: EventHandler<ReleaseOption>,
-    on_preload: EventHandler<ReleaseOption>,
-) -> Element {
-    let low = release.seeders < LOW_SEEDS;
-    let (a, b) = (release.clone(), release.clone());
-    rsx! {
-        div { class: if last { "rel last" } else { "rel" },
-            div {
-                div { class: "rt", "{release.title}" }
-                div { class: "tags",
-                    span { class: "tag q", "{release.quality}" }
-                    span { class: "tag", "{release.voice}" }
-                    if release.direct_play {
-                        span { class: "tag ok", "играет сразу" }
-                    } else {
-                        span { class: "tag warn", "нужна перекодировка" }
-                    }
-                    if last { span { class: "tag ok", "вы смотрели эту" } }
-                }
-            }
-            div { class: "side",
-                div { "{release.size}" }
-                div { class: if low { "seeds low" } else { "seeds" }, "▲ {release.seeders}" }
-            }
-            div { class: "act",
-                button { class: "btn primary", onclick: move |_| on_pick.call(a.clone()), "▶ Смотреть" }
-                if low {
-                    button { class: "btn ghost", onclick: move |_| on_preload.call(b.clone()), "⇣ Скачать заранее" }
-                }
             }
         }
     }

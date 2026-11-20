@@ -9,7 +9,7 @@ use axum::{
     Router,
 };
 use http_body_util::BodyExt;
-use kino_core::{AuthResponse, ContinueItem, Me, Progress, Role, WatchlistItem};
+use kino_core::{AuthResponse, ContinueItem, Me, Progress, ReleaseChoice, Role, WatchlistItem};
 use kino_server::{app, catalog::DemoCatalog, config::Config, telegram_auth, AppState};
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -398,4 +398,48 @@ async fn catalog_browse_and_continue_has_titles(pool: PgPool) {
     .await;
     let (_, cont) = call(&app, Method::GET, "/api/continue", Some(&u.token), None).await;
     assert_eq!(cont[0]["title"]["title"], "Во все тяжкие");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_choice_is_remembered_per_season(pool: PgPool) {
+    let app = test_app(pool);
+    let u = login_ok(&app, ADMIN_TG, None).await;
+    let pick = |season: i32, hash: char, voice: &str| {
+        json!({"kind": "tv", "tmdb_id": 1396, "season": season, "infohash": hash.to_string().repeat(40).to_uppercase(),
+               "title": format!("S{season:02} pack"), "quality": "1080p", "voice": voice})
+    };
+    for body in [
+        pick(1, 'a', "LostFilm"),
+        pick(2, 'b', "LostFilm"),
+        pick(1, 'c', "NewStudio"),
+    ] {
+        let (status, _) = call(&app, Method::PUT, "/api/release-choice", Some(&u.token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = call(&app, Method::GET, "/api/release-choice/tv/1396", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let list: Vec<ReleaseChoice> = serde_json::from_value(body).unwrap();
+    assert_eq!(list.len(), 2, "one choice per season");
+    assert_eq!(list[0].release.season, 1, "newest first");
+    assert_eq!(list[0].release.infohash, "c".repeat(40), "replaced and lowercased");
+    assert_eq!(list[0].release.voice.as_deref(), Some("NewStudio"));
+
+    let bad = json!({"kind": "movie", "tmdb_id": 603, "season": 2, "infohash": "a".repeat(40)});
+    let (status, _) = call(&app, Method::PUT, "/api/release-choice", Some(&u.token), Some(bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let bad = json!({"kind": "movie", "tmdb_id": 603, "infohash": "xyz"});
+    let (status, _) = call(&app, Method::PUT, "/api/release-choice", Some(&u.token), Some(bad)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&u.token), None).await;
+    let other = login_ok(&app, 7, inv["code"].as_str()).await;
+    let (_, body) = call(
+        &app,
+        Method::GET,
+        "/api/release-choice/tv/1396",
+        Some(&other.token),
+        None,
+    )
+    .await;
+    assert_eq!(body, json!([]), "choices are per user");
 }

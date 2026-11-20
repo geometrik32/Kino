@@ -10,8 +10,8 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ProgressUpdate, Role, SearchResults, Season,
-    TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice, ReleaseChoiceUpdate,
+    Role, SearchResults, Season, TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/continue", get(continue_watching))
         .route("/progress", put(save_progress))
         .route("/progress/{kind}/{tmdb_id}", get(title_progress))
+        .route("/release-choice", put(save_release_choice))
+        .route("/release-choice/{kind}/{tmdb_id}", get(release_choices))
         .route("/watchlist", get(watchlist))
         .route(
             "/watchlist/{kind}/{tmdb_id}",
@@ -145,6 +147,11 @@ async fn continue_watching(
     Ok(Json(items))
 }
 
+/// BitTorrent v1 (SHA-1) or v2 (SHA-256) info-hash in hex.
+fn infohash_ok(h: &str) -> bool {
+    matches!(h.len(), 40 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn validate(u: &ProgressUpdate) -> Result<(), AppError> {
     let ok_num = |x: f64| x.is_finite() && x >= 0.0;
     if !ok_num(u.position_sec) || !ok_num(u.duration_sec) {
@@ -159,8 +166,7 @@ fn validate(u: &ProgressUpdate) -> Result<(), AppError> {
         return Err(AppError::bad_request("a series needs season >= 0 and episode >= 1"));
     }
     if let Some(r) = &u.release {
-        let hex_ok = matches!(r.infohash.len(), 40 | 64) && r.infohash.bytes().all(|b| b.is_ascii_hexdigit());
-        if !hex_ok {
+        if !infohash_ok(&r.infohash) {
             return Err(AppError::bad_request(
                 "release.infohash must be a 40 or 64 character hex string",
             ));
@@ -182,6 +188,33 @@ async fn save_progress(
         r.infohash.make_ascii_lowercase();
     }
     Ok(Json(db::save_progress(&state.pool, user.0, &u).await?))
+}
+
+async fn save_release_choice(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(mut c): Json<ReleaseChoiceUpdate>,
+) -> Result<Json<ReleaseChoice>, AppError> {
+    if !infohash_ok(&c.infohash) {
+        return Err(AppError::bad_request(
+            "infohash must be a 40 or 64 character hex string",
+        ));
+    }
+    if c.tmdb_id <= 0 || c.season < 0 || (c.kind == MediaKind::Movie && c.season != 0) {
+        return Err(AppError::bad_request("tmdb_id must be positive; season is 0 for films"));
+    }
+    c.infohash.make_ascii_lowercase();
+    Ok(Json(db::save_release_choice(&state.pool, user.0, &c).await?))
+}
+
+async fn release_choices(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+) -> Result<Json<Vec<ReleaseChoice>>, AppError> {
+    Ok(Json(
+        db::release_choices(&state.pool, user.0, parse_kind(&kind)?, tmdb_id).await?,
+    ))
 }
 
 fn parse_kind(kind: &str) -> Result<MediaKind, AppError> {

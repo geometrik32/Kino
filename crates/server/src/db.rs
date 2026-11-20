@@ -1,7 +1,10 @@
 //! Database access. Queries are checked at runtime (no live DB needed to build).
 
 use chrono::{DateTime, Utc};
-use kino_core::{is_finished, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseRef, Role, WatchlistItem};
+use kino_core::{
+    is_finished, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseRef,
+    Role, WatchlistItem,
+};
 use rand::{distr::Alphanumeric, Rng};
 use sqlx::{PgPool, Row};
 
@@ -275,4 +278,69 @@ pub async fn watchlist_remove(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb
         .execute(pool)
         .await?;
     Ok(r.rows_affected() > 0)
+}
+
+/// Remembers the release picked for a film or a season, replacing an earlier one.
+pub async fn save_release_choice(
+    pool: &PgPool,
+    user_id: i64,
+    c: &ReleaseChoiceUpdate,
+) -> Result<ReleaseChoice, sqlx::Error> {
+    let chosen_at: DateTime<Utc> = sqlx::query_scalar(
+        "INSERT INTO release_choice
+            (user_id, media_kind, tmdb_id, season, infohash, release_title, quality, voice, chosen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
+         ON CONFLICT (user_id, media_kind, tmdb_id, season) DO UPDATE SET
+           infohash = EXCLUDED.infohash, release_title = EXCLUDED.release_title,
+           quality = EXCLUDED.quality, voice = EXCLUDED.voice, chosen_at = EXCLUDED.chosen_at
+         RETURNING chosen_at",
+    )
+    .bind(user_id)
+    .bind(c.kind.as_str())
+    .bind(c.tmdb_id)
+    .bind(c.season)
+    .bind(&c.infohash)
+    .bind(c.title.as_deref())
+    .bind(c.quality.as_deref())
+    .bind(c.voice.as_deref())
+    .fetch_one(pool)
+    .await?;
+    Ok(ReleaseChoice {
+        release: c.clone(),
+        chosen_at,
+    })
+}
+
+/// All remembered releases for a title (one per season for a series), newest first.
+pub async fn release_choices(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+) -> Result<Vec<ReleaseChoice>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT season, infohash, release_title, quality, voice, chosen_at FROM release_choice
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 ORDER BY chosen_at DESC",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            Ok(ReleaseChoice {
+                release: ReleaseChoiceUpdate {
+                    kind,
+                    tmdb_id,
+                    season: row.try_get("season")?,
+                    infohash: row.try_get("infohash")?,
+                    title: row.try_get("release_title")?,
+                    quality: row.try_get("quality")?,
+                    voice: row.try_get("voice")?,
+                },
+                chosen_at: row.try_get("chosen_at")?,
+            })
+        })
+        .collect()
 }

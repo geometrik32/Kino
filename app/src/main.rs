@@ -7,10 +7,10 @@ mod api;
 mod telegram;
 
 use dioxus::prelude::*;
-use kino_core::{AuthResponse, MediaKind, TitleSummary, WidgetAuthRequest};
+use kino_core::{AuthResponse, MediaKind, ReleaseChoiceUpdate, TitleSummary, WidgetAuthRequest};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, PlayTarget, ReleasePicker, SearchView, Shell, Tab, TitleView, WatchlistView,
-    STYLE,
+    mock_releases, play_target, HomeView, LoginView, PickerPanel, PlayTarget, ReleaseFilter, ReleaseOption,
+    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, WatchlistView, STYLE,
 };
 
 fn main() {
@@ -230,6 +230,14 @@ fn Watchlist(token: String, on_open: EventHandler<TitleSummary>) -> Element {
     }
 }
 
+/// Short label of a remembered release for the title page.
+fn choice_label(c: &ReleaseChoiceUpdate) -> String {
+    match (&c.voice, &c.quality) {
+        (Some(v), Some(q)) => format!("{v} · {q}"),
+        _ => c.title.clone().unwrap_or_else(|| "выбрана".into()),
+    }
+}
+
 #[component]
 fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let t1 = token.clone();
@@ -242,7 +250,8 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                 .await?
                 .iter()
                 .any(|w| w.kind == kind && w.tmdb_id == id);
-            Ok::<_, api::Failure>((details, progress, in_list))
+            let choices = api::release_choices(&t, kind, id).await?;
+            Ok::<_, api::Failure>((details, progress, in_list, choices))
         }
     });
     let mut chosen_season = use_signal(|| None::<i32>);
@@ -252,7 +261,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         let picked = chosen_season();
         // Default: the season of the last watched episode, else the first one.
         let default = match &*data.read() {
-            Some(Ok((d, p, _))) if kind == MediaKind::Tv => {
+            Some(Ok((d, p, _, _))) if kind == MediaKind::Tv => {
                 let last = p.iter().max_by_key(|p| p.updated_at).map(|p| p.season);
                 last.or_else(|| d.seasons.iter().map(|s| s.number).find(|n| *n > 0))
             }
@@ -266,20 +275,59 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         }
     });
     let mut in_list = use_signal(|| None::<bool>);
+    // Choices made in this visit, newest first; they override the loaded ones.
+    let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
     let mut picker = use_signal(|| None::<PlayTarget>);
+    let mut filter = use_signal(ReleaseFilter::default);
+    let mut sort = use_signal(ReleaseSort::default);
+    let mut panel = use_signal(|| None::<PickerPanel>);
+    let mut playing = use_signal(|| None::<(PlayTarget, String)>);
 
-    let guard = data.read();
-    let (details, progress, listed) = match &*guard {
+    let state = data.read().clone();
+    let (details, progress, listed, loaded) = match state {
         None => return loading(),
         Some(Err(e)) => return error_text(&e.message),
-        Some(Ok(v)) => v.clone(),
+        Some(Ok(v)) => v,
     };
-    drop(guard);
     let listed = in_list().unwrap_or(listed);
-    let last_release = progress
+    let mut choices: Vec<ReleaseChoiceUpdate> = picked_now();
+    choices.extend(loaded.into_iter().map(|c| c.release));
+    let season_key = move |t: &PlayTarget| if kind == MediaKind::Tv { t.season } else { 0 };
+    let choice_for = {
+        let choices = choices.clone();
+        move |s: i32| choices.iter().find(|c| c.season == s).cloned()
+    };
+    let latest = choices.first().cloned();
+    let (target, _) = play_target(&details, &progress);
+    let release_label = choice_for(season_key(&target)).map(|c| choice_label(&c));
+    let watched: Vec<String> = progress
         .iter()
-        .max_by_key(|p| p.updated_at)
-        .and_then(|p| p.release.clone());
+        .filter_map(|p| p.release.as_ref().map(|r| r.infohash.clone()))
+        .collect();
+
+    let open_picker = {
+        let latest = latest.clone();
+        let choice_for = choice_for.clone();
+        move |t: PlayTarget| {
+            // A new season starts pre-filtered to the quality and voice-over picked last time.
+            let f = match (choice_for(season_key(&t)), &latest) {
+                (None, Some(prev)) => ReleaseFilter::like(prev),
+                _ => ReleaseFilter::default(),
+            };
+            filter.set(f);
+            panel.set(None);
+            picker.set(Some(t));
+        }
+    };
+    let on_play = {
+        let choice_for = choice_for.clone();
+        let mut open_picker = open_picker.clone();
+        move |t: PlayTarget| match choice_for(season_key(&t)) {
+            Some(c) => playing.set(Some((t, choice_label(&c)))),
+            None => open_picker(t),
+        }
+    };
+
     let heading = picker().map(|p| {
         let mut h = details.summary.title.clone();
         if kind == MediaKind::Tv {
@@ -290,14 +338,19 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         }
         h
     });
-    let season_for_releases = picker().filter(|_| kind == MediaKind::Tv).map(|p| p.season);
+    let picker_season = picker().map(|p| season_key(&p));
+    let chosen_hash = picker_season.and_then(&choice_for).map(|c| c.infohash);
+    let summary = details.summary.clone();
+    let t3 = token.clone();
     rsx! {
         TitleView {
             details: details.clone(),
             season: season.read().clone().flatten(),
             progress,
             in_watchlist: listed,
-            on_play: move |p| picker.set(Some(p)),
+            release_label,
+            on_play,
+            on_change_release: open_picker,
             on_toggle_watchlist: move |on: bool| {
                 in_list.set(Some(on));
                 let t = token.clone();
@@ -309,16 +362,49 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             },
             on_season: move |n| chosen_season.set(Some(n)),
         }
-        if let Some(heading) = heading {
+        if let (Some(heading), Some(target)) = (heading, picker()) {
             ReleasePicker {
                 heading,
-                releases: mock_releases(&details.summary, season_for_releases),
-                last_infohash: last_release.map(|r| r.infohash),
+                releases: mock_releases(&details.summary, (kind == MediaKind::Tv).then_some(target.season)),
+                chosen: chosen_hash,
+                watched,
+                filter: filter(),
+                sort: sort(),
+                panel: panel(),
                 mock: true,
-                // Playback arrives in stage 3.
-                on_pick: move |_| picker.set(None),
+                on_filter: move |f| filter.set(f),
+                on_sort: move |s| sort.set(s),
+                on_panel: move |p| panel.set(p),
+                on_pick: move |r: ReleaseOption| {
+                    let choice = r.to_choice(&summary, season_key(&target));
+                    picked_now.with_mut(|v| {
+                        v.retain(|c| c.season != choice.season);
+                        v.insert(0, choice.clone());
+                    });
+                    picker.set(None);
+                    playing.set(Some((target.clone(), r.label())));
+                    let t = t3.clone();
+                    spawn(async move {
+                        let _ = api::save_release_choice(&t, &choice).await;
+                    });
+                },
+                // Preloading arrives with the player (stage 3).
                 on_preload: move |_| picker.set(None),
                 on_close: move |_| picker.set(None),
+            }
+        }
+        if let Some((t, label)) = playing() {
+            div { class: "sheet-bg", onclick: move |_| playing.set(None),
+                div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                    h3 { "Запуск" }
+                    p { class: "hint",
+                        if kind == MediaKind::Tv { "{kino_core::episode_code(t.season, t.episode)} · " }
+                        "раздача {label}"
+                        if t.position_sec > 0.0 { " · с {kino_core::clock(t.position_sec)}" }
+                    }
+                    p { class: "muted", "Плеер появится на следующем этапе. Выбор раздачи уже сохранён и будет использоваться по умолчанию на всех устройствах." }
+                    button { class: "btn ghost", onclick: move |_| playing.set(None), "Закрыть" }
+                }
             }
         }
     }
