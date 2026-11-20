@@ -11,8 +11,8 @@ use std::{
 
 use async_trait::async_trait;
 use kino_core::{
-    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails,
-    TitleExtras, TitleSummary,
+    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, SeasonSummary,
+    TitleDetails, TitleExtras, TitleSummary,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -21,6 +21,8 @@ use super::{year_of, Catalog, CatalogError};
 const API: &str = "https://api.themoviedb.org/3";
 const IMAGES: &str = "https://image.tmdb.org/t/p";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
+/// Answers kept at most; the oldest are dropped first.
+const CACHE_MAX: usize = 400;
 const ALLOWED_SIZES: [&str; 5] = ["w185", "w300", "w342", "w780", "w1280"];
 
 /// A network error without the request URL, which carries the API key.
@@ -80,10 +82,13 @@ impl TmdbCatalog {
         }
         let value: serde_json::Value = resp.json().await.map_err(net_error)?;
         let parsed = serde_json::from_value(value.clone()).map_err(|e| CatalogError::Upstream(e.to_string()))?;
-        self.cache
-            .lock()
-            .expect("cache lock")
-            .insert(cache_key, (Instant::now(), value));
+        trim_insert(
+            &mut self.cache.lock().expect("cache lock"),
+            cache_key,
+            value,
+            CACHE_TTL,
+            CACHE_MAX,
+        );
         Ok(parsed)
     }
 
@@ -91,6 +96,27 @@ impl TmdbCatalog {
         let page: Page = self.get(path, &[]).await?;
         Ok(page.results.into_iter().filter_map(|r| r.into_summary(kind)).collect())
     }
+}
+
+/// Stores an answer, first dropping what has expired and, when the cache is
+/// still full, the oldest answers, so it never grows past `max`.
+fn trim_insert(
+    cache: &mut HashMap<String, (Instant, serde_json::Value)>,
+    key: String,
+    value: serde_json::Value,
+    ttl: Duration,
+    max: usize,
+) {
+    if cache.len() >= max {
+        cache.retain(|_, (at, _)| at.elapsed() < ttl);
+    }
+    while cache.len() >= max {
+        let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else {
+            break;
+        };
+        cache.remove(&oldest);
+    }
+    cache.insert(key, (Instant::now(), value));
 }
 
 #[derive(Deserialize)]
@@ -184,6 +210,7 @@ struct RawCast {
 /// How many actors and titles per row the page shows.
 const MAX_CAST: usize = 20;
 const MAX_TITLES: usize = 20;
+const MAX_CREDITS: usize = 60;
 
 pub(crate) fn extras_from(raw: serde_json::Value, kind: MediaKind, own_id: i64) -> Result<TitleExtras, CatalogError> {
     let r: RawExtras = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
@@ -218,6 +245,65 @@ pub(crate) fn extras_from(raw: serde_json::Value, kind: MediaKind, own_id: i64) 
         cast,
         recommendations,
         similar,
+    })
+}
+
+#[derive(Deserialize)]
+struct RawPerson {
+    id: i64,
+    name: String,
+    biography: Option<String>,
+    birthday: Option<String>,
+    deathday: Option<String>,
+    place_of_birth: Option<String>,
+    profile_path: Option<String>,
+    combined_credits: Option<RawCombined>,
+}
+
+#[derive(Deserialize)]
+struct RawCombined {
+    #[serde(default)]
+    cast: Vec<RawCredit>,
+}
+
+#[derive(Deserialize)]
+struct RawCredit {
+    #[serde(flatten)]
+    item: ListItem,
+    #[serde(default)]
+    popularity: f32,
+    #[serde(default)]
+    genre_ids: Vec<i32>,
+}
+
+/// TMDB genres of appearances as oneself (talk shows, news, award shows):
+/// not what anyone looks for in a filmography.
+const SELF_GENRES: [i32; 3] = [10767, 10763, 10764];
+
+pub(crate) fn person_from(raw: serde_json::Value) -> Result<PersonDetails, CatalogError> {
+    let r: RawPerson = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
+    let mut cast = r.combined_credits.map(|c| c.cast).unwrap_or_default();
+    cast.retain(|c| !c.genre_ids.iter().any(|g| SELF_GENRES.contains(g)));
+    cast.sort_by(|a, b| b.popularity.total_cmp(&a.popularity));
+    let mut credits: Vec<TitleSummary> = Vec::new();
+    for c in cast {
+        let Some(t) = c.item.into_summary(None) else { continue };
+        // A role in several episodes or a re-listed film comes more than once.
+        if t.poster_path.is_some() && !credits.iter().any(|o| o.kind == t.kind && o.tmdb_id == t.tmdb_id) {
+            credits.push(t);
+        }
+    }
+    credits.truncate(MAX_CREDITS);
+    let text = |s: Option<String>| s.filter(|s| !s.trim().is_empty());
+    Ok(PersonDetails {
+        id: r.id,
+        name: r.name,
+        biography: text(r.biography),
+        birthday: text(r.birthday),
+        deathday: text(r.deathday),
+        place_of_birth: text(r.place_of_birth),
+        profile_path: r.profile_path,
+        credits,
     })
 }
 
@@ -341,6 +427,13 @@ impl Catalog for TmdbCatalog {
             .get(&path, &[("append_to_response", "credits,recommendations,similar")])
             .await?;
         extras_from(raw, kind, tmdb_id)
+    }
+
+    async fn person(&self, id: i64) -> Result<PersonDetails, CatalogError> {
+        let raw: serde_json::Value = self
+            .get(&format!("/person/{id}"), &[("append_to_response", "combined_credits")])
+            .await?;
+        person_from(raw)
     }
 
     async fn season(&self, tmdb_id: i64, number: i32) -> Result<Season, CatalogError> {
@@ -477,6 +570,37 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_person_with_filmography() {
+        let raw = json!({
+            "id": 17419, "name": "Брайан Крэнстон", "biography": "  ", "birthday": "1956-03-07",
+            "place_of_birth": "Голливуд, США", "profile_path": "/a.jpg",
+            "combined_credits": { "cast": [
+                {"id": 1, "media_type": "tv", "name": "Малкольм в центре внимания", "first_air_date": "2000-01-09",
+                 "poster_path": "/m.jpg", "popularity": 40.0, "genre_ids": [35]},
+                {"id": 1396, "media_type": "tv", "name": "Во все тяжкие", "first_air_date": "2008-01-20",
+                 "poster_path": "/b.jpg", "popularity": 90.5, "genre_ids": [18]},
+                {"id": 1396, "media_type": "tv", "name": "Во все тяжкие", "first_air_date": "2008-01-20",
+                 "poster_path": "/b.jpg", "popularity": 90.5, "genre_ids": [18]},
+                {"id": 2, "media_type": "tv", "name": "Вечернее шоу", "first_air_date": "2010-01-01",
+                 "poster_path": "/t.jpg", "popularity": 99.0, "genre_ids": [10767]},
+                {"id": 3, "media_type": "movie", "title": "Без постера", "poster_path": null, "popularity": 50.0, "genre_ids": []},
+                {"id": 4, "media_type": "movie", "title": "Драйв", "release_date": "2011-09-16",
+                 "poster_path": "/d.jpg", "popularity": 60.0, "genre_ids": [80]}
+            ]}
+        });
+        let p = person_from(raw).unwrap();
+        assert_eq!(p.name, "Брайан Крэнстон");
+        assert_eq!(p.biography, None, "blank biography is dropped");
+        assert_eq!(p.birthday.as_deref(), Some("1956-03-07"));
+        assert_eq!(
+            p.credits.iter().map(|t| (t.kind, t.tmdb_id)).collect::<Vec<_>>(),
+            [(MediaKind::Tv, 1396), (MediaKind::Movie, 4), (MediaKind::Tv, 1)],
+            "most popular first; once each; no talk shows, no title without a poster"
+        );
+        assert_eq!(p.credits[1].year, Some(2011));
+    }
+
+    #[test]
     fn mixed_search_results_skip_people() {
         let page: Page = serde_json::from_value(json!({"results": [
             {"id": 1, "media_type": "person", "name": "Someone"},
@@ -490,6 +614,24 @@ mod tests {
             vec![(MediaKind::Movie, 603), (MediaKind::Tv, 1399)]
         );
         assert_eq!(items[0].year, Some(1999));
+    }
+
+    #[test]
+    fn the_cache_stays_small() {
+        let mut cache = HashMap::new();
+        for i in 0..50 {
+            trim_insert(&mut cache, format!("k{i}"), json!(i), CACHE_TTL, 10);
+            assert!(cache.len() <= 10);
+        }
+        // The newest are kept, the oldest are gone.
+        assert!(cache.contains_key("k49") && !cache.contains_key("k0"));
+        // Expired answers go before live ones.
+        let mut cache = HashMap::new();
+        for i in 0..4 {
+            trim_insert(&mut cache, format!("k{i}"), json!(i), Duration::ZERO, 4);
+        }
+        trim_insert(&mut cache, "new".into(), json!(1), Duration::ZERO, 4);
+        assert_eq!(cache.len(), 1, "all four had expired");
     }
 
     #[test]

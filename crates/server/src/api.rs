@@ -11,9 +11,9 @@ use axum::{
 use chrono::Utc;
 use kino_core::{
     AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me,
-    MediaKind, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate,
-    UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    MediaKind, PersonDetails, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice,
+    ReleaseChoiceUpdate, Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus,
+    TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +69,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalog/search", get(catalog_search))
         .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
         .route("/catalog/{kind}/{tmdb_id}/extras", get(catalog_extras))
+        .route("/person/{id}", get(person))
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
         .merge(crate::play::routes())
@@ -453,7 +454,10 @@ async fn put_prefs(
     Json(p): Json<UserPrefs>,
 ) -> Result<Json<UserPrefs>, AppError> {
     let long = |v: &Option<String>| v.as_ref().is_some_and(|v| v.chars().count() > 100);
-    if long(&p.quality) || long(&p.voice) || long(&p.subtitle_lang) {
+    if [&p.quality, &p.voice, &p.subtitle_lang, &p.language, &p.codec, &p.sort]
+        .into_iter()
+        .any(long)
+    {
         return Err(AppError::bad_request("values must be at most 100 characters"));
     }
     userdata::set_prefs(&state.pool, user.0, &p).await?;
@@ -618,7 +622,10 @@ async fn catalog_details(
     _user: CurrentUser,
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleDetails>, AppError> {
-    Ok(Json(state.catalog.details(parse_kind(&kind)?, tmdb_id).await?))
+    let details = state.catalog.details(parse_kind(&kind)?, tmdb_id).await?;
+    // Whoever opens a title is likely to press "Смотреть": look for releases meanwhile.
+    crate::play::prefetch_releases(&state, details.clone());
+    Ok(Json(details))
 }
 
 /// Cast, recommendations and similar titles. A failure here must not spoil the
@@ -629,6 +636,15 @@ async fn catalog_extras(
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleExtras>, AppError> {
     Ok(Json(state.catalog.extras(parse_kind(&kind)?, tmdb_id).await?))
+}
+
+/// An actor with their films and series.
+async fn person(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path(id): Path<i64>,
+) -> Result<Json<PersonDetails>, AppError> {
+    Ok(Json(state.catalog.person(id).await?))
 }
 
 async fn catalog_season(

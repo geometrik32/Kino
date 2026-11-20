@@ -151,10 +151,24 @@ async fn rating_tracks_prefs(pool: PgPool) {
 
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
     assert_eq!(serde_json::from_value::<UserPrefs>(p).unwrap(), UserPrefs::default());
-    let prefs = json!({"quality": "2160p", "voice": "LostFilm", "subtitle_lang": null});
-    call(&app, Method::PUT, "/api/prefs", Some(&t), Some(prefs.clone())).await;
+    let prefs = json!({
+        "quality": "2160p", "voice": null, "subtitle_lang": null, "language": "Русский",
+        "hdr": false, "dolby_vision": null, "subtitles": true, "codec": "H.264", "direct_play": true,
+        "min_seeders": 5, "max_size_gb": 40, "sort": "bitrate"
+    });
+    let (code, _) = call(&app, Method::PUT, "/api/prefs", Some(&t), Some(prefs.clone())).await;
+    assert_eq!(code, StatusCode::OK);
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
     assert_eq!(p, prefs);
+    // An old client that knows only the first three fields still works, and clears the rest.
+    let old = json!({"quality": "1080p", "voice": "LostFilm", "subtitle_lang": null});
+    call(&app, Method::PUT, "/api/prefs", Some(&t), Some(old)).await;
+    let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
+    let p: UserPrefs = serde_json::from_value(p).unwrap();
+    assert_eq!(
+        (p.quality.as_deref(), p.voice.as_deref(), p.language),
+        (Some("1080p"), Some("LostFilm"), None)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]

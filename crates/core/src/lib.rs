@@ -303,6 +303,22 @@ pub struct CastMember {
     pub profile_path: Option<String>,
 }
 
+/// An actor's page: who they are and what they appeared in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PersonDetails {
+    pub id: i64,
+    pub name: String,
+    /// Russian when TMDB has it, else empty.
+    pub biography: Option<String>,
+    /// `YYYY-MM-DD`.
+    pub birthday: Option<String>,
+    pub deathday: Option<String>,
+    pub place_of_birth: Option<String>,
+    pub profile_path: Option<String>,
+    /// Films and series, best known first, each once.
+    pub credits: Vec<TitleSummary>,
+}
+
 /// What the title page shows below the description: `GET /api/catalog/{kind}/{id}/extras`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TitleExtras {
@@ -507,15 +523,43 @@ pub struct HistoryEntry {
     pub title: Option<TitleSummary>,
 }
 
-/// Defaults used when picking releases and tracks.
+/// Defaults used when picking releases and tracks. Every field is optional:
+/// `None` means "no preference".
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct UserPrefs {
     /// "1080p", "2160p", ...
     pub quality: Option<String>,
-    /// Preferred voice-over, e.g. "LostFilm".
+    /// Studio of the voice-over. No longer set from the profile (there are too many
+    /// studios to list); still used to pick an audio track when an old value is stored.
     pub voice: Option<String>,
-    /// Subtitle language, e.g. "Русский"; `None` means no subtitles.
+    /// Subtitle language in the player, e.g. "Русский"; `None` means no subtitles.
     pub subtitle_lang: Option<String>,
+    /// Audio language, e.g. "Русский": filters the releases and picks the audio track.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Release filters: `Some(true)` wants it, `Some(false)` does not.
+    #[serde(default)]
+    pub hdr: Option<bool>,
+    #[serde(default)]
+    pub dolby_vision: Option<bool>,
+    /// The release has subtitles.
+    #[serde(default)]
+    pub subtitles: Option<bool>,
+    /// "H.264", "HEVC" or "AV1".
+    #[serde(default)]
+    pub codec: Option<String>,
+    /// Plays in the browser without re-encoding.
+    #[serde(default)]
+    pub direct_play: Option<bool>,
+    /// At least this many seeders.
+    #[serde(default)]
+    pub min_seeders: Option<u32>,
+    /// At most this many gigabytes.
+    #[serde(default)]
+    pub max_size_gb: Option<u32>,
+    /// How the releases are sorted: "seeders", "size", "bitrate", "name", "source", "date", "watched".
+    #[serde(default)]
+    pub sort: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

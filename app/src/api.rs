@@ -4,9 +4,10 @@ use std::sync::LazyLock;
 
 use kino_core::{
     ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
-    MarkWatched, Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate,
-    RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, StreamProgress,
-    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress,
+    ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate,
+    StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest,
+    WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -127,6 +128,11 @@ pub async fn details(token: &str, kind: MediaKind, id: i64) -> Result<TitleDetai
 /// Cast, recommendations and similar titles; loaded apart so the page shows at once.
 pub async fn extras(token: &str, kind: MediaKind, id: i64) -> Result<TitleExtras, Failure> {
     get(&format!("/api/catalog/{}/{id}/extras", kind.as_str()), token).await
+}
+
+/// An actor and their films and series.
+pub async fn person(token: &str, id: i64) -> Result<PersonDetails, Failure> {
+    get(&format!("/api/person/{id}"), token).await
 }
 
 pub async fn season(token: &str, id: i64, number: i32) -> Result<Season, Failure> {

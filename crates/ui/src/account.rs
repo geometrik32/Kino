@@ -2,6 +2,8 @@
 
 use chrono::{DateTime, FixedOffset, Utc};
 use dioxus::prelude::*;
+
+use crate::releases::{ReleaseSort, CODECS, SEEDER_STEPS, SIZE_STEPS};
 use kino_core::{
     clock, episode_code, HistoryEntry, MediaKind, PreloadItem, PreloadState, TitleState, TitleStatus, TitleSummary,
     UserPrefs,
@@ -68,7 +70,7 @@ fn stars(r: i16) -> String {
 
 /// Quality, voice-over and subtitle options offered in the settings.
 const QUALITIES: [&str; 3] = ["2160p", "1080p", "720p"];
-const VOICES: [&str; 5] = ["Дубляж", "LostFilm", "NewStudio", "Кубик в Кубе", "Оригинал"];
+const LANGUAGES: [&str; 3] = ["Русский", "Английский", "Украинский"];
 const SUBTITLES: [&str; 2] = ["Русский", "Английский"];
 
 #[component]
@@ -96,13 +98,35 @@ pub fn ProfileView(
             }
         }
         section { class: "section",
-            h2 { "Настройки по умолчанию" }
-            p { class: "muted small", "Используются, когда раздача выбирается впервые, и для дорожек в плеере." }
+            h2 { "Раздачи по умолчанию" }
+            p { class: "muted small", "Эти фильтры сразу применяются к списку раздач. В списке их можно изменить или сбросить. Если по ним ничего не нашлось, покажем все раздачи." }
             div { class: "panel",
                 PrefRow { name: "Качество", any: "Любое", options: QUALITIES.map(String::from).to_vec(), selected: p.quality.clone(),
                     on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { quality: v, ..p.clone() }) } }
-                PrefRow { name: "Перевод", any: "Любой", options: VOICES.map(String::from).to_vec(), selected: p.voice.clone(),
-                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { voice: v, ..p.clone() }) } }
+                PrefRow { name: "Язык озвучки", any: "Любой", options: LANGUAGES.map(String::from).to_vec(), selected: p.language.clone(),
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { language: v, ..p.clone() }) } }
+                PrefYesNo { name: "HDR", value: p.hdr,
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { hdr: v, ..p.clone() }) } }
+                PrefYesNo { name: "Dolby Vision", value: p.dolby_vision,
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { dolby_vision: v, ..p.clone() }) } }
+                PrefYesNo { name: "Субтитры в раздаче", value: p.subtitles,
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { subtitles: v, ..p.clone() }) } }
+                PrefRow { name: "Кодек", any: "Любой", options: CODECS.map(String::from).to_vec(), selected: p.codec.clone(),
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { codec: v, ..p.clone() }) } }
+                PrefYesNo { name: "Играет без перекодирования", value: p.direct_play,
+                    on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { direct_play: v, ..p.clone() }) } }
+                PrefRow { name: "Раздающих", any: "Любое число", options: SEEDER_STEPS.map(|n| format!("от {n}")).to_vec(), selected: p.min_seeders.map(|n| format!("от {n}")),
+                    on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { min_seeders: v.and_then(|s| s.trim_start_matches("от ").parse().ok()), ..p.clone() }) } }
+                PrefRow { name: "Размер", any: "Любой", options: SIZE_STEPS.map(|n| format!("до {n} ГБ")).to_vec(), selected: p.max_size_gb.map(|n| format!("до {n} ГБ")),
+                    on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { max_size_gb: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" ГБ").parse().ok()), ..p.clone() }) } }
+                PrefRow { name: "Сортировка", any: "По раздающим", options: ReleaseSort::ALL.iter().skip(1).map(|s| s.label().to_owned()).collect(), selected: p.sort.as_deref().map(|k| ReleaseSort::from_key(Some(k))).filter(|s| *s != ReleaseSort::Seeders).map(|s| s.label().to_owned()),
+                    on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { sort: v.and_then(|l| ReleaseSort::ALL.into_iter().find(|s| s.label() == l)).map(|s| s.key().to_owned()), ..p.clone() }) } }
+            }
+        }
+        section { class: "section",
+            h2 { "Плеер" }
+            p { class: "muted small", "Язык озвучки выше выбирает и звуковую дорожку в файле. Выбор в плеере запоминается для каждого фильма отдельно." }
+            div { class: "panel",
                 PrefRow { name: "Субтитры", any: "Без субтитров", options: SUBTITLES.map(String::from).to_vec(), selected: p.subtitle_lang.clone(),
                     on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { subtitle_lang: v, ..p.clone() }) } }
             }
@@ -166,6 +190,21 @@ fn PrefRow(
                         onclick: { let v = o.clone(); move |_| on_select.call(Some(v.clone())) },
                         "{o}"
                     }
+                }
+            }
+        }
+    }
+}
+
+/// "Не важно / Есть / Нет".
+#[component]
+fn PrefYesNo(name: &'static str, value: Option<bool>, on_select: EventHandler<Option<bool>>) -> Element {
+    rsx! {
+        div { class: "frow",
+            div { class: "fname", "{name}" }
+            div { class: "fopts",
+                for (label, v) in [("Не важно", None), ("Нужно", Some(true)), ("Не нужно", Some(false))] {
+                    button { class: if value == v { "chip sm active" } else { "chip sm" }, onclick: move |_| on_select.call(v), "{label}" }
                 }
             }
         }

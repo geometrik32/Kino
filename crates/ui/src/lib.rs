@@ -8,8 +8,8 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, image_url, CastMember, ContinueItem, HomeFeed, ImageSize, MediaKind, Progress, SearchResults,
-    Season, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
+    clock, episode_code, image_url, CastMember, ContinueItem, HomeFeed, ImageSize, MediaKind, PersonDetails, Progress,
+    SearchResults, Season, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
 };
 
 /// The stylesheet all components rely on.
@@ -595,14 +595,19 @@ pub fn TitleView(
 /// What goes below the description: the cast, then what to watch next.
 /// Loaded apart from the title, so a slow or failing TMDB never blanks the page.
 #[component]
-pub fn TitleExtrasView(extras: TitleExtras, on_open: EventHandler<TitleSummary>) -> Element {
+pub fn TitleExtrasView(
+    extras: TitleExtras,
+    on_open: EventHandler<TitleSummary>,
+    /// An actor was tapped: their id.
+    on_person: EventHandler<i64>,
+) -> Element {
     rsx! {
         if !extras.cast.is_empty() {
             section { class: "section",
                 h2 { "В ролях" }
                 div { class: "row cast",
                     for c in extras.cast {
-                        CastCard { key: "{c.id}", person: c }
+                        CastCard { key: "{c.id}", person: c, on_person }
                     }
                 }
             }
@@ -617,9 +622,10 @@ pub fn TitleExtrasView(extras: TitleExtras, on_open: EventHandler<TitleSummary>)
 }
 
 #[component]
-fn CastCard(person: CastMember) -> Element {
+fn CastCard(person: CastMember, on_person: EventHandler<i64>) -> Element {
+    let id = person.id;
     rsx! {
-        div { class: "cast-card",
+        button { class: "cast-card", onclick: move |_| on_person.call(id),
             div { class: "avatar",
                 if let Some(p) = &person.profile_path {
                     img { src: image_url(p, ImageSize::Profile), alt: "{person.name}", loading: "lazy" }
@@ -629,6 +635,68 @@ fn CastCard(person: CastMember) -> Element {
             }
             div { class: "who", "{person.name}" }
             if let Some(role) = &person.character { div { class: "role", "{role}" } }
+        }
+    }
+}
+
+/// An actor: photo, a few facts, the biography and everything they played in.
+#[component]
+pub fn PersonView(person: PersonDetails, on_open: EventHandler<TitleSummary>) -> Element {
+    let mut expanded = use_signal(|| false);
+    let mut facts: Vec<(&str, String)> = Vec::new();
+    if let Some(b) = &person.birthday {
+        facts.push(("Родился", ru_date(b)));
+    }
+    if let Some(d) = &person.deathday {
+        facts.push(("Умер", ru_date(d)));
+    }
+    if let Some(p) = &person.place_of_birth {
+        facts.push(("Место рождения", p.clone()));
+    }
+    // A short biography needs no "read more".
+    let long = person.biography.as_ref().is_some_and(|b| b.chars().count() > 420);
+    let n = person.credits.len();
+    rsx! {
+        section { class: "section person",
+            div { class: "person-head",
+                div { class: "avatar big",
+                    if let Some(p) = &person.profile_path {
+                        img { src: image_url(p, ImageSize::Poster), alt: "{person.name}" }
+                    } else {
+                        div { class: "placeholder", style: "background: {fallback_bg(person.id)}", "{initials(&person.name)}" }
+                    }
+                }
+                div { class: "person-info",
+                    h1 { "{person.name}" }
+                    if !facts.is_empty() {
+                        dl { class: "facts",
+                            for (k, v) in facts {
+                                dt { "{k}" } dd { "{v}" }
+                            }
+                        }
+                    }
+                    if let Some(bio) = &person.biography {
+                        p { class: if expanded() || !long { "bio" } else { "bio clamp" }, "{bio}" }
+                        if long {
+                            button { class: "link", onclick: move |_| expanded.toggle(),
+                                if expanded() { "Свернуть" } else { "Читать полностью" }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        section { class: "section",
+            h2 { "Фильмография" }
+            if n == 0 {
+                p { class: "muted", "TMDB не знает, где снимался этот актёр." }
+            } else {
+                div { class: "grid",
+                    for item in person.credits {
+                        PosterCard { key: "{item.kind.as_str()}{item.tmdb_id}", item, on_open }
+                    }
+                }
+            }
         }
     }
 }

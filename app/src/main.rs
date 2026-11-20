@@ -17,8 +17,8 @@ use kino_core::{
     TitleSummary, UserPrefs, WidgetAuthRequest,
 };
 use kino_ui::{
-    play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption,
-    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView, STYLE,
+    play_target, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter,
+    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView, STYLE,
 };
 
 fn main() {
@@ -235,6 +235,8 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
 enum View {
     Tab(Tab),
     Title(MediaKind, i64),
+    /// An actor's page.
+    Person(i64),
 }
 
 #[component]
@@ -255,13 +257,18 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
         .unwrap_or_default();
     let tab = match view() {
         View::Tab(t) => Some(t),
-        View::Title(..) => None,
+        View::Title(..) | View::Person(_) => None,
     };
     let mut open_title = move |kind: MediaKind, id: i64| {
         trail.with_mut(|t| t.push(view()));
         view.set(View::Title(kind, id));
     };
     let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id);
+    let open_person = move |id: i64| {
+        telegram::haptic(telegram::Haptic::Tap);
+        trail.with_mut(|t| t.push(view()));
+        view.set(View::Person(id));
+    };
     rsx! {
         if !trail().is_empty() {
             native::BackButton {
@@ -299,7 +306,8 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
                         on_logout,
                     }
                 },
-                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id, on_open: open } },
+                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id, on_open: open, on_person: open_person } },
+                View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, on_open: open } },
             }
         }
     }
@@ -311,6 +319,20 @@ fn error_text(message: &str) -> Element {
 
 fn loading() -> Element {
     rsx! { p { class: "muted section", "Загрузка…" } }
+}
+
+#[component]
+fn Person(token: String, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
+    let data = use_resource(move || {
+        let t = token.clone();
+        async move { api::person(&t, id).await }
+    });
+    let state = data.read().clone();
+    match state {
+        None => loading(),
+        Some(Err(e)) => error_text(&e.message),
+        Some(Ok(person)) => rsx! { PersonView { person, on_open } },
+    }
 }
 
 #[component]
@@ -428,6 +450,8 @@ fn Profile(
             now,
             utc_offset_min,
             on_prefs: move |p: UserPrefs| {
+                // The studio is no longer chosen here, so an old one must not linger unseen.
+                let p = UserPrefs { voice: None, ..p };
                 prefs_now.set(Some(p.clone()));
                 let t = token.clone();
                 spawn(async move {
@@ -457,7 +481,13 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
 }
 
 #[component]
-fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
+fn Title(
+    token: String,
+    kind: MediaKind,
+    id: i64,
+    on_open: EventHandler<TitleSummary>,
+    on_person: EventHandler<i64>,
+) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -503,6 +533,15 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
     let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
     let mut picker = use_signal(|| None::<PlayTarget>);
     let mut filter = use_signal(ReleaseFilter::default);
+    // The user's default filters are applied when the picker opens; if they leave
+    // nothing, the list is shown without them (once the releases have loaded).
+    let mut defaults_pending = use_signal(|| false);
+    let mut defaults_relaxed = use_signal(|| false);
+    let t_prefs = token.clone();
+    let user_prefs = use_resource(move || {
+        let t = t_prefs.clone();
+        async move { api::prefs(&t).await.ok() }
+    });
     let mut sort = use_signal(ReleaseSort::default);
     let mut panel = use_signal(|| None::<PickerPanel>);
     let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
@@ -516,6 +555,33 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
             let season = if kind == MediaKind::Tv { p.season } else { 0 };
             Some(api::releases(&t, kind, id, season).await)
         }
+    });
+
+    // Once the releases are in: when the default filters leave nothing, drop them
+    // (the season of the episode stays) and say so.
+    use_effect(move || {
+        let Some(Ok(list)) = releases.read().clone().flatten() else {
+            return;
+        };
+        if !*defaults_pending.peek() {
+            return;
+        }
+        defaults_pending.set(false);
+        let f = filter.peek().clone();
+        if list.releases.is_empty() || list.releases.iter().any(|r| f.matches(r)) {
+            return;
+        }
+        let season_only = match (kind, picker.peek().as_ref()) {
+            (MediaKind::Tv, Some(t)) => ReleaseFilter::default().for_season(t.season),
+            _ => ReleaseFilter::default(),
+        };
+        let relaxed = if list.releases.iter().any(|r| season_only.matches(r)) {
+            season_only
+        } else {
+            ReleaseFilter::default()
+        };
+        filter.set(relaxed);
+        defaults_relaxed.set(true);
     });
 
     let state = data.read().clone();
@@ -541,16 +607,28 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
         .filter_map(|p| p.release.as_ref().map(|r| r.infohash.clone()))
         .collect();
 
+    let loaded_prefs = user_prefs.read().clone().flatten().unwrap_or_default();
     let open_picker = {
         let latest = latest.clone();
         let choice_for = choice_for.clone();
         move |t: PlayTarget| {
-            // A new season starts pre-filtered to the quality and voice-over picked last time.
-            let f = match (choice_for(season_key(&t)), &latest) {
+            // A new season starts pre-filtered to the quality and voice-over picked last time,
+            // then the user's default filters, and a series always to the season of the
+            // episode about to play.
+            let base = match (choice_for(season_key(&t)), &latest) {
                 (None, Some(prev)) => ReleaseFilter::like(prev),
                 _ => ReleaseFilter::default(),
             };
+            let f = base.or(ReleaseFilter::from_prefs(&loaded_prefs));
+            let f = if kind == MediaKind::Tv {
+                f.for_season(t.season)
+            } else {
+                f
+            };
             filter.set(f);
+            sort.set(ReleaseSort::from_key(loaded_prefs.sort.as_deref()));
+            defaults_pending.set(true);
+            defaults_relaxed.set(false);
             panel.set(None);
             picker.set(Some(t));
         }
@@ -646,7 +724,7 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
             on_season: move |n| chosen_season.set(Some(n)),
         }
         if let Some(Some(extras)) = extras.read().clone() {
-            TitleExtrasView { extras, on_open }
+            TitleExtrasView { extras, on_open, on_person }
         }
         if let (Some(heading), Some(target)) = (heading, picker()) {
             match releases.read().clone().flatten() {
@@ -676,6 +754,7 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
                 sort: sort(),
                 panel: panel(),
                 mock: !list.configured,
+                note: defaults_relaxed().then(|| "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned()),
                 on_filter: move |f| filter.set(f),
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),

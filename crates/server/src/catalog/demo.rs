@@ -3,8 +3,8 @@
 
 use async_trait::async_trait;
 use kino_core::{
-    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails,
-    TitleExtras, TitleSummary,
+    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, SeasonSummary,
+    TitleDetails, TitleExtras, TitleSummary,
 };
 
 use super::{Catalog, CatalogError};
@@ -70,6 +70,20 @@ fn summary(t: &DemoTitle) -> TitleSummary {
         rating: Some(t.rating),
         overview: Some(t.overview.to_owned()),
     }
+}
+
+/// The made-up cast every demo title has.
+const DEMO_PEOPLE: [(&str, &str); 6] = [
+    ("Анна Лебедева", "Главная роль"),
+    ("Игорь Соколов", "Партнёр"),
+    ("Мария Верховская", "Антагонист"),
+    ("Пётр Громов", "Наставник"),
+    ("Елена Мартынова", "Свидетель"),
+    ("Дмитрий Орлов", "Друг семьи"),
+];
+
+fn find_any(id: i64) -> Result<&'static DemoTitle, CatalogError> {
+    TITLES.iter().find(|t| t.id == id).ok_or(CatalogError::NotFound)
 }
 
 fn find(kind: MediaKind, id: i64) -> Result<&'static DemoTitle, CatalogError> {
@@ -151,15 +165,7 @@ impl Catalog for DemoCatalog {
         let t = find(kind, tmdb_id)?;
         // Made-up cast without photos; the other titles of the demo catalog stand in
         // for recommendations and similar ones.
-        let people = [
-            ("Анна Лебедева", "Главная роль"),
-            ("Игорь Соколов", "Партнёр"),
-            ("Мария Верховская", "Антагонист"),
-            ("Пётр Громов", "Наставник"),
-            ("Елена Мартынова", "Свидетель"),
-            ("Дмитрий Орлов", "Друг семьи"),
-        ];
-        let cast = people
+        let cast = DEMO_PEOPLE
             .iter()
             .enumerate()
             .map(|(i, (name, role))| CastMember {
@@ -181,6 +187,29 @@ impl Catalog for DemoCatalog {
             cast,
             recommendations: others(true),
             similar: others(false),
+        })
+    }
+
+    async fn person(&self, id: i64) -> Result<PersonDetails, CatalogError> {
+        // The demo cast of title `t` has ids `t * 10 + 0..5` (see `extras`).
+        let title = find_any(id / 10)?;
+        let (name, role) = DEMO_PEOPLE
+            .get(usize::try_from(id % 10).map_err(|_| CatalogError::NotFound)?)
+            .ok_or(CatalogError::NotFound)?;
+        // Their own title first, then a few more of the catalog.
+        let mut credits = vec![summary(title)];
+        credits.extend(TITLES.iter().filter(|o| o.id != title.id).map(summary).take(7));
+        Ok(PersonDetails {
+            id,
+            name: (*name).to_owned(),
+            biography: Some(format!(
+                "Вымышленный актёр демонстрационного каталога. Сыграл роль: {role}. Настоящая биография появится вместе с данными TMDB."
+            )),
+            birthday: Some("1985-04-12".into()),
+            deathday: None,
+            place_of_birth: Some("Орёл, Россия".into()),
+            profile_path: None,
+            credits,
         })
     }
 

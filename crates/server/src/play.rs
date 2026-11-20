@@ -44,6 +44,8 @@ pub struct Media {
     pub jackett: Option<Jackett>,
     pub torrserver: Option<TorrServer>,
     pub qbit: Option<QBittorrent>,
+    /// Recent indexer results; see [`torrent::search_cache`].
+    pub searches: torrent::search_cache::SearchCache,
     pub preload_dir: Option<PathBuf>,
     pub ffmpeg: String,
     pub ffprobe: String,
@@ -76,6 +78,7 @@ impl Media {
                     c.qbittorrent_save_path.clone(),
                 )
             }),
+            searches: torrent::search_cache::SearchCache::default(),
             preload_dir: c.preload_dir.clone(),
             ffmpeg: or(&c.ffmpeg, "ffmpeg"),
             ffprobe: or(&c.ffprobe, "ffprobe"),
@@ -147,8 +150,7 @@ async fn releases(
             configured: false,
         }));
     };
-    let items = torrent::search(jackett, &details).await?;
-    torrent::save_sources(&state.pool, &items).await?;
+    let items = torrent::search_cached(&state.media.searches, &state.pool, jackett, &details).await?;
     let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, &details)).collect();
     // Releases downloaded before are shown by their real info-hash, so the
     // remembered choice and "По просмотренным" find them.
@@ -171,6 +173,23 @@ async fn releases(
         releases,
         configured: true,
     }))
+}
+
+/// Starts the release search for a title in the background, so the list is ready
+/// by the time someone presses "Смотреть". Does nothing without an indexer, and
+/// nothing new when the title was searched recently.
+pub fn prefetch_releases(state: &AppState, details: TitleDetails) {
+    if state.media.jackett.is_none() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Some(jackett) = &state.media.jackett {
+            if let Err(e) = torrent::search_cached(&state.media.searches, &state.pool, jackett, &details).await {
+                tracing::debug!(error = %e, "background release search failed");
+            }
+        }
+    });
 }
 
 /// How long a stream link works.
@@ -358,6 +377,15 @@ pub fn choose_tracks(
             .map(|t| t.index)
     };
     let audio = by_label(&probe.audio, audio)
+        .or_else(|| {
+            // The audio language from the profile, when the file has such a track.
+            let want = prefs.language.as_deref()?;
+            probe
+                .audio
+                .iter()
+                .find(|t| t.language.as_deref().map(language_name) == Some(want))
+                .map(|t| t.index)
+        })
         .or_else(|| {
             let voice = prefs.voice.as_deref()?.to_lowercase();
             probe
@@ -584,6 +612,18 @@ mod tests {
             ..none
         };
         assert_eq!(choose_tracks(&probe, None, None, &prefs), (Some(1), Some(1)));
+        // Just a language in the profile: the first audio track in it, studio or not.
+        let by_language = UserPrefs {
+            language: Some("Русский".into()),
+            ..UserPrefs::default()
+        };
+        assert_eq!(choose_tracks(&probe, None, None, &by_language), (Some(1), None));
+        // A language the file does not have changes nothing.
+        let german = UserPrefs {
+            language: Some("Немецкий".into()),
+            ..UserPrefs::default()
+        };
+        assert_eq!(choose_tracks(&probe, None, None, &german), (Some(0), None));
         // What was picked in the player wins over the preferences.
         assert_eq!(
             choose_tracks(&probe, Some("Английский"), Some("off"), &prefs),
