@@ -98,6 +98,19 @@ cd app && dx bundle --web --release
 
 Прямую ссылку `t.me/<бот>/<имя>` можно получить в @BotFather: `/newapp` → выбрать бота → адрес `https://KINO_HOST`.
 
+### Приложение для телефона (Android)
+
+Тот же интерфейс на Dioxus, в системном WebView; запросы к серверу идут из Rust (`reqwest`),
+вход — через бота (приложение показывает код, пользователь нажимает «Запустить» в Telegram).
+Всё, что отличается от сайта, лежит в `app/src/platform/`.
+
+```sh
+rustup target add aarch64-linux-android
+# нужны Android SDK (platforms;android-34, build-tools;34.0.0) и NDK 27: ANDROID_HOME, ANDROID_NDK_HOME
+cd app && dx bundle --android --release --features mobile --no-default-features
+# адрес сервера по умолчанию — KINO_SERVER_URL=https://kino.example.com (иначе https://kino.aat-terra.ru)
+```
+
 ## Установка на TrueNAS
 
 1. CI собирает образ `ghcr.io/geometrik32/kino` при каждом пуше в `main`

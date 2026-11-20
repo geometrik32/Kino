@@ -91,8 +91,18 @@ pub fn routes() -> Router<AppState> {
         .route("/releases/{kind}/{tmdb_id}", get(releases))
         .route("/play", post(play))
         .route("/play/progress/{release}", get(play_progress))
-        .route("/stream/{token}", get(stream))
-        .route("/stream/{token}/sub/{file}", get(subtitle))
+        .merge(
+            // The stream links are signed and the apps play them from another origin,
+            // subtitles included: let any page read them.
+            Router::new()
+                .route("/stream/{token}", get(stream))
+                .route("/stream/{token}/sub/{file}", get(subtitle))
+                .layer(
+                    tower_http::cors::CorsLayer::new()
+                        .allow_origin(tower_http::cors::Any)
+                        .allow_methods([axum::http::Method::GET, axum::http::Method::HEAD]),
+                ),
+        )
 }
 
 impl From<TorrentError> for AppError {

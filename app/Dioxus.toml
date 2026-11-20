@@ -2,6 +2,11 @@
 name = "kino"
 default_platform = "web"
 
+[bundle]
+identifier = "ru.aatterra.orelkino"
+publisher = "Орловский кинопоказ"
+short_description = "Орловский кинопоказ"
+
 [web.app]
 title = "Орловский кинопоказ"
 

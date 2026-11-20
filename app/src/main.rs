@@ -5,6 +5,7 @@
 
 mod api;
 mod native;
+mod platform;
 mod player;
 mod telegram;
 
@@ -21,6 +22,24 @@ use kino_ui::{
 };
 
 fn main() {
+    #[cfg(any(feature = "mobile", feature = "desktop"))]
+    {
+        // The WebView's own page: let the picture go under the notch and system bars
+        // (the screens add the safe-area padding themselves).
+        const HEAD: &str = r#"<script>
+            var m = document.querySelector('meta[name=viewport]');
+            if (m) { m.content += ', viewport-fit=cover'; }
+        </script>"#;
+        #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+        use dioxus::desktop::Config;
+        #[cfg(feature = "mobile")]
+        use dioxus::mobile::Config;
+        dioxus::LaunchBuilder::new()
+            .with_cfg(Config::new().with_custom_head(HEAD.to_owned()))
+            .launch(App);
+    }
+
+    #[cfg(not(any(feature = "mobile", feature = "desktop")))]
     dioxus::launch(App);
 }
 
@@ -33,6 +52,7 @@ enum Session {
 
 /// Tries every way to be logged in: Mini App data, Login Widget redirect, saved token.
 async fn establish() -> Session {
+    platform::init().await;
     let invite = telegram::invite();
     let attempt: Option<Result<AuthResponse, api::Failure>> = if let Some(init) = telegram::init_data() {
         Some(api::login_webapp(init, invite).await)
@@ -61,7 +81,7 @@ async fn establish() -> Session {
         None => {}
     }
 
-    if let Some(token) = api::saved_token() {
+    if let Some(token) = api::saved_token().await {
         match api::me(&token).await {
             Ok(me) => {
                 return Session::LoggedIn {
@@ -112,18 +132,27 @@ enum LinkLogin {
     Failed(String),
 }
 
+/// In the apps a link must be handed to the system; a page opens it by itself.
+fn open_link(e: &Event<MouseData>, url: &str) {
+    if !platform::is_web() {
+        e.prevent_default();
+        platform::open_external(url);
+    }
+}
+
 #[component]
 fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
     let mut state = use_signal(|| LinkLogin::Idle);
     // Made in advance so the button is a plain link: browsers block pop-ups
     // opened after a network round trip.
-    let mut link = use_resource(move || api::start_login_link(telegram::invite()));
+    let mut invite = use_signal(telegram::invite);
+    let mut link = use_resource(move || api::start_login_link(invite()));
     let mut wait = move |token: String| {
         state.set(LinkLogin::Waiting);
         spawn(async move {
             // The link lives 10 minutes; ask every 2 seconds.
             for _ in 0..300 {
-                gloo_timers::future::TimeoutFuture::new(2_000).await;
+                platform::sleep(2_000).await;
                 if *state.peek() != LinkLogin::Waiting {
                     return;
                 }
@@ -167,15 +196,32 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
             match (state(), ready) {
                 (LinkLogin::Waiting, Some(l)) => rsx! {
                     p { "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
-                    a { class: "btn ghost", href: "{l.url}", target: "_blank", rel: "noopener", "Открыть Telegram ещё раз" }
+                    a {
+                        class: "btn ghost",
+                        href: "{l.url}",
+                        target: "_blank",
+                        rel: "noopener",
+                        onclick: move |e: Event<MouseData>| open_link(&e, &l.url),
+                        "Открыть Telegram ещё раз"
+                    }
                     p {
                         a { href: "#", onclick: move |e: Event<MouseData>| { e.prevent_default(); state.set(LinkLogin::Idle) }, "Отмена" }
                     }
                 },
                 (_, Some(l)) => rsx! {
                     a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener",
-                        onclick: move |_| wait(l.token.clone()),
+                        onclick: move |e: Event<MouseData>| {
+                            open_link(&e, &l.url);
+                            wait(l.token.clone());
+                        },
                         "Войти через Telegram"
+                    }
+                    if !platform::is_web() {
+                        input {
+                            class: "field",
+                            placeholder: "Код приглашения (если есть)",
+                            oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
+                        }
                     }
                 },
                 (_, None) => rsx! { p { class: "muted", "Готовим вход…" } },
@@ -347,13 +393,6 @@ fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
     }
 }
 
-/// Current time from the browser (`Utc::now` is not available in wasm).
-fn browser_now() -> (chrono::DateTime<chrono::Utc>, i32) {
-    let d = js_sys::Date::new_0();
-    let now = chrono::DateTime::from_timestamp_millis(d.get_time() as i64).unwrap_or_default();
-    (now, -(d.get_timezone_offset() as i32))
-}
-
 #[component]
 fn Profile(
     token: String,
@@ -378,7 +417,7 @@ fn Profile(
         Some(Err(e)) => return error_text(&e.message),
         Some(Ok(v)) => v,
     };
-    let (now, utc_offset_min) = browser_now();
+    let (now, utc_offset_min) = platform::now();
     let t2 = token.clone();
     rsx! {
         ProfileView {
