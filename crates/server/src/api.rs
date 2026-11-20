@@ -32,6 +32,7 @@ pub struct AppState {
     pub pool: Pool,
     pub config: Arc<Config>,
     pub catalog: Arc<dyn Catalog>,
+    pub media: Arc<crate::play::Media>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -67,6 +68,7 @@ pub fn router() -> Router<AppState> {
         .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
+        .merge(crate::play::routes())
 }
 
 /// The logged-in user, from `Authorization: Bearer <token>`.
@@ -161,8 +163,9 @@ async fn continue_watching(
 }
 
 /// BitTorrent v1 (SHA-1) or v2 (SHA-256) info-hash in hex.
+/// An info-hash (v1 or v2), or the placeholder key of a release found by the indexer.
 fn infohash_ok(h: &str) -> bool {
-    matches!(h.len(), 40 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit())
+    (matches!(h.len(), 40 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit())) || kino_core::is_release_key(h)
 }
 
 fn validate(u: &ProgressUpdate) -> Result<(), AppError> {
@@ -434,6 +437,24 @@ async fn add_preload(
         ));
     }
     r.infohash.make_ascii_lowercase();
+    let media = &state.media;
+    let Some(qbit) = &media.qbit else {
+        // Without a downloader the request is only recorded (demo mode).
+        return Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?));
+    };
+    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash).await?;
+    r.infohash = src.infohash.clone().unwrap_or(r.infohash);
+    if r.title.is_none() && !src.title.is_empty() {
+        r.title = Some(src.title.clone());
+    }
+    qbit.add(&src).await.map_err(|e| {
+        tracing::warn!(error = %e, "qBittorrent add failed");
+        AppError::new(
+            StatusCode::BAD_GATEWAY,
+            "downloader_unavailable",
+            "Загрузчик сейчас недоступен",
+        )
+    })?;
     Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?))
 }
 
@@ -442,14 +463,14 @@ async fn delete_preload(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    if userdata::preload_delete(&state.pool, user.0, id).await? {
-        Ok(StatusCode::NO_CONTENT)
-    } else {
-        Err(AppError::not_found())
-    }
+    let Some(hash) = userdata::preload_delete(&state.pool, user.0, id).await? else {
+        return Err(AppError::not_found());
+    };
+    crate::jobs::remove_files(&state, &hash).await;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-fn parse_kind(kind: &str) -> Result<MediaKind, AppError> {
+pub(crate) fn parse_kind(kind: &str) -> Result<MediaKind, AppError> {
     MediaKind::parse(kind).ok_or_else(|| AppError::bad_request("kind must be `movie` or `tv`"))
 }
 

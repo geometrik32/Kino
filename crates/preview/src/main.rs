@@ -11,13 +11,13 @@ use std::path::PathBuf;
 use chrono::{Duration, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    ContinueItem, HistoryEntry, HomeFeed, MediaKind, PreloadItem, PreloadState, Progress, ReleaseRef, SearchResults,
-    Season, TitleDetails, TitleState, TitleStatus, UserPrefs,
+    ContinueItem, HistoryEntry, HomeFeed, MediaKind, MediaTrack, PreloadItem, PreloadState, Progress, ReleaseRef,
+    SearchResults, Season, TitleDetails, TitleState, TitleStatus, UserPrefs,
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, MyView, PickerPanel, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker,
-    ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
+    mock_releases, HomeView, LoginView, MyView, PickerPanel, PlayerMenu, PlayerState, PlayerView, ProfileView,
+    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
 };
 
 #[derive(Clone, PartialEq)]
@@ -29,6 +29,8 @@ struct Picker {
     filter: ReleaseFilter,
     sort: ReleaseSort,
     panel: Option<PickerPanel>,
+    /// Demo data (shows the "примеры" badge) or parsed from a tracker feed.
+    mock: bool,
 }
 
 #[derive(Clone, PartialEq)]
@@ -46,6 +48,7 @@ enum Screen {
     },
     Mine(Vec<TitleState>, Option<TitleStatus>),
     Profile(Vec<HistoryEntry>, Vec<PreloadItem>, UserPrefs),
+    Player(PlayerState),
     Login,
 }
 
@@ -67,6 +70,22 @@ fn Page(props: PageProps) -> Element {
         _ => String::new(),
     };
     let body = match props.screen {
+        Screen::Player(state) => {
+            return rsx! {
+                PlayerView {
+                    state,
+                    on_toggle: |_| {},
+                    on_seek: |_| {},
+                    on_menu: |_| {},
+                    on_audio: |_| {},
+                    on_subtitle: |_| {},
+                    on_next: |_| {},
+                    on_fullscreen: |_| {},
+                    on_close: |_| {},
+                    on_video: |_| {},
+                }
+            }
+        }
         Screen::Login => {
             return rsx! {
                 LoginView { invite: Some("demo".to_string()),
@@ -125,7 +144,7 @@ fn Page(props: PageProps) -> Element {
                     filter: p.filter,
                     sort: p.sort,
                     panel: p.panel,
-                    mock: true,
+                    mock: p.mock,
                     on_filter: |_| {},
                     on_sort: |_| {},
                     on_panel: |_| {},
@@ -377,6 +396,7 @@ async fn main() -> anyhow::Result<()> {
         filter,
         sort,
         panel,
+        mock: true,
     };
     let bb_screen = |picker| Screen::Title {
         details: bb.clone(),
@@ -386,6 +406,57 @@ async fn main() -> anyhow::Result<()> {
         my_rating: None,
         release_label: Some(chosen.label()),
         picker,
+    };
+    // Releases as the indexer delivers them: names from a tracker feed, parsed.
+    let feed = kino_server::torrent::torznab::parse_feed(include_str!("feed.xml"))?;
+    let mut live: Vec<ReleaseOption> = feed.iter().map(kino_server::torrent::to_release).collect();
+    live.sort_by_key(|r| std::cmp::Reverse(r.seeders));
+    let live_picker = Picker {
+        heading: "Во все тяжкие · S02E06 · продолжить с 41:12".to_string(),
+        releases: live,
+        chosen: None,
+        watched: vec![],
+        filter: ReleaseFilter::default(),
+        sort: ReleaseSort::Seeders,
+        panel: None,
+        mock: false,
+    };
+    let track = |index, lang: &str, title: Option<&str>, codec: &str, channels, default| MediaTrack {
+        index,
+        language: Some(lang.into()),
+        title: title.map(String::from),
+        codec: codec.into(),
+        channels: Some(channels),
+        default,
+    };
+    let player = PlayerState {
+        title: "Во все тяжкие".into(),
+        subtitle: Some("S02E06 · Ку-ку".into()),
+        release: "LostFilm · 1080p · RuTracker".into(),
+        src: String::new(),
+        subtitles_src: None,
+        poster: Some("frame.jpg".into()),
+        position: 2472.0,
+        duration: Some(2820.0),
+        paused: true,
+        waiting: false,
+        status: None,
+        error: None,
+        audio: vec![
+            track(0, "rus", Some("LostFilm"), "eac3", 6, true),
+            track(1, "rus", Some("NewStudio"), "ac3", 2, false),
+            track(2, "eng", Some("Original"), "dts", 6, false),
+        ],
+        subtitle_tracks: vec![
+            track(0, "rus", Some("Полные"), "subrip", 0, false),
+            track(1, "eng", None, "subrip", 0, false),
+        ],
+        audio_track: Some(0),
+        subtitle_track: None,
+        menu: None,
+        next: Some("S02E07".into()),
+        transcoded: true,
+        preloaded: false,
     };
     let filtered = ReleaseFilter {
         quality: Some("2160p".into()),
@@ -435,6 +506,39 @@ async fn main() -> anyhow::Result<()> {
                 release_label: Some("NewStudio · 1080p · RuTor".into()),
                 picker: None,
             },
+        ),
+        ("releases-live", "Раздачи с трекеров", bb_screen(Some(live_picker))),
+        ("player", "Плеер", Screen::Player(player.clone())),
+        (
+            "player-audio",
+            "Плеер · звук",
+            Screen::Player(PlayerState {
+                menu: Some(PlayerMenu::Audio),
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-next",
+            "Плеер · следующая серия",
+            Screen::Player(PlayerState {
+                position: 2795.0,
+                paused: false,
+                subtitle_track: Some(0),
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-loading",
+            "Плеер · запуск",
+            Screen::Player(PlayerState {
+                position: 0.0,
+                duration: None,
+                paused: false,
+                status: Some("Подключаемся к раздаче…".into()),
+                audio: vec![],
+                subtitle_tracks: vec![],
+                ..player.clone()
+            }),
         ),
         ("mine", "Мои", Screen::Mine(mine, None)),
         ("profile", "Профиль", Screen::Profile(history, preloads, prefs)),

@@ -14,11 +14,12 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process", "fs", "io-util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 axum = "0.8"
 tower-http = { version = "0.6", features = ["fs", "trace", "cors"] }
+tower = { version = "0.5", features = ["util"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
@@ -27,7 +28,13 @@ subtle = "2"
 url = "2"
 rand = "0.9"
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart", "cookies"] }
+roxmltree = "0.20"
+regex = "1"
+sha1 = "0.10"
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["io"] }
+
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -348,17 +348,16 @@ pub async fn preloads(pool: &PgPool, user_id: i64) -> Result<Vec<PreloadItem>, s
     rows.iter().map(preload_from_row).collect()
 }
 
-/// Removes a preload by hand. Returns false if there was none.
-pub async fn preload_delete(pool: &PgPool, user_id: i64, id: i64) -> Result<bool, sqlx::Error> {
-    let r = sqlx::query(
+/// Removes a preload by hand. Returns its info-hash, or `None` if there was none.
+pub async fn preload_delete(pool: &PgPool, user_id: i64, id: i64) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
         "UPDATE preload SET state = 'deleted', delete_after = NULL
-         WHERE user_id = $1 AND id = $2 AND state <> 'deleted'",
+         WHERE user_id = $1 AND id = $2 AND state <> 'deleted' RETURNING infohash",
     )
     .bind(user_id)
     .bind(id)
-    .execute(pool)
-    .await?;
-    Ok(r.rows_affected() > 0)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Once a film or a season is watched, its preloads are scheduled for removal.
@@ -394,6 +393,43 @@ pub async fn preloads_due(pool: &PgPool) -> Result<Vec<(i64, String)>, sqlx::Err
     rows.iter()
         .map(|r| Ok((r.try_get("id")?, r.try_get("infohash")?)))
         .collect()
+}
+
+/// Info-hashes of preloads still downloading.
+pub async fn preloads_active(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar("SELECT DISTINCT infohash FROM preload WHERE state IN ('queued', 'downloading')")
+        .fetch_all(pool)
+        .await
+}
+
+/// Progress from the torrent client, for every user who asked for this release.
+pub async fn preload_progress(
+    pool: &PgPool,
+    infohash: &str,
+    state: PreloadState,
+    progress: f32,
+    size_bytes: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE preload SET state = $2, progress = $3, size_bytes = COALESCE($4, size_bytes),
+             ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END
+         WHERE infohash = $1 AND state IN ('queued', 'downloading')",
+    )
+    .bind(infohash)
+    .bind(state.as_str())
+    .bind(progress)
+    .bind(size_bytes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether someone else still keeps this release on the server.
+pub async fn preload_in_use(pool: &PgPool, infohash: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND state <> 'deleted')")
+        .bind(infohash)
+        .fetch_one(pool)
+        .await
 }
 
 pub async fn preload_mark_deleted(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {

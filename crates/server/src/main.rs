@@ -38,7 +38,9 @@ async fn main() -> anyhow::Result<()> {
             Arc::new(DemoCatalog)
         }
     };
+    let media = Arc::new(kino_server::play::Media::new(&config.torrents));
     let state = AppState {
+        media,
         pool,
         config: Arc::new(config),
         catalog,

@@ -2,9 +2,10 @@
 
 use gloo_net::http::{Request, Response};
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PreloadItem,
-    PreloadRequest, Progress, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, SearchResults, Season, StatusUpdate,
-    TitleDetails, TitleState, TitleStatus, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PlayInfo, PlayRequest,
+    PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
+    ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
+    WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -215,4 +216,21 @@ pub async fn add_preload(token: &str, r: &PreloadRequest) -> Result<PreloadItem,
 
 pub async fn delete_preload(token: &str, id: i64) -> Result<(), Failure> {
     send("DELETE", &format!("/api/preload/{id}"), token, None::<&()>).await
+}
+
+pub async fn releases(token: &str, kind: MediaKind, id: i64, season: i32) -> Result<ReleaseList, Failure> {
+    get(&format!("/api/releases/{}/{id}?season={season}", kind.as_str()), token).await
+}
+
+pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {
+    send("POST", "/api/play", token, Some(r)).await
+}
+
+pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, Failure> {
+    send("PUT", "/api/progress", token, Some(u)).await
+}
+
+pub async fn set_tracks(token: &str, kind: MediaKind, id: i64, t: &TracksUpdate) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/{}/{id}/tracks", kind.as_str());
+    send("PUT", &path, token, Some(t)).await
 }

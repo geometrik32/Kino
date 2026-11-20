@@ -3,7 +3,7 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
-use kino_core::{episode_code, MediaKind, TitleStatus};
+use kino_core::{episode_code, MediaKind, PreloadState, TitleStatus};
 
 use crate::{api::AppState, userdata};
 
@@ -55,16 +55,49 @@ where
     Ok(sent)
 }
 
-/// Marks preloads past their removal time as deleted.
-///
-/// The files live in the torrent client; removing them there comes with the
-/// downloader (stage 3). Until then this only updates the records.
+/// Removes preloads past their removal time, with their files once nobody
+/// else keeps the same release.
 pub async fn expire_preloads(state: &AppState) -> anyhow::Result<usize> {
     let due = userdata::preloads_due(&state.pool).await?;
-    for (id, _infohash) in &due {
+    for (id, infohash) in &due {
         userdata::preload_mark_deleted(&state.pool, *id).await?;
+        remove_files(state, infohash).await;
     }
     Ok(due.len())
+}
+
+/// Deletes a release from the downloader unless another preload still uses it.
+pub async fn remove_files(state: &AppState, infohash: &str) {
+    let Some(qbit) = &state.media.qbit else { return };
+    match userdata::preload_in_use(&state.pool, infohash).await {
+        Ok(false) => {
+            if let Err(e) = qbit.delete(infohash).await {
+                tracing::warn!(error = %e, infohash, "could not delete the preloaded files");
+            }
+        }
+        Ok(true) => {}
+        Err(e) => tracing::warn!(error = %e, "preload lookup failed"),
+    }
+}
+
+/// Copies download progress from qBittorrent into the preload records.
+pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
+    let Some(qbit) = &state.media.qbit else { return Ok(()) };
+    let hashes = userdata::preloads_active(&state.pool).await?;
+    if hashes.is_empty() {
+        return Ok(());
+    }
+    let infos = qbit.info(&hashes).await?;
+    for hash in &hashes {
+        let (st, progress, size) = match infos.iter().find(|i| i.hash.eq_ignore_ascii_case(hash)) {
+            None => (PreloadState::Failed, 0.0, None),
+            Some(i) if i.failed() => (PreloadState::Failed, i.progress, Some(i.size)),
+            Some(i) if i.done() => (PreloadState::Ready, 1.0, Some(i.size)),
+            Some(i) => (PreloadState::Downloading, i.progress, Some(i.size)),
+        };
+        userdata::preload_progress(&state.pool, hash, st, progress, size).await?;
+    }
+    Ok(())
 }
 
 /// Sends a message through the Telegram Bot API.
@@ -82,6 +115,16 @@ pub async fn telegram_send(client: &reqwest::Client, token: &str, chat_id: i64, 
 pub fn spawn(state: AppState, every: Duration) {
     let client = reqwest::Client::new();
     let token = Arc::new(state.config.bot_token.clone());
+    let sync_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            tick.tick().await;
+            if let Err(e) = sync_preloads(&sync_state).await {
+                tracing::warn!(error = %e, "preload progress update failed");
+            }
+        }
+    });
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(3600));
         let mut since_check = every;

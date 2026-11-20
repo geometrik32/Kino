@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:torznab="http://torznab.com/schemas/2015/feed">
+  <channel>
+    <title>AggregateSearch</title>
+    <item>
+      <title>Во все тяжкие / Breaking Bad / Сезон: 2 / Серии: 1-13 из 13 [2009, США, драма, WEB-DL 1080p] MVO (LostFilm) + Sub (Rus, Eng)</title>
+      <guid>https://rutracker.org/forum/viewtopic.php?t=1</guid>
+      <jackettindexer id="rutracker">RuTracker.org</jackettindexer>
+      <link>http://jackett:9117/dl/rutracker/?jackett_apikey=KEY&amp;path=abc&amp;file=Breaking+Bad</link>
+      <pubDate>Fri, 08 Mar 2024 12:00:00 +0300</pubDate>
+      <size>28400000000</size>
+      <torznab:attr name="seeders" value="214" />
+      <torznab:attr name="peers" value="230" />
+    </item>
+    <item>
+      <title>Во все тяжкие / Breaking Bad / Сезон 2 / 2009 / ДБ, СТ / WEB-DL (2160p) / HDR10 / HEVC</title>
+      <jackettindexer id="kinozal">Kinozal.tv</jackettindexer>
+      <link>http://jackett:9117/dl/kinozal/?jackett_apikey=KEY&amp;path=def</link>
+      <pubDate>Sun, 19 Jan 2025 08:30:00 +0000</pubDate>
+      <size>96100000000</size>
+      <torznab:attr name="seeders" value="41" />
+      <torznab:attr name="infohash" value="C12FE1C06BBA254A9DC9F519B335AA7C1367A88A" />
+    </item>
+    <item>
+      <title>Breaking Bad S01-S05 Complete 720p BluRay x264</title>
+      <jackettindexer id="rutor">Rutor</jackettindexer>
+      <link>magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&amp;dn=bb</link>
+      <pubDate>Thu, 01 Dec 2022 10:00:00 +0000</pubDate>
+      <torznab:attr name="size" value="52000000000" />
+      <torznab:attr name="seeders" value="12" />
+    </item>
+    <item>
+      <title></title>
+    </item>
+  </channel>
+</rss>

@@ -31,6 +31,57 @@ pub struct Config {
     pub notify_every: std::time::Duration,
     /// How long a preloaded release is kept after it was watched.
     pub preload_keep: chrono::Duration,
+    /// Torrent services; each one is optional. See [`TorrentConfig`].
+    pub torrents: TorrentConfig,
+}
+
+/// Where the torrent services live. Without Jackett the release list is demo
+/// data; without TorrServer nothing can be played; without qBittorrent there is
+/// no preloading.
+#[derive(Clone, Default)]
+pub struct TorrentConfig {
+    pub jackett_url: Option<String>,
+    pub jackett_api_key: Option<String>,
+    pub torrserver_url: Option<String>,
+    pub torrserver_user: Option<String>,
+    pub torrserver_password: Option<String>,
+    pub qbittorrent_url: Option<String>,
+    pub qbittorrent_user: String,
+    pub qbittorrent_password: String,
+    /// Download folder as qBittorrent sees it.
+    pub qbittorrent_save_path: Option<String>,
+    /// The same folder as this server sees it, to play preloaded files from disk.
+    pub preload_dir: Option<PathBuf>,
+    pub ffmpeg: String,
+    pub ffprobe: String,
+    /// `none`, `qsv` (Intel Quick Sync) or `vaapi`.
+    pub hwaccel: String,
+}
+
+impl TorrentConfig {
+    pub fn from_env() -> Self {
+        let opt = |n: &str| {
+            std::env::var(n)
+                .ok()
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            jackett_url: opt("JACKETT_URL"),
+            jackett_api_key: opt("JACKETT_API_KEY"),
+            torrserver_url: opt("TORRSERVER_URL"),
+            torrserver_user: opt("TORRSERVER_USER"),
+            torrserver_password: opt("TORRSERVER_PASSWORD"),
+            qbittorrent_url: opt("QBITTORRENT_URL"),
+            qbittorrent_user: opt("QBITTORRENT_USER").unwrap_or_else(|| "admin".into()),
+            qbittorrent_password: opt("QBITTORRENT_PASSWORD").unwrap_or_default(),
+            qbittorrent_save_path: opt("QBITTORRENT_SAVE_PATH"),
+            preload_dir: opt("PRELOAD_DIR").map(PathBuf::from),
+            ffmpeg: opt("FFMPEG").unwrap_or_else(|| "ffmpeg".into()),
+            ffprobe: opt("FFPROBE").unwrap_or_else(|| "ffprobe".into()),
+            hwaccel: opt("TRANSCODE_HWACCEL").unwrap_or_else(|| "none".into()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Config {
@@ -45,6 +96,10 @@ impl std::fmt::Debug for Config {
                 &self.tmdb_api_key.as_ref().map(|_| "set").unwrap_or("demo catalog"),
             )
             .field("static_dir", &self.static_dir)
+            .field("jackett", &self.torrents.jackett_url)
+            .field("torrserver", &self.torrents.torrserver_url)
+            .field("qbittorrent", &self.torrents.qbittorrent_url)
+            .field("hwaccel", &self.torrents.hwaccel)
             .finish_non_exhaustive()
     }
 }
@@ -96,6 +151,7 @@ impl Config {
                     .parse()
                     .context("PRELOAD_KEEP_DAYS must be a number")?,
             ),
+            torrents: TorrentConfig::from_env(),
         })
     }
 }

@@ -47,8 +47,10 @@ impl Tab {
 const TABS: [Tab; 4] = [Tab::Home, Tab::Search, Tab::Mine, Tab::Profile];
 
 mod account;
+mod player;
 mod releases;
 pub use account::*;
+pub use player::*;
 pub use releases::*;
 
 fn hue(id: i64) -> i64 {

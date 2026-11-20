@@ -19,6 +19,10 @@ pub const BOT_TOKEN: &str = "123456:TEST-token";
 pub const ADMIN_TG: i64 = 1000;
 
 pub fn test_state(pool: PgPool) -> AppState {
+    test_state_with(pool, Default::default())
+}
+
+pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfig) -> AppState {
     let config = Config {
         database_url: String::new(),
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -34,9 +38,11 @@ pub fn test_state(pool: PgPool) -> AppState {
         static_dir: None,
         notify_every: std::time::Duration::from_secs(3600),
         preload_keep: chrono::Duration::days(7),
+        torrents,
     };
     AppState {
         pool,
+        media: Arc::new(kino_server::play::Media::new(&config.torrents)),
         config: Arc::new(config),
         catalog: Arc::new(DemoCatalog),
     }
@@ -96,4 +102,33 @@ pub async fn login_ok(app: &Router, tg_id: i64, invite: Option<&str>) -> AuthRes
     let (status, body) = login(app, tg_id, invite).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     serde_json::from_value(body).unwrap()
+}
+
+/// A request with extra headers; returns status, headers and the raw body.
+pub async fn raw(
+    app: &Router,
+    method: Method,
+    path: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
+    let mut req = Request::builder().method(method).uri(path);
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+    let (parts, body) = resp.into_parts();
+    let bytes = body.collect().await.unwrap().to_bytes().to_vec();
+    (parts.status, parts.headers, bytes)
+}
+
+/// Serves `router` on a free local port; returns its base URL.
+pub async fn serve(router: Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    format!("http://{addr}")
 }

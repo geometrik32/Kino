@@ -4,16 +4,19 @@
 //! The screens live in `kino-ui`; this crate fetches data and handles clicks.
 
 mod api;
+mod player;
 mod telegram;
+
+use player::{PlayStart, Player};
 
 use dioxus::prelude::*;
 use kino_core::{
-    AuthResponse, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs,
-    WidgetAuthRequest,
+    image_url, AuthResponse, ImageSize, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate, TitleStatus,
+    TitleSummary, UserPrefs, WidgetAuthRequest,
 };
 use kino_ui::{
-    mock_releases, play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter,
-    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
+    play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption,
+    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
 };
 
 fn main() {
@@ -366,7 +369,18 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let mut filter = use_signal(ReleaseFilter::default);
     let mut sort = use_signal(ReleaseSort::default);
     let mut panel = use_signal(|| None::<PickerPanel>);
-    let mut playing = use_signal(|| None::<(PlayTarget, String)>);
+    let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
+    let t0 = token.clone();
+    // Releases for the open picker, loaded from the indexer (or demo data).
+    let releases = use_resource(move || {
+        let t = t0.clone();
+        let open = picker();
+        async move {
+            let p = open?;
+            let season = if kind == MediaKind::Tv { p.season } else { 0 };
+            Some(api::releases(&t, kind, id, season).await)
+        }
+    });
 
     let state = data.read().clone();
     let (details, progress, st, loaded) = match state {
@@ -409,7 +423,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         let choice_for = choice_for.clone();
         let mut open_picker = open_picker.clone();
         move |t: PlayTarget| match choice_for(season_key(&t)) {
-            Some(c) => playing.set(Some((t, choice_label(&c)))),
+            Some(c) => playing.set(Some((t, c))),
             None => open_picker(t),
         }
     };
@@ -437,7 +451,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             my_rating,
             release_label,
             on_play,
-            on_change_release: open_picker,
+            on_change_release: open_picker.clone(),
             on_status: {
                 let token = token.clone();
                 move |s: Option<TitleStatus>| {
@@ -478,15 +492,33 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_season: move |n| chosen_season.set(Some(n)),
         }
         if let (Some(heading), Some(target)) = (heading, picker()) {
-            ReleasePicker {
+            match releases.read().clone().flatten() {
+                None => rsx! {
+                    div { class: "sheet-bg", onclick: move |_| picker.set(None),
+                        div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                            h3 { "{heading}" }
+                            p { class: "muted", "Ищем раздачи на трекерах…" }
+                        }
+                    }
+                },
+                Some(Err(e)) => rsx! {
+                    div { class: "sheet-bg", onclick: move |_| picker.set(None),
+                        div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                            h3 { "{heading}" }
+                            p { class: "error", "{e.message}" }
+                            button { class: "btn ghost", onclick: move |_| picker.set(None), "Закрыть" }
+                        }
+                    }
+                },
+                Some(Ok(list)) => rsx! { ReleasePicker {
                 heading,
-                releases: mock_releases(&details.summary, (kind == MediaKind::Tv).then_some(target.season)),
+                releases: list.releases,
                 chosen: chosen_hash,
                 watched,
                 filter: filter(),
                 sort: sort(),
                 panel: panel(),
-                mock: true,
+                mock: !list.configured,
                 on_filter: move |f| filter.set(f),
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),
@@ -497,7 +529,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                         v.insert(0, choice.clone());
                     });
                     picker.set(None);
-                    playing.set(Some((target.clone(), r.label())));
+                    playing.set(Some((target.clone(), choice.clone())));
                     let t = t3.clone();
                     spawn(async move {
                         let _ = api::save_release_choice(&t, &choice).await;
@@ -527,6 +559,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                     }
                 },
                 on_close: move |_| picker.set(None),
+            } },
             }
         }
         if let Some(text) = notice() {
@@ -537,18 +570,31 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                 }
             }
         }
-        if let Some((t, label)) = playing() {
-            div { class: "sheet-bg", onclick: move |_| playing.set(None),
-                div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                    h3 { "Запуск" }
-                    p { class: "hint",
-                        if kind == MediaKind::Tv { "{kino_core::episode_code(t.season, t.episode)} · " }
-                        "раздача {label}"
-                        if t.position_sec > 0.0 { " · с {kino_core::clock(t.position_sec)}" }
+        if let Some((t, rel)) = playing() {
+            Player {
+                key: "{t.season}-{t.episode}-{rel.infohash}",
+                token: token.clone(),
+                start: PlayStart {
+                    kind,
+                    tmdb_id: id,
+                    title: details.summary.title.clone(),
+                    poster: details.summary.backdrop_path.as_deref().map(|p| image_url(p, ImageSize::Backdrop)),
+                    season: t.season,
+                    episode: t.episode,
+                    choices: choices.clone(),
+                    release: rel,
+                },
+                on_close: move |_| {
+                    playing.set(None);
+                    data.restart();
+                },
+                on_need_release: {
+                    let mut open_picker = open_picker.clone();
+                    move |(season, episode): (i32, i32)| {
+                        playing.set(None);
+                        open_picker(PlayTarget { season, episode, position_sec: 0.0 });
                     }
-                    p { class: "muted", "Плеер появится на следующем этапе. Выбор раздачи уже сохранён и будет использоваться по умолчанию на всех устройствах." }
-                    button { class: "btn ghost", onclick: move |_| playing.set(None), "Закрыть" }
-                }
+                },
             }
         }
     }

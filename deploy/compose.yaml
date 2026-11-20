@@ -30,7 +30,18 @@ services:
     depends_on:
       kino-db:
         condition: service_healthy
-    mem_limit: 256m
+    # Re-encoding runs inside this container, so it gets more memory and the GPU.
+    mem_limit: 768m
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-107}"
+    volumes:
+      # Preloaded releases, the same folder qBittorrent downloads into.
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads:ro
+    extra_hosts:
+      # TorrServer already runs on the host network (port 5665).
+      - host.docker.internal:host-gateway
     networks: [kino, proxy]
     labels:
       traefik.enable: "true"
@@ -51,6 +62,41 @@ services:
       kino-server:
         condition: service_started
     mem_limit: 64m
+    networks: [kino]
+
+  # Searches all trackers at once. Add trackers in its web UI (LAN only):
+  # http://<server>:9117, then copy the API key into .env.
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-568}"
+      PGID: "${PGID:-568}"
+      TZ: Europe/Moscow
+    volumes:
+      - ./data/jackett:/config
+    ports:
+      - "9117:9117"
+    mem_limit: 256m
+    networks: [kino]
+
+  # Downloads releases in advance ("Скачать заранее") to the HDD pool.
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-568}"
+      PGID: "${PGID:-568}"
+      TZ: Europe/Moscow
+      WEBUI_PORT: "8090"
+    volumes:
+      - ./data/qbittorrent:/config
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/kino/downloads}:/downloads
+    ports:
+      - "8090:8090"
+      - "6881:6881"
+      - "6881:6881/udp"
+    mem_limit: 384m
     networks: [kino]
 
 networks:

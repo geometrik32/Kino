@@ -2,57 +2,8 @@
 //! sorting and the remembered choice.
 
 use dioxus::prelude::*;
-use kino_core::{ReleaseChoiceUpdate, TitleSummary};
-
-/// A torrent release offered for a title.
-///
-/// Until the indexer is connected (stage 3) these come from [`mock_releases`].
-#[derive(Debug, Clone, PartialEq)]
-pub struct ReleaseOption {
-    pub infohash: String,
-    pub title: String,
-    /// "2160p", "1080p", "720p".
-    pub quality: String,
-    pub size_bytes: u64,
-    pub seeders: u32,
-    /// Voice-over / translation, e.g. "LostFilm" or "Дубляж".
-    pub voice: String,
-    /// Audio language, e.g. "Русский".
-    pub language: String,
-    /// Where the release was found, e.g. "RuTracker".
-    pub tracker: String,
-    /// Upload date, `YYYY-MM-DD`.
-    pub added: String,
-    /// Release year of the video.
-    pub year: Option<i32>,
-    /// Season of a series pack.
-    pub season: Option<i32>,
-    pub hdr: bool,
-    pub dolby_vision: bool,
-    pub subtitles: bool,
-    /// Whether a browser can play it as-is (H.264/AAC); otherwise the server transcodes.
-    pub direct_play: bool,
-}
-
-impl ReleaseOption {
-    /// Short label for the title page, e.g. "LostFilm · 1080p · RuTracker".
-    pub fn label(&self) -> String {
-        format!("{} · {} · {}", self.voice, self.quality, self.tracker)
-    }
-
-    /// What to remember when the user picks this release.
-    pub fn to_choice(&self, title: &TitleSummary, season: i32) -> ReleaseChoiceUpdate {
-        ReleaseChoiceUpdate {
-            kind: title.kind,
-            tmdb_id: title.tmdb_id,
-            season,
-            infohash: self.infohash.clone(),
-            title: Some(self.title.clone()),
-            quality: Some(self.quality.clone()),
-            voice: Some(self.voice.clone()),
-        }
-    }
-}
+use kino_core::ReleaseChoiceUpdate;
+pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
 
 /// Seeds below this count make streaming unreliable; offer preloading instead.
 pub const LOW_SEEDS: u32 = 5;
@@ -405,8 +356,9 @@ fn ReleaseRow(
                     span { class: "tag", "{release.tracker}" }
                     if release.direct_play {
                         span { class: "tag ok", "играет сразу" }
-                    } else {
-                        span { class: "tag warn", "нужна перекодировка" }
+                    } else if release.codec.is_some() || release.hdr {
+                        // Known to need the server's help; unknown codecs are not guessed.
+                        span { class: "tag warn", "перекодируется" }
                     }
                     if chosen {
                         span { class: "tag ok", "ваша раздача" }
@@ -441,224 +393,10 @@ fn ru_short_date(d: &str) -> String {
     }
 }
 
-/// Sample releases for the picker until the indexer is connected (stage 3).
-pub fn mock_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOption> {
-    let original = title.original_title.clone().unwrap_or_else(|| title.title.clone());
-    let year = title.year;
-    let tv = season.is_some();
-    #[allow(clippy::type_complexity)]
-    let rows: &[(
-        char,
-        &str,
-        &str,
-        f64,
-        u32,
-        &str,
-        &str,
-        &str,
-        &str,
-        i32,
-        bool,
-        bool,
-        bool,
-        bool,
-    )] = &[
-        // hash, quality, rip, GB, seeds, voice, language, tracker, added, season offset, hdr, dv, subs, direct
-        (
-            'a',
-            "1080p",
-            "WEB-DL",
-            28.4,
-            214,
-            "LostFilm",
-            "Русский",
-            "RuTracker",
-            "2024-03-08",
-            0,
-            false,
-            false,
-            true,
-            true,
-        ),
-        (
-            'b',
-            "2160p",
-            "WEB-DL HDR | HEVC",
-            96.1,
-            41,
-            "Дубляж",
-            "Русский",
-            "Kinozal",
-            "2025-01-19",
-            0,
-            true,
-            false,
-            true,
-            false,
-        ),
-        (
-            'c',
-            "1080p",
-            "BDRip | x264",
-            21.7,
-            87,
-            "NewStudio",
-            "Русский",
-            "RuTor",
-            "2023-11-02",
-            0,
-            false,
-            false,
-            false,
-            true,
-        ),
-        (
-            'd',
-            "720p",
-            "HDTVRip",
-            11.0,
-            3,
-            "Кубик в Кубе",
-            "Русский",
-            "NNM-Club",
-            "2019-06-14",
-            0,
-            false,
-            false,
-            false,
-            true,
-        ),
-        (
-            'e',
-            "2160p",
-            "BDRemux | DV | Atmos",
-            214.0,
-            2,
-            "Оригинал",
-            "Английский",
-            "RuTracker",
-            "2025-06-30",
-            0,
-            true,
-            true,
-            true,
-            false,
-        ),
-        (
-            'f',
-            "1080p",
-            "WEB-DL",
-            26.9,
-            56,
-            "LostFilm",
-            "Русский",
-            "RuTor",
-            "2024-02-11",
-            0,
-            false,
-            false,
-            false,
-            true,
-        ),
-        (
-            'g',
-            "2160p",
-            "WEB-DL SDR",
-            64.3,
-            19,
-            "Дубляж",
-            "Русский",
-            "RuTracker",
-            "2024-09-21",
-            0,
-            false,
-            false,
-            true,
-            false,
-        ),
-        (
-            'h',
-            "1080p",
-            "WEB-DLRip",
-            14.2,
-            128,
-            "Дубляж",
-            "Русский",
-            "Kinozal",
-            "2024-05-05",
-            -1,
-            false,
-            false,
-            false,
-            true,
-        ),
-        (
-            'i',
-            "1080p",
-            "WEB-DL",
-            23.0,
-            9,
-            "Ozz",
-            "Украинский",
-            "Toloka",
-            "2023-08-17",
-            0,
-            false,
-            false,
-            true,
-            true,
-        ),
-        (
-            'j',
-            "720p",
-            "WEB-DL",
-            6.8,
-            33,
-            "Оригинал",
-            "Английский",
-            "RuTracker",
-            "2022-12-01",
-            1,
-            false,
-            false,
-            true,
-            true,
-        ),
-    ];
-    rows.iter()
-        .map(
-            |&(h, q, rip, gb, seeds, voice, lang, tracker, added, ds, hdr, dv, subs, direct)| {
-                let s = season.map(|s| (s + ds).max(1));
-                let what = match s {
-                    Some(s) => format!("S{s:02}"),
-                    None => year.map(|y| y.to_string()).unwrap_or_default(),
-                };
-                ReleaseOption {
-                    infohash: h.to_string().repeat(40),
-                    title: format!("{} / {original} ({what}) {q} {rip} | {voice}", title.title),
-                    quality: q.into(),
-                    size_bytes: ((if tv { gb } else { gb / 2.6 }) * 1e9) as u64,
-                    seeders: seeds,
-                    voice: voice.into(),
-                    language: lang.into(),
-                    tracker: tracker.into(),
-                    added: added.into(),
-                    year,
-                    season: s,
-                    hdr,
-                    dolby_vision: dv,
-                    subtitles: subs,
-                    direct_play: direct,
-                }
-            },
-        )
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kino_core::MediaKind;
+    use kino_core::{MediaKind, TitleSummary};
 
     fn title() -> TitleSummary {
         TitleSummary {
