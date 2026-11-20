@@ -65,6 +65,8 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .hero h1 { font-size: 44px; line-height: 1.05; margin: 0 0 10px; }
 .hero .meta { color: var(--muted); margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .hero p { margin: 0 0 20px; color: var(--soft); }
+/* A long synopsis must not push the buttons off the screen */
+.hero p.clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
 .rating { color: var(--ok); font-weight: 700; }
 .btns { display: flex; gap: 10px; flex-wrap: wrap; }
 .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 10px; font-weight: 700; }
@@ -223,6 +225,7 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
   .content { padding: 0 calc(16px + var(--sar)) calc(90px + var(--sab)) calc(16px + var(--sal)); }
   .hero { margin: 0 calc(-16px - var(--sar)) 4px calc(-16px - var(--sal)); padding: 90px calc(16px + var(--sar)) 24px calc(16px + var(--sal)); min-height: 0; }
   .hero h1 { font-size: 30px; }
+  .hero p.clamp { -webkit-line-clamp: 3; }
   .hero-bg::after { background: linear-gradient(0deg, var(--bg) 10%, color-mix(in srgb, var(--bg) 50%, transparent) 60%, color-mix(in srgb, var(--bg) 20%, transparent) 100%); }
   .poster { flex-basis: 118px; width: 118px; }
   .wide { flex-basis: 240px; width: 240px; }
@@ -253,12 +256,23 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .p-bottom { padding-bottom: calc(16px + var(--sab)); }
 .p-top { top: 0; display: flex; gap: 14px; align-items: center; background: linear-gradient(rgba(0,0,0,.75), transparent); }
 .p-bottom { bottom: 0; background: linear-gradient(transparent, rgba(0,0,0,.85) 45%); padding-top: 48px; }
-.player:not(.show):not(:hover) .p-top, .player:not(.show):not(:hover) .p-bottom { opacity: 0; }
+.p-zones { position: absolute; inset: 0; display: grid; grid-template-columns: 1fr 1fr; -webkit-user-select: none; user-select: none; }
+.p-zone { -webkit-tap-highlight-color: transparent; }
+.player:not(.show) .p-top, .player:not(.show) .p-bottom { opacity: 0; pointer-events: none; }
+/* With a mouse the controls also come back when the pointer is over the player */
+@media (hover: hover) and (pointer: fine) {
+  .player:hover .p-top, .player:hover .p-bottom { opacity: 1; pointer-events: auto; }
+}
+.p-flash { position: absolute; top: 50%; padding: 12px 18px; border-radius: 999px; background: rgba(0,0,0,.6); font-weight: 800; font-size: 18px; pointer-events: none; animation: p-flash .7s ease-out forwards; }
+.p-flash.left { left: 12%; transform: translateY(-50%); }
+.p-flash.right { right: 12%; transform: translateY(-50%); }
+@keyframes p-flash { 0% { opacity: 0; } 15% { opacity: 1; } 100% { opacity: .85; } }
 .p-title .t { font-weight: 800; font-size: 18px; }
 .p-title .s { color: rgba(255,255,255,.7); font-size: 14px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 2px; }
 .p-icon { min-width: 42px; height: 42px; border-radius: 50%; background: rgba(255,255,255,.12); color: #fff; font-weight: 700; font-size: 15px; padding: 0 10px; }
 .p-icon.p-play { min-width: 52px; height: 52px; font-size: 18px; background: #fff; color: #000; }
 .p-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: grid; justify-items: center; gap: 10px; text-align: center; max-width: 80%; }
+.p-center { z-index: 2; }
 .p-center p { margin: 0; color: rgba(255,255,255,.85); }
 .p-big { width: 84px; height: 84px; border-radius: 50%; background: rgba(0,0,0,.55); border: 2px solid rgba(255,255,255,.8); color: #fff; font-size: 30px; display: grid; place-items: center; }
 .p-error { background: rgba(20,22,30,.92); padding: 22px; border-radius: var(--radius); }
@@ -330,6 +344,10 @@ input { font-size: 16px; }
 @media (max-height: 480px) and (orientation: landscape) {
   .tabbar { display: none; }
   .p-bottom { padding-top: 20px; }
-  .p-menu { bottom: 110px; max-height: calc(100vh - 140px); overflow-y: auto; }
+  .p-buttons { margin-top: 8px; flex-wrap: nowrap; }
+  .p-pill .long { display: none; }
+  .p-pill .short { display: inline; }
+  .p-pill { padding: 8px 12px; }
+  .p-menu { bottom: 96px; max-height: calc(100vh - 120px); overflow-y: auto; }
   .p-next { bottom: 100px; }
 }

@@ -43,6 +43,11 @@ mod imp {
         pub fn pause(&self) {
             let _ = self.0.pause();
         }
+        /// Playback speed (1.0 is normal).
+        pub fn set_rate(&self, rate: f64) {
+            self.0.set_default_playback_rate(rate);
+            self.0.set_playback_rate(rate);
+        }
     }
 
     /// Starts mirroring (nothing to do in a browser).
@@ -107,6 +112,12 @@ mod imp {
         pub fn pause(&self) {
             SNAPSHOT.lock().expect("video snapshot").paused = true;
             run(format!("var v=document.getElementById('{VIDEO_ID}'); if(v) v.pause();"));
+        }
+        /// Playback speed (1.0 is normal).
+        pub fn set_rate(&self, rate: f64) {
+            run(format!(
+                "var v=document.getElementById('{VIDEO_ID}'); if(v) {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
+            ));
         }
     }
 

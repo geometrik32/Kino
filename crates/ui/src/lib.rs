@@ -340,7 +340,7 @@ fn Hero(
                     if let Some(r) = rate { span { class: "rating", "★ {r}" } }
                     for m in meta { span { "{m}" } }
                 }
-                if let Some(o) = &item.overview { p { "{o}" } }
+                if let Some(o) = &item.overview { p { class: "clamp", "{o}" } }
                 div { class: "btns",
                     if let (Some(c), Some(label)) = (resume, resume_label) {
                         button { class: "btn primary", onclick: move |_| on_play.call(c.clone()), "▶ {label}" }

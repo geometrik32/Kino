@@ -44,3 +44,36 @@ pub async fn sleep(ms: u32) {
         .join::<i32>()
         .await;
 }
+
+/// Whether the main way to point is a finger (phone, tablet).
+pub async fn touch_screen() -> bool {
+    dioxus::document::eval("return window.matchMedia('(pointer: coarse)').matches;")
+        .join::<bool>()
+        .await
+        .unwrap_or(false)
+}
+
+/// The player takes the screen: on a phone the picture turns to landscape and the
+/// system bars go away; `false` gives everything back.
+pub fn player_mode(on: bool) {
+    #[cfg(target_os = "android")]
+    android::player_mode(on);
+    #[cfg(not(target_os = "android"))]
+    {
+        // A phone's browser (and Telegram) needs full screen before it lets the page rotate.
+        let js = if on {
+            "try { if (window.matchMedia('(pointer: coarse)').matches) { \
+               var el = document.documentElement; \
+               var go = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+               if (el.requestFullscreen && !document.fullscreenElement) { el.requestFullscreen().then(go, go); } else { go(); } \
+               var tg = window.Telegram && window.Telegram.WebApp; \
+               if (tg && tg.lockOrientation) { tg.lockOrientation(); } } } catch (e) {}"
+        } else {
+            "try { if (screen.orientation && screen.orientation.unlock) { screen.orientation.unlock(); } \
+               var tg = window.Telegram && window.Telegram.WebApp; \
+               if (tg && tg.unlockOrientation) { tg.unlockOrientation(); } \
+               if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen(); } } catch (e) {}"
+        };
+        let _ = dioxus::document::eval(js);
+    }
+}
