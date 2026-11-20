@@ -12,9 +12,11 @@ use crate::{api::AppState, userdata};
 /// The first check of a series only records the latest episode, so nobody gets
 /// a message for episodes that were out before they started watching.
 /// A watched series with a new episode goes back to "Смотрю".
+///
+/// `send(telegram_id, text, open_url)`: `open_url` is the Mini App link that opens the series.
 pub async fn check_new_episodes<F, Fut>(state: &AppState, send: F) -> anyhow::Result<usize>
 where
-    F: Fn(i64, String) -> Fut,
+    F: Fn(i64, String, String) -> Fut,
     Fut: Future<Output = anyhow::Result<()>>,
 {
     let mut sent = 0;
@@ -28,12 +30,12 @@ where
             None => {}
             Some(_) => {
                 let text = format!(
-                    "Вышла новая серия «{}»: {}.\n{}",
+                    "Вышла новая серия «{}»: {}.",
                     d.summary.title,
                     episode_code(latest.0, latest.1),
-                    state.config.public_url
                 );
-                if let Err(e) = send(f.telegram_id, text).await {
+                let open_url = format!("{}/?open=tv_{}", state.config.public_url, f.tmdb_id);
+                if let Err(e) = send(f.telegram_id, text, open_url).await {
                     tracing::warn!(error = %e, user = f.user_id, "new-episode message failed");
                     continue;
                 }
@@ -100,11 +102,21 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sends a message through the Telegram Bot API.
-pub async fn telegram_send(client: &reqwest::Client, token: &str, chat_id: i64, text: String) -> anyhow::Result<()> {
+/// Sends a message through the Telegram Bot API, with a button that opens `open_url` as a Mini App.
+pub async fn telegram_send(
+    client: &reqwest::Client,
+    token: &str,
+    chat_id: i64,
+    text: String,
+    open_url: String,
+) -> anyhow::Result<()> {
     let resp = client
         .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
-        .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+        .json(&serde_json::json!({
+            "chat_id": chat_id,
+            "text": text,
+            "reply_markup": { "inline_keyboard": [[{ "text": "Смотреть", "web_app": { "url": open_url } }]] },
+        }))
         .send()
         .await?;
     anyhow::ensure!(resp.status().is_success(), "Telegram answered {}", resp.status());
@@ -140,9 +152,9 @@ pub fn spawn(state: AppState, every: Duration) {
             since_check += Duration::from_secs(3600);
             if since_check >= every {
                 since_check = Duration::ZERO;
-                let send = |chat, text| {
+                let send = |chat, text, open_url| {
                     let (client, token) = (client.clone(), token.clone());
-                    async move { telegram_send(&client, &token, chat, text).await }
+                    async move { telegram_send(&client, &token, chat, text, open_url).await }
                 };
                 match check_new_episodes(&state, send).await {
                     Ok(n) if n > 0 => tracing::info!(sent = n, "new-episode notifications"),

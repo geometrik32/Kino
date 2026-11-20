@@ -257,8 +257,8 @@ async fn new_episode_notification(pool: PgPool) {
     assert_eq!(status(&app, &t, "tv/1396").await, Some(TitleStatus::Watched));
 
     let sent = std::sync::Mutex::new(Vec::new());
-    let send = |chat: i64, text: String| {
-        sent.lock().unwrap().push((chat, text));
+    let send = |chat: i64, text: String, url: String| {
+        sent.lock().unwrap().push((chat, text, url));
         async { Ok(()) }
     };
     // The first check only remembers where the series is.
@@ -280,6 +280,11 @@ async fn new_episode_notification(pool: PgPool) {
         msgs[0].1.contains("S05E16") && msgs[0].1.contains("Во все тяжкие"),
         "{}",
         msgs[0].1
+    );
+    assert!(
+        msgs[0].2.ends_with("/?open=tv_1396"),
+        "the button opens the series: {}",
+        msgs[0].2
     );
     assert_eq!(
         status(&app, &t, "tv/1396").await,

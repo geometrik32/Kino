@@ -8,7 +8,7 @@ use kino_core::{
 use kino_ui::{PlayerMenu, PlayerState, PlayerView, VIDEO_ID};
 use wasm_bindgen::JsCast;
 
-use crate::api;
+use crate::{api, native, telegram};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +63,17 @@ fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
         (Some(v), Some(q)) => format!("{v} · {q}"),
         _ => r.title.clone().unwrap_or_default(),
+    }
+}
+
+/// Leaves Telegram's full screen when the player goes away.
+struct FullscreenGuard;
+
+impl Drop for FullscreenGuard {
+    fn drop(&mut self) {
+        if telegram::is_fullscreen() {
+            telegram::set_fullscreen(false);
+        }
     }
 }
 
@@ -301,18 +312,26 @@ pub fn Player(
         }
     };
 
-    let close = {
+    let close = Callback::new({
         let mut save = save.clone();
-        move |_| {
+        move |_: ()| {
             save(false);
             if let Some(v) = video() {
                 let _ = v.pause();
             }
             on_close.call(());
         }
-    };
+    });
+    // On a phone in Telegram the film takes the whole screen, and Telegram's Back closes it.
+    use_hook(|| {
+        if telegram::is_mobile() {
+            telegram::set_fullscreen(true);
+        }
+        std::rc::Rc::new(FullscreenGuard)
+    });
 
     rsx! {
+        native::BackButton { on_back: move |_| close.call(()) }
         PlayerView {
             state: ui(),
             on_toggle: move |_| {
@@ -365,6 +384,9 @@ pub fn Player(
             },
             on_next: move |_| go_next(),
             on_fullscreen: move |_| {
+                if telegram::set_fullscreen(!telegram::is_fullscreen()) {
+                    return;
+                }
                 if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
                     if doc.fullscreen_element().is_some() {
                         doc.exit_fullscreen();
