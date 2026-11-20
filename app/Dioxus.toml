@@ -3,7 +3,7 @@ name = "kino"
 default_platform = "web"
 
 [web.app]
-title = "Кино"
+title = "Орловский кинопоказ"
 
 [web.resource]
 style = []

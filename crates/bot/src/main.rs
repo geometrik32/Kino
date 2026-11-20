@@ -56,7 +56,7 @@ fn app_url(base: &Url, start_payload: &str) -> Url {
 }
 
 fn open_button(url: Url) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new([[InlineKeyboardButton::web_app("Открыть кино", WebAppInfo { url })]])
+    InlineKeyboardMarkup::new([[InlineKeyboardButton::web_app("Открыть кинопоказ", WebAppInfo { url })]])
 }
 
 async fn is_admin(state: &BotState, telegram_id: i64) -> anyhow::Result<bool> {

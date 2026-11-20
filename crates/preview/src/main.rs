@@ -198,7 +198,7 @@ fn page(screen: Screen, title: &str) -> String {
     format!(
         "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{title} — Кино</title><style>{STYLE}</style></head><body>{body}</body></html>"
+         <title>{title} — Орловский кинопоказ</title><style>{STYLE}</style></head><body>{body}</body></html>"
     )
 }
 

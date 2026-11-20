@@ -110,7 +110,7 @@ pub fn Shell(
 ) -> Element {
     rsx! {
         header { class: "topbar",
-            button { class: "logo", onclick: move |_| on_tab.call(Tab::Home), "КИНО", span { "." } }
+            button { class: "logo", onclick: move |_| on_tab.call(Tab::Home), "Орловский", span { " кинопоказ" } }
             nav { class: "nav",
                 for t in TABS {
                     button {
@@ -689,7 +689,7 @@ pub fn LoginView(invite: Option<String>, error: Option<String>, children: Elemen
     rsx! {
         div { class: "login",
             div { class: "box",
-                div { class: "logo", "КИНО", span { "." } }
+                div { class: "logo", "Орловский", span { " кинопоказ" } }
                 p { "Фильмы и сериалы с вашего сервера. Прогресс просмотра синхронизируется между телефоном, компьютером и телевизором." }
                 if invite.is_some() {
                     p { class: "rating", "Вас пригласили. Войдите через Telegram, чтобы принять приглашение." }
