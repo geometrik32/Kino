@@ -122,6 +122,19 @@ services:
     mem_limit: 384m
     networks: [kino]
 
+  # Way out abroad for what is blocked here (Telegram, TMDB), and nothing else:
+  # kino-server and kino-bot use it through TELEGRAM_PROXY / TMDB_PROXY.
+  # Needs data/xray/config.json, see deploy/xray/config.example.json.
+  # Reachable only inside this stack.
+  xray:
+    image: ghcr.io/xtls/xray-core:26.10.31
+    restart: unless-stopped
+    command: ["run", "-c", "/etc/xray/config.json"]
+    volumes:
+      - ./data/xray/config.json:/etc/xray/config.json:ro
+    mem_limit: 64m
+    networks: [kino]
+
 networks:
   kino: {}
   proxy:
