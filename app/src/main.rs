@@ -246,7 +246,8 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
 #[derive(Clone, PartialEq)]
 enum View {
     Tab(Tab),
-    Title(MediaKind, i64),
+    /// A title page; the flag starts playback at once (from "Continue watching").
+    Title(MediaKind, i64, bool),
 }
 
 #[component]
@@ -254,7 +255,7 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
     // A link to a title (from a bot message) opens it, with Home behind it.
     let link = use_hook(telegram::open_target);
     let mut view = use_signal(|| match link {
-        Some((kind, id)) => View::Title(kind, id),
+        Some((kind, id)) => View::Title(kind, id, false),
         None => View::Tab(Tab::Home),
     });
     // Where "Back" goes from a title page.
@@ -269,11 +270,17 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
         View::Tab(t) => Some(t),
         View::Title(..) => None,
     };
-    let mut open_title = move |kind: MediaKind, id: i64| {
-        trail.with_mut(|t| t.push(view()));
-        view.set(View::Title(kind, id));
+    let mut open_title = move |kind: MediaKind, id: i64, play: bool| {
+        // Coming back to a title must not start it again.
+        trail.with_mut(|t| {
+            t.push(match view() {
+                View::Title(k, i, _) => View::Title(k, i, false),
+                v => v,
+            })
+        });
+        view.set(View::Title(kind, id, play));
     };
-    let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id);
+    let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id, false);
     rsx! {
         if !trail().is_empty() {
             native::BackButton {
@@ -292,29 +299,54 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
                 trail.set(Vec::new());
+                query.set(String::new());
                 view.set(View::Tab(t));
             },
             on_query: move |q: String| {
-                query.set(q);
                 trail.set(Vec::new());
-                view.set(View::Tab(Tab::Search));
+                view.set(View::Tab(if q.trim().is_empty() { Tab::Home } else { Tab::Search }));
+                query.set(q);
             },
             match view() {
-                View::Tab(Tab::Home) => rsx! { Home { token: token.clone(), on_open: open } },
+                View::Tab(Tab::Home) => rsx! {
+                    Home { token: token.clone(), on_open: open, on_play: move |(k, id)| open_title(k, id, true) }
+                },
                 View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, on_open: open } },
                 View::Tab(Tab::Mine) => rsx! { Mine { token: token.clone(), on_open: open } },
                 View::Tab(Tab::Profile) => rsx! {
                     Profile {
                         token: token.clone(),
                         name: name.clone(),
-                        on_open: move |(k, id)| open_title(k, id),
+                        on_open: move |(k, id)| open_title(k, id, false),
                         on_logout,
                     }
                 },
-                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id, on_open: open } },
+                View::Title(kind, id, play) => rsx! {
+                    Title {
+                        key: "{kind.as_str()}{id}{play}",
+                        token: token.clone(),
+                        kind,
+                        id,
+                        autoplay: play,
+                        on_open: open,
+                        // Closing a player that was started from Home goes back to Home.
+                        on_exit: move |_| {
+                            if let Some(prev) = trail.with_mut(|t| t.pop()) {
+                                view.set(prev);
+                            }
+                        },
+                    }
+                },
             }
         }
     }
+}
+
+/// Fires once when it appears: lets a page start playback after it has loaded.
+#[component]
+fn AutoPlay(on_start: EventHandler<()>) -> Element {
+    use_effect(move || on_start.call(()));
+    rsx! {}
 }
 
 fn error_text(message: &str) -> Element {
@@ -326,7 +358,7 @@ fn loading() -> Element {
 }
 
 #[component]
-fn Home(token: String, on_open: EventHandler<TitleSummary>) -> Element {
+fn Home(token: String, on_open: EventHandler<TitleSummary>, on_play: EventHandler<(MediaKind, i64)>) -> Element {
     let t2 = token.clone();
     let mut data = use_resource(move || {
         let t = token.clone();
@@ -345,10 +377,8 @@ fn Home(token: String, on_open: EventHandler<TitleSummary>) -> Element {
                 feed,
                 continue_items: cont,
                 on_open,
-                // Opens the title; its main button resumes where the user stopped.
-                on_play: move |c: kino_core::ContinueItem| {
-                    if let Some(t) = c.title { on_open.call(t) }
-                },
+                // Plays at once from where the user stopped, without the title page in between.
+                on_play: move |c: kino_core::ContinueItem| on_play.call((c.last.kind, c.last.tmdb_id)),
                 on_drop: move |c: kino_core::ContinueItem| {
                     let t = t2.clone();
                     spawn(async move {
@@ -383,7 +413,7 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
         _ => None,
     };
     rsx! {
-        SearchView { query: query(), results: shown, on_open, on_query: move |q| query.set(q) }
+        SearchView { results: shown, on_open }
         if let Some(e) = err { {error_text(&e)} }
     }
 }
@@ -469,7 +499,14 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
 }
 
 #[component]
-fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
+fn Title(
+    token: String,
+    kind: MediaKind,
+    id: i64,
+    autoplay: bool,
+    on_open: EventHandler<TitleSummary>,
+    on_exit: EventHandler<()>,
+) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -518,6 +555,7 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
     let mut sort = use_signal(ReleaseSort::default);
     let mut panel = use_signal(|| None::<PickerPanel>);
     let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
+    let mut auto = use_signal(|| autoplay);
     let t0 = token.clone();
     // Releases for the open picker, loaded from the indexer (or demo data).
     let releases = use_resource(move || {
@@ -605,6 +643,17 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
         }
         if notice().is_some() {
             native::BackButton { on_back: move |_| notice.set(None) }
+        }
+        if auto() {
+            AutoPlay {
+                on_start: {
+                    let t = target.clone();
+                    move |_| {
+                        auto.set(false);
+                        on_play.call(t.clone());
+                    }
+                },
+            }
         }
         TitleView {
             details: details.clone(),
@@ -756,7 +805,11 @@ fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSum
                 },
                 on_close: move |_| {
                     playing.set(None);
-                    data.restart();
+                    if autoplay {
+                        on_exit.call(());
+                    } else {
+                        data.restart();
+                    }
                 },
                 on_need_release: {
                     let mut open_picker = open_picker.clone();

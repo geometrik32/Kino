@@ -53,7 +53,9 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .nav button.active { color: var(--fg); }
 .search { margin-left: auto; display: flex; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--line); border-radius: 999px; padding: 8px 14px; width: 320px; }
 .search input { flex: 1; background: none; border: 0; outline: 0; color: var(--fg); font: inherit; min-width: 0; }
-.avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--card); display: grid; place-items: center; font-weight: 700; color: var(--muted); }
+.avatar { width: 34px; height: 34px; border-radius: 50%; background: var(--card); display: grid; place-items: center; font-weight: 700; color: var(--muted); flex: none; }
+button.avatar { cursor: pointer; }
+button.avatar:hover, .avatar.active { color: var(--fg); box-shadow: 0 0 0 2px var(--accent); }
 .tabbar { display: none; }
 .content { padding: 0 32px 48px; }
 
@@ -65,8 +67,6 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .hero h1 { font-size: 44px; line-height: 1.05; margin: 0 0 10px; }
 .hero .meta { color: var(--muted); margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; }
 .hero p { margin: 0 0 20px; color: var(--soft); }
-/* A long synopsis must not push the buttons off the screen */
-.hero p.clamp { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
 .rating { color: var(--ok); font-weight: 700; }
 .btns { display: flex; gap: 10px; flex-wrap: wrap; }
 .btn { display: inline-flex; align-items: center; gap: 8px; padding: 11px 20px; border-radius: 10px; font-weight: 700; }
@@ -202,8 +202,11 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 
 /* Phone */
 @media (max-width: 720px) {
-  .topbar { padding: 12px 16px; gap: 12px; }
-  .topbar .nav, .topbar .search, .topbar .avatar { display: none; }
+  .topbar { padding: 10px 16px; gap: 10px; }
+  .topbar .nav { display: none; }
+  .logo { font-size: 16px; }
+  .search { margin-left: 0; flex: 1; width: auto; min-width: 0; padding: 7px 12px; }
+  .search input { font-size: 15px; }
   .tabbar { display: flex; position: fixed; bottom: 0; left: 0; right: 0; z-index: 10; background: var(--bg2); border-top: 1px solid var(--line); padding: 8px var(--sar) calc(8px + var(--sab)) var(--sal); }
   .tabbar button { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; font-size: 11px; color: var(--muted); }
   .tabbar button b { font-size: 20px; font-weight: 400; line-height: 1; }
@@ -211,7 +214,6 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
   .content { padding: 0 calc(16px + var(--sar)) calc(90px + var(--sab)) calc(16px + var(--sal)); }
   .hero { margin: 0 calc(-16px - var(--sar)) 4px calc(-16px - var(--sal)); padding: 90px calc(16px + var(--sar)) 24px calc(16px + var(--sal)); min-height: 0; }
   .hero h1 { font-size: 30px; }
-  .hero p.clamp { -webkit-line-clamp: 3; }
   .hero-bg::after { background: linear-gradient(0deg, var(--bg) 10%, color-mix(in srgb, var(--bg) 50%, transparent) 60%, color-mix(in srgb, var(--bg) 20%, transparent) 100%); }
   .poster { flex-basis: 118px; width: 118px; }
   .wide { flex-basis: 240px; width: 240px; }
@@ -228,10 +230,7 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
   .sheet-bg { align-items: flex-end; }
   .sheet { border-radius: 16px 16px 0 0; padding: 18px 16px calc(28px + var(--sab)); }
   .frow { grid-template-columns: 1fr; gap: 6px; }
-  .msearch { display: flex; }
 }
-.msearch { display: none; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 14px; margin: 8px 0 4px; }
-.msearch input { flex: 1; background: none; border: 0; outline: 0; color: var(--fg); font: inherit; }
 
 /* Player */
 .player { position: fixed; inset: 0; z-index: 50; background: #000; color: #fff; overflow: hidden; }

@@ -44,7 +44,8 @@ impl Tab {
     }
 }
 
-const TABS: [Tab; 4] = [Tab::Home, Tab::Search, Tab::Mine, Tab::Profile];
+/// Search lives in the top bar and the profile behind its avatar, so they are not tabs.
+const TABS: [Tab; 2] = [Tab::Home, Tab::Mine];
 
 mod account;
 mod player;
@@ -124,12 +125,17 @@ pub fn Shell(
                 span { class: "muted", "⌕" }
                 input {
                     r#type: "search",
-                    placeholder: "Фильмы и сериалы",
+                    placeholder: "Поиск",
                     value: "{query}",
                     oninput: move |e| on_query.call(e.value()),
                 }
             }
-            div { class: "avatar", "{user_initial}" }
+            button {
+                class: if tab == Some(Tab::Profile) { "avatar active" } else { "avatar" },
+                title: "Профиль",
+                onclick: move |_| on_tab.call(Tab::Profile),
+                "{user_initial}"
+            }
         }
         main { class: "content", {children} }
         nav { class: "tabbar",
@@ -140,22 +146,6 @@ pub fn Shell(
                     b { "{t.icon()}" }
                     "{t.label()}"
                 }
-            }
-        }
-    }
-}
-
-/// Search field shown at the top of the search screen on phones.
-#[component]
-pub fn MobileSearch(query: String, on_query: EventHandler<String>) -> Element {
-    rsx! {
-        label { class: "msearch",
-            span { class: "muted", "⌕" }
-            input {
-                r#type: "search",
-                placeholder: "Фильмы и сериалы",
-                value: "{query}",
-                oninput: move |e| on_query.call(e.value()),
             }
         }
     }
@@ -280,16 +270,7 @@ pub fn HomeView(
     on_play: EventHandler<ContinueItem>,
     on_drop: EventHandler<ContinueItem>,
 ) -> Element {
-    // Hero: the title you watched last, otherwise the first popular one.
-    let hero_item = continue_items
-        .first()
-        .and_then(|c| c.title.clone())
-        .or_else(|| feed.rows.first().and_then(|r| r.items.first().cloned()));
-    let hero_continue = continue_items.first().cloned();
     rsx! {
-        if let Some(h) = hero_item {
-            Hero { item: h, resume: hero_continue, on_open, on_play }
-        }
         if feed.demo {
             p { class: "demo-note", "Демо-каталог: без ключа TMDB показываются встроенные примеры без постеров." }
         }
@@ -310,57 +291,8 @@ pub fn HomeView(
 }
 
 #[component]
-fn Hero(
-    item: TitleSummary,
-    resume: Option<ContinueItem>,
-    on_open: EventHandler<TitleSummary>,
-    on_play: EventHandler<ContinueItem>,
-) -> Element {
-    let mut meta = vec![kind_label(item.kind).to_owned()];
-    if let Some(y) = item.year {
-        meta.push(y.to_string());
-    }
-    let rate = rating(&item);
-    let resume_label = resume.as_ref().map(|c| match (c.last.kind, c.next_episode) {
-        (MediaKind::Tv, Some((s, e))) => format!("Смотреть {}", episode_code(s, e)),
-        (MediaKind::Tv, None) => format!(
-            "Продолжить {} с {}",
-            episode_code(c.last.season, c.last.episode),
-            clock(c.last.position_sec)
-        ),
-        (MediaKind::Movie, _) => format!("Продолжить с {}", clock(c.last.position_sec)),
-    });
-    let open_item = item.clone();
+pub fn SearchView(results: Option<SearchResults>, on_open: EventHandler<TitleSummary>) -> Element {
     rsx! {
-        div { class: "hero",
-            div { class: "hero-bg", style: "{backdrop_style(&item)}" }
-            div { class: "hero-body",
-                h1 { "{item.title}" }
-                div { class: "meta",
-                    if let Some(r) = rate { span { class: "rating", "★ {r}" } }
-                    for m in meta { span { "{m}" } }
-                }
-                if let Some(o) = &item.overview { p { class: "clamp", "{o}" } }
-                div { class: "btns",
-                    if let (Some(c), Some(label)) = (resume, resume_label) {
-                        button { class: "btn primary", onclick: move |_| on_play.call(c.clone()), "▶ {label}" }
-                    }
-                    button { class: "btn ghost", onclick: move |_| on_open.call(open_item.clone()), "Подробнее" }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-pub fn SearchView(
-    query: String,
-    results: Option<SearchResults>,
-    on_open: EventHandler<TitleSummary>,
-    on_query: EventHandler<String>,
-) -> Element {
-    rsx! {
-        MobileSearch { query: query.clone(), on_query }
         section { class: "section",
             match results {
                 None => rsx! { p { class: "muted", "Введите название фильма или сериала — по-русски или в оригинале." } },
