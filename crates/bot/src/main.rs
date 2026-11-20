@@ -17,16 +17,25 @@ use url::Url;
 /// `/start` payload prefix for invites: `t.me/<bot>?start=inv_<code>`.
 const INVITE_PREFIX: &str = "inv_";
 
-#[derive(BotCommands, Clone, Debug, PartialEq)]
-#[command(rename_rule = "lowercase", description = "Команды:")]
-enum Command {
-    #[command(description = "открыть кинотеатр")]
-    Start(String),
-    #[command(description = "показать помощь")]
-    Help,
-    #[command(description = "создать приглашение (только админ)")]
-    Invite,
+mod commands {
+    // teloxide's `BotCommands` derive emits code that Rust 1.100+ reports as unreachable.
+    #![allow(unreachable_code)]
+
+    use teloxide::utils::command::BotCommands;
+
+    #[derive(BotCommands, Clone, Debug, PartialEq)]
+    #[command(rename_rule = "lowercase", description = "Команды:")]
+    pub enum Command {
+        #[command(description = "открыть кинотеатр")]
+        Start(String),
+        #[command(description = "показать помощь")]
+        Help,
+        #[command(description = "создать приглашение (только админ)")]
+        Invite,
+    }
 }
+
+use commands::Command;
 
 struct BotState {
     pool: PgPool,
