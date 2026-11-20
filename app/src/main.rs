@@ -17,7 +17,7 @@ use kino_core::{
 };
 use kino_ui::{
     play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption,
-    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
+    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView, STYLE,
 };
 
 fn main() {
@@ -253,7 +253,7 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
                         on_logout,
                     }
                 },
-                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id } },
+                View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id, on_open: open } },
             }
         }
     }
@@ -418,7 +418,7 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
 }
 
 #[component]
-fn Title(token: String, kind: MediaKind, id: i64) -> Element {
+fn Title(token: String, kind: MediaKind, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -429,6 +429,12 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             let choices = api::release_choices(&t, kind, id).await?;
             Ok::<_, api::Failure>((details, progress, st, choices))
         }
+    });
+    // Cast and suggestions come apart from the title: if TMDB is slow or fails, the page still works.
+    let t_extras = token.clone();
+    let extras = use_resource(move || {
+        let t = t_extras.clone();
+        async move { api::extras(&t, kind, id).await.ok() }
     });
     let mut chosen_season = use_signal(|| None::<i32>);
     let t2 = token.clone();
@@ -599,6 +605,9 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                 }
             },
             on_season: move |n| chosen_season.set(Some(n)),
+        }
+        if let Some(Some(extras)) = extras.read().clone() {
+            TitleExtrasView { extras, on_open }
         }
         if let (Some(heading), Some(target)) = (heading, picker()) {
             match releases.read().clone().flatten() {

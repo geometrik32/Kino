@@ -54,9 +54,11 @@
 | GET | `/api/catalog/home` | Подборки для главной |
 | GET | `/api/catalog/search?q=` | Поиск фильмов и сериалов |
 | GET | `/api/catalog/{movie\|tv}/{tmdb_id}` | Карточка тайтла |
+| GET | `/api/catalog/{movie\|tv}/{tmdb_id}/extras` | Актёры, «Рекомендации» и «Похожие» (TMDB) |
 | GET | `/api/catalog/tv/{tmdb_id}/season/{n}` | Серии сезона |
 | GET | `/api/img/{size}/{file}` | Постер через сервер (без токена, кешируется) |
 | GET | `/api/releases/{movie\|tv}/{tmdb_id}?season=` | Раздачи с трекеров (или демо без Jackett) |
+| GET | `/api/play/progress/{release}` | Сколько подгружено до старта: фаза, процент, раздающие, скорость |
 | POST | `/api/play` | Начать просмотр: файл, дорожки, место продолжения, ссылка на поток |
 | GET | `/api/stream/{token}[?audio=&start=]` | Видео (без токена в заголовке, ссылка подписана) |
 | GET | `/api/stream/{token}/sub/{n}.vtt` | Субтитры в WebVTT |

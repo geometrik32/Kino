@@ -2,8 +2,8 @@
 //! sorting and the remembered choice.
 
 use dioxus::prelude::*;
-use kino_core::ReleaseChoiceUpdate;
 pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
+use kino_core::{format_bitrate, ReleaseChoiceUpdate};
 
 /// Seeds below this count make streaming unreliable; offer preloading instead.
 pub const LOW_SEEDS: u32 = 5;
@@ -86,6 +86,7 @@ pub enum ReleaseSort {
     #[default]
     Seeders,
     Size,
+    Bitrate,
     Name,
     Source,
     Date,
@@ -93,9 +94,10 @@ pub enum ReleaseSort {
 }
 
 impl ReleaseSort {
-    pub const ALL: [ReleaseSort; 6] = [
+    pub const ALL: [ReleaseSort; 7] = [
         ReleaseSort::Seeders,
         ReleaseSort::Size,
+        ReleaseSort::Bitrate,
         ReleaseSort::Name,
         ReleaseSort::Source,
         ReleaseSort::Date,
@@ -106,6 +108,7 @@ impl ReleaseSort {
         match self {
             ReleaseSort::Seeders => "По раздающим",
             ReleaseSort::Size => "По размеру",
+            ReleaseSort::Bitrate => "По битрейту",
             ReleaseSort::Name => "По названию",
             ReleaseSort::Source => "По источнику",
             ReleaseSort::Date => "По дате",
@@ -120,6 +123,8 @@ pub fn sort_releases(list: &mut [ReleaseOption], sort: ReleaseSort, watched: &[S
     match sort {
         ReleaseSort::Seeders => list.sort_by_key(|r| Reverse(r.seeders)),
         ReleaseSort::Size => list.sort_by_key(|r| Reverse(r.size_bytes)),
+        // Highest first; releases with an unknown bitrate go last.
+        ReleaseSort::Bitrate => list.sort_by_key(|r| (r.bitrate_kbps.is_none(), Reverse(r.bitrate_kbps))),
         ReleaseSort::Name => list.sort_by_key(|r| r.title.to_lowercase()),
         ReleaseSort::Source => list.sort_by_key(|r| (r.tracker.clone(), Reverse(r.seeders))),
         ReleaseSort::Date => list.sort_by_key(|r| Reverse(r.added.clone())),
@@ -369,6 +374,18 @@ fn ReleaseRow(
             }
             div { class: "side",
                 div { "{human_size(release.size_bytes)}" }
+                if let Some(kbps) = release.bitrate_kbps {
+                    div {
+                        class: "bitrate",
+                        title: if release.bitrate_approx {
+                            "Приблизительно: размер раздачи, делённый на длительность. Включает звук."
+                        } else {
+                            "Битрейт видео из названия раздачи"
+                        },
+                        if release.bitrate_approx { "≈ " }
+                        "{format_bitrate(kbps)}"
+                    }
+                }
                 div { class: if low { "seeds low" } else { "seeds" }, "▲ {release.seeders}" }
                 div { "{added}" }
             }
@@ -425,6 +442,13 @@ mod tests {
         assert!(hits.iter().all(|r| r.quality == "2160p" && r.hdr));
         sort_releases(&mut hits, ReleaseSort::Size, &[]);
         assert!(hits.windows(2).all(|w| w[0].size_bytes >= w[1].size_bytes));
+
+        let mut by_rate = all.clone();
+        by_rate[3].bitrate_kbps = None;
+        sort_releases(&mut by_rate, ReleaseSort::Bitrate, &[]);
+        assert_eq!(by_rate.last().unwrap().bitrate_kbps, None, "unknown goes last");
+        let known: Vec<_> = by_rate.iter().filter_map(|r| r.bitrate_kbps).collect();
+        assert!(known.windows(2).all(|w| w[0] >= w[1]));
 
         let mut list = all.clone();
         let watched = vec!["c".repeat(40)];

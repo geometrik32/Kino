@@ -3,7 +3,8 @@
 
 use async_trait::async_trait;
 use kino_core::{
-    CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails, TitleSummary,
+    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, SearchResults, Season, SeasonSummary, TitleDetails,
+    TitleExtras, TitleSummary,
 };
 
 use super::{Catalog, CatalogError};
@@ -143,6 +144,43 @@ impl Catalog for DemoCatalog {
             seasons,
             imdb_id: None,
             last_episode: t.seasons.last().map(|&n| (t.seasons.len() as i32, n)),
+        })
+    }
+
+    async fn extras(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleExtras, CatalogError> {
+        let t = find(kind, tmdb_id)?;
+        // Made-up cast without photos; the other titles of the demo catalog stand in
+        // for recommendations and similar ones.
+        let people = [
+            ("Анна Лебедева", "Главная роль"),
+            ("Игорь Соколов", "Партнёр"),
+            ("Мария Верховская", "Антагонист"),
+            ("Пётр Громов", "Наставник"),
+            ("Елена Мартынова", "Свидетель"),
+            ("Дмитрий Орлов", "Друг семьи"),
+        ];
+        let cast = people
+            .iter()
+            .enumerate()
+            .map(|(i, (name, role))| CastMember {
+                id: t.id * 10 + i as i64,
+                name: (*name).to_owned(),
+                character: Some((*role).to_owned()),
+                profile_path: None,
+            })
+            .collect();
+        let others = |same_genre: bool| -> Vec<TitleSummary> {
+            TITLES
+                .iter()
+                .filter(|o| o.id != t.id && (o.genres.iter().any(|g| t.genres.contains(g)) == same_genre))
+                .map(summary)
+                .take(8)
+                .collect()
+        };
+        Ok(TitleExtras {
+            cast,
+            recommendations: others(true),
+            similar: others(false),
         })
     }
 
