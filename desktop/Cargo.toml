@@ -1,0 +1,24 @@
+[package]
+name = "kino-desktop"
+description = "Орловский кинопоказ for Windows (and other desktops): Dioxus window + native libmpv player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "orel-kino"
+path = "src/main.rs"
+
+[dependencies]
+kino-core.workspace = true
+kino-ui = { path = "../crates/ui" }
+kino-mpv = { path = "../crates/mpv" }
+serde.workspace = true
+serde_json.workspace = true
+dirs = "6"
+dioxus = { version = "0.7", features = ["desktop"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

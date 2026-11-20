@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/server", "crates/bot", "crates/ui", "crates/preview", "app"]
+members = ["crates/core", "crates/server", "crates/bot", "crates/ui", "crates/preview", "crates/mpv", "app", "desktop"]
 # The Dioxus app targets wasm32; build it with `dx` (see README).
 default-members = ["crates/core", "crates/server", "crates/bot", "crates/ui", "crates/preview"]
 
