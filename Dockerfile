@@ -9,7 +9,7 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p kino-server -p kino-bot
-RUN cd app && dx bundle --web --release \
+RUN cd app && dx bundle --web --release -p kino-app \
  && mkdir -p /out \
  && cp -r "$(dirname "$(find /src/target/dx -path '*release/web/public/index.html' | head -n1)")" /out/web
 
