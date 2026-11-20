@@ -85,9 +85,9 @@ button { font: inherit; color: inherit; cursor: pointer; border: 0; background: 
 .cast-card:hover .who { color: var(--accent); }
 .cast-card:hover .avatar { outline: 2px solid var(--accent); }
 .person-head { display: flex; gap: 28px; align-items: flex-start; }
-.avatar.big { flex: 0 0 180px; width: 180px; height: 180px; border-radius: 50%; overflow: hidden; background: var(--card); }
-.avatar.big img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.avatar.big .placeholder { width: 100%; height: 100%; display: grid; place-items: center; font-weight: 700; font-size: 52px; color: rgba(255,255,255,.85); }
+.person-photo { flex: 0 0 180px; width: 180px; height: 180px; border-radius: 50%; overflow: hidden; background: var(--card); }
+.person-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.person-photo .placeholder { width: 100%; height: 100%; display: grid; place-items: center; font-weight: 700; font-size: 52px; color: rgba(255,255,255,.85); }
 .person-info { min-width: 0; max-width: 760px; }
 .person-info h1 { margin: 0 0 6px; font-size: 32px; }
 .bio { white-space: pre-line; line-height: 1.55; margin: 14px 0 6px; }

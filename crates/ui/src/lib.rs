@@ -659,7 +659,7 @@ pub fn PersonView(person: PersonDetails, on_open: EventHandler<TitleSummary>) ->
     rsx! {
         section { class: "section person",
             div { class: "person-head",
-                div { class: "avatar big",
+                div { class: "person-photo",
                     if let Some(p) = &person.profile_path {
                         img { src: image_url(p, ImageSize::Poster), alt: "{person.name}" }
                     } else {
