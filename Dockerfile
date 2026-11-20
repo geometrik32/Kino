@@ -1,6 +1,7 @@
 # One image with both binaries (kino-server, kino-bot) and the built web app.
 
-FROM rust:1-bookworm AS build
+# dx needs glibc 2.39+, so Debian 13 (trixie).
+FROM rust:1-trixie AS build
 ARG DX_VERSION=0.7.10
 RUN rustup target add wasm32-unknown-unknown \
  && curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v${DX_VERSION}/dx-x86_64-unknown-linux-gnu.tar.gz" \
@@ -8,11 +9,11 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /src
 COPY . .
 RUN cargo build --release --locked -p kino-server -p kino-bot
-RUN cd app && dx bundle --web --release \
+RUN cd app && dx bundle --web --release -p kino-app \
  && mkdir -p /out \
  && cp -r "$(dirname "$(find /src/target/dx -path '*release/web/public/index.html' | head -n1)")" /out/web
 
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 # ffmpeg re-encodes what browsers cannot play; the Intel driver lets it use
 # Quick Sync / VA-API on the server's UHD 630 (pass /dev/dri to the container).
 RUN sed -i 's/Components: main/Components: main non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
