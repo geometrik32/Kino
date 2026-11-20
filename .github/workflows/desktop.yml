@@ -80,11 +80,18 @@ jobs:
           path: dist/*
           retention-days: 30
 
-      - name: Publish release "desktop-latest"
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      # `main` -> release "desktop-latest"; a pull request of this repository -> "desktop-preview".
+      # The download link stays the same: .../releases/download/<tag>/Orel-Kino-Setup.exe
+      - name: Publish release
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
         run: |
-          gh release delete desktop-latest --yes --cleanup-tag || true
-          gh release create desktop-latest dist/Orel-Kino-Setup.exe dist/Orel-Kino-portable.zip \
-            --prerelease --title "Windows: последняя сборка (${{ steps.ver.outputs.v }})" \
-            --notes "Установщик «Орловского кинопоказа» для Windows. Собрано из коммита ${{ github.sha }}."
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag=desktop-latest; title="Windows: последняя сборка из main"
+          else
+            tag=desktop-preview; title="Windows: пробная сборка (ветка ${{ github.head_ref }})"
+          fi
+          gh release delete "$tag" --yes --cleanup-tag || true
+          gh release create "$tag" dist/Orel-Kino-Setup.exe dist/Orel-Kino-portable.zip \
+            --prerelease --title "$title, ${{ steps.ver.outputs.v }}" \
+            --notes "Установщик «Орловского кинопоказа» для Windows. Коммит ${{ github.sha }}."
