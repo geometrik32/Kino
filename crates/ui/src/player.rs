@@ -12,6 +12,28 @@ pub const VIDEO_ID: &str = "kino-video";
 pub enum PlayerMenu {
     Audio,
     Subtitles,
+    Speed,
+    Episodes,
+}
+
+/// Playback speeds offered in the menu.
+pub const SPEEDS: [f32; 6] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
+
+/// "1×", "1.25×".
+pub fn speed_label(rate: f32) -> String {
+    if (rate - rate.round()).abs() < 0.001 {
+        format!("{}×", rate.round() as i32)
+    } else {
+        format!("{rate}×")
+    }
+}
+
+/// One line of the episode list in the player.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerEpisode {
+    pub number: i32,
+    pub title: String,
+    pub watched: bool,
 }
 
 /// Everything the player shows. The app owns the state and the `<video>`.
@@ -51,6 +73,16 @@ pub struct PlayerState {
     pub transcoded: bool,
     /// Played from the server's disk.
     pub preloaded: bool,
+    /// The buttons and the seek bar are shown (a tap on the picture toggles them).
+    pub controls: bool,
+    /// Playback speed.
+    pub rate: f32,
+    /// Season being watched and its episodes (series only); `episode` is the current one.
+    pub season: i32,
+    pub episode: i32,
+    pub episodes: Vec<PlayerEpisode>,
+    /// "«10 с» / «10 с»»" feedback after a double tap: forward or back, total seconds.
+    pub flash: Option<(bool, i32)>,
 }
 
 /// Seconds before the end when "next episode" is offered.
@@ -95,6 +127,15 @@ pub fn PlayerView(
     on_next: EventHandler<()>,
     on_fullscreen: EventHandler<()>,
     on_close: EventHandler<()>,
+    /// A tap on the picture: show or hide the controls.
+    on_tap: EventHandler<()>,
+    /// A double tap on the left (`false`) or right (`true`) half: jump 10 seconds.
+    on_double_tap: EventHandler<bool>,
+    on_speed: EventHandler<f32>,
+    /// Play this episode of the current season.
+    on_episode: EventHandler<i32>,
+    /// Choose another release (another voice-over) for the current episode.
+    on_pick_release: EventHandler<()>,
     /// `<video>` events: time update, metadata, waiting, playing, pause, play, ended, error.
     on_video: EventHandler<&'static str>,
 ) -> Element {
@@ -106,8 +147,11 @@ pub fn PlayerView(
     let audio_name = track_name(&s.audio, s.audio_track, "—");
     let sub_name = track_name(&s.subtitle_tracks, s.subtitle_track, "Выкл");
     let remaining = (dur - pos).max(0.0);
+    let shown = s.controls || s.paused || s.menu.is_some();
+    let busy = s.waiting || s.status.is_some();
+    let rate = if s.rate > 0.0 { s.rate } else { 1.0 };
     rsx! {
-        div { class: if s.paused || s.menu.is_some() { "player show" } else { "player" },
+        div { class: if shown { "player show" } else { "player" },
             video {
                 id: VIDEO_ID,
                 src: if s.src.is_empty() { None } else { Some(s.src.clone()) },
@@ -115,7 +159,6 @@ pub fn PlayerView(
                 autoplay: true,
                 playsinline: true,
                 preload: "auto",
-                onclick: move |_| on_toggle.call(()),
                 ontimeupdate: move |_| on_video.call("time"),
                 onloadedmetadata: move |_| on_video.call("metadata"),
                 onwaiting: move |_| on_video.call("waiting"),
@@ -126,6 +169,24 @@ pub fn PlayerView(
                 onerror: move |_| on_video.call("error"),
                 if let Some(vtt) = &s.subtitles_src {
                     track { kind: "subtitles", src: "{vtt}", srclang: "ru", label: "{sub_name}", default: true }
+                }
+            }
+            // Taps on the picture: once shows or hides the controls, twice on a side jumps 10 seconds.
+            div { class: "p-zones",
+                div {
+                    class: "p-zone",
+                    onclick: move |_| on_tap.call(()),
+                    ondoubleclick: move |_| on_double_tap.call(false),
+                }
+                div {
+                    class: "p-zone",
+                    onclick: move |_| on_tap.call(()),
+                    ondoubleclick: move |_| on_double_tap.call(true),
+                }
+            }
+            if let Some((forward, secs)) = s.flash {
+                div { class: if forward { "p-flash right" } else { "p-flash left" },
+                    if forward { "{secs} с ›››" } else { "‹‹‹ {secs} с" }
                 }
             }
             div { class: "p-top",
@@ -149,8 +210,12 @@ pub fn PlayerView(
                         if let Some(st) = &s.status { p { "{st}" } }
                     }
                 }
-            } else if s.paused && s.menu.is_none() {
-                button { class: "p-center p-big", onclick: move |_| on_toggle.call(()), "▶" }
+            } else if shown && s.menu.is_none() && !busy {
+                button {
+                    class: "p-center p-big",
+                    onclick: move |_| on_toggle.call(()),
+                    if s.paused { "▶" } else { "❚❚" }
+                }
             }
             if let Some(err) = &s.error {
                 div { class: "p-center p-error",
@@ -202,16 +267,55 @@ pub fn PlayerView(
                         span { class: "muted short", "CC " }
                         "{sub_name}"
                     }
-                    if let Some(next) = &s.next {
-                        button { class: "p-pill", onclick: move |_| on_next.call(()), span { class: "long", "Далее · " } "{next} ›" }
+                    button {
+                        class: if s.menu == Some(PlayerMenu::Speed) { "p-pill on" } else { "p-pill" },
+                        onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Speed) { None } else { Some(PlayerMenu::Speed) }),
+                        span { class: "muted long", "Скорость " }
+                        span { class: "muted short", "⏱ " }
+                        "{speed_label(rate)}"
+                    }
+                    if !s.episodes.is_empty() {
+                        button {
+                            class: if s.menu == Some(PlayerMenu::Episodes) { "p-pill on" } else { "p-pill" },
+                            onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Episodes) { None } else { Some(PlayerMenu::Episodes) }),
+                            span { class: "long", "Серии" }
+                            span { class: "short", "☰" }
+                        }
                     }
                     button { class: "p-icon", title: "Во весь экран", onclick: move |_| on_fullscreen.call(()), "⛶" }
                 }
             }
             if let Some(menu) = s.menu {
                 div { class: "p-menu",
-                    h4 { if menu == PlayerMenu::Audio { "Звуковая дорожка" } else { "Субтитры" } }
-                    if menu == PlayerMenu::Audio {
+                    h4 {
+                        match menu {
+                            PlayerMenu::Audio => "Звуковая дорожка".to_owned(),
+                            PlayerMenu::Subtitles => "Субтитры".to_owned(),
+                            PlayerMenu::Speed => "Скорость".to_owned(),
+                            PlayerMenu::Episodes => format!("Серии · сезон {}", s.season),
+                        }
+                    }
+                    if menu == PlayerMenu::Speed {
+                        for r in SPEEDS {
+                            button {
+                                key: "r{r}",
+                                class: if (rate - r).abs() < 0.001 { "p-opt on" } else { "p-opt" },
+                                onclick: move |_| on_speed.call(r),
+                                span { "{speed_label(r)}" }
+                                if (r - 1.0).abs() < 0.001 { span { class: "muted small", "обычная" } }
+                            }
+                        }
+                    } else if menu == PlayerMenu::Episodes {
+                        for e in s.episodes.clone() {
+                            button {
+                                key: "e{e.number}",
+                                class: if e.number == s.episode { "p-opt on" } else { "p-opt" },
+                                onclick: move |_| on_episode.call(e.number),
+                                span { "{e.number}. {e.title}" }
+                                if e.watched { span { class: "muted small", "просмотрена" } }
+                            }
+                        }
+                    } else if menu == PlayerMenu::Audio {
                         if s.audio.is_empty() { p { class: "muted small", "Сервер не смог прочитать дорожки файла." } }
                         for t in s.audio.clone() {
                             button {
@@ -221,6 +325,10 @@ pub fn PlayerView(
                                 span { "{t.label()}" }
                                 span { class: "muted small", "{t.codec.to_uppercase()}" }
                             }
+                        }
+                        if s.audio.len() <= 1 && !s.audio.is_empty() {
+                            p { class: "muted small", "В этой раздаче одна звуковая дорожка. Другие переводы есть в других раздачах." }
+                            button { class: "p-opt", onclick: move |_| on_pick_release.call(()), "Выбрать другую раздачу ›" }
                         }
                     } else {
                         button {
@@ -237,7 +345,9 @@ pub fn PlayerView(
                             }
                         }
                     }
-                    p { class: "muted small", "Выбор запоминается для этого фильма или сериала на всех устройствах." }
+                    if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
+                        p { class: "muted small", "Выбор запоминается для этого фильма или сериала на всех устройствах." }
+                    }
                 }
             }
         }

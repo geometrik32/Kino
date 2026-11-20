@@ -16,9 +16,9 @@ use kino_core::{
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, MyView, PickerPanel, PlayerMenu, PlayerState, PlayerView, ProfileView,
-    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView,
-    STYLE,
+    mock_releases, HomeView, LoginView, MyView, PickerPanel, PlayerEpisode, PlayerMenu, PlayerState, PlayerView,
+    ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView,
+    TitleView, STYLE,
 };
 
 #[derive(Clone, PartialEq)]
@@ -84,6 +84,11 @@ fn Page(props: PageProps) -> Element {
                     on_next: |_| {},
                     on_fullscreen: |_| {},
                     on_close: |_| {},
+                    on_tap: |_| {},
+                    on_double_tap: |_| {},
+                    on_speed: |_| {},
+                    on_episode: |_| {},
+                    on_pick_release: |_| {},
                     on_video: |_| {},
                 }
             }
@@ -470,6 +475,28 @@ async fn main() -> anyhow::Result<()> {
         next: Some("S02E07".into()),
         transcoded: true,
         preloaded: false,
+        controls: true,
+        rate: 1.0,
+        season: 2,
+        episode: 6,
+        episodes: [
+            "Семь тридцать семь",
+            "Копчёный лосось",
+            "Бесконечное лето",
+            "Хорошо в ванной",
+            "Ку-ку",
+            "Кошмар на улице Вязов",
+            "Окружная свадьба",
+        ]
+        .iter()
+        .enumerate()
+        .map(|(i, t)| PlayerEpisode {
+            number: i as i32 + 1,
+            title: (*t).into(),
+            watched: i < 5,
+        })
+        .collect(),
+        flash: None,
     };
     let filtered = ReleaseFilter {
         quality: Some("2160p".into()),
@@ -528,6 +555,44 @@ async fn main() -> anyhow::Result<()> {
             "Плеер · звук",
             Screen::Player(PlayerState {
                 menu: Some(PlayerMenu::Audio),
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-speed",
+            "Плеер · скорость",
+            Screen::Player(PlayerState {
+                menu: Some(PlayerMenu::Speed),
+                rate: 1.25,
+                paused: false,
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-episodes",
+            "Плеер · серии",
+            Screen::Player(PlayerState {
+                menu: Some(PlayerMenu::Episodes),
+                paused: false,
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-one-track",
+            "Плеер · одна дорожка",
+            Screen::Player(PlayerState {
+                menu: Some(PlayerMenu::Audio),
+                audio: vec![track(0, "rus", Some("LostFilm"), "eac3", 6, true)],
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-doubletap",
+            "Плеер · двойной тап",
+            Screen::Player(PlayerState {
+                paused: false,
+                controls: false,
+                flash: Some((true, 20)),
                 ..player.clone()
             }),
         ),
