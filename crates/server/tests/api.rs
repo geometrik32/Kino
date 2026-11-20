@@ -455,3 +455,37 @@ async fn telegram_app_login_still_needs_an_invite(pool: PgPool) {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "not_invited");
 }
+
+/// What the bot's `/login` does: make a link, confirm it for the sender, hand the
+/// code to the browser, which then logs in once with it.
+#[sqlx::test(migrations = "./migrations")]
+async fn bot_login_link_signs_the_browser_in_once(pool: PgPool) {
+    use kino_server::telegram_auth::TelegramUser;
+    let app = test_app(pool.clone());
+    assert!(kino_server::db::user_by_telegram(&pool, ADMIN_TG)
+        .await
+        .unwrap()
+        .is_none());
+    let admin = TelegramUser {
+        id: ADMIN_TG,
+        first_name: Some("Админ".into()),
+        last_name: None,
+        username: None,
+        photo_url: None,
+    };
+    let code = kino_server::db::create_login_link(&pool, None).await.unwrap();
+    assert!(kino_server::db::confirm_login_link(&pool, &code, &admin).await.unwrap());
+
+    let (status, done) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(done["status"], "done");
+    let me = kino_server::db::user_by_telegram(&pool, ADMIN_TG)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(me.first_name.as_deref(), Some("Админ"));
+
+    // A second try with the same code finds nothing left.
+    let (_, again) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
+    assert_eq!(again["status"], "expired");
+}

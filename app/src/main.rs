@@ -60,6 +60,18 @@ async fn establish() -> Session {
         let r = api::login_widget(WidgetAuthRequest { fields, invite }).await;
         telegram::clean_url();
         Some(r)
+    } else if let Some(code) = telegram::login_token() {
+        // The bot's `/login` link: the code was confirmed in the chat already.
+        let r = match api::poll_login_link(&code).await {
+            Ok(kino_core::LoginLinkStatus::Done { auth }) => Ok(auth),
+            Ok(_) => Err(api::Failure {
+                code: "expired".into(),
+                message: "Ссылка для входа устарела. Отправьте боту /login ещё раз.".into(),
+            }),
+            Err(f) => Err(f),
+        };
+        telegram::clean_url();
+        Some(r)
     } else {
         None
     };

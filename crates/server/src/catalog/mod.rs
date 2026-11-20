@@ -18,6 +18,22 @@ pub enum CatalogError {
     Upstream(String),
 }
 
+/// The catalog the settings ask for: TMDB with a key, the demo one without.
+/// Shared by the server and the bot, so both see the same titles.
+pub fn from_settings(
+    api_key: Option<&str>,
+    language: &str,
+    proxy: Option<&str>,
+) -> anyhow::Result<std::sync::Arc<dyn Catalog>> {
+    Ok(match api_key {
+        Some(key) => std::sync::Arc::new(TmdbCatalog::new(key.to_owned(), language.to_owned(), proxy)?),
+        None => {
+            tracing::warn!("TMDB_API_KEY is not set: using the built-in demo catalog");
+            std::sync::Arc::new(DemoCatalog)
+        }
+    })
+}
+
 #[async_trait]
 pub trait Catalog: Send + Sync {
     async fn home(&self) -> Result<HomeFeed, CatalogError>;

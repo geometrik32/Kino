@@ -37,6 +37,15 @@ pub async fn get_user(pool: &PgPool, id: i64) -> Result<Option<Me>, sqlx::Error>
     row.as_ref().map(me_from_row).transpose()
 }
 
+/// The account of a Telegram user, if they have logged in before.
+pub async fn user_by_telegram(pool: &PgPool, telegram_id: i64) -> Result<Option<Me>, sqlx::Error> {
+    let row = sqlx::query(&format!("SELECT {ME_COLUMNS} FROM users WHERE telegram_id = $1"))
+        .bind(telegram_id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(me_from_row).transpose()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum LoginOutcome {
     LoggedIn(Me),
