@@ -7,10 +7,13 @@ mod api;
 mod telegram;
 
 use dioxus::prelude::*;
-use kino_core::{AuthResponse, MediaKind, ReleaseChoiceUpdate, TitleSummary, WidgetAuthRequest};
+use kino_core::{
+    AuthResponse, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs,
+    WidgetAuthRequest,
+};
 use kino_ui::{
-    mock_releases, play_target, HomeView, LoginView, PickerPanel, PlayTarget, ReleaseFilter, ReleaseOption,
-    ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, WatchlistView, STYLE,
+    mock_releases, play_target, HomeView, LoginView, MyView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter,
+    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
 };
 
 fn main() {
@@ -82,7 +85,16 @@ fn App() -> Element {
         match session() {
             Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
             Session::LoggedOut { error } => rsx! { Login { error } },
-            Session::LoggedIn { token, name } => rsx! { Main { token, name } },
+            Session::LoggedIn { token, name } => rsx! {
+                Main {
+                    token,
+                    name,
+                    on_logout: move |_| {
+                        api::forget_token();
+                        session.set(Session::LoggedOut { error: None });
+                    },
+                }
+            },
         }
     }
 }
@@ -112,7 +124,7 @@ enum View {
 }
 
 #[component]
-fn Main(token: String, name: String) -> Element {
+fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
     let mut view = use_signal(|| View::Tab(Tab::Home));
     let mut query = use_signal(String::new);
     let initial = name
@@ -138,7 +150,15 @@ fn Main(token: String, name: String) -> Element {
             match view() {
                 View::Tab(Tab::Home) => rsx! { Home { token: token.clone(), on_open: open } },
                 View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, on_open: open } },
-                View::Tab(Tab::Watchlist) => rsx! { Watchlist { token: token.clone(), on_open: open } },
+                View::Tab(Tab::Mine) => rsx! { Mine { token: token.clone(), on_open: open } },
+                View::Tab(Tab::Profile) => rsx! {
+                    Profile {
+                        token: token.clone(),
+                        name: name.clone(),
+                        on_open: move |(k, id)| view.set(View::Title(k, id)),
+                        on_logout,
+                    }
+                },
                 View::Title(kind, id) => rsx! { Title { key: "{kind.as_str()}{id}", token: token.clone(), kind, id } },
             }
         }
@@ -155,7 +175,8 @@ fn loading() -> Element {
 
 #[component]
 fn Home(token: String, on_open: EventHandler<TitleSummary>) -> Element {
-    let data = use_resource(move || {
+    let t2 = token.clone();
+    let mut data = use_resource(move || {
         let t = token.clone();
         async move {
             let feed = api::home(&t).await?;
@@ -175,6 +196,14 @@ fn Home(token: String, on_open: EventHandler<TitleSummary>) -> Element {
                 // Opens the title; its main button resumes where the user stopped.
                 on_play: move |c: kino_core::ContinueItem| {
                     if let Some(t) = c.title { on_open.call(t) }
+                },
+                on_drop: move |c: kino_core::ContinueItem| {
+                    let t = t2.clone();
+                    spawn(async move {
+                        if api::set_status(&t, c.last.kind, c.last.tmdb_id, Some(TitleStatus::Dropped)).await.is_ok() {
+                            data.restart();
+                        }
+                    });
                 },
             }
         },
@@ -208,25 +237,81 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
 }
 
 #[component]
-fn Watchlist(token: String, on_open: EventHandler<TitleSummary>) -> Element {
+fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
+    let mut filter = use_signal(|| None::<TitleStatus>);
     let items = use_resource(move || {
         let t = token.clone();
-        async move {
-            let list = api::watchlist(&t).await?;
-            let mut out = Vec::new();
-            for w in list {
-                if let Ok(d) = api::details(&t, w.kind, w.tmdb_id).await {
-                    out.push(d.summary);
-                }
-            }
-            Ok::<_, api::Failure>(out)
-        }
+        async move { api::my(&t).await }
     });
     let state = items.read().clone();
     match state {
         None => loading(),
         Some(Err(e)) => error_text(&e.message),
-        Some(Ok(items)) => rsx! { WatchlistView { items, on_open } },
+        Some(Ok(items)) => rsx! {
+            MyView { items, filter: filter(), on_filter: move |f| filter.set(f), on_open }
+        },
+    }
+}
+
+/// Current time from the browser (`Utc::now` is not available in wasm).
+fn browser_now() -> (chrono::DateTime<chrono::Utc>, i32) {
+    let d = js_sys::Date::new_0();
+    let now = chrono::DateTime::from_timestamp_millis(d.get_time() as i64).unwrap_or_default();
+    (now, -(d.get_timezone_offset() as i32))
+}
+
+#[component]
+fn Profile(
+    token: String,
+    name: String,
+    on_open: EventHandler<(MediaKind, i64)>,
+    on_logout: EventHandler<()>,
+) -> Element {
+    let t1 = token.clone();
+    let mut data = use_resource(move || {
+        let t = t1.clone();
+        async move {
+            let history = api::history(&t).await?;
+            let preloads = api::preloads(&t).await?;
+            let prefs = api::prefs(&t).await?;
+            Ok::<_, api::Failure>((history, preloads, prefs))
+        }
+    });
+    let mut prefs_now = use_signal(|| None::<UserPrefs>);
+    let state = data.read().clone();
+    let (history, preloads, prefs) = match state {
+        None => return loading(),
+        Some(Err(e)) => return error_text(&e.message),
+        Some(Ok(v)) => v,
+    };
+    let (now, utc_offset_min) = browser_now();
+    let t2 = token.clone();
+    rsx! {
+        ProfileView {
+            name,
+            history,
+            preloads,
+            prefs: prefs_now().unwrap_or(prefs),
+            now,
+            utc_offset_min,
+            on_prefs: move |p: UserPrefs| {
+                prefs_now.set(Some(p.clone()));
+                let t = token.clone();
+                spawn(async move {
+                    let _ = api::save_prefs(&t, &p).await;
+                });
+            },
+            on_delete_preload: move |pid: i64| {
+                let t = t2.clone();
+                spawn(async move {
+                    if api::delete_preload(&t, pid).await.is_ok() {
+                        data.restart();
+                    }
+                });
+            },
+            on_open,
+            on_logout,
+        }
     }
 }
 
@@ -241,17 +326,14 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
 #[component]
 fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let t1 = token.clone();
-    let data = use_resource(move || {
+    let mut data = use_resource(move || {
         let t = t1.clone();
         async move {
             let details = api::details(&t, kind, id).await?;
             let progress = api::title_progress(&t, kind, id).await?;
-            let in_list = api::watchlist(&t)
-                .await?
-                .iter()
-                .any(|w| w.kind == kind && w.tmdb_id == id);
+            let st = api::title_state(&t, kind, id).await?;
             let choices = api::release_choices(&t, kind, id).await?;
-            Ok::<_, api::Failure>((details, progress, in_list, choices))
+            Ok::<_, api::Failure>((details, progress, st, choices))
         }
     });
     let mut chosen_season = use_signal(|| None::<i32>);
@@ -274,7 +356,10 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             }
         }
     });
-    let mut in_list = use_signal(|| None::<bool>);
+    // Optimistic edits; cleared when the data reloads.
+    let mut status_now = use_signal(|| None::<Option<TitleStatus>>);
+    let mut rating_now = use_signal(|| None::<Option<i16>>);
+    let mut notice = use_signal(|| None::<String>);
     // Choices made in this visit, newest first; they override the loaded ones.
     let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
     let mut picker = use_signal(|| None::<PlayTarget>);
@@ -284,12 +369,13 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let mut playing = use_signal(|| None::<(PlayTarget, String)>);
 
     let state = data.read().clone();
-    let (details, progress, listed, loaded) = match state {
+    let (details, progress, st, loaded) = match state {
         None => return loading(),
         Some(Err(e)) => return error_text(&e.message),
         Some(Ok(v)) => v,
     };
-    let listed = in_list().unwrap_or(listed);
+    let status = status_now().unwrap_or(st.status);
+    let my_rating = rating_now().unwrap_or(st.rating);
     let mut choices: Vec<ReleaseChoiceUpdate> = picked_now();
     choices.extend(loaded.into_iter().map(|c| c.release));
     let season_key = move |t: &PlayTarget| if kind == MediaKind::Tv { t.season } else { 0 };
@@ -347,18 +433,47 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             details: details.clone(),
             season: season.read().clone().flatten(),
             progress,
-            in_watchlist: listed,
+            status,
+            my_rating,
             release_label,
             on_play,
             on_change_release: open_picker,
-            on_toggle_watchlist: move |on: bool| {
-                in_list.set(Some(on));
-                let t = token.clone();
-                spawn(async move {
-                    if api::set_watchlist(&t, kind, id, on).await.is_err() {
-                        in_list.set(Some(!on));
-                    }
-                });
+            on_status: {
+                let token = token.clone();
+                move |s: Option<TitleStatus>| {
+                    status_now.set(Some(s));
+                    let t = token.clone();
+                    spawn(async move {
+                        if api::set_status(&t, kind, id, s).await.is_ok() {
+                            // A film marked "Просмотрено" also changes its progress.
+                            data.restart();
+                            status_now.set(None);
+                        }
+                    });
+                }
+            },
+            on_rate: {
+                let token = token.clone();
+                move |r: Option<i16>| {
+                    rating_now.set(Some(r));
+                    let t = token.clone();
+                    spawn(async move {
+                        let _ = api::set_rating(&t, kind, id, r).await;
+                    });
+                }
+            },
+            on_mark: {
+                let token = token.clone();
+                move |(season, episodes, watched): (i32, Vec<i32>, bool)| {
+                    let t = token.clone();
+                    let m = MarkWatched { kind, tmdb_id: id, season, episodes, watched };
+                    spawn(async move {
+                        if api::mark(&t, &m).await.is_ok() {
+                            status_now.set(None);
+                            data.restart();
+                        }
+                    });
+                }
             },
             on_season: move |n| chosen_season.set(Some(n)),
         }
@@ -388,9 +503,38 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                         let _ = api::save_release_choice(&t, &choice).await;
                     });
                 },
-                // Preloading arrives with the player (stage 3).
-                on_preload: move |_| picker.set(None),
+                on_preload: {
+                    let summary = details.summary.clone();
+                    let t4 = token.clone();
+                    let pre_season = picker_season.unwrap_or(0);
+                    move |r: ReleaseOption| {
+                        picker.set(None);
+                        let req = PreloadRequest {
+                            kind,
+                            tmdb_id: id,
+                            season: pre_season,
+                            infohash: r.infohash.clone(),
+                            title: Some(r.title.clone()),
+                        };
+                        let t = t4.clone();
+                        let name = summary.title.clone();
+                        spawn(async move {
+                            notice.set(Some(match api::add_preload(&t, &req).await {
+                                Ok(_) => format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки»."),
+                                Err(e) => format!("Не удалось поставить в загрузку: {}", e.message),
+                            }));
+                        });
+                    }
+                },
                 on_close: move |_| picker.set(None),
+            }
+        }
+        if let Some(text) = notice() {
+            div { class: "sheet-bg", onclick: move |_| notice.set(None),
+                div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                    p { "{text}" }
+                    button { class: "btn ghost", onclick: move |_| notice.set(None), "Хорошо" }
+                }
             }
         }
         if let Some((t, label)) = playing() {

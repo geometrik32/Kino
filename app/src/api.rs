@@ -2,8 +2,9 @@
 
 use gloo_net::http::{Request, Response};
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HomeFeed, Me, MediaKind, Progress, ReleaseChoice, ReleaseChoiceUpdate,
-    SearchResults, Season, TitleDetails, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PreloadItem,
+    PreloadRequest, Progress, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, SearchResults, Season, StatusUpdate,
+    TitleDetails, TitleState, TitleStatus, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
@@ -105,10 +106,6 @@ pub async fn continue_watching(token: &str) -> Result<Vec<ContinueItem>, Failure
     get("/api/continue", token).await
 }
 
-pub async fn watchlist(token: &str) -> Result<Vec<WatchlistItem>, Failure> {
-    get("/api/watchlist", token).await
-}
-
 pub async fn home(token: &str) -> Result<HomeFeed, Failure> {
     get("/api/catalog/home", token).await
 }
@@ -130,27 +127,6 @@ pub async fn title_progress(token: &str, kind: MediaKind, id: i64) -> Result<Vec
     get(&format!("/api/progress/{}/{id}", kind.as_str()), token).await
 }
 
-/// Adds to or removes from "Хочу посмотреть".
-pub async fn set_watchlist(token: &str, kind: MediaKind, id: i64, on: bool) -> Result<(), Failure> {
-    let path = format!("/api/watchlist/{}/{id}", kind.as_str());
-    let auth = format!("Bearer {token}");
-    let req = if on {
-        Request::put(&path)
-    } else {
-        Request::delete(&path)
-    };
-    let resp = req
-        .header("Authorization", &auth)
-        .send()
-        .await
-        .map_err(Failure::network)?;
-    if resp.ok() || resp.status() == 404 {
-        Ok(())
-    } else {
-        decode::<serde_json::Value>(resp).await.map(|_| ())
-    }
-}
-
 pub async fn release_choices(token: &str, kind: MediaKind, id: i64) -> Result<Vec<ReleaseChoice>, Failure> {
     get(&format!("/api/release-choice/{}/{id}", kind.as_str()), token).await
 }
@@ -162,4 +138,81 @@ pub async fn save_release_choice(token: &str, choice: &ReleaseChoiceUpdate) -> R
         .json(choice)
         .map_err(Failure::network)?;
     decode(req.send().await.map_err(Failure::network)?).await
+}
+
+/// PUT/POST/DELETE with an optional JSON body; the response body is decoded.
+async fn send<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&impl serde::Serialize>,
+) -> Result<T, Failure> {
+    let auth = format!("Bearer {token}");
+    let builder = match method {
+        "PUT" => Request::put(path),
+        "POST" => Request::post(path),
+        _ => Request::delete(path),
+    }
+    .header("Authorization", &auth);
+    let req = match body {
+        Some(b) => builder.json(b).map_err(Failure::network)?,
+        None => builder.build().map_err(Failure::network)?,
+    };
+    let resp = req.send().await.map_err(Failure::network)?;
+    if resp.status() == 204 {
+        // No body: decode `null` into `()` (or any type that accepts it).
+        return serde_json::from_str("null").map_err(Failure::network);
+    }
+    decode(resp).await
+}
+
+pub async fn title_state(token: &str, kind: MediaKind, id: i64) -> Result<TitleState, Failure> {
+    get(&format!("/api/title/{}/{id}/state", kind.as_str()), token).await
+}
+
+pub async fn set_status(
+    token: &str,
+    kind: MediaKind,
+    id: i64,
+    status: Option<TitleStatus>,
+) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/{}/{id}/status", kind.as_str());
+    send("PUT", &path, token, Some(&StatusUpdate { status })).await
+}
+
+pub async fn set_rating(token: &str, kind: MediaKind, id: i64, rating: Option<i16>) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/{}/{id}/rating", kind.as_str());
+    send("PUT", &path, token, Some(&RatingUpdate { rating })).await
+}
+
+pub async fn mark(token: &str, m: &MarkWatched) -> Result<(), Failure> {
+    send("POST", "/api/marks", token, Some(m)).await
+}
+
+pub async fn my(token: &str) -> Result<Vec<TitleState>, Failure> {
+    get("/api/my", token).await
+}
+
+pub async fn history(token: &str) -> Result<Vec<HistoryEntry>, Failure> {
+    get("/api/history?limit=100", token).await
+}
+
+pub async fn prefs(token: &str) -> Result<UserPrefs, Failure> {
+    get("/api/prefs", token).await
+}
+
+pub async fn save_prefs(token: &str, p: &UserPrefs) -> Result<UserPrefs, Failure> {
+    send("PUT", "/api/prefs", token, Some(p)).await
+}
+
+pub async fn preloads(token: &str) -> Result<Vec<PreloadItem>, Failure> {
+    get("/api/preload", token).await
+}
+
+pub async fn add_preload(token: &str, r: &PreloadRequest) -> Result<PreloadItem, Failure> {
+    send("POST", "/api/preload", token, Some(r)).await
+}
+
+pub async fn delete_preload(token: &str, id: i64) -> Result<(), Failure> {
+    send("DELETE", &format!("/api/preload/{id}"), token, None::<&()>).await
 }

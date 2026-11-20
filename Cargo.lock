@@ -2216,6 +2216,7 @@ dependencies = [
 name = "kino-app"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dioxus",
  "gloo-net",
  "js-sys",
@@ -2296,6 +2297,7 @@ dependencies = [
 name = "kino-ui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dioxus",
  "kino-core",
 ]

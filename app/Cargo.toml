@@ -10,6 +10,7 @@ publish.workspace = true
 kino-core.workspace = true
 kino-ui = { path = "../crates/ui" }
 serde.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
 serde_json.workspace = true
 dioxus = { version = "0.7", features = ["web", "router"] }
 gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }

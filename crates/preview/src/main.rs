@@ -11,12 +11,13 @@ use std::path::PathBuf;
 use chrono::{Duration, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    ContinueItem, HomeFeed, MediaKind, Progress, ReleaseRef, SearchResults, Season, TitleDetails, TitleSummary,
+    ContinueItem, HistoryEntry, HomeFeed, MediaKind, PreloadItem, PreloadState, Progress, ReleaseRef, SearchResults,
+    Season, TitleDetails, TitleState, TitleStatus, UserPrefs,
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, PickerPanel, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
-    SearchView, Shell, Tab, TitleView, WatchlistView, STYLE,
+    mock_releases, HomeView, LoginView, MyView, PickerPanel, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker,
+    ReleaseSort, SearchView, Shell, Tab, TitleView, STYLE,
 };
 
 #[derive(Clone, PartialEq)]
@@ -38,11 +39,13 @@ enum Screen {
         details: TitleDetails,
         season: Option<Season>,
         progress: Vec<Progress>,
-        in_watchlist: bool,
+        status: Option<TitleStatus>,
+        my_rating: Option<i16>,
         release_label: Option<String>,
         picker: Option<Picker>,
     },
-    Watchlist(Vec<TitleSummary>),
+    Mine(Vec<TitleState>, Option<TitleStatus>),
+    Profile(Vec<HistoryEntry>, Vec<PreloadItem>, UserPrefs),
     Login,
 }
 
@@ -55,7 +58,8 @@ fn Page(props: PageProps) -> Element {
     let tab = match &props.screen {
         Screen::Home(..) => Some(Tab::Home),
         Screen::Search(..) => Some(Tab::Search),
-        Screen::Watchlist(..) => Some(Tab::Watchlist),
+        Screen::Mine(..) => Some(Tab::Mine),
+        Screen::Profile(..) => Some(Tab::Profile),
         _ => None,
     };
     let query = match &props.screen {
@@ -70,14 +74,31 @@ fn Page(props: PageProps) -> Element {
                 }
             }
         }
-        Screen::Home(feed, cont) => rsx! { HomeView { feed, continue_items: cont, on_open: |_| {}, on_play: |_| {} } },
+        Screen::Home(feed, cont) => {
+            rsx! { HomeView { feed, continue_items: cont, on_open: |_| {}, on_play: |_| {}, on_drop: |_| {} } }
+        }
         Screen::Search(q, r) => rsx! { SearchView { query: q, results: Some(r), on_open: |_| {}, on_query: |_| {} } },
-        Screen::Watchlist(items) => rsx! { WatchlistView { items, on_open: |_| {} } },
+        Screen::Mine(items, filter) => rsx! { MyView { items, filter, on_filter: |_| {}, on_open: |_| {} } },
+        Screen::Profile(history, preloads, prefs) => rsx! {
+            ProfileView {
+                name: "Даниил",
+                history,
+                preloads,
+                prefs,
+                now: Utc::now(),
+                utc_offset_min: 180,
+                on_prefs: |_| {},
+                on_delete_preload: |_| {},
+                on_open: |_| {},
+                on_logout: |_| {},
+            }
+        },
         Screen::Title {
             details,
             season,
             progress,
-            in_watchlist,
+            status,
+            my_rating,
             release_label,
             picker,
         } => rsx! {
@@ -85,11 +106,14 @@ fn Page(props: PageProps) -> Element {
                 details,
                 season,
                 progress,
-                in_watchlist,
+                status,
+                my_rating,
                 release_label,
                 on_play: |_| {},
                 on_change_release: |_| {},
-                on_toggle_watchlist: |_| {},
+                on_status: |_| {},
+                on_rate: |_| {},
+                on_mark: |_| {},
                 on_season: |_| {},
             }
             if let Some(p) = picker {
@@ -218,16 +242,19 @@ async fn main() -> anyhow::Result<()> {
             last: bb_progress.last().unwrap().clone(),
             next_episode: None,
             title: title_of(MediaKind::Tv, 1396).await,
+            stale: false,
         },
         ContinueItem {
             last: inc_progress[0].clone(),
             next_episode: None,
             title: title_of(MediaKind::Movie, 27205).await,
+            stale: false,
         },
         ContinueItem {
             last: dark_last,
             next_episode: Some((1, 5)),
             title: title_of(MediaKind::Tv, 70523).await,
+            stale: true,
         },
     ];
 
@@ -237,15 +264,108 @@ async fn main() -> anyhow::Result<()> {
         ep.air_date = Some(format!("2009-{:02}-{:02}", 3 + date / 4, 1 + (date * 7) % 28));
     }
     let inception = cat.details(MediaKind::Movie, 27205).await?;
-    let mut watchlist = Vec::new();
-    for (k, id) in [
-        (MediaKind::Movie, 438631),
-        (MediaKind::Tv, 100088),
-        (MediaKind::Movie, 157336),
-        (MediaKind::Tv, 76479),
+    // "Мои": a mix of statuses and ratings.
+    let mut mine = Vec::new();
+    for (k, id, st, rating) in [
+        (MediaKind::Tv, 1396, TitleStatus::Watching, None),
+        (MediaKind::Movie, 27205, TitleStatus::Watching, None),
+        (MediaKind::Tv, 70523, TitleStatus::Watching, None),
+        (MediaKind::Movie, 438631, TitleStatus::Want, None),
+        (MediaKind::Tv, 100088, TitleStatus::Want, None),
+        (MediaKind::Movie, 157336, TitleStatus::Want, None),
+        (MediaKind::Movie, 603, TitleStatus::Watched, Some(5)),
+        (MediaKind::Movie, 155, TitleStatus::Watched, Some(5)),
+        (MediaKind::Movie, 550, TitleStatus::Watched, Some(4)),
+        (MediaKind::Tv, 1399, TitleStatus::Watched, Some(3)),
+        (MediaKind::Tv, 76479, TitleStatus::Dropped, Some(2)),
     ] {
-        watchlist.extend(title_of(k, id).await);
+        mine.push(TitleState {
+            kind: k,
+            tmdb_id: id,
+            status: Some(st),
+            rating,
+            audio_track: None,
+            subtitle_track: None,
+            updated_at: Utc::now(),
+            title: title_of(k, id).await,
+        });
     }
+    let hist = |k, id, s, e, from: f64, to: f64, ago_h: i64, dev: &str| HistoryEntry {
+        kind: k,
+        tmdb_id: id,
+        season: s,
+        episode: e,
+        started_at: Utc::now() - Duration::hours(ago_h) - Duration::minutes(40),
+        last_at: Utc::now() - Duration::hours(ago_h),
+        position_from: from,
+        position_to: to,
+        device: Some(dev.into()),
+        title: None,
+    };
+    let mut history = vec![
+        hist(MediaKind::Tv, 1396, 2, 6, 0.0, 2472.0, 1, "Телефон"),
+        hist(MediaKind::Tv, 1396, 2, 5, 0.0, 2810.0, 22, "Компьютер"),
+        hist(MediaKind::Movie, 27205, 0, 0, 1820.0, 4360.0, 26, "Телевизор"),
+        hist(MediaKind::Movie, 27205, 0, 0, 0.0, 1820.0, 50, "Телефон"),
+        hist(MediaKind::Tv, 70523, 1, 4, 0.0, 3290.0, 74, "Компьютер"),
+    ];
+    for h in &mut history {
+        h.title = title_of(h.kind, h.tmdb_id).await;
+    }
+    let preload = |id, k, tmdb, season, title: &str, state, progress, gb: f64, delete_days: Option<i64>| PreloadItem {
+        id,
+        kind: k,
+        tmdb_id: tmdb,
+        season,
+        infohash: "e".repeat(40),
+        title: Some(title.into()),
+        state,
+        progress,
+        size_bytes: Some((gb * 1e9) as i64),
+        requested_at: Utc::now() - Duration::hours(3),
+        ready_at: None,
+        delete_after: delete_days.map(|d| Utc::now() + Duration::days(d) + Duration::hours(1)),
+    };
+    let preloads = vec![
+        preload(
+            1,
+            MediaKind::Tv,
+            100088,
+            2,
+            "Одни из нас / The Last of Us (S02) 2160p BDRemux | Оригинал",
+            PreloadState::Downloading,
+            0.42,
+            61.0,
+            None,
+        ),
+        preload(
+            2,
+            MediaKind::Movie,
+            438631,
+            0,
+            "Дюна / Dune (2021) 2160p WEB-DL HDR | Дубляж",
+            PreloadState::Ready,
+            1.0,
+            23.5,
+            None,
+        ),
+        preload(
+            3,
+            MediaKind::Movie,
+            157336,
+            0,
+            "Интерстеллар / Interstellar (2014) 1080p BDRip | Дубляж",
+            PreloadState::Ready,
+            1.0,
+            12.1,
+            Some(5),
+        ),
+    ];
+    let prefs = UserPrefs {
+        quality: Some("1080p".into()),
+        voice: Some("LostFilm".into()),
+        subtitle_lang: None,
+    };
 
     let bb_releases = mock_releases(&bb.summary, Some(2));
     let chosen = bb_releases[0].clone();
@@ -262,7 +382,8 @@ async fn main() -> anyhow::Result<()> {
         details: bb.clone(),
         season: Some(bb_s2.clone()),
         progress: bb_progress.clone(),
-        in_watchlist: false,
+        status: Some(TitleStatus::Watching),
+        my_rating: None,
         release_label: Some(chosen.label()),
         picker,
     };
@@ -309,12 +430,14 @@ async fn main() -> anyhow::Result<()> {
                 details: inception.clone(),
                 season: None,
                 progress: inc_progress,
-                in_watchlist: true,
+                status: Some(TitleStatus::Watching),
+                my_rating: Some(4),
                 release_label: Some("NewStudio · 1080p · RuTor".into()),
                 picker: None,
             },
         ),
-        ("watchlist", "Хочу посмотреть", Screen::Watchlist(watchlist)),
+        ("mine", "Мои", Screen::Mine(mine, None)),
+        ("profile", "Профиль", Screen::Profile(history, preloads, prefs)),
         ("login", "Вход", Screen::Login),
     ];
     for (file, title, screen) in pages {

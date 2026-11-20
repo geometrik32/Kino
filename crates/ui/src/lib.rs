@@ -9,7 +9,7 @@
 use dioxus::prelude::*;
 use kino_core::{
     clock, episode_code, image_url, ContinueItem, HomeFeed, ImageSize, MediaKind, Progress, SearchResults, Season,
-    TitleDetails, TitleSummary,
+    TitleDetails, TitleStatus, TitleSummary,
 };
 
 /// The stylesheet all components rely on.
@@ -20,7 +20,8 @@ pub const STYLE: &str = include_str!("style.css");
 pub enum Tab {
     Home,
     Search,
-    Watchlist,
+    Mine,
+    Profile,
 }
 
 impl Tab {
@@ -28,7 +29,8 @@ impl Tab {
         match self {
             Tab::Home => "Главная",
             Tab::Search => "Поиск",
-            Tab::Watchlist => "Хочу посмотреть",
+            Tab::Mine => "Мои",
+            Tab::Profile => "Профиль",
         }
     }
 
@@ -36,14 +38,17 @@ impl Tab {
         match self {
             Tab::Home => "⌂",
             Tab::Search => "⌕",
-            Tab::Watchlist => "☆",
+            Tab::Mine => "☆",
+            Tab::Profile => "☺",
         }
     }
 }
 
-const TABS: [Tab; 3] = [Tab::Home, Tab::Search, Tab::Watchlist];
+const TABS: [Tab; 4] = [Tab::Home, Tab::Search, Tab::Mine, Tab::Profile];
 
+mod account;
 mod releases;
+pub use account::*;
 pub use releases::*;
 
 fn hue(id: i64) -> i64 {
@@ -186,7 +191,11 @@ pub fn PosterCard(item: TitleSummary, on_open: EventHandler<TitleSummary>) -> El
 
 /// "Continue watching" card: still frame, progress bar, where you stopped.
 #[component]
-pub fn ContinueCard(item: ContinueItem, on_play: EventHandler<ContinueItem>) -> Element {
+pub fn ContinueCard(
+    item: ContinueItem,
+    on_play: EventHandler<ContinueItem>,
+    on_drop: EventHandler<ContinueItem>,
+) -> Element {
     let p = &item.last;
     let name = item
         .title
@@ -218,18 +227,26 @@ pub fn ContinueCard(item: ContinueItem, on_play: EventHandler<ContinueItem>) -> 
         None => format!("background-image: {}", fallback_bg(p.tmdb_id)),
     };
     let release = p.release.as_ref().and_then(|r| r.title.clone());
-    let it = item.clone();
+    let (it, it2) = (item.clone(), item.clone());
     rsx! {
-        button { class: "wide", onclick: move |_| on_play.call(it.clone()),
-            div { class: "img",
-                div { class: "hero-bg", style: "{bg}; position:absolute; inset:0; background-size:cover" }
-                div { class: "play", i { "▶" } }
-                div { class: "bar", div { style: "width: {pct:.0}%" } }
+        div { class: "wide",
+            button { class: "hit", onclick: move |_| on_play.call(it.clone()),
+                div { class: "img",
+                    div { class: "hero-bg", style: "{bg}; position:absolute; inset:0; background-size:cover" }
+                    div { class: "play", i { "▶" } }
+                    div { class: "bar", div { style: "width: {pct:.0}%" } }
+                }
+                div { class: "name", "{name}" }
+                div { class: "sub", "{line}" }
+                if let Some(r) = release {
+                    div { class: "sub", style: "opacity:.7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis", "{r}" }
+                }
             }
-            div { class: "name", "{name}" }
-            div { class: "sub", "{line}" }
-            if let Some(r) = release {
-                div { class: "sub", style: "opacity:.7; white-space:nowrap; overflow:hidden; text-overflow:ellipsis", "{r}" }
+            if item.stale {
+                div { class: "stale",
+                    span { "Давно не смотрели." }
+                    button { class: "link", onclick: move |_| on_drop.call(it2.clone()), "Бросить?" }
+                }
             }
         }
     }
@@ -259,6 +276,7 @@ pub fn HomeView(
     continue_items: Vec<ContinueItem>,
     on_open: EventHandler<TitleSummary>,
     on_play: EventHandler<ContinueItem>,
+    on_drop: EventHandler<ContinueItem>,
 ) -> Element {
     // Hero: the title you watched last, otherwise the first popular one.
     let hero_item = continue_items
@@ -278,7 +296,7 @@ pub fn HomeView(
                 h2 { "Продолжить просмотр" }
                 div { class: "row",
                     for item in continue_items {
-                        ContinueCard { key: "{item.last.kind.as_str()}{item.last.tmdb_id}", item, on_play }
+                        ContinueCard { key: "{item.last.kind.as_str()}{item.last.tmdb_id}", item, on_play, on_drop }
                     }
                 }
             }
@@ -353,24 +371,6 @@ pub fn SearchView(
                         }
                     }
                 },
-            }
-        }
-    }
-}
-
-#[component]
-pub fn WatchlistView(items: Vec<TitleSummary>, on_open: EventHandler<TitleSummary>) -> Element {
-    rsx! {
-        section { class: "section",
-            h2 { "Хочу посмотреть" }
-            if items.is_empty() {
-                p { class: "muted", "Пока пусто. Нажмите «Хочу посмотреть» на странице фильма." }
-            } else {
-                div { class: "grid",
-                    for item in items {
-                        PosterCard { key: "{item.kind.as_str()}{item.tmdb_id}", item, on_open }
-                    }
-                }
             }
         }
     }
@@ -451,13 +451,18 @@ pub fn TitleView(
     /// The season whose episodes are listed (series only).
     season: Option<Season>,
     progress: Vec<Progress>,
-    in_watchlist: bool,
+    status: Option<TitleStatus>,
+    /// The user's own 1–5 rating.
+    my_rating: Option<i16>,
     /// The remembered release for the season about to play, e.g. "LostFilm · 1080p".
     /// "Смотреть" uses it without asking; `None` means the picker opens.
     release_label: Option<String>,
     on_play: EventHandler<PlayTarget>,
     on_change_release: EventHandler<PlayTarget>,
-    on_toggle_watchlist: EventHandler<bool>,
+    on_status: EventHandler<Option<TitleStatus>>,
+    on_rate: EventHandler<Option<i16>>,
+    /// Mark episodes watched (`true`) or not: `(season, episodes, watched)`.
+    on_mark: EventHandler<(i32, Vec<i32>, bool)>,
     on_season: EventHandler<i32>,
 ) -> Element {
     let s = &details.summary;
@@ -517,12 +522,9 @@ pub fn TitleView(
                             let t = target.clone();
                             move |_| on_play.call(t.clone())
                         }, "▶ {play_label}" }
-                        button {
-                            class: if in_watchlist { "btn ghost on" } else { "btn ghost" },
-                            onclick: move |_| on_toggle_watchlist.call(!in_watchlist),
-                            if in_watchlist { "✓ В списке" } else { "+ Хочу посмотреть" }
-                        }
                     }
+                    StatusPicker { status, on_status }
+                    Stars { rating: my_rating, on_rate }
                     div { class: "chosen-rel",
                         if let Some(l) = release_label {
                             span { class: "muted", "Раздача: " }
@@ -553,6 +555,20 @@ pub fn TitleView(
                         }
                     }
                 }
+                {
+                    let all: Vec<i32> = season.episodes.iter().map(|e| e.number).collect();
+                    let all_done = !all.is_empty() && all.iter().all(|n| {
+                        progress.iter().any(|p| p.season == season.number && p.episode == *n && p.finished)
+                    });
+                    let n = season.number;
+                    rsx! {
+                        div { class: "season-acts",
+                            button { class: "link", onclick: move |_| on_mark.call((n, all.clone(), !all_done)),
+                                if all_done { "Снять отметки с сезона" } else { "Отметить сезон просмотренным" }
+                            }
+                        }
+                    }
+                }
                 div { class: "episodes",
                     for ep in season.episodes.iter().cloned() {
                         EpisodeRow {
@@ -565,6 +581,7 @@ pub fn TitleView(
                             progress: progress.iter().find(|p| p.season == season.number && p.episode == ep.number).cloned(),
                             current: current == Some((season.number, ep.number)),
                             on_play,
+                            on_mark,
                         }
                     }
                 }
@@ -583,6 +600,7 @@ fn EpisodeRow(
     progress: Option<Progress>,
     current: bool,
     on_play: EventHandler<PlayTarget>,
+    on_mark: EventHandler<(i32, Vec<i32>, bool)>,
 ) -> Element {
     let mut sub = Vec::new();
     if let Some(m) = runtime_min {
@@ -602,20 +620,63 @@ fn EpisodeRow(
         episode: number,
         position_sec: resume_at,
     };
+    let done = progress.as_ref().is_some_and(|p| p.finished);
     rsx! {
-        button { class: if current { "ep current" } else { "ep" }, onclick: move |_| on_play.call(target.clone()),
-            div { class: "num", "{number}" }
-            div {
-                div { class: "t", "{name}" }
-                div { class: "s", "{sub}" }
-                if let Some(p) = progress.as_ref().filter(|p| !p.finished) {
-                    div { class: "mini", div { style: "width: {percent(p):.0}%" } }
+        div { class: if current { "ep current" } else { "ep" },
+            button { class: "hit", onclick: move |_| on_play.call(target.clone()),
+                div { class: "num", "{number}" }
+                div {
+                    div { class: "t", "{name}" }
+                    div { class: "s", "{sub}" }
+                    if let Some(p) = progress.as_ref().filter(|p| !p.finished) {
+                        div { class: "mini", div { style: "width: {percent(p):.0}%" } }
+                    }
                 }
             }
-            match progress {
-                Some(p) if p.finished => rsx! { div { class: "state done", "✓ Просмотрено" } },
+            match &progress {
+                Some(p) if p.finished => rsx! { div { class: "state done", "Просмотрено" } },
                 Some(p) => rsx! { div { class: "state", "{clock(p.position_sec)} из {clock(p.duration_sec)}" } },
                 None => rsx! { div { class: "state" } },
+            }
+            button {
+                class: if done { "mark on" } else { "mark" },
+                title: if done { "Снять отметку" } else { "Отметить просмотренной" },
+                onclick: move |_| on_mark.call((season, vec![number], !done)),
+                "✓"
+            }
+        }
+    }
+}
+
+/// The four statuses; tapping the active one clears it.
+#[component]
+pub fn StatusPicker(status: Option<TitleStatus>, on_status: EventHandler<Option<TitleStatus>>) -> Element {
+    rsx! {
+        div { class: "status-row",
+            for st in TitleStatus::ALL {
+                button {
+                    class: if status == Some(st) { "chip active" } else { "chip" },
+                    onclick: move |_| on_status.call(if status == Some(st) { None } else { Some(st) }),
+                    "{st.label()}"
+                }
+            }
+        }
+    }
+}
+
+/// 1–5 stars; tapping the current value removes the rating.
+#[component]
+pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element {
+    let r = rating.unwrap_or(0);
+    rsx! {
+        div { class: "stars",
+            span { class: "muted", "Ваша оценка" }
+            for n in 1..=5i16 {
+                button {
+                    class: if n <= r { "star on" } else { "star" },
+                    onclick: move |_| on_rate.call(if rating == Some(n) { None } else { Some(n) }),
+                    "★"
+                }
             }
         }
     }
