@@ -1,0 +1,17 @@
+[package]
+name = "kino-bot"
+description = "Kino Telegram bot: opens the app, hands out invites"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kino-server.workspace = true
+anyhow.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
+url = "2"
