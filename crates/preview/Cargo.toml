@@ -1,0 +1,17 @@
+[package]
+name = "kino-preview"
+description = "Renders Kino screens on demo data to static HTML, for screenshots and design review"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+kino-core.workspace = true
+kino-server.workspace = true
+kino-ui = { path = "../ui" }
+anyhow.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+dioxus = { version = "0.7", default-features = false, features = ["macro", "html", "signals", "hooks"] }
+dioxus-ssr = "0.7"

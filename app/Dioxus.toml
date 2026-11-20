@@ -1,0 +1,14 @@
+[application]
+name = "kino"
+default_platform = "web"
+
+[web.app]
+title = "Орловский кинопоказ"
+
+[web.resource]
+style = []
+# Telegram Mini App bridge. Harmless in a normal browser.
+script = ["https://telegram.org/js/telegram-web-app.js"]
+
+[web.resource.dev]
+script = []

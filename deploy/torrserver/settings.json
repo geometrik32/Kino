@@ -1,0 +1,29 @@
+{
+  "BitTorr": {
+    "CacheSize": 67108864,
+    "PreloadCache": 50,
+    "ReaderReadAHead": 95,
+    "UseDisk": false,
+    "RemoveCacheOnDrop": false,
+    "ForceEncrypt": false,
+    "RetrackersMode": 1,
+    "TorrentDisconnectTimeout": 30,
+    "EnableDebug": false,
+    "EnableDLNA": false,
+    "EnableRutorSearch": false,
+    "EnableTorznabSearch": false,
+    "EnableIPv6": false,
+    "DisableTCP": false,
+    "DisableUTP": false,
+    "DisableUPNP": false,
+    "DisableDHT": false,
+    "DisablePEX": false,
+    "DisableUpload": false,
+    "DownloadRateLimit": 0,
+    "UploadRateLimit": 0,
+    "ConnectionsLimit": 25,
+    "PeersListenPort": 32000,
+    "ResponsiveMode": true,
+    "EnableLPD": true
+  }
+}

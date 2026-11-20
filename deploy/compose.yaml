@@ -1,0 +1,128 @@
+# «Орловский кинопоказ» (кино «Орёл») on TrueNAS: a stack of its own, with every
+# module it needs. Nothing from the Lampa stack is shared or touched.
+# Put this folder next to the other compose projects
+# (e.g. /mnt/M2_Apps/arcane/projects/orel-kino), copy .env.example to .env,
+# fill it in, then `docker compose up -d`.
+#
+# HTTPS comes from the Traefik that already runs on the server (network "proxy").
+
+name: orel-kino
+
+services:
+  kino-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: kino
+      POSTGRES_DB: kino
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kino -d kino"]
+      interval: 10s
+      retries: 5
+    mem_limit: 256m
+    networks: [kino]
+
+  kino-server:
+    image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+    depends_on:
+      kino-db:
+        condition: service_healthy
+    # Re-encoding runs inside this container, so it gets more memory and the GPU.
+    mem_limit: 768m
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-107}"
+    volumes:
+      # Preloaded releases, the same folder qBittorrent downloads into.
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads:ro
+    networks: [kino, proxy]
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: proxy
+      traefik.http.routers.orel-kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
+      traefik.http.routers.orel-kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.orel-kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
+      traefik.http.services.orel-kino.loadbalancer.server.port: "8080"
+
+  kino-bot:
+    image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
+    command: ["kino-bot"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+    depends_on:
+      kino-server:
+        condition: service_started
+    mem_limit: 64m
+    networks: [kino]
+
+  # Our own TorrServer, separate from Lampa's: streams torrents while they download.
+  # Reachable only inside this stack.
+  torrserver:
+    image: ghcr.io/yourok/torrserver:MatriX.141.5
+    restart: unless-stopped
+    # Settings copied from the Lampa TorrServer (64 MB RAM cache, 25 connections),
+    # except a fixed peer port: put deploy/torrserver/settings.json into
+    # data/torrserver/config/ before the first start.
+    environment:
+      TS_PORT: "8090"
+      TS_DONTKILL: "1"
+      TS_CONF_PATH: /opt/ts/config
+      TS_TORR_DIR: /opt/ts/torrents
+    volumes:
+      - ./data/torrserver:/opt/ts
+    ports:
+      # BitTorrent peers.
+      - "32000:32000"
+      - "32000:32000/udp"
+    mem_limit: 512m
+    networks: [kino]
+
+  # Searches all trackers at once. Add trackers in its web UI (LAN only):
+  # http://<server>:9117, then copy the API key into .env.
+  jackett:
+    image: lscr.io/linuxserver/jackett:latest
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-568}"
+      PGID: "${PGID:-568}"
+      TZ: Europe/Moscow
+    volumes:
+      - ./data/jackett:/config
+    ports:
+      - "9117:9117"
+    mem_limit: 256m
+    networks: [kino]
+
+  # Downloads releases in advance ("Скачать заранее") to the HDD pool.
+  qbittorrent:
+    image: lscr.io/linuxserver/qbittorrent:latest
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-568}"
+      PGID: "${PGID:-568}"
+      TZ: Europe/Moscow
+      WEBUI_PORT: "8085"
+    volumes:
+      - ./data/qbittorrent:/config
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads
+    ports:
+      - "8085:8085"
+      - "6882:6882"
+      - "6882:6882/udp"
+    mem_limit: 384m
+    networks: [kino]
+
+networks:
+  kino: {}
+  proxy:
+    external: true
