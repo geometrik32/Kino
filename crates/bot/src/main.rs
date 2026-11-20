@@ -12,7 +12,7 @@ use kino_server::{
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use teloxide::{
     prelude::*,
-    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo},
+    types::{CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MenuButton, WebAppInfo},
     utils::command::BotCommands,
 };
 use tracing_subscriber::EnvFilter;
@@ -198,6 +198,16 @@ async fn main() -> anyhow::Result<()> {
     bot.set_my_commands(Command::bot_commands())
         .await
         .context("setting bot commands")?;
+    // The blue button next to the message field opens the app in every private chat.
+    bot.set_chat_menu_button()
+        .menu_button(MenuButton::WebApp {
+            text: "Кино".into(),
+            web_app: WebAppInfo {
+                url: public_url.clone(),
+            },
+        })
+        .await
+        .context("setting the menu button")?;
     tracing::info!(%bot_username, "bot started");
 
     let state = Arc::new(BotState {

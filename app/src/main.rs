@@ -4,6 +4,7 @@
 //! The screens live in `kino-ui`; this crate fetches data and handles clicks.
 
 mod api;
+mod native;
 mod player;
 mod telegram;
 
@@ -79,7 +80,7 @@ async fn establish() -> Session {
 fn App() -> Element {
     let mut session = use_signal(|| Session::Checking);
     use_effect(move || {
-        telegram::ready();
+        telegram::init();
         spawn(async move { session.set(establish().await) });
     });
 
@@ -192,7 +193,14 @@ enum View {
 
 #[component]
 fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
-    let mut view = use_signal(|| View::Tab(Tab::Home));
+    // A link to a title (from a bot message) opens it, with Home behind it.
+    let link = use_hook(telegram::open_target);
+    let mut view = use_signal(|| match link {
+        Some((kind, id)) => View::Title(kind, id),
+        None => View::Tab(Tab::Home),
+    });
+    // Where "Back" goes from a title page.
+    let mut trail = use_signal(|| link.map(|_| vec![View::Tab(Tab::Home)]).unwrap_or_default());
     let mut query = use_signal(String::new);
     let initial = name
         .chars()
@@ -203,15 +211,34 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
         View::Tab(t) => Some(t),
         View::Title(..) => None,
     };
-    let open = move |t: TitleSummary| view.set(View::Title(t.kind, t.tmdb_id));
+    let mut open_title = move |kind: MediaKind, id: i64| {
+        trail.with_mut(|t| t.push(view()));
+        view.set(View::Title(kind, id));
+    };
+    let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id);
     rsx! {
+        if !trail().is_empty() {
+            native::BackButton {
+                on_back: move |_| {
+                    telegram::haptic(telegram::Haptic::Tap);
+                    if let Some(prev) = trail.with_mut(|t| t.pop()) {
+                        view.set(prev);
+                    }
+                },
+            }
+        }
         Shell {
             tab,
             query: query(),
             user_initial: initial,
-            on_tab: move |t| view.set(View::Tab(t)),
+            on_tab: move |t| {
+                telegram::haptic(telegram::Haptic::Tap);
+                trail.set(Vec::new());
+                view.set(View::Tab(t));
+            },
             on_query: move |q: String| {
                 query.set(q);
+                trail.set(Vec::new());
                 view.set(View::Tab(Tab::Search));
             },
             match view() {
@@ -222,7 +249,7 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
                     Profile {
                         token: token.clone(),
                         name: name.clone(),
-                        on_open: move |(k, id)| view.set(View::Title(k, id)),
+                        on_open: move |(k, id)| open_title(k, id),
                         on_logout,
                     }
                 },
@@ -462,7 +489,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
         move |s: i32| choices.iter().find(|c| c.season == s).cloned()
     };
     let latest = choices.first().cloned();
-    let (target, _) = play_target(&details, &progress);
+    let (target, play_label) = play_target(&details, &progress);
     let release_label = choice_for(season_key(&target)).map(|c| choice_label(&c));
     let watched: Vec<String> = progress
         .iter()
@@ -483,14 +510,17 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             picker.set(Some(t));
         }
     };
-    let on_play = {
+    let on_play = Callback::new({
         let choice_for = choice_for.clone();
         let mut open_picker = open_picker.clone();
-        move |t: PlayTarget| match choice_for(season_key(&t)) {
-            Some(c) => playing.set(Some((t, c))),
-            None => open_picker(t),
+        move |t: PlayTarget| {
+            telegram::haptic(telegram::Haptic::Tap);
+            match choice_for(season_key(&t)) {
+                Some(c) => playing.set(Some((t, c))),
+                None => open_picker(t),
+            }
         }
-    };
+    });
 
     let heading = picker().map(|p| {
         let mut h = details.summary.title.clone();
@@ -506,7 +536,19 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
     let chosen_hash = picker_season.and_then(&choice_for).map(|c| c.infohash);
     let summary = details.summary.clone();
     let t3 = token.clone();
+    let main_label = format!("▶ {play_label}");
+    let main_target = target.clone();
     rsx! {
+        // Inside Telegram: the native big button plays, the native Back closes what is open.
+        if playing().is_none() && picker().is_none() && notice().is_none() {
+            native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
+        }
+        if picker().is_some() {
+            native::BackButton { on_back: move |_| picker.set(None) }
+        }
+        if notice().is_some() {
+            native::BackButton { on_back: move |_| notice.set(None) }
+        }
         TitleView {
             details: details.clone(),
             season: season.read().clone().flatten(),
@@ -519,6 +561,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_status: {
                 let token = token.clone();
                 move |s: Option<TitleStatus>| {
+                    telegram::haptic(telegram::Haptic::Select);
                     status_now.set(Some(s));
                     let t = token.clone();
                     spawn(async move {
@@ -533,6 +576,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_rate: {
                 let token = token.clone();
                 move |r: Option<i16>| {
+                    telegram::haptic(telegram::Haptic::Select);
                     rating_now.set(Some(r));
                     let t = token.clone();
                     spawn(async move {
@@ -543,6 +587,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
             on_mark: {
                 let token = token.clone();
                 move |(season, episodes, watched): (i32, Vec<i32>, bool)| {
+                    telegram::haptic(telegram::Haptic::Select);
                     let t = token.clone();
                     let m = MarkWatched { kind, tmdb_id: id, season, episodes, watched };
                     spawn(async move {
@@ -614,6 +659,7 @@ fn Title(token: String, kind: MediaKind, id: i64) -> Element {
                         };
                         let t = t4.clone();
                         let name = summary.title.clone();
+                        telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
                             notice.set(Some(match api::add_preload(&t, &req).await {
                                 Ok(_) => format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки»."),
