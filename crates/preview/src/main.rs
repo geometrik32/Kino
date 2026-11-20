@@ -11,14 +11,15 @@ use std::path::PathBuf;
 use chrono::{Duration, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    ContinueItem, HistoryEntry, HomeFeed, MediaKind, MediaTrack, PreloadItem, PreloadState, Progress, ReleaseRef,
-    SearchResults, Season, StreamPhase, StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, UserPrefs,
+    ContinueItem, HistoryEntry, HomeFeed, MediaKind, MediaTrack, PersonDetails, PreloadItem, PreloadState, Progress,
+    ReleaseRef, SearchResults, Season, StreamPhase, StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus,
+    UserPrefs,
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, MyView, PickerPanel, PlayerEpisode, PlayerMenu, PlayerState, PlayerView,
-    ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView,
-    TitleView, STYLE,
+    mock_releases, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayerEpisode, PlayerMenu, PlayerState,
+    PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab,
+    TitleExtrasView, TitleView, STYLE,
 };
 
 #[derive(Clone, PartialEq)]
@@ -49,6 +50,7 @@ enum Screen {
         extras: Option<TitleExtras>,
     },
     Mine(Vec<TitleState>, Option<TitleStatus>),
+    Person(PersonDetails),
     Profile(Vec<HistoryEntry>, Vec<PreloadItem>, UserPrefs),
     Player(PlayerState),
     Login,
@@ -104,6 +106,7 @@ fn Page(props: PageProps) -> Element {
             rsx! { HomeView { feed, continue_items: cont, on_open: |_| {}, on_play: |_| {}, on_drop: |_| {} } }
         }
         Screen::Search(_, r) => rsx! { SearchView { results: Some(r), on_open: |_| {} } },
+        Screen::Person(person) => rsx! { PersonView { person, on_open: |_| {} } },
         Screen::Mine(items, filter) => rsx! { MyView { items, filter, on_filter: |_| {}, on_open: |_| {} } },
         Screen::Profile(history, preloads, prefs) => rsx! {
             ProfileView {
@@ -144,7 +147,7 @@ fn Page(props: PageProps) -> Element {
                 on_season: |_| {},
             }
             if let Some(extras) = extras {
-                TitleExtrasView { extras, on_open: |_| {} }
+                TitleExtrasView { extras, on_open: |_| {}, on_person: |_| {} }
             }
             if let Some(p) = picker {
                 ReleasePicker {
@@ -156,6 +159,7 @@ fn Page(props: PageProps) -> Element {
                     sort: p.sort,
                     panel: p.panel,
                     mock: p.mock,
+                    note: None,
                     on_filter: |_| {},
                     on_sort: |_| {},
                     on_panel: |_| {},
@@ -395,8 +399,13 @@ async fn main() -> anyhow::Result<()> {
     ];
     let prefs = UserPrefs {
         quality: Some("1080p".into()),
-        voice: Some("LostFilm".into()),
+        voice: None,
         subtitle_lang: None,
+        language: Some("Русский".into()),
+        codec: Some("H.264".into()),
+        min_seeders: Some(20),
+        sort: Some("bitrate".into()),
+        ..UserPrefs::default()
     };
 
     let bb_releases = mock_releases(&bb.summary, Some(2));
@@ -646,6 +655,11 @@ async fn main() -> anyhow::Result<()> {
                 subtitle_tracks: vec![],
                 ..player.clone()
             }),
+        ),
+        (
+            "person",
+            "Актёр",
+            Screen::Person(cat.person(bb_extras.cast[0].id).await?),
         ),
         ("mine", "Мои", Screen::Mine(mine, None)),
         ("profile", "Профиль", Screen::Profile(history, preloads, prefs)),

@@ -68,6 +68,26 @@ pub async fn expire_preloads(state: &AppState) -> anyhow::Result<usize> {
     Ok(due.len())
 }
 
+/// How long a release the indexer once listed is kept after it was last seen.
+const SOURCE_KEEP_DAYS: i32 = 30;
+
+/// Forgets releases (and their `.torrent` files) that were not listed for a month,
+/// unless someone still has them in progress, as their chosen release or as a
+/// download. Searching again brings back what is still on the trackers.
+pub async fn prune_sources(state: &AppState) -> anyhow::Result<u64> {
+    let done = sqlx::query(
+        "DELETE FROM torrent_source s
+         WHERE s.updated_at < now() - make_interval(days => $1)
+           AND NOT EXISTS (SELECT 1 FROM watch_progress p WHERE p.release_infohash IN (s.key, s.infohash))
+           AND NOT EXISTS (SELECT 1 FROM release_choice c WHERE c.infohash IN (s.key, s.infohash))
+           AND NOT EXISTS (SELECT 1 FROM preload l WHERE l.infohash IN (s.key, s.infohash))",
+    )
+    .bind(SOURCE_KEEP_DAYS)
+    .execute(&state.pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
 /// Deletes a release from the downloader unless another preload still uses it.
 pub async fn remove_files(state: &AppState, infohash: &str) {
     let Some(qbit) = &state.media.qbit else { return };
@@ -148,6 +168,11 @@ pub fn spawn(state: AppState, every: Duration) {
             tick.tick().await;
             if let Err(e) = expire_preloads(&state).await {
                 tracing::warn!(error = %e, "preload expiry failed");
+            }
+            match prune_sources(&state).await {
+                Ok(n) if n > 0 => tracing::info!(removed = n, "old releases forgotten"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "pruning old releases failed"),
             }
             since_check += Duration::from_secs(3600);
             if since_check >= every {

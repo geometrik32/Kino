@@ -266,30 +266,62 @@ pub async fn history(pool: &PgPool, user_id: i64, limit: i64) -> Result<Vec<Hist
 }
 
 pub async fn get_prefs(pool: &PgPool, user_id: i64) -> Result<UserPrefs, sqlx::Error> {
-    let row = sqlx::query("SELECT quality, voice, subtitle_lang FROM user_prefs WHERE user_id = $1")
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?;
+    let row = sqlx::query(
+        "SELECT quality, voice, subtitle_lang, language, hdr, dolby_vision, subtitles, codec, direct_play,
+                min_seeders, max_size_gb, sort
+         FROM user_prefs WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(match row {
-        Some(r) => UserPrefs {
-            quality: r.try_get("quality")?,
-            voice: r.try_get("voice")?,
-            subtitle_lang: r.try_get("subtitle_lang")?,
-        },
+        Some(r) => {
+            let count = |col: &str| -> Result<Option<u32>, sqlx::Error> {
+                Ok(r.try_get::<Option<i32>, _>(col)?.and_then(|n| u32::try_from(n).ok()))
+            };
+            UserPrefs {
+                quality: r.try_get("quality")?,
+                voice: r.try_get("voice")?,
+                subtitle_lang: r.try_get("subtitle_lang")?,
+                language: r.try_get("language")?,
+                hdr: r.try_get("hdr")?,
+                dolby_vision: r.try_get("dolby_vision")?,
+                subtitles: r.try_get("subtitles")?,
+                codec: r.try_get("codec")?,
+                direct_play: r.try_get("direct_play")?,
+                min_seeders: count("min_seeders")?,
+                max_size_gb: count("max_size_gb")?,
+                sort: r.try_get("sort")?,
+            }
+        }
         None => UserPrefs::default(),
     })
 }
 
 pub async fn set_prefs(pool: &PgPool, user_id: i64, p: &UserPrefs) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO user_prefs (user_id, quality, voice, subtitle_lang) VALUES ($1, $2, $3, $4)
+        "INSERT INTO user_prefs (user_id, quality, voice, subtitle_lang, language, hdr, dolby_vision, subtitles,
+                                 codec, direct_play, min_seeders, max_size_gb, sort)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
          ON CONFLICT (user_id) DO UPDATE SET
-           quality = EXCLUDED.quality, voice = EXCLUDED.voice, subtitle_lang = EXCLUDED.subtitle_lang",
+           quality = EXCLUDED.quality, voice = EXCLUDED.voice, subtitle_lang = EXCLUDED.subtitle_lang,
+           language = EXCLUDED.language, hdr = EXCLUDED.hdr, dolby_vision = EXCLUDED.dolby_vision,
+           subtitles = EXCLUDED.subtitles, codec = EXCLUDED.codec, direct_play = EXCLUDED.direct_play,
+           min_seeders = EXCLUDED.min_seeders, max_size_gb = EXCLUDED.max_size_gb, sort = EXCLUDED.sort",
     )
     .bind(user_id)
     .bind(p.quality.as_deref())
     .bind(p.voice.as_deref())
     .bind(p.subtitle_lang.as_deref())
+    .bind(p.language.as_deref())
+    .bind(p.hdr)
+    .bind(p.dolby_vision)
+    .bind(p.subtitles)
+    .bind(p.codec.as_deref())
+    .bind(p.direct_play)
+    .bind(p.min_seeders.map(|n| n.min(i32::MAX as u32) as i32))
+    .bind(p.max_size_gb.map(|n| n.min(i32::MAX as u32) as i32))
+    .bind(p.sort.as_deref())
     .execute(pool)
     .await?;
     Ok(())

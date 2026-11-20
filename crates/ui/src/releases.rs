@@ -3,7 +3,13 @@
 
 use dioxus::prelude::*;
 pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
-use kino_core::{format_bitrate, ReleaseChoiceUpdate};
+use kino_core::{format_bitrate, ReleaseChoiceUpdate, UserPrefs};
+
+/// Video codecs a release can name.
+pub const CODECS: [&str; 3] = ["H.264", "HEVC", "AV1"];
+/// Choices for "at least N seeders" and "at most N GB".
+pub const SEEDER_STEPS: [u32; 4] = [5, 20, 50, 100];
+pub const SIZE_STEPS: [u32; 5] = [5, 10, 20, 40, 80];
 
 /// Seeds below this count make streaming unreliable; offer preloading instead.
 pub const LOW_SEEDS: u32 = 5;
@@ -36,6 +42,14 @@ pub struct ReleaseFilter {
     pub season: Option<i32>,
     pub tracker: Option<String>,
     pub year: Option<i32>,
+    /// "H.264", "HEVC" or "AV1"; releases that do not say are left out.
+    pub codec: Option<String>,
+    /// Plays in the browser without re-encoding.
+    pub direct_play: Option<bool>,
+    /// At least this many seeders.
+    pub min_seeders: Option<u32>,
+    /// At most this many gigabytes.
+    pub max_size_gb: Option<u32>,
 }
 
 impl ReleaseFilter {
@@ -45,6 +59,49 @@ impl ReleaseFilter {
             quality: choice.quality.clone(),
             voice: choice.voice.clone(),
             ..Self::default()
+        }
+    }
+
+    /// The filters the user keeps in the profile.
+    pub fn from_prefs(p: &UserPrefs) -> Self {
+        Self {
+            quality: p.quality.clone(),
+            hdr: p.hdr,
+            dolby_vision: p.dolby_vision,
+            subtitles: p.subtitles,
+            language: p.language.clone(),
+            codec: p.codec.clone(),
+            direct_play: p.direct_play,
+            min_seeders: p.min_seeders.filter(|n| *n > 0),
+            max_size_gb: p.max_size_gb.filter(|n| *n > 0),
+            ..Self::default()
+        }
+    }
+
+    /// This filter, with what is unset taken from `other`.
+    pub fn or(self, other: Self) -> Self {
+        Self {
+            quality: self.quality.or(other.quality),
+            hdr: self.hdr.or(other.hdr),
+            dolby_vision: self.dolby_vision.or(other.dolby_vision),
+            subtitles: self.subtitles.or(other.subtitles),
+            voice: self.voice.or(other.voice),
+            language: self.language.or(other.language),
+            season: self.season.or(other.season),
+            tracker: self.tracker.or(other.tracker),
+            year: self.year.or(other.year),
+            codec: self.codec.or(other.codec),
+            direct_play: self.direct_play.or(other.direct_play),
+            min_seeders: self.min_seeders.or(other.min_seeders),
+            max_size_gb: self.max_size_gb.or(other.max_size_gb),
+        }
+    }
+
+    /// The same filter, narrowed to the season about to be watched.
+    pub fn for_season(self, season: i32) -> Self {
+        Self {
+            season: Some(season),
+            ..self
         }
     }
 
@@ -58,9 +115,14 @@ impl ReleaseFilter {
             && ok(&self.subtitles, &r.subtitles)
             && ok(&self.voice, &r.voice)
             && ok(&self.language, &r.language)
-            && self.season.is_none_or(|s| r.season == Some(s))
+            // A release with no single season is a pack of several (or the name does not say): it has the season too.
+            && self.season.is_none_or(|s| r.season.is_none_or(|have| have == s))
             && ok(&self.tracker, &r.tracker)
             && self.year.is_none_or(|y| r.year == Some(y))
+            && self.codec.as_ref().is_none_or(|c| r.codec.as_ref() == Some(c))
+            && ok(&self.direct_play, &r.direct_play)
+            && self.min_seeders.is_none_or(|n| r.seeders >= n)
+            && self.max_size_gb.is_none_or(|g| r.size_bytes <= u64::from(g) * 1_000_000_000)
     }
 
     pub fn active(&self) -> usize {
@@ -74,6 +136,10 @@ impl ReleaseFilter {
             self.season.is_some(),
             self.tracker.is_some(),
             self.year.is_some(),
+            self.codec.is_some(),
+            self.direct_play.is_some(),
+            self.min_seeders.is_some(),
+            self.max_size_gb.is_some(),
         ]
         .iter()
         .filter(|on| **on)
@@ -103,6 +169,24 @@ impl ReleaseSort {
         ReleaseSort::Date,
         ReleaseSort::Watched,
     ];
+
+    /// Name stored in the profile.
+    pub fn key(self) -> &'static str {
+        match self {
+            ReleaseSort::Seeders => "seeders",
+            ReleaseSort::Size => "size",
+            ReleaseSort::Bitrate => "bitrate",
+            ReleaseSort::Name => "name",
+            ReleaseSort::Source => "source",
+            ReleaseSort::Date => "date",
+            ReleaseSort::Watched => "watched",
+        }
+    }
+
+    /// The sorting named in the profile; the default one for anything unknown.
+    pub fn from_key(key: Option<&str>) -> Self {
+        Self::ALL.into_iter().find(|s| Some(s.key()) == key).unwrap_or_default()
+    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -161,6 +245,8 @@ pub fn ReleasePicker(
     panel: Option<PickerPanel>,
     /// Marks the list as sample data.
     mock: bool,
+    /// A line under the heading, e.g. that the default filters were relaxed.
+    note: Option<String>,
     on_filter: EventHandler<ReleaseFilter>,
     on_sort: EventHandler<ReleaseSort>,
     on_panel: EventHandler<Option<PickerPanel>>,
@@ -199,6 +285,7 @@ pub fn ReleasePicker(
                     if mock { span { class: "mock", "примеры" } }
                 }
                 div { class: "hint", "{heading}" }
+                if let Some(n) = &note { div { class: "hint note", "{n}" } }
                 div { class: "toolbar",
                     button {
                         class: if panel == Some(PickerPanel::Filter) || n_active > 0 { "chip active" } else { "chip" },
@@ -287,6 +374,17 @@ fn FilterPanel(releases: Vec<ReleaseOption>, filter: ReleaseFilter, on_filter: E
                     options: seasons.iter().map(|s| s.to_string()).collect::<Vec<_>>(), selected: f.season.map(|s| s.to_string()),
                     on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { season: v.and_then(|s| s.parse().ok()), ..f.clone() }) } }
             }
+            FilterRow { name: "Кодек", any: "Любой",
+                options: CODECS.map(String::from).to_vec(), selected: f.codec.clone(),
+                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { codec: v, ..f.clone() }) } }
+            YesNoRow { name: "Играет без перекодирования", value: f.direct_play,
+                on_select: { let f = f.clone(); move |v| set(ReleaseFilter { direct_play: v, ..f.clone() }) } }
+            FilterRow { name: "Раздающих", any: "Любое число",
+                options: SEEDER_STEPS.map(|n| format!("от {n}")).to_vec(), selected: f.min_seeders.map(|n| format!("от {n}")),
+                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { min_seeders: v.and_then(|s| s.trim_start_matches("от ").parse().ok()), ..f.clone() }) } }
+            FilterRow { name: "Размер", any: "Любой",
+                options: SIZE_STEPS.map(|n| format!("до {n} ГБ")).to_vec(), selected: f.max_size_gb.map(|n| format!("до {n} ГБ")),
+                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { max_size_gb: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" ГБ").parse().ok()), ..f.clone() }) } }
             FilterRow { name: "Трекер", any: "Любой",
                 options: trackers, selected: f.tracker.clone(),
                 on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { tracker: v, ..f.clone() }) } }
@@ -459,6 +557,49 @@ mod tests {
             ..Default::default()
         }
         .matches(&all[9]));
+        // A season filter keeps that season and packs, and drops other seasons.
+        let s2 = ReleaseFilter::default().for_season(2);
+        assert!(all.iter().filter(|r| r.season == Some(2)).all(|r| s2.matches(r)));
+        assert!(!all.iter().filter(|r| r.season == Some(3)).any(|r| s2.matches(r)));
+        let mut pack = all[0].clone();
+        pack.season = None;
+        assert!(s2.matches(&pack));
+        // Defaults from the profile become filters; what the user already picked wins over them.
+        let prefs = UserPrefs {
+            language: Some("Русский".into()),
+            codec: Some("H.264".into()),
+            min_seeders: Some(50),
+            max_size_gb: Some(30),
+            hdr: Some(false),
+            ..UserPrefs::default()
+        };
+        let d = ReleaseFilter::from_prefs(&prefs);
+        assert_eq!(d.active(), 5);
+        let fit: Vec<_> = all.iter().filter(|r| d.matches(r)).collect();
+        assert!(!fit.is_empty());
+        assert!(fit.iter().all(|r| r.language == "Русский"
+            && r.codec.as_deref() == Some("H.264")
+            && r.seeders >= 50
+            && r.size_bytes <= 30_000_000_000
+            && !r.hdr));
+        let mine = ReleaseFilter {
+            quality: Some("720p".into()),
+            ..Default::default()
+        }
+        .or(ReleaseFilter::from_prefs(&UserPrefs {
+            quality: Some("2160p".into()),
+            language: Some("Русский".into()),
+            ..UserPrefs::default()
+        }));
+        assert_eq!(
+            (mine.quality.as_deref(), mine.language.as_deref()),
+            (Some("720p"), Some("Русский"))
+        );
+        assert_eq!(ReleaseSort::from_key(Some("bitrate")), ReleaseSort::Bitrate);
+        assert_eq!(ReleaseSort::from_key(Some("nonsense")), ReleaseSort::Seeders);
+        assert!(ReleaseSort::ALL
+            .iter()
+            .all(|s| ReleaseSort::from_key(Some(s.key())) == *s));
         assert_eq!(human_size(28_400_000_000), "28.4 ГБ");
         assert_eq!(ru_short_date("2024-03-08"), "08.03.24");
     }

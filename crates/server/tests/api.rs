@@ -320,6 +320,17 @@ async fn catalog_browse_and_continue_has_titles(pool: PgPool) {
             .collect();
         assert!(!ids.contains(&json!(1396)), "{row}: {ids:?}");
     }
+    // An actor from the cast opens with a filmography.
+    let actor = extras["cast"][0]["id"].as_i64().unwrap();
+    let (status, person) = call(&app, Method::GET, &format!("/api/person/{actor}"), Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(person["name"], extras["cast"][0]["name"]);
+    assert_eq!(person["credits"][0]["tmdb_id"], 1396, "their own title first");
+    let (status, _) = call(&app, Method::GET, "/api/person/1", Some(&u.token), None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(&app, Method::GET, &format!("/api/person/{actor}"), None, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
     let (status, _) = call(&app, Method::GET, "/api/catalog/tv/1396/extras", None, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, _) = call(

@@ -54,6 +54,11 @@ fn torrent() -> Vec<u8> {
 /// Jackett: the fixture feed with links pointing back at itself, the
 /// `.torrent` behind one link and a redirect to a magnet behind another.
 async fn start_jackett() -> String {
+    start_jackett_counted(Arc::new(AtomicU32::new(0))).await
+}
+
+/// The same, counting every search it is asked for.
+async fn start_jackett_counted(hits: Arc<AtomicU32>) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let feed = include_str!("fixtures/torznab.xml").replace("http://jackett:9117", &base);
@@ -62,6 +67,7 @@ async fn start_jackett() -> String {
             "/api/v2.0/indexers/all/results/torznab/api",
             get(move |Query(q): Query<Vec<(String, String)>>| async move {
                 assert!(q.iter().any(|(k, v)| k == "apikey" && v == "secret"));
+                hits.fetch_add(1, Ordering::SeqCst);
                 feed
             }),
         )
@@ -506,4 +512,88 @@ async fn transcodes_with_ffmpeg(pool: PgPool) {
     assert_eq!(code, StatusCode::OK);
     let vtt = String::from_utf8(vtt).unwrap();
     assert!(vtt.starts_with("WEBVTT") && vtt.contains("Привет"), "{vtt}");
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn release_search_is_started_early_and_remembered(pool: PgPool) {
+    let hits = Arc::new(AtomicU32::new(0));
+    let jackett = start_jackett_counted(hits.clone()).await;
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            ..Default::default()
+        },
+    ));
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+
+    // Opening the title page starts the search by itself (a Russian and an original-name query).
+    let (code, _) = call(&app, Method::GET, "/api/catalog/tv/1396", Some(&t), None).await;
+    assert_eq!(code, StatusCode::OK);
+    for _ in 0..50 {
+        if hits.load(Ordering::SeqCst) >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+    // The list is then served from memory, however often it is asked for.
+    for season in 1..=3 {
+        let (code, body) = call(
+            &app,
+            Method::GET,
+            &format!("/api/releases/tv/1396?season={season}"),
+            Some(&t),
+            None,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let list: ReleaseList = serde_json::from_value(body).unwrap();
+        assert_eq!(list.releases.len(), 3);
+    }
+    call(&app, Method::GET, "/api/catalog/tv/1396", Some(&t), None).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 2, "no second search for the same title");
+
+    // Another title is searched on its own.
+    call(&app, Method::GET, "/api/releases/movie/603", Some(&t), None).await;
+    assert_eq!(hits.load(Ordering::SeqCst), 4);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn old_releases_are_forgotten_unless_in_use(pool: PgPool) {
+    let state = test_state(pool.clone());
+    let (free, chosen, fresh) = ("a".repeat(40), "b".repeat(40), "c".repeat(40));
+    for key in [&free, &chosen, &fresh] {
+        sqlx::query("INSERT INTO torrent_source (key, title, infohash, torrent) VALUES ($1, 't', $1, '\\x00')")
+            .bind(key)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE torrent_source SET updated_at = now() - interval '40 days' WHERE key <> $1")
+        .bind(&fresh)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = app(state.clone());
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/release-choice",
+        Some(&t),
+        Some(json!({ "kind": "movie", "tmdb_id": 603, "infohash": chosen })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+
+    assert_eq!(jobs::prune_sources(&state).await.unwrap(), 1);
+    let left: Vec<String> = sqlx::query_scalar("SELECT key FROM torrent_source ORDER BY key")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(left, [chosen, fresh]);
 }

@@ -5,6 +5,7 @@ pub mod bencode;
 pub mod ffmpeg;
 pub mod files;
 pub mod qbit;
+pub mod search_cache;
 pub mod title;
 pub mod token;
 pub mod torrserver;
@@ -160,6 +161,24 @@ pub async fn search(jackett: &Jackett, details: &TitleDetails) -> Result<Vec<Tor
     let mut items: Vec<_> = seen.into_values().collect();
     items.sort_by_key(|it| std::cmp::Reverse(it.seeders));
     Ok(items)
+}
+
+/// Searches for the title unless that was done recently; the search also records
+/// where each release can be downloaded from. Several callers at once share one search.
+pub async fn search_cached(
+    cache: &search_cache::SearchCache,
+    pool: &PgPool,
+    jackett: &Jackett,
+    details: &TitleDetails,
+) -> Result<std::sync::Arc<Vec<TorznabItem>>, TorrentError> {
+    let key = (details.summary.kind, details.summary.tmdb_id);
+    cache
+        .get_or_search(key, || async {
+            let items = search(jackett, details).await?;
+            save_sources(pool, &items).await?;
+            Ok(std::sync::Arc::new(items))
+        })
+        .await
 }
 
 /// Remembers where each release can be downloaded from.
