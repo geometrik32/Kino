@@ -2,12 +2,12 @@
 
 use gloo_net::http::{Request, Response};
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PlayInfo, PlayRequest,
-    PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
-    WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
+    MarkWatched, Me, MediaKind, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate,
+    RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate, TitleDetails,
+    TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
-use serde::{de::DeserializeOwned, Deserialize};
+use serde::de::DeserializeOwned;
 
 const TOKEN_KEY: &str = "kino.token";
 
@@ -72,21 +72,6 @@ async fn get<T: DeserializeOwned>(path: &str, token: &str) -> Result<T, Failure>
     decode(resp).await
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PublicConfig {
-    pub bot_username: Option<String>,
-}
-
-pub async fn public_config() -> Result<PublicConfig, Failure> {
-    decode(
-        Request::get("/api/public-config")
-            .send()
-            .await
-            .map_err(Failure::network)?,
-    )
-    .await
-}
-
 pub async fn login_webapp(init_data: String, invite: Option<String>) -> Result<AuthResponse, Failure> {
     let req = Request::post("/api/auth/webapp")
         .json(&WebAppAuthRequest { init_data, invite })
@@ -97,6 +82,24 @@ pub async fn login_webapp(init_data: String, invite: Option<String>) -> Result<A
 pub async fn login_widget(req: WidgetAuthRequest) -> Result<AuthResponse, Failure> {
     let req = Request::post("/api/auth/widget").json(&req).map_err(Failure::network)?;
     decode(req.send().await.map_err(Failure::network)?).await
+}
+
+/// Starts logging in through the Telegram app.
+pub async fn start_login_link(invite: Option<String>) -> Result<LoginLink, Failure> {
+    let req = Request::post("/api/auth/link")
+        .json(&LoginLinkRequest { invite })
+        .map_err(Failure::network)?;
+    decode(req.send().await.map_err(Failure::network)?).await
+}
+
+pub async fn poll_login_link(token: &str) -> Result<LoginLinkStatus, Failure> {
+    decode(
+        Request::get(&format!("/api/auth/link/{token}"))
+            .send()
+            .await
+            .map_err(Failure::network)?,
+    )
+    .await
 }
 
 pub async fn me(token: &str) -> Result<Me, Failure> {

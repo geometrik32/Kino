@@ -10,10 +10,10 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, MarkWatched, Me, MediaKind, PreloadItem, PreloadRequest,
-    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role, SearchResults, Season,
-    StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest,
-    WidgetAuthRequest,
+    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me,
+    MediaKind, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
+    Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleState, TitleStatus, TracksUpdate, UserPrefs,
+    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/public-config", get(public_config))
         .route("/auth/webapp", post(auth_webapp))
         .route("/auth/widget", post(auth_widget))
+        .route("/auth/link", post(start_login_link))
+        .route("/auth/link/{token}", get(poll_login_link))
         .route("/me", get(me))
         .route("/continue", get(continue_watching))
         .route("/progress", put(save_progress))
@@ -133,6 +135,41 @@ async fn auth_widget(
     let tg =
         telegram_auth::verify_widget(&req.fields, &cfg.bot_token, Utc::now(), cfg.auth_max_age).map_err(auth_failed)?;
     finish_login(&state, tg, req.invite).await
+}
+
+/// Starts logging in through the Telegram app: the site opens `url`, the user
+/// presses the button in the bot, and the site's poll gets the session.
+async fn start_login_link(
+    State(state): State<AppState>,
+    Json(req): Json<LoginLinkRequest>,
+) -> Result<Json<LoginLink>, AppError> {
+    let Some(bot) = &state.config.bot_username else {
+        return Err(AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_bot",
+            "Вход через Telegram не настроен: не указан BOT_USERNAME.",
+        ));
+    };
+    let token = db::create_login_link(&state.pool, req.invite.as_deref()).await?;
+    let url = format!("https://t.me/{bot}?start={}{token}", db::LOGIN_PREFIX);
+    Ok(Json(LoginLink { token, url }))
+}
+
+async fn poll_login_link(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> Result<Json<LoginLinkStatus>, AppError> {
+    if token.len() > 64 || !token.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Ok(Json(LoginLinkStatus::Expired));
+    }
+    match db::take_login_link(&state.pool, &token).await? {
+        db::LoginLinkState::Pending => Ok(Json(LoginLinkStatus::Pending)),
+        db::LoginLinkState::Expired => Ok(Json(LoginLinkStatus::Expired)),
+        db::LoginLinkState::Confirmed(tg, invite) => {
+            let Json(auth) = finish_login(&state, tg, invite).await?;
+            Ok(Json(LoginLinkStatus::Done { auth }))
+        }
+    }
 }
 
 async fn load_me(state: &AppState, user: &CurrentUser) -> Result<Me, AppError> {

@@ -22,6 +22,18 @@ const IMAGES: &str = "https://image.tmdb.org/t/p";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 const ALLOWED_SIZES: [&str; 5] = ["w185", "w300", "w342", "w780", "w1280"];
 
+/// A network error without the request URL, which carries the API key.
+fn net_error(e: reqwest::Error) -> CatalogError {
+    let mut causes = String::new();
+    let mut source = std::error::Error::source(&e);
+    while let Some(s) = source {
+        causes.push_str(": ");
+        causes.push_str(&s.to_string());
+        source = s.source();
+    }
+    CatalogError::Upstream(format!("{}{causes}", e.without_url()))
+}
+
 pub struct TmdbCatalog {
     http: reqwest::Client,
     /// v3 API key or v4 read access token (starts with `eyJ`).
@@ -31,18 +43,15 @@ pub struct TmdbCatalog {
 }
 
 impl TmdbCatalog {
-    pub fn new(key: String, language: String) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .user_agent("kino-server")
-            .build()
-            .expect("reqwest client builds");
-        Self {
+    /// `proxy`, when given, carries all TMDB traffic (API and images).
+    pub fn new(key: String, language: String, proxy: Option<&str>) -> anyhow::Result<Self> {
+        let http = crate::config::http_client(proxy, Duration::from_secs(15))?;
+        Ok(Self {
             http,
             key,
             language,
             cache: Mutex::default(),
-        }
+        })
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, CatalogError> {
@@ -61,14 +70,14 @@ impl TmdbCatalog {
         } else {
             req.query(&[("api_key", &self.key)])
         };
-        let resp = req.send().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let resp = req.send().await.map_err(net_error)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(CatalogError::NotFound);
         }
         if !resp.status().is_success() {
             return Err(CatalogError::Upstream(format!("TMDB answered {}", resp.status())));
         }
-        let value: serde_json::Value = resp.json().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let value: serde_json::Value = resp.json().await.map_err(net_error)?;
         let parsed = serde_json::from_value(value.clone()).map_err(|e| CatalogError::Upstream(e.to_string()))?;
         self.cache
             .lock()
@@ -293,7 +302,7 @@ impl Catalog for TmdbCatalog {
             .get(format!("{IMAGES}/{size}/{file}"))
             .send()
             .await
-            .map_err(|e| CatalogError::Upstream(e.to_string()))?;
+            .map_err(net_error)?;
         if !resp.status().is_success() {
             return Err(CatalogError::NotFound);
         }
@@ -303,7 +312,7 @@ impl Catalog for TmdbCatalog {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("image/jpeg")
             .to_owned();
-        let bytes = resp.bytes().await.map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(net_error)?;
         Ok((bytes.to_vec(), ctype))
     }
 }

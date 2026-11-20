@@ -34,6 +34,8 @@ pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfi
         bot_username: Some("kino_test_bot".into()),
         public_url: "https://kino.example.com".into(),
         tmdb_api_key: None,
+        telegram_proxy: None,
+        tmdb_proxy: None,
         tmdb_language: "ru-RU".into(),
         static_dir: None,
         notify_every: std::time::Duration::from_secs(3600),
