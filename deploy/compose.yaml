@@ -47,10 +47,10 @@ services:
     labels:
       traefik.enable: "true"
       traefik.docker.network: proxy
-      traefik.http.routers.kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
-      traefik.http.routers.kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
-      traefik.http.routers.kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
-      traefik.http.services.kino.loadbalancer.server.port: "8080"
+      traefik.http.routers.orel-kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
+      traefik.http.routers.orel-kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.orel-kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
+      traefik.http.services.orel-kino.loadbalancer.server.port: "8080"
 
   kino-bot:
     image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
