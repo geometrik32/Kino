@@ -70,7 +70,8 @@ pub fn now() -> (chrono::DateTime<chrono::Utc>, i32) {
     )
 }
 
-/// Full screen on or off.
+/// Full screen on or off (the desktop player window has its own).
+#[cfg_attr(feature = "desktop", allow(dead_code))]
 pub fn toggle_fullscreen() {
     let _ = eval(
         "if (document.fullscreenElement) { document.exitFullscreen(); } \

@@ -1,6 +1,9 @@
 //! Drives the `<video>` of [`PlayerView`]: starts playback on the server,
 //! seeks, switches tracks, saves the position and moves to the next episode.
 
+// On desktop the player lives in `mpv_player.rs`; what is left here is shared.
+#![cfg_attr(feature = "desktop", allow(unused_imports, dead_code))]
+
 use dioxus::prelude::*;
 use kino_core::{
     episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
@@ -26,11 +29,11 @@ pub struct PlayStart {
 }
 
 /// How often the position is saved while playing, seconds of video.
-const SAVE_EVERY: f64 = 10.0;
+pub(crate) const SAVE_EVERY: f64 = 10.0;
 
 pub use crate::platform::device_name;
 
-fn release_label(r: &ReleaseChoiceUpdate) -> String {
+pub(crate) fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
         (Some(v), Some(q)) => format!("{v} · {q}"),
         _ => r.title.clone().unwrap_or_default(),
@@ -48,6 +51,7 @@ impl Drop for FullscreenGuard {
     }
 }
 
+#[cfg(not(feature = "desktop"))]
 #[component]
 pub fn Player(
     token: String,

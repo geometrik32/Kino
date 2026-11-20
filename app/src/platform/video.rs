@@ -132,4 +132,5 @@ mod imp {
     }
 }
 
+#[cfg_attr(feature = "desktop", allow(unused_imports))]
 pub use imp::{use_bridge, video};

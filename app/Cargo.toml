@@ -10,7 +10,7 @@ publish.workspace = true
 # One crate, three kinds of builds. `dx` picks the feature of its platform.
 default = ["web"]
 web = ["dioxus/web"]
-desktop = ["dioxus/desktop"]
+desktop = ["dioxus/desktop", "dep:kino-mpv", "dep:tokio", "dep:dirs"]
 mobile = ["dioxus/mobile"]
 
 [dependencies]
@@ -22,6 +22,10 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "std"
 dioxus = { version = "0.7", features = ["router"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 urlencoding = "2"
+# Desktop only: the native player (libmpv is loaded at run time) and the window.
+kino-mpv = { path = "../crates/mpv", optional = true }
+tokio = { version = "1", features = ["sync"], optional = true }
+dirs = { version = "6", optional = true }
 
 # In the browser (WebAssembly).
 [target.'cfg(target_arch = "wasm32")'.dependencies]
@@ -36,3 +40,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

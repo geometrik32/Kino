@@ -16,6 +16,8 @@ pub use native::*;
 
 #[cfg(target_os = "android")]
 mod android;
+// The desktop app plays through libmpv and does not use the <video> bridge.
+#[cfg_attr(feature = "desktop", allow(dead_code))]
 pub mod video;
 
 /// Absolute URL of a server path such as `/api/me`.

@@ -4,12 +4,18 @@
 //! The screens live in `kino-ui`; this crate fetches data and handles clicks.
 
 mod api;
+#[cfg(feature = "desktop")]
+mod mpv_player;
 mod native;
 mod platform;
 mod player;
 mod telegram;
 
-use player::{PlayStart, Player};
+#[cfg(feature = "desktop")]
+use mpv_player::Player;
+use player::PlayStart;
+#[cfg(not(feature = "desktop"))]
+use player::Player;
 
 use dioxus::prelude::*;
 use kino_core::{
@@ -31,16 +37,36 @@ fn main() {
             if (m) { m.content += ', viewport-fit=cover'; }
         </script>"#;
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
-        use dioxus::desktop::Config;
+        let config = desktop_config(HEAD);
         #[cfg(feature = "mobile")]
-        use dioxus::mobile::Config;
-        dioxus::LaunchBuilder::new()
-            .with_cfg(Config::new().with_custom_head(HEAD.to_owned()))
-            .launch(App);
+        let config = dioxus::mobile::Config::new().with_custom_head(HEAD.to_owned());
+        dioxus::LaunchBuilder::new().with_cfg(config).launch(App);
     }
 
     #[cfg(not(any(feature = "mobile", feature = "desktop")))]
     dioxus::launch(App);
+}
+
+/// The window of the Windows (and other desktop) app.
+#[cfg(all(feature = "desktop", not(feature = "mobile")))]
+fn desktop_config(head: &str) -> dioxus::desktop::Config {
+    use dioxus::desktop::{tao::window::Icon, Config, LogicalSize, WindowBuilder};
+    // 64x64 RGBA pixels; the icon of the .exe itself is `desktop/assets/icon.ico`.
+    let icon = Icon::from_rgba(include_bytes!("../../desktop/assets/icon-64.rgba").to_vec(), 64, 64).ok();
+    let window = WindowBuilder::new()
+        .with_title("Орловский кинопоказ")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_min_inner_size(LogicalSize::new(480.0, 600.0))
+        .with_window_icon(icon);
+    let mut config = Config::new()
+        .with_window(window)
+        .with_menu(None)
+        .with_custom_head(head.to_owned());
+    // The WebView keeps the saved sign-in (localStorage) here, whatever folder the app is installed in.
+    if let Some(dir) = dirs::config_dir() {
+        config = config.with_data_directory(dir.join("Orel Kino").join("webview"));
+    }
+    config
 }
 
 #[derive(Clone, PartialEq)]
