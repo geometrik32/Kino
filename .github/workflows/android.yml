@@ -36,22 +36,23 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: android-actions/setup-android@v3
-
       - name: Configure Android SDK & NDK
         shell: bash
         run: |
-          SDK_MANAGER="$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")"
+          ANDROID_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_ROOT" >> "$GITHUB_ENV"
+          SDK_MANAGER="$(command -v sdkmanager || echo "$ANDROID_ROOT/cmdline-tools/latest/bin/sdkmanager")"
           yes | "$SDK_MANAGER" --licenses > /dev/null || true
           "$SDK_MANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
           NDK_PATH="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}"
           if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
-            NDK_PATH="$(ls -d "$ANDROID_HOME"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
+            NDK_PATH="$(ls -d "$ANDROID_ROOT"/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)"
           fi
           if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
             "$SDK_MANAGER" "ndk;27.2.12479018"
-            NDK_PATH="$ANDROID_HOME/ndk/27.2.12479018"
+            NDK_PATH="$ANDROID_ROOT/ndk/27.2.12479018"
           fi
           echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
