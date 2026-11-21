@@ -31,11 +31,16 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+      IMAGE_CACHE_DIR: /var/cache/kino-img
+      JACKETT_WAKE_URL: http://sablier:10000
+      JACKETT_WAKE_GROUP: jackett
+      JACKETT_WAKE_DURATION: 10m
+      MAX_TRANSCODES: "${MAX_TRANSCODES:-2}"
     depends_on:
       kino-db:
         condition: service_healthy
-    # Re-encoding runs inside this container, so it gets more memory and the GPU.
-    mem_limit: 768m
+    # Compact cache + up to 2 concurrent transcodes fit comfortably in 640m.
+    mem_limit: 640m
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -43,6 +48,8 @@ services:
     volumes:
       # Preloaded releases, the same folder qBittorrent downloads into.
       - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads:ro
+      # Disk cache for TMDB posters/backdrops (keeps image cache out of RAM).
+      - ./data/image-cache:/var/cache/kino-img
     networks: [kino, proxy, vpn]
     labels:
       traefik.enable: "true"
@@ -50,15 +57,23 @@ services:
       traefik.http.routers.orel-kino.rule: Host(`${KINO_HOST:?set KINO_HOST in .env}`)
       traefik.http.routers.orel-kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
       traefik.http.routers.orel-kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
+      traefik.http.routers.orel-kino.middlewares: orel-kino-compress
+      traefik.http.middlewares.orel-kino-compress.compress: "true"
       traefik.http.services.orel-kino.loadbalancer.server.port: "8080"
 
   kino-bot:
     image: ghcr.io/geometrik32/kino:${KINO_VERSION:-latest}
     command: ["kino-bot"]
     restart: unless-stopped
-    env_file: .env
     environment:
       DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
+      BOT_TOKEN: "${BOT_TOKEN:?set BOT_TOKEN in .env}"
+      PUBLIC_URL: "${PUBLIC_URL:?set PUBLIC_URL in .env}"
+      ADMIN_TELEGRAM_IDS: "${ADMIN_TELEGRAM_IDS:-}"
+      TMDB_API_KEY: "${TMDB_API_KEY:-}"
+      TMDB_LANGUAGE: "${TMDB_LANGUAGE:-ru-RU}"
+      TMDB_PROXY: "${TMDB_PROXY:-}"
+      TELEGRAM_PROXY: "${TELEGRAM_PROXY:-}"
     depends_on:
       kino-server:
         condition: service_started
@@ -66,32 +81,45 @@ services:
     networks: [kino, vpn]
 
   # Our own TorrServer, separate from Lampa's: streams torrents while they download.
-  # Reachable only inside this stack.
+  # Reachable only inside this stack; stream cache lives on the HDD pool to save RAM.
   torrserver:
     image: ghcr.io/yourok/torrserver:MatriX.141.5
     restart: unless-stopped
-    # Settings copied from the Lampa TorrServer (64 MB RAM cache, 25 connections),
-    # except a fixed peer port: put deploy/torrserver/settings.json into
-    # data/torrserver/config/ before the first start.
+    # Put deploy/torrserver/settings.json into data/torrserver/config/ before starting.
     environment:
       TS_PORT: "8090"
       TS_DONTKILL: "1"
       TS_CONF_PATH: /opt/ts/config
       TS_TORR_DIR: /opt/ts/torrents
+      GOMEMLIMIT: "192MiB"
     volumes:
       - ./data/torrserver:/opt/ts
+      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}/torrserver-cache:/opt/ts/cache
     ports:
       # BitTorrent peers.
       - "32000:32000"
       - "32000:32000/udp"
-    mem_limit: 512m
+    mem_limit: 256m
     networks: [kino]
 
-  # Searches all trackers at once. Add trackers in its web UI (LAN only):
-  # http://<server>:9117, then copy the API key into .env.
+  # Wakes Jackett on demand when someone browses for a new title, and stops it after 10m idle.
+  # Isolated to the internal network; kino-server never gets direct Docker socket access.
+  sablier:
+    image: sablierapp/sablier:1.21.1
+    restart: unless-stopped
+    command:
+      - start
+      - --provider.name=docker
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    mem_limit: 32m
+    networks: [kino]
+
+  # Searches trackers on demand; sleeps at 0 MB RAM when idle (managed by sablier).
+  # Web UI (LAN only, when awake): http://<server>:9117
   jackett:
     image: lscr.io/linuxserver/jackett:latest
-    restart: unless-stopped
+    restart: "no"
     environment:
       PUID: "${PUID:-568}"
       PGID: "${PGID:-568}"
@@ -100,8 +128,16 @@ services:
       - ./data/jackett:/config
     ports:
       - "9117:9117"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf --max-time 3 -o /dev/null http://127.0.0.1:9117/UI/Login || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    labels:
+      sablier.enable: "true"
+      sablier.group: "jackett"
     mem_limit: 256m
-    networks: [kino]
+    networks: [kino, vpn]
 
   # Downloads releases in advance ("Скачать заранее") to the HDD pool.
   qbittorrent:

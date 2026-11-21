@@ -201,6 +201,11 @@ impl Drop for PopGuard {
     }
 }
 
+/// True while handling a browser `popstate` event (`window.history` already stepped back).
+pub fn in_popstate() -> bool {
+    IN_POPSTATE.with(|p| p.get())
+}
+
 /// Hooks `window.history` (`popstate`) to the app's back stack in regular browsers.
 /// Inside Telegram Mini App, Telegram's native `BackButton` owns navigation.
 pub fn init_history(has_initial_trail: bool, initial_url: Option<&str>) {

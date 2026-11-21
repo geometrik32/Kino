@@ -94,22 +94,69 @@ pub fn open_external(url: &str) {
 
 #[cfg(target_os = "android")]
 fn open_url(url: &str) -> Result<(), String> {
+    if !super::is_safe_external_url(url) {
+        return Err("disallowed URL scheme".into());
+    }
     super::android::open_url(url)
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "windows")]
 fn open_url(url: &str) -> Result<(), String> {
-    // Windows and macOS have a shell opener; Linux uses xdg-open.
-    let (cmd, args): (&str, Vec<&str>) = if cfg!(target_os = "windows") {
-        ("cmd", vec!["/C", "start", "", url])
-    } else if cfg!(target_os = "macos") {
-        ("open", vec![url])
-    } else {
-        ("xdg-open", vec![url])
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+
+    if !super::is_safe_external_url(url) {
+        return Err("disallowed URL scheme".into());
+    }
+
+    // Call ShellExecuteW directly so cmd.exe never parses shell metacharacters (&, |, ^, %).
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut std::ffi::c_void,
+            lp_operation: *const u16,
+            lp_file: *const u16,
+            lp_parameters: *const u16,
+            lp_directory: *const u16,
+            n_show_cmd: i32,
+        ) -> isize;
+    }
+
+    let wide = |s: &str| -> Vec<u16> { OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect() };
+    let op = wide("open");
+    let file = wide(url);
+    const SW_SHOWNORMAL: i32 = 1;
+    // SAFETY: `op` and `file` are valid NUL-terminated UTF-16 buffers alive for the duration of the call.
+    let rc = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            op.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
     };
-    std::process::Command::new(cmd)
-        .args(args)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    if rc > 32 {
+        Ok(())
+    } else {
+        Err(format!("ShellExecuteW failed with code {rc}"))
+    }
+}
+
+#[cfg(all(not(target_os = "android"), not(target_os = "windows")))]
+fn open_url(url: &str) -> Result<(), String> {
+    if !super::is_safe_external_url(url) {
+        return Err("disallowed URL scheme".into());
+    }
+    let mut cmd = if cfg!(target_os = "macos") {
+        let mut c = std::process::Command::new("open");
+        c.arg("--").arg(url);
+        c
+    } else {
+        let mut c = std::process::Command::new("xdg-open");
+        c.arg(url);
+        c
+    };
+    cmd.spawn().map(|_| ()).map_err(|e| e.to_string())
 }

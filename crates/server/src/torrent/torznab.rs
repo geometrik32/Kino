@@ -1,5 +1,10 @@
 //! Jackett's Torznab API: search all configured trackers at once.
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use chrono::DateTime;
 
 /// One search result as Jackett returns it.
@@ -22,11 +27,88 @@ pub struct TorznabItem {
 #[derive(Debug, thiserror::Error)]
 pub enum TorznabError {
     #[error("indexer is unreachable: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(String),
     #[error("indexer answered with an error: {0}")]
     Api(String),
     #[error("indexer answer is not valid XML: {0}")]
     Xml(#[from] roxmltree::Error),
+}
+
+impl From<reqwest::Error> for TorznabError {
+    fn from(e: reqwest::Error) -> Self {
+        // Strip the URL so `apikey` never ends up in logs.
+        Self::Http(e.without_url().to_string())
+    }
+}
+
+/// Optional Sablier wake handle for starting a sleeping Jackett container on demand.
+#[derive(Clone)]
+pub struct JackettWake {
+    http: reqwest::Client,
+    url: String,
+    group: String,
+    duration: String,
+    last_bg_wake: Arc<AtomicU64>,
+}
+
+impl JackettWake {
+    pub fn new(http: reqwest::Client, base_url: &str, group: String, duration: String) -> Self {
+        Self {
+            http,
+            url: format!("{}/api/strategies/blocking", base_url.trim_end_matches('/')),
+            group,
+            duration,
+            last_bg_wake: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Triggers a non-blocking wake request at most once per minute.
+    pub fn wake_background(&self) {
+        let now = Self::now_secs();
+        let prev = self.last_bg_wake.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) < 60 {
+            return;
+        }
+        if self
+            .last_bg_wake
+            .compare_exchange(prev, now, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        let wake = self.clone();
+        tokio::spawn(async move {
+            wake.ensure_ready().await;
+        });
+    }
+
+    /// Ensures the Jackett container is running and healthy before sending a request.
+    pub async fn ensure_ready(&self) {
+        let res = self
+            .http
+            .get(&self.url)
+            .query(&[
+                ("group", self.group.as_str()),
+                ("session_duration", self.duration.as_str()),
+            ])
+            .timeout(std::time::Duration::from_secs(45))
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => {
+                self.last_bg_wake.store(Self::now_secs(), Ordering::Relaxed);
+            }
+            Ok(r) => tracing::warn!(status = %r.status(), "Sablier wake returned non-success"),
+            Err(e) => tracing::warn!(error = %e.without_url(), "Sablier wake request failed"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -34,6 +116,7 @@ pub struct Jackett {
     http: reqwest::Client,
     base: String,
     api_key: String,
+    wake: Option<JackettWake>,
 }
 
 /// Torznab categories: movies (2000) and TV (5000) with sub-categories, plus
@@ -48,10 +131,33 @@ impl Jackett {
             http,
             base: base.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
+            wake: None,
         }
     }
 
+    pub fn with_wake(mut self, wake: JackettWake) -> Self {
+        self.wake = Some(wake);
+        self
+    }
+
+    pub fn wake_in_background(&self) {
+        if let Some(w) = &self.wake {
+            w.wake_background();
+        }
+    }
+
+    pub async fn ensure_ready(&self) {
+        if let Some(w) = &self.wake {
+            w.ensure_ready().await;
+        }
+    }
+
+    pub fn owns_link(&self, link: &str) -> bool {
+        link.starts_with(&self.base)
+    }
+
     pub async fn search(&self, query: &str, cats: &str) -> Result<Vec<TorznabItem>, TorznabError> {
+        self.ensure_ready().await;
         let url = format!("{}/api/v2.0/indexers/all/results/torznab/api", self.base);
         let body = self
             .http

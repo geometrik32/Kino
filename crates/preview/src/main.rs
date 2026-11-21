@@ -87,6 +87,7 @@ fn Page(props: PageProps) -> Element {
                     on_audio: |_| {},
                     on_subtitle: |_| {},
                     on_next: |_| {},
+                    on_scale: |_| {},
                     on_fullscreen: |_| {},
                     on_close: |_| {},
                     on_tap: |_| {},
@@ -358,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
             rating,
             audio_track: None,
             subtitle_track: None,
+            video_scale: None,
             updated_at: Utc::now(),
             title: title_of(k, id).await,
         });
@@ -523,6 +525,7 @@ async fn main() -> anyhow::Result<()> {
         preloaded: false,
         controls: true,
         rate: 1.0,
+        scale: kino_ui::VideoScale::FitWidth,
         volume: 0.78,
         muted: false,
         show_volume: true,
@@ -551,6 +554,7 @@ async fn main() -> anyhow::Result<()> {
         sync_members: Vec::new(),
         sync_waiting_for: Vec::new(),
         sync_client_id: String::new(),
+        sync_sound_client_id: None,
     };
     let filtered = ReleaseFilter {
         quality: Some("2160p".into()),
@@ -619,6 +623,31 @@ async fn main() -> anyhow::Result<()> {
                 menu: Some(PlayerMenu::Speed),
                 rate: 1.25,
                 paused: false,
+                ..player.clone()
+            }),
+        ),
+        (
+            "player-sync",
+            "Плеер · синхронизация",
+            Screen::Player(PlayerState {
+                menu: Some(PlayerMenu::Sync),
+                paused: false,
+                sync_client_id: "pc-1".into(),
+                sync_sound_client_id: Some("pc-1".into()),
+                sync_members: vec![
+                    kino_core::SyncMemberInfo {
+                        client_id: "pc-1".into(),
+                        device: "ПК · Chrome".into(),
+                        ready: true,
+                        buffering: false,
+                    },
+                    kino_core::SyncMemberInfo {
+                        client_id: "phone-2".into(),
+                        device: "Телефон · Android".into(),
+                        ready: true,
+                        buffering: false,
+                    },
+                ],
                 ..player.clone()
             }),
         ),

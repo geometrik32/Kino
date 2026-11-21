@@ -71,6 +71,7 @@ pub enum SyncEventKind {
     Episode,
     Release,
     Audio,
+    Sound,
     Buffering,
     Resumed,
     Members,
@@ -102,6 +103,9 @@ pub struct SyncState {
     /// Label of the selected audio track, when known.
     #[serde(default)]
     pub audio_track: Option<String>,
+    /// `client_id` of the member currently outputting playback sound.
+    #[serde(default)]
+    pub sound_client_id: Option<String>,
     /// Server unix epoch milliseconds when `position_sec` was computed.
     pub server_now_ms: i64,
     /// Client that originated this update (`None` for server barrier/disconnect events).
@@ -152,6 +156,10 @@ pub enum SyncClientMsg {
     Audio {
         audio_track: Option<String>,
         position_sec: f64,
+    },
+    /// Assigns playback sound output to `client_id` (all other devices stay muted).
+    Sound {
+        client_id: String,
     },
     /// Periodic heartbeat & drift report while playing.
     Report {

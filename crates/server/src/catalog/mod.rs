@@ -29,8 +29,24 @@ pub fn from_settings(
     language: &str,
     proxy: Option<&str>,
 ) -> anyhow::Result<std::sync::Arc<dyn Catalog>> {
+    from_settings_with_image_cache(api_key, language, proxy, None)
+}
+
+/// Same as [`from_settings`], optionally attaching a bounded disk cache for TMDB images.
+pub fn from_settings_with_image_cache(
+    api_key: Option<&str>,
+    language: &str,
+    proxy: Option<&str>,
+    image_cache: Option<(std::path::PathBuf, u64)>,
+) -> anyhow::Result<std::sync::Arc<dyn Catalog>> {
     Ok(match api_key {
-        Some(key) => std::sync::Arc::new(TmdbCatalog::new(key.to_owned(), language.to_owned(), proxy)?),
+        Some(key) => {
+            let mut cat = TmdbCatalog::new(key.to_owned(), language.to_owned(), proxy)?;
+            if let Some((dir, max_mb)) = image_cache {
+                cat = cat.with_image_cache(dir, max_mb * 1024 * 1024);
+            }
+            std::sync::Arc::new(cat)
+        }
         None => {
             tracing::warn!("TMDB_API_KEY is not set: using the built-in demo catalog");
             std::sync::Arc::new(DemoCatalog)
@@ -188,7 +204,7 @@ pub(crate) fn yo_query_variants(query: &str) -> Vec<String> {
         candidate.push(replacement);
         candidate.push_str(&trimmed[byte_idx + ch.len_utf8()..]);
         push_unique(&mut variants, trimmed, candidate);
-        if variants.len() > MAX_YO_POSITIONS {
+        if variants.len() >= MAX_YO_POSITIONS {
             break;
         }
     }
@@ -207,7 +223,11 @@ pub(crate) fn anchor_word_query(query: &str) -> Option<String> {
     }
     words
         .into_iter()
-        .filter(|w| w.chars().count() >= 3 && !w.contains(['е', 'Е', 'ё', 'Ё']))
+        .filter(|w| {
+            w.chars().count() >= 3
+                && !w.contains(['е', 'Е', 'ё', 'Ё'])
+                && !(w.len() == 4 && w.bytes().all(|b| b.is_ascii_digit()))
+        })
         .max_by_key(|w| w.chars().count())
         .map(str::to_owned)
 }

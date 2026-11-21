@@ -61,11 +61,27 @@ where
 /// else keeps the same release.
 pub async fn expire_preloads(state: &AppState) -> anyhow::Result<usize> {
     let due = userdata::preloads_due(&state.pool).await?;
+    let mut removed = 0usize;
     for (id, infohash) in &due {
+        if let Some(qbit) = &state.media.qbit {
+            match userdata::preload_in_use_except(&state.pool, infohash, *id).await {
+                Ok(false) => {
+                    if let Err(e) = qbit.delete(infohash).await {
+                        tracing::warn!(error = %e, infohash, "could not delete expired preloaded files; will retry");
+                        continue;
+                    }
+                }
+                Ok(true) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "preload lookup failed");
+                    continue;
+                }
+            }
+        }
         userdata::preload_mark_deleted(&state.pool, *id).await?;
-        remove_files(state, infohash).await;
+        removed += 1;
     }
-    Ok(due.len())
+    Ok(removed)
 }
 
 /// How long a release the indexer once listed is kept after it was last seen.
@@ -125,20 +141,23 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
 /// Sends a message through the Telegram Bot API, with a button that opens `open_url` as a Mini App.
 pub async fn telegram_send(
     client: &reqwest::Client,
+    api_base: &str,
     token: &str,
     chat_id: i64,
     text: String,
     open_url: String,
 ) -> anyhow::Result<()> {
+    let base = api_base.trim_end_matches('/');
     let resp = client
-        .post(format!("https://api.telegram.org/bot{token}/sendMessage"))
+        .post(format!("{base}/bot{token}/sendMessage"))
         .json(&serde_json::json!({
             "chat_id": chat_id,
             "text": text,
             "reply_markup": { "inline_keyboard": [[{ "text": "Смотреть", "web_app": { "url": open_url } }]] },
         }))
         .send()
-        .await?;
+        .await
+        .map_err(|e| anyhow::anyhow!("Telegram request failed: {}", e.without_url()))?;
     anyhow::ensure!(resp.status().is_success(), "Telegram answered {}", resp.status());
     Ok(())
 }
@@ -151,6 +170,13 @@ pub fn spawn(state: AppState, every: Duration) {
             reqwest::Client::new()
         });
     let token = Arc::new(state.config.bot_token.clone());
+    let api_base = Arc::new(
+        state
+            .config
+            .telegram_api_url
+            .clone()
+            .unwrap_or_else(|| "https://api.telegram.org".into()),
+    );
     let sync_state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(30));
@@ -178,8 +204,8 @@ pub fn spawn(state: AppState, every: Duration) {
             if since_check >= every {
                 since_check = Duration::ZERO;
                 let send = |chat, text, open_url| {
-                    let (client, token) = (client.clone(), token.clone());
-                    async move { telegram_send(&client, &token, chat, text, open_url).await }
+                    let (client, api_base, token) = (client.clone(), api_base.clone(), token.clone());
+                    async move { telegram_send(&client, &api_base, &token, chat, text, open_url).await }
                 };
                 match check_new_episodes(&state, send).await {
                     Ok(n) if n > 0 => tracing::info!(sent = n, "new-episode notifications"),

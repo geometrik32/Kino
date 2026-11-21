@@ -8,12 +8,55 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok()?
 }
 
+/// Loads Telegram's Mini App SDK on demand only when launched inside Telegram,
+/// so regular browsers never block on `telegram.org`.
+async fn ensure_telegram_sdk() {
+    let js = r#"
+        if (window.Telegram && window.Telegram.WebApp && window.Telegram.WebApp.initData) {
+            return true;
+        }
+        var h = window.location.hash || '';
+        var s = window.location.search || '';
+        var cached = false;
+        try { cached = !!window.sessionStorage.getItem('__telegram__initParams'); } catch (e) {}
+        var inTg = cached
+            || h.indexOf('tgWebAppData=') !== -1
+            || h.indexOf('tgWebAppPlatform=') !== -1
+            || s.indexOf('tgWebAppData=') !== -1
+            || !!window.TelegramWebviewProxy
+            || !!window.TelegramGameProxy;
+        if (!inTg) return false;
+        return await new Promise(function(resolve) {
+            var done = false;
+            var finish = function(ok) { if (!done) { done = true; resolve(ok); } };
+            var existing = document.querySelector('script[data-kino-tg-sdk]');
+            if (existing) {
+                if (window.Telegram && window.Telegram.WebApp) { finish(true); return; }
+                existing.addEventListener('load', function() { finish(true); }, { once: true });
+                existing.addEventListener('error', function() { finish(false); }, { once: true });
+                setTimeout(function() { finish(false); }, 5000);
+                return;
+            }
+            var el = document.createElement('script');
+            el.src = 'https://telegram.org/js/telegram-web-app.js';
+            el.async = true;
+            el.setAttribute('data-kino-tg-sdk', '1');
+            el.onload = function() { finish(true); };
+            el.onerror = function() { finish(false); };
+            setTimeout(function() { finish(false); }, 5000);
+            document.head.appendChild(el);
+        });
+    "#;
+    let _ = dioxus::document::eval(js).join::<bool>().await;
+}
+
 /// Called once before the first screen.
 pub async fn init() {
     let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
     super::set_server_base(&origin);
+    ensure_telegram_sdk().await;
 }
 
 /// Web always talks to its own origin.
@@ -80,7 +123,10 @@ pub fn random_id() -> String {
 
 /// Opens a link outside the app.
 pub fn open_external(url: &str) {
+    if !super::is_safe_external_url(url) {
+        return;
+    }
     if let Some(w) = web_sys::window() {
-        let _ = w.open_with_url_and_target(url, "_blank");
+        let _ = w.open_with_url_and_target_and_features(url, "_blank", "noopener,noreferrer");
     }
 }

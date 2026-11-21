@@ -437,6 +437,31 @@ pub struct PlayInfo {
     pub native: bool,
 }
 
+/// Body of `POST /api/play/probe`: retries probing an active stream when
+/// metadata was not yet ready at playback start.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlayProbeRequest {
+    pub kind: crate::MediaKind,
+    pub tmdb_id: i64,
+    /// Stream path or full URL (`/api/stream/<token>`).
+    pub stream: String,
+    #[serde(default)]
+    pub native: bool,
+}
+
+/// Answer of `POST /api/play/probe`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PlayProbe {
+    /// Updated stream path when probing discovered e.g. copyable H.264 video.
+    pub stream: Option<String>,
+    pub direct: bool,
+    pub duration: Option<f64>,
+    pub audio: Vec<MediaTrack>,
+    pub subtitles: Vec<MediaTrack>,
+    pub audio_track: Option<i32>,
+    pub subtitle_track: Option<i32>,
+}
+
 impl PlayInfo {
     /// Whether the client can play the file as it is with this audio track.
     pub fn plays_directly(&self, audio: Option<i32>) -> bool {

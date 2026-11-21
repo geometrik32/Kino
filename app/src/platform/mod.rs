@@ -15,8 +15,38 @@ mod native;
 pub use native::*;
 
 #[cfg(target_os = "android")]
-mod android;
+pub(crate) mod android;
 pub mod video;
+
+/// Allows only `https://` or `tg://` external links without whitespace, control
+/// characters or shell/markup metacharacters.
+pub fn is_safe_external_url(url: &str) -> bool {
+    if url.len() > 2048 {
+        return false;
+    }
+    let rest = if let Some(r) = url.strip_prefix("https://") {
+        r
+    } else if let Some(r) = url.strip_prefix("tg://") {
+        r
+    } else {
+        return false;
+    };
+    if rest.is_empty() || rest.starts_with(['/', '@', '-', '.']) {
+        return false;
+    }
+    if !url
+        .bytes()
+        .all(|b| (0x21..=0x7e).contains(&b) && !matches!(b, b'"' | b'\'' | b'`' | b'\\' | b'<' | b'>'))
+    {
+        return false;
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    !authority.is_empty()
+        && !authority.contains('@')
+        && authority
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']'))
+}
 
 /// Absolute URL of a server path such as `/api/me`.
 pub fn abs(path: &str) -> String {
@@ -51,6 +81,15 @@ pub fn set_server_base(base: &str) {
 }
 
 /// Waits `ms` milliseconds without blocking the UI.
+/// Uses native Tokio timers on Desktop/Android (avoiding WebView IPC and background throttling)
+/// and `setTimeout` on WebAssembly.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(ms: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(u64::from(ms))).await;
+}
+
+/// Waits `ms` milliseconds without blocking the UI.
+#[cfg(target_arch = "wasm32")]
 pub async fn sleep(ms: u32) {
     let _ = dioxus::document::eval(&format!("await new Promise(r => setTimeout(r, {ms})); return 0;"))
         .join::<i32>()
@@ -166,5 +205,28 @@ pub fn player_mode(on: bool) {
              } catch (e) {}"
         };
         let _ = dioxus::document::eval(js);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_external_url;
+
+    #[test]
+    fn external_url_validation_allows_https_and_tg_only() {
+        assert!(is_safe_external_url(
+            "https://t.me/Orlovski_Kinopokaz_bot?start=login_abc123"
+        ));
+        assert!(is_safe_external_url(
+            "tg://resolve?domain=Orlovski_Kinopokaz_bot&start=login_abc123"
+        ));
+        assert!(!is_safe_external_url("http://t.me/bot"));
+        assert!(!is_safe_external_url("javascript:alert(1)"));
+        assert!(!is_safe_external_url("file:///etc/passwd"));
+        assert!(!is_safe_external_url("intent://scan/#Intent;end"));
+        assert!(!is_safe_external_url("https://t.me/bot?a=1 \"calc.exe\""));
+        assert!(!is_safe_external_url("https://t.me/bot\ncalc.exe"));
+        assert!(!is_safe_external_url("https://user@evil.example/"));
+        assert!(!is_safe_external_url("https:///etc/passwd"));
     }
 }

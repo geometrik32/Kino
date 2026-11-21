@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use dioxus::html::MountedData;
 use dioxus::prelude::*;
+pub use kino_core::VideoScale;
 use kino_core::{clock, MediaTrack, StreamProgress, SyncMemberInfo};
 
 use crate::icons::{self, Icon};
@@ -85,6 +86,8 @@ pub struct PlayerState {
     pub controls: bool,
     /// Playback speed.
     pub rate: f32,
+    /// Video scaling mode: fit width or fit height.
+    pub scale: VideoScale,
     /// Volume 0.0..=1.0 and mute flag (desktop).
     pub volume: f32,
     pub muted: bool,
@@ -106,6 +109,8 @@ pub struct PlayerState {
     pub sync_waiting_for: Vec<String>,
     /// Identifier of this client inside `sync_members`.
     pub sync_client_id: String,
+    /// Identifier of the device currently outputting playback sound in the sync room.
+    pub sync_sound_client_id: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -135,6 +140,7 @@ impl Default for PlayerState {
             preloaded: false,
             controls: false,
             rate: 1.0,
+            scale: VideoScale::default(),
             volume: 1.0,
             muted: false,
             show_volume: true,
@@ -147,7 +153,19 @@ impl Default for PlayerState {
             sync_members: Vec::new(),
             sync_waiting_for: Vec::new(),
             sync_client_id: String::new(),
+            sync_sound_client_id: None,
         }
+    }
+}
+
+impl PlayerState {
+    /// True when multiple devices are synchronized and another device owns audio output.
+    pub fn is_sync_muted(&self) -> bool {
+        self.sync_members.len() > 1
+            && self
+                .sync_sound_client_id
+                .as_deref()
+                .is_some_and(|cid| cid != self.sync_client_id)
     }
 }
 
@@ -181,6 +199,19 @@ pub fn ConnectProgress(progress: StreamProgress) -> Element {
     }
 }
 
+/// Whether player controls (bars, dock, center play) should be visible.
+pub fn controls_shown(locked: bool, state: &PlayerState, scrubbing: bool) -> bool {
+    !locked && (state.controls || state.menu.is_some() || scrubbing)
+}
+
+/// Filters zero-pixel synthetic `pointermove` events emitted on layout/cursor changes.
+pub fn pointer_moved(prev: Option<(f64, f64)>, next: (f64, f64)) -> bool {
+    match prev {
+        Some((lx, ly)) => (next.0 - lx).abs() >= 1.0 || (next.1 - ly).abs() >= 1.0,
+        None => true,
+    }
+}
+
 #[component]
 pub fn PlayerView(
     state: PlayerState,
@@ -191,8 +222,10 @@ pub fn PlayerView(
     on_audio: EventHandler<i32>,
     on_subtitle: EventHandler<Option<i32>>,
     on_next: EventHandler<()>,
+    on_scale: EventHandler<()>,
     on_fullscreen: EventHandler<()>,
     on_close: EventHandler<()>,
+    #[props(default)] on_title: Option<EventHandler<()>>,
     /// A tap on the picture: show or hide the controls.
     on_tap: EventHandler<()>,
     /// A double tap on the left (`false`) or right (`true`) half: jump 10 seconds.
@@ -207,13 +240,25 @@ pub fn PlayerView(
     #[props(default)] on_volume: Option<EventHandler<f32>>,
     #[props(default)] on_mute: Option<EventHandler<()>>,
     #[props(default)] on_unmute: Option<EventHandler<()>>,
+    #[props(default)] on_sync_sound: Option<EventHandler<String>>,
+    #[props(default)] on_activity: Option<EventHandler<()>>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
     let mut scrub = use_signal(|| None::<f64>);
     let mut track_el = use_signal(|| None::<Rc<MountedData>>);
     let mut drag_rect = use_signal(|| None::<(f64, f64)>);
+    let mut drag_gen = use_signal(|| 0u64);
+    let mut drag_active = use_signal(|| false);
+    let mut drag_end_y = use_signal(|| None::<f64>);
     let mut dismissed_next = use_signal(|| None::<String>);
+    let mut last_mouse = use_signal(|| None::<(f64, f64)>);
+    let mut tap_gen = use_signal(|| 0u64);
+    let ping_activity = move || {
+        if let Some(cb) = on_activity {
+            cb.call(());
+        }
+    };
 
     let s = state;
     let dur = s.duration.unwrap_or(0.0);
@@ -226,11 +271,26 @@ pub fn PlayerView(
     let near_end = dur > 0.0 && dur - pos < NEXT_PROMPT_SEC;
     let show_next = near_end && s.next.is_some() && dismissed_next().as_deref() != s.next.as_deref() && !locked();
     let sub_name = track_name(&s.subtitle_tracks, s.subtitle_track, "Выкл");
+    let sub_lang = s
+        .subtitle_track
+        .and_then(|idx| s.subtitle_tracks.iter().find(|t| t.index == idx))
+        .and_then(|t| t.language.as_deref())
+        .map(|l| match l {
+            "rus" | "ru" => "ru",
+            "eng" | "en" => "en",
+            "ukr" | "uk" => "uk",
+            "jpn" | "ja" => "ja",
+            other if other.len() == 2 => other,
+            _ => "ru",
+        })
+        .unwrap_or("ru");
     let audio_sub_open = matches!(s.menu, Some(PlayerMenu::Audio | PlayerMenu::Subtitles));
-    let shown = !locked() && (s.controls || s.paused || s.menu.is_some() || scrub().is_some());
+    let shown = controls_shown(locked(), &s, scrub().is_some());
     let busy = s.error.is_none() && (s.waiting || s.status.is_some());
     let rate = if s.rate > 0.0 { s.rate } else { 1.0 };
-    let vol_pct = if s.muted {
+    let sync_muted = s.is_sync_muted();
+    let effective_muted = s.muted || s.auto_muted || sync_muted;
+    let vol_pct = if effective_muted {
         0.0
     } else {
         (s.volume.clamp(0.0, 1.0)) * 100.0
@@ -245,15 +305,59 @@ pub fn PlayerView(
     };
 
     rsx! {
-        div { class: "{player_cls}",
+        div {
+            class: "{player_cls}",
+            onpointermove: move |e| {
+                if let Some((top, h)) = *drag_rect.peek() {
+                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                    scrub.set(Some(frac * dur.max(1.0)));
+                    ping_activity();
+                    return;
+                }
+                if e.data().pointer_type() == "mouse" {
+                    let p = e.client_coordinates();
+                    let next = (p.x, p.y);
+                    if pointer_moved(*last_mouse.peek(), next) {
+                        last_mouse.set(Some(next));
+                        ping_activity();
+                    }
+                }
+            },
+            onpointerup: move |e| {
+                if *drag_active.peek() {
+                    drag_active.set(false);
+                    if let Some((top, h)) = drag_rect.take() {
+                        let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                        let v = frac * dur.max(1.0);
+                        scrub.set(None);
+                        on_seek.call(v);
+                    } else {
+                        // `get_client_rect().await` is still resolving; finish the tap once it returns.
+                        drag_end_y.set(Some(e.client_coordinates().y));
+                    }
+                }
+            },
+            onpointercancel: move |_| {
+                if *drag_active.peek() || drag_rect.peek().is_some() {
+                    drag_gen.set(drag_gen() + 1);
+                    drag_active.set(false);
+                    drag_end_y.set(None);
+                    drag_rect.set(None);
+                    scrub.set(None);
+                }
+            },
+            onmouseleave: move |_| {
+                last_mouse.set(None);
+            },
             if s.native_video {
                 div { id: VIDEO_ID, class: "p-native-slot" }
             } else {
                 video {
                     id: VIDEO_ID,
                     src: if s.src.is_empty() { None } else { Some(s.src.clone()) },
-                    poster: s.poster.clone().unwrap_or_default(),
+                    poster: s.poster.clone(),
                     autoplay: s.autoplay,
+                    muted: effective_muted,
                     playsinline: true,
                     preload: "auto",
                     ontimeupdate: move |_| on_video.call("time"),
@@ -267,7 +371,14 @@ pub fn PlayerView(
                     onended: move |_| on_video.call("ended"),
                     onerror: move |_| on_video.call("error"),
                     if let Some(vtt) = &s.subtitles_src {
-                        track { kind: "subtitles", src: "{vtt}", srclang: "ru", label: "{sub_name}", default: true }
+                        track {
+                            key: "{vtt}",
+                            kind: "subtitles",
+                            src: "{vtt}",
+                            srclang: "{sub_lang}",
+                            label: "{sub_name}",
+                            default: true,
+                        }
                     }
                 }
             }
@@ -284,6 +395,7 @@ pub fn PlayerView(
                                 e.stop_propagation();
                                 locked.set(false);
                                 lock_hint.set(false);
+                                ping_activity();
                             },
                             Icon { svg: icons::UNLOCK, class: "ic sm" }
                             "Разблокировать экран"
@@ -291,17 +403,47 @@ pub fn PlayerView(
                     }
                 }
             } else {
-                // Taps on the picture: once shows/hides controls (touch) or toggles play (mouse), twice jumps 10s.
+                // Taps on the picture: debounce single tap vs double tap so jumping ±10s never fires pause+play first.
                 div { class: "p-zones",
                     div {
                         class: "p-zone",
-                        onclick: move |_| on_tap.call(()),
-                        ondoubleclick: move |_| on_double_tap.call(false),
+                        onclick: move |_| {
+                            let n = *tap_gen.peek() + 1;
+                            tap_gen.set(n);
+                            spawn(async move {
+                                let _ = dioxus::document::eval("await new Promise(r => setTimeout(r, 220)); return 0;")
+                                    .join::<i32>()
+                                    .await;
+                                if *tap_gen.peek() == n {
+                                    on_tap.call(());
+                                }
+                            });
+                        },
+                        ondoubleclick: move |_| {
+                            let next = *tap_gen.peek() + 1;
+                            tap_gen.set(next);
+                            on_double_tap.call(false);
+                        },
                     }
                     div {
                         class: "p-zone",
-                        onclick: move |_| on_tap.call(()),
-                        ondoubleclick: move |_| on_double_tap.call(true),
+                        onclick: move |_| {
+                            let n = *tap_gen.peek() + 1;
+                            tap_gen.set(n);
+                            spawn(async move {
+                                let _ = dioxus::document::eval("await new Promise(r => setTimeout(r, 220)); return 0;")
+                                    .join::<i32>()
+                                    .await;
+                                if *tap_gen.peek() == n {
+                                    on_tap.call(());
+                                }
+                            });
+                        },
+                        ondoubleclick: move |_| {
+                            let next = *tap_gen.peek() + 1;
+                            tap_gen.set(next);
+                            on_double_tap.call(true);
+                        },
                     }
                 }
 
@@ -311,11 +453,11 @@ pub fn PlayerView(
                     }
                 }
 
-                div { class: "p-top",
+                div { class: "p-top", onpointerdown: move |_| ping_activity(),
                     div { class: "p-top-l",
                         button {
                             class: "p-glass-btn icon",
-                            title: "К странице тайтла",
+                            title: "Назад",
                             "aria-label": "Назад",
                             onclick: move |_| on_close.call(()),
                             Icon { svg: icons::BACK, class: "ic" }
@@ -323,7 +465,13 @@ pub fn PlayerView(
                         button {
                             class: "p-title-link",
                             title: "Открыть страницу тайтла",
-                            onclick: move |_| on_close.call(()),
+                            onclick: move |_| {
+                                if let Some(cb) = on_title {
+                                    cb.call(());
+                                } else {
+                                    on_close.call(());
+                                }
+                            },
                             div { class: "p-title-t",
                                 span { "{s.title}" }
                                 Icon { svg: icons::CHEV_R, class: "ic sm muted" }
@@ -454,44 +602,58 @@ pub fn PlayerView(
                     }
                 }
 
-                div { class: "p-dock",
+                div { class: "p-dock", onpointerdown: move |_| ping_activity(),
                     div { class: "p-seek-row",
                         span { class: "p-time", "{clock(display_pos)}" }
                         div {
                             class: "p-track",
                             onmounted: move |e| track_el.set(Some(e.data())),
                             onpointerdown: move |e| {
+                                if dur <= 0.0 {
+                                    return;
+                                }
                                 let Some(el) = track_el() else { return };
                                 let cy = e.client_coordinates().y;
+                                let my_gen = *drag_gen.peek() + 1;
+                                drag_gen.set(my_gen);
+                                drag_active.set(true);
+                                drag_end_y.set(None);
+                                drag_rect.set(None);
+                                let seek_dur = dur;
                                 spawn(async move {
                                     if let Ok(rect) = el.get_client_rect().await {
+                                        if *drag_gen.peek() != my_gen {
+                                            return;
+                                        }
                                         if rect.height() > rect.width() && rect.height() > 1.0 {
                                             let top = rect.min_y();
                                             let h = rect.height();
-                                            drag_rect.set(Some((top, h)));
-                                            let frac = ((cy - top) / h).clamp(0.0, 1.0);
-                                            scrub.set(Some(frac * dur.max(1.0)));
+                                            if *drag_active.peek() {
+                                                drag_rect.set(Some((top, h)));
+                                                let frac = ((cy - top) / h).clamp(0.0, 1.0);
+                                                scrub.set(Some(frac * seek_dur));
+                                            } else if let Some(end_y) = drag_end_y.take() {
+                                                let frac = ((end_y - top) / h).clamp(0.0, 1.0);
+                                                scrub.set(None);
+                                                on_seek.call(frac * seek_dur);
+                                            }
+                                        } else {
+                                            let was_released = !*drag_active.peek();
+                                            drag_active.set(false);
+                                            drag_end_y.set(None);
+                                            if was_released {
+                                                scrub.set(None);
+                                            }
+                                        }
+                                    } else if *drag_gen.peek() == my_gen {
+                                        let was_released = !*drag_active.peek();
+                                        drag_active.set(false);
+                                        drag_end_y.set(None);
+                                        if was_released {
+                                            scrub.set(None);
                                         }
                                     }
                                 });
-                            },
-                            onpointermove: move |e| {
-                                if let Some((top, h)) = drag_rect() {
-                                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
-                                    scrub.set(Some(frac * dur.max(1.0)));
-                                }
-                            },
-                            onpointerup: move |e| {
-                                if let Some((top, h)) = drag_rect.take() {
-                                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
-                                    let v = frac * dur.max(1.0);
-                                    scrub.set(None);
-                                    on_seek.call(v);
-                                }
-                            },
-                            onpointercancel: move |_| {
-                                drag_rect.set(None);
-                                scrub.set(None);
                             },
                             div { class: "p-fill", style: "width: {pct:.2}%" }
                             if scrub().is_some() {
@@ -503,10 +665,12 @@ pub fn PlayerView(
                                 max: "{dur.max(1.0)}",
                                 step: "1",
                                 value: "{display_pos.floor()}",
+                                disabled: dur <= 0.0,
                                 "aria-label": "Перемотка",
                                 oninput: move |e| {
                                     if let Ok(v) = e.value().parse::<f64>() {
                                         scrub.set(Some(v));
+                                        ping_activity();
                                     }
                                 },
                                 onchange: move |e| {
@@ -514,6 +678,17 @@ pub fn PlayerView(
                                     if let Ok(v) = e.value().parse::<f64>() {
                                         on_seek.call(v);
                                     }
+                                },
+                                onpointerup: move |_| {
+                                    if drag_rect.peek().is_none() {
+                                        scrub.set(None);
+                                    }
+                                },
+                                onpointercancel: move |_| {
+                                    scrub.set(None);
+                                },
+                                onblur: move |_| {
+                                    scrub.set(None);
                                 },
                             }
                         }
@@ -545,14 +720,20 @@ pub fn PlayerView(
                             div { class: "p-vol desktop-only",
                                 button {
                                     class: "p-vol-btn",
-                                    title: if s.muted || s.volume <= 0.001 { "Включить звук" } else { "Выключить звук" },
+                                    title: if sync_muted {
+                                        "Звук на другом устройстве — нажмите, чтобы включить здесь"
+                                    } else if effective_muted || s.volume <= 0.001 {
+                                        "Включить звук"
+                                    } else {
+                                        "Выключить звук"
+                                    },
                                     "aria-label": "Громкость",
                                     onclick: move |_| {
                                         if let Some(cb) = on_mute {
                                             cb.call(());
                                         }
                                     },
-                                    Icon { svg: if s.muted || s.volume <= 0.001 { icons::VOL_MUTE } else { icons::VOL }, class: "ic sm" }
+                                    Icon { svg: if effective_muted || s.volume <= 0.001 { icons::VOL_MUTE } else { icons::VOL }, class: "ic sm" }
                                 }
                                 div { class: "p-vol-track",
                                     div { class: "p-vol-fill", style: "width: {vol_pct:.0}%" }
@@ -575,7 +756,9 @@ pub fn PlayerView(
                         div { class: "p-spacer" }
                         if !s.episodes.is_empty() {
                             button {
-                                class: if s.menu == Some(PlayerMenu::Episodes) { "p-glass-btn active" } else { "p-glass-btn" },
+                                class: if s.menu == Some(PlayerMenu::Episodes) { "p-glass-btn p-ep-btn active" } else { "p-glass-btn p-ep-btn" },
+                                title: "Список серий",
+                                "aria-label": "Серии",
                                 onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Episodes) { None } else { Some(PlayerMenu::Episodes) }),
                                 Icon { svg: icons::LIST, class: "ic sm" }
                                 span { class: "long", "Серии" }
@@ -597,6 +780,26 @@ pub fn PlayerView(
                             "{speed_label(rate)}"
                         }
                         button {
+                            class: "p-glass-btn p-scale-btn",
+                            title: if s.scale == VideoScale::FitWidth {
+                                "Масштаб: по ширине экрана (нажмите для «По высоте»)"
+                            } else {
+                                "Масштаб: по высоте экрана (нажмите для «По ширине»)"
+                            },
+                            "aria-label": if s.scale == VideoScale::FitWidth {
+                                "Масштаб: по ширине"
+                            } else {
+                                "Масштаб: по высоте"
+                            },
+                            onclick: move |_| on_scale.call(()),
+                            Icon {
+                                svg: if s.scale == VideoScale::FitWidth { icons::FIT_WIDTH } else { icons::FIT_HEIGHT },
+                                class: "ic sm"
+                            }
+                            span { class: "long", "{s.scale.label()}" }
+                            span { class: "short", "{s.scale.short_label()}" }
+                        }
+                        button {
                             class: "p-glass-btn icon p-fs-btn",
                             title: "Во весь экран",
                             "aria-label": "Во весь экран",
@@ -613,6 +816,7 @@ pub fn PlayerView(
                             PlayerMenu::Sync => "p-popover sync",
                             _ => "p-popover",
                         },
+                        onpointerdown: move |_| ping_activity(),
                         if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
                             div { class: "p-pop-tabs",
                                 button {
@@ -708,12 +912,14 @@ pub fn PlayerView(
                         } else if menu == PlayerMenu::Sync {
                             h4 { "Синхронизация · {s.sync_members.len()} устр." }
                             p { class: "muted small p-pop-note p-sync-note",
-                                "Воспроизведение, пауза, скорость и перемотка синхронизируются."
+                                "Воспроизведение, пауза, скорость и перемотка синхронизируются. Звук играет только на одном устройстве."
                             }
                             div { class: "p-sync-list",
                                 for m in s.sync_members.clone() {
                                     {
                                         let is_self = !s.sync_client_id.is_empty() && m.client_id == s.sync_client_id;
+                                        let has_sound = s.sync_sound_client_id.as_deref() == Some(m.client_id.as_str())
+                                            || (s.sync_sound_client_id.is_none() && is_self);
                                         let dev_lower = m.device.to_lowercase();
                                         let icon_svg = if dev_lower.contains("телефон")
                                             || dev_lower.contains("android")
@@ -735,18 +941,41 @@ pub fn PlayerView(
                                         } else {
                                             ("Смотрит", "p-sync-badge ok")
                                         };
+                                        let sound_label = if is_self { "Звук здесь" } else { "Звук там" };
+                                        let sound_title = if has_sound {
+                                            format!("Звук сейчас на устройстве «{}»", m.device)
+                                        } else if is_self {
+                                            "Переключить звук на это устройство".to_owned()
+                                        } else {
+                                            format!("Переключить звук на «{}»", m.device)
+                                        };
+                                        let target_cid = m.client_id.clone();
                                         rsx! {
                                             div {
                                                 key: "{m.client_id}",
                                                 class: if is_self { "p-sync-row self" } else { "p-sync-row" },
-                                                Icon { svg: icon_svg, class: "ic sm muted" }
-                                                div { class: "p-sync-meta",
-                                                    div { class: "p-sync-name", "{m.device}" }
-                                                    if is_self {
-                                                        div { class: "p-sync-sub", "Это устройство" }
+                                                div { class: "p-sync-head",
+                                                    Icon { svg: icon_svg, class: "ic sm muted" }
+                                                    div { class: "p-sync-meta",
+                                                        div { class: "p-sync-name", "{m.device}" }
+                                                        if is_self {
+                                                            div { class: "p-sync-sub", "Это устройство" }
+                                                        }
                                                     }
+                                                    span { class: "{status_cls}", "{status_txt}" }
                                                 }
-                                                span { class: "{status_cls}", "{status_txt}" }
+                                                button {
+                                                    class: if has_sound { "p-sync-sound on" } else { "p-sync-sound" },
+                                                    title: "{sound_title}",
+                                                    "aria-pressed": if has_sound { "true" } else { "false" },
+                                                    onclick: move |_| {
+                                                        if let Some(cb) = on_sync_sound {
+                                                            cb.call(target_cid.clone());
+                                                        }
+                                                    },
+                                                    Icon { svg: if has_sound { icons::VOL } else { icons::VOL_MUTE }, class: "ic xs" }
+                                                    span { "{sound_label}" }
+                                                }
                                             }
                                         }
                                     }
@@ -772,5 +1001,75 @@ pub fn PlayerView(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{controls_shown, pointer_moved, PlayerMenu, PlayerState, VideoScale};
+
+    #[test]
+    fn paused_hides_controls_when_inactive() {
+        let mut s = PlayerState {
+            paused: true,
+            controls: true,
+            ..PlayerState::default()
+        };
+        assert!(controls_shown(false, &s, false));
+
+        s.controls = false;
+        assert!(!controls_shown(false, &s, false));
+        assert!(controls_shown(false, &s, true));
+
+        s.menu = Some(PlayerMenu::Audio);
+        assert!(controls_shown(false, &s, false));
+        assert!(!controls_shown(true, &s, false));
+    }
+
+    #[test]
+    fn pointer_moved_ignores_subpixel_jitter() {
+        assert!(pointer_moved(None, (10.0, 20.0)));
+        assert!(!pointer_moved(Some((10.0, 20.0)), (10.4, 20.5)));
+        assert!(pointer_moved(Some((10.0, 20.0)), (11.1, 20.0)));
+    }
+
+    #[test]
+    fn video_scale_toggles_and_round_trips() {
+        assert_eq!(VideoScale::FitWidth.toggle(), VideoScale::FitHeight);
+        assert_eq!(VideoScale::FitHeight.toggle(), VideoScale::FitWidth);
+        for mode in [VideoScale::FitWidth, VideoScale::FitHeight] {
+            assert_eq!(VideoScale::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(VideoScale::parse("fill"), None);
+    }
+
+    #[test]
+    fn sync_muted_reflects_sound_owner() {
+        let member = |cid: &str| kino_core::SyncMemberInfo {
+            client_id: cid.into(),
+            device: cid.into(),
+            ready: true,
+            buffering: false,
+        };
+        let mut s = PlayerState {
+            sync_client_id: "a".into(),
+            sync_members: vec![member("a")],
+            sync_sound_client_id: Some("b".into()),
+            ..PlayerState::default()
+        };
+        // Solo playback is never sync-muted.
+        assert!(!s.is_sync_muted());
+
+        s.sync_members.push(member("b"));
+        // Two devices, sound belongs to "b" -> "a" is sync-muted.
+        assert!(s.is_sync_muted());
+
+        // Switching sound to "a" unmutes "a".
+        s.sync_sound_client_id = Some("a".into());
+        assert!(!s.is_sync_muted());
+
+        // Missing owner does not falsely mute.
+        s.sync_sound_client_id = None;
+        assert!(!s.is_sync_muted());
     }
 }

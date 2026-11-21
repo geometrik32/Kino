@@ -423,19 +423,21 @@ impl ImageSize {
     }
 }
 
-static ASSET_BASE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ASSET_BASE: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
 /// Where the server lives, for clients that are not served by it (the phone and
 /// desktop apps). The website leaves it unset and keeps using relative URLs.
-/// Set it once at startup, before the first screen is drawn.
+/// Can be updated at runtime if the user switches server URLs.
 pub fn set_asset_base(base: impl Into<String>) {
-    let _ = ASSET_BASE.set(base.into().trim_end_matches('/').to_owned());
+    let mut guard = ASSET_BASE.write().unwrap_or_else(|e| e.into_inner());
+    *guard = base.into().trim_end_matches('/').to_owned();
 }
 
 /// `path` (starting with `/`) as a URL the current client can load; full URLs pass through unchanged.
 pub fn asset_url(path: &str) -> String {
     if path.starts_with('/') {
-        format!("{}{}", ASSET_BASE.get().map(String::as_str).unwrap_or(""), path)
+        let base = ASSET_BASE.read().unwrap_or_else(|e| e.into_inner());
+        format!("{}{}", base.as_str(), path)
     } else {
         path.to_owned()
     }
@@ -512,6 +514,56 @@ impl TitleStatus {
     }
 }
 
+/// How the player fits the video frame to the screen (exactly 2 proportional modes).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VideoScale {
+    /// Width matches the screen width; height scales proportionally.
+    #[default]
+    #[serde(rename = "width")]
+    FitWidth,
+    /// Height matches the screen height; width scales proportionally.
+    #[serde(rename = "height")]
+    FitHeight,
+}
+
+impl VideoScale {
+    pub fn toggle(self) -> Self {
+        match self {
+            VideoScale::FitWidth => VideoScale::FitHeight,
+            VideoScale::FitHeight => VideoScale::FitWidth,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoScale::FitWidth => "По ширине",
+            VideoScale::FitHeight => "По высоте",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            VideoScale::FitWidth => "Ширина",
+            VideoScale::FitHeight => "Высота",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VideoScale::FitWidth => "width",
+            VideoScale::FitHeight => "height",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "width" => Some(VideoScale::FitWidth),
+            "height" => Some(VideoScale::FitHeight),
+            _ => None,
+        }
+    }
+}
+
 /// Everything the user has set or the server has derived for one title.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TitleState {
@@ -523,6 +575,9 @@ pub struct TitleState {
     /// Audio and subtitle tracks picked in the player, restored next time.
     pub audio_track: Option<String>,
     pub subtitle_track: Option<String>,
+    /// Remembered player scaling mode (`width` / `height`), restored next time.
+    #[serde(default)]
+    pub video_scale: Option<VideoScale>,
     pub updated_at: DateTime<Utc>,
     /// Name and poster, filled in by the server for lists.
     #[serde(default)]
@@ -546,6 +601,12 @@ pub struct RatingUpdate {
 pub struct TracksUpdate {
     pub audio_track: Option<String>,
     pub subtitle_track: Option<String>,
+}
+
+/// Body of `PUT /api/title/{kind}/{id}/scale`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleUpdate {
+    pub video_scale: Option<VideoScale>,
 }
 
 /// Body of `POST /api/marks`: mark episodes (or a film) watched or not,
@@ -703,5 +764,11 @@ mod catalog_tests {
         assert_eq!(clock(2472.5), "41:12");
         assert_eq!(clock(3723.0), "1:02:03");
         assert_eq!(image_url("/a.jpg", ImageSize::Poster), "/api/img/w342/a.jpg");
+        assert_eq!(VideoScale::FitWidth.toggle(), VideoScale::FitHeight);
+        assert_eq!(
+            VideoScale::parse(VideoScale::FitHeight.as_str()),
+            Some(VideoScale::FitHeight)
+        );
+        assert_eq!(VideoScale::parse("fill"), None);
     }
 }

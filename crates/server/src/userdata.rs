@@ -3,7 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use kino_core::{
-    HistoryEntry, MarkWatched, MediaKind, PreloadItem, PreloadRequest, PreloadState, TitleState, TitleStatus, UserPrefs,
+    HistoryEntry, MarkWatched, MediaKind, PreloadItem, PreloadRequest, PreloadState, TitleState, TitleStatus,
+    UserPrefs, VideoScale,
 };
 use sqlx::{postgres::PgRow, PgPool, Row};
 
@@ -18,10 +19,11 @@ fn kind_of(row: &PgRow) -> Result<MediaKind, sqlx::Error> {
     MediaKind::parse(&k).ok_or_else(|| decode_err("media_kind", &k))
 }
 
-const STATE_COLUMNS: &str = "media_kind, tmdb_id, status, rating, audio_track, subtitle_track, updated_at";
+const STATE_COLUMNS: &str = "media_kind, tmdb_id, status, rating, audio_track, subtitle_track, video_scale, updated_at";
 
 fn state_from_row(row: &PgRow) -> Result<TitleState, sqlx::Error> {
     let status: Option<String> = row.try_get("status")?;
+    let video_scale: Option<String> = row.try_get("video_scale")?;
     Ok(TitleState {
         kind: kind_of(row)?,
         tmdb_id: row.try_get("tmdb_id")?,
@@ -32,6 +34,10 @@ fn state_from_row(row: &PgRow) -> Result<TitleState, sqlx::Error> {
         rating: row.try_get("rating")?,
         audio_track: row.try_get("audio_track")?,
         subtitle_track: row.try_get("subtitle_track")?,
+        video_scale: match video_scale {
+            Some(s) => Some(VideoScale::parse(&s).ok_or_else(|| decode_err("video_scale", &s))?),
+            None => None,
+        },
         updated_at: row.try_get("updated_at")?,
         title: None,
     })
@@ -56,15 +62,16 @@ pub async fn get_state(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i6
             rating: None,
             audio_track: None,
             subtitle_track: None,
+            video_scale: None,
             updated_at: Utc::now(),
             title: None,
         }),
     }
 }
 
-/// Sets one column of a title's state, creating the row if needed.
-async fn set_column<T>(
-    pool: &PgPool,
+/// Sets columns of a title's state on an open connection, creating the row if needed.
+async fn set_column_on<T>(
+    conn: &mut sqlx::PgConnection,
     user_id: i64,
     kind: MediaKind,
     tmdb_id: i64,
@@ -81,7 +88,7 @@ where
     .bind(user_id)
     .bind(kind.as_str())
     .bind(tmdb_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await?;
     let row = sqlx::query(&format!(
         "UPDATE title_state SET {sets}, updated_at = now()
@@ -91,9 +98,25 @@ where
     .bind(kind.as_str())
     .bind(tmdb_id)
     .bind(bind)
-    .fetch_one(pool)
+    .fetch_one(conn)
     .await?;
     state_from_row(&row)
+}
+
+/// Sets one column of a title's state, creating the row if needed.
+async fn set_column<T>(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    sets: &str,
+    bind: T,
+) -> Result<TitleState, sqlx::Error>
+where
+    T: for<'q> sqlx::Encode<'q, sqlx::Postgres> + sqlx::Type<sqlx::Postgres> + Send,
+{
+    let mut conn = pool.acquire().await?;
+    set_column_on(&mut conn, user_id, kind, tmdb_id, sets, bind).await
 }
 
 pub async fn set_status(
@@ -114,14 +137,28 @@ pub async fn set_status(
     .await
 }
 
-pub async fn set_rating(
+/// Saves the user's rating; setting a rating (`Some`) marks the title `watched`
+/// and marks `targets` `(season, episode)` finished in one transaction.
+pub async fn rate_and_mark(
     pool: &PgPool,
     user_id: i64,
     kind: MediaKind,
     tmdb_id: i64,
     rating: Option<i16>,
+    targets: &[(i32, i32)],
 ) -> Result<TitleState, sqlx::Error> {
-    set_column(pool, user_id, kind, tmdb_id, "rating = $4", rating).await
+    let mut tx = pool.begin().await?;
+    let sets = if rating.is_some() {
+        "rating = $4, status = 'watched'"
+    } else {
+        "rating = $4"
+    };
+    let st = set_column_on(&mut tx, user_id, kind, tmdb_id, sets, rating).await?;
+    if rating.is_some() && !targets.is_empty() {
+        mark_many_tx(&mut tx, user_id, kind, tmdb_id, targets, true).await?;
+    }
+    tx.commit().await?;
+    Ok(st)
 }
 
 pub async fn set_tracks(
@@ -141,6 +178,24 @@ pub async fn set_tracks(
         tmdb_id,
         "audio_track = $4[1], subtitle_track = $4[2]",
         packed,
+    )
+    .await
+}
+
+pub async fn set_scale(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    scale: Option<VideoScale>,
+) -> Result<TitleState, sqlx::Error> {
+    set_column(
+        pool,
+        user_id,
+        kind,
+        tmdb_id,
+        "video_scale = $4",
+        scale.map(VideoScale::as_str),
     )
     .await
 }
@@ -214,6 +269,45 @@ pub async fn taste_signals(pool: &PgPool, user_id: i64) -> Result<Vec<UserTitleS
         .collect()
 }
 
+async fn mark_many_tx(
+    conn: &mut sqlx::PgConnection,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    targets: &[(i32, i32)],
+    watched: bool,
+) -> Result<(), sqlx::Error> {
+    let unique: std::collections::BTreeSet<(i32, i32)> = targets.iter().copied().collect();
+    if unique.is_empty() {
+        return Ok(());
+    }
+    let (seasons, episodes): (Vec<i32>, Vec<i32>) = unique.into_iter().unzip();
+    if watched {
+        sqlx::query(
+            "INSERT INTO watch_progress
+               (user_id, media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished)
+             SELECT $1, $2, $3, s, e, 0, 0, TRUE
+             FROM UNNEST($4::int[], $5::int[]) AS t(s, e)
+             ON CONFLICT (user_id, media_kind, tmdb_id, season, episode) DO UPDATE SET
+               finished = TRUE, position_sec = watch_progress.duration_sec, updated_at = now()",
+        )
+    } else {
+        sqlx::query(
+            "DELETE FROM watch_progress
+             WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3
+               AND (season, episode) IN (SELECT s, e FROM UNNEST($4::int[], $5::int[]) AS t(s, e))",
+        )
+    }
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(&seasons)
+    .bind(&episodes)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Marks episodes (or a film) watched, or clears them.
 pub async fn mark(pool: &PgPool, user_id: i64, m: &MarkWatched) -> Result<(), sqlx::Error> {
     let targets: Vec<(i32, i32)> = match m.kind {
@@ -221,29 +315,7 @@ pub async fn mark(pool: &PgPool, user_id: i64, m: &MarkWatched) -> Result<(), sq
         MediaKind::Tv => m.episodes.iter().map(|e| (m.season, *e)).collect(),
     };
     let mut tx = pool.begin().await?;
-    for (season, episode) in targets {
-        if m.watched {
-            sqlx::query(
-                "INSERT INTO watch_progress
-                   (user_id, media_kind, tmdb_id, season, episode, position_sec, duration_sec, finished)
-                 VALUES ($1, $2, $3, $4, $5, 0, 0, TRUE)
-                 ON CONFLICT (user_id, media_kind, tmdb_id, season, episode) DO UPDATE SET
-                   finished = TRUE, position_sec = watch_progress.duration_sec, updated_at = now()",
-            )
-        } else {
-            sqlx::query(
-                "DELETE FROM watch_progress
-                 WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND season = $4 AND episode = $5",
-            )
-        }
-        .bind(user_id)
-        .bind(m.kind.as_str())
-        .bind(m.tmdb_id)
-        .bind(season)
-        .bind(episode)
-        .execute(&mut *tx)
-        .await?;
-    }
+    mark_many_tx(&mut tx, user_id, m.kind, m.tmdb_id, &targets, m.watched).await?;
     tx.commit().await
 }
 
@@ -265,9 +337,13 @@ pub async fn refresh_status(
     let progress = db::title_progress(pool, user_id, kind, tmdb_id).await?;
     let done = match kind {
         MediaKind::Movie => progress.iter().any(|p| p.finished),
-        MediaKind::Tv => match catalog.details(kind, tmdb_id).await.ok().and_then(|d| d.last_episode) {
-            Some(last) => progress.iter().any(|p| p.finished && (p.season, p.episode) >= last),
-            None => false,
+        MediaKind::Tv => match catalog.details(kind, tmdb_id).await {
+            Ok(d) => match d.last_episode {
+                Some(last) => progress.iter().any(|p| p.finished && (p.season, p.episode) >= last),
+                None => current == Some(TitleStatus::Watched),
+            },
+            // Keep Watched status across transient TMDB errors.
+            Err(_) => current == Some(TitleStatus::Watched),
         },
     };
     let derived = if done {
@@ -511,6 +587,15 @@ pub async fn preload_progress(
 pub async fn preload_in_use(pool: &PgPool, infohash: &str) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND state <> 'deleted')")
         .bind(infohash)
+        .fetch_one(pool)
+        .await
+}
+
+/// Whether another preload row (besides `exclude_id`) still uses this release.
+pub async fn preload_in_use_except(pool: &PgPool, infohash: &str, exclude_id: i64) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND id <> $2 AND state <> 'deleted')")
+        .bind(infohash)
+        .bind(exclude_id)
         .fetch_one(pool)
         .await
 }

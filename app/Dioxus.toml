@@ -13,8 +13,8 @@ title = "Орловский кинопоказ"
 
 [web.resource]
 style = []
-# Telegram Mini App bridge. Harmless in a normal browser.
-script = ["https://telegram.org/js/telegram-web-app.js"]
+# Telegram Mini App SDK is loaded dynamically on web only when Telegram launch params are present.
+script = []
 
 [web.resource.dev]
 script = []
@@ -24,6 +24,7 @@ min_sdk = 24
 target_sdk = 35
 compile_sdk = 35
 gradle_dependencies = [
+    "androidx.core:core-ktx:1.15.0",
     "androidx.media3:media3-exoplayer:1.9.0",
     "androidx.media3:media3-ui:1.9.0",
     "org.jellyfin.media3:media3-ffmpeg-decoder:1.9.0+1",
@@ -31,5 +32,5 @@ gradle_dependencies = [
 proguard_rules = ["android/proguard-kino.pro"]
 
 [android.application]
-uses_cleartext_traffic = true
+uses_cleartext_traffic = false
 large_heap = true

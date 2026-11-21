@@ -5,13 +5,17 @@
 
 use std::{
     collections::HashMap,
-    sync::Mutex,
-    time::{Duration, Instant},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant, SystemTime},
 };
 
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
-use futures_util::future::join_all;
+use futures_util::{future::join_all, StreamExt};
 use kino_core::{
     CastMember, CatalogRow, Episode, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, SeasonSummary,
     ShelfPage, TitleDetails, TitleExtras, TitleSummary,
@@ -31,10 +35,14 @@ use super::{
 const API: &str = "https://api.themoviedb.org/3";
 const IMAGES: &str = "https://image.tmdb.org/t/p";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
-/// Answers kept at most; the oldest are dropped first.
-const CACHE_MAX: usize = 2000;
+/// Hard bounds on the in-memory JSON cache (stores compact UTF-8 bytes, not Value ASTs).
+const CACHE_MAX: usize = 1000;
+const CACHE_MAX_BYTES: usize = 16 * 1024 * 1024;
+const MAX_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SHELF_PAGE: u32 = 20;
 const ALLOWED_SIZES: [&str; 5] = ["w185", "w300", "w342", "w780", "w1280"];
+/// Maximum poster/backdrop size accepted from TMDB to prevent OOM on malformed/chunked responses.
+const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// A network error without the request URL, which carries the API key.
 fn net_error(e: reqwest::Error) -> CatalogError {
@@ -48,12 +56,224 @@ fn net_error(e: reqwest::Error) -> CatalogError {
     CatalogError::Upstream(format!("{}{causes}", e.without_url()))
 }
 
+type InflightMap = Mutex<HashMap<String, Arc<tokio::sync::Notify>>>;
+
+struct InflightGuard<'a> {
+    map: &'a InflightMap,
+    key: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.map.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.key);
+        self.notify.notify_waiters();
+    }
+}
+
+enum InflightSlot<'a> {
+    Leader(InflightGuard<'a>),
+    Wait(tokio::sync::futures::OwnedNotified),
+}
+
+fn acquire_inflight<'a>(map: &'a InflightMap, key: String) -> InflightSlot<'a> {
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(n) = guard.get(&key) {
+        InflightSlot::Wait(Arc::clone(n).notified_owned())
+    } else {
+        let n = Arc::new(tokio::sync::Notify::new());
+        guard.insert(key.clone(), Arc::clone(&n));
+        InflightSlot::Leader(InflightGuard { map, key, notify: n })
+    }
+}
+
+struct CacheEntry {
+    inserted_at: Instant,
+    last_used: u64,
+    bytes: Arc<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct JsonCache {
+    entries: HashMap<String, CacheEntry>,
+    total_bytes: usize,
+    tick: u64,
+}
+
+impl JsonCache {
+    fn get(&mut self, key: &str, ttl: Duration) -> Option<Arc<Vec<u8>>> {
+        let expired = self.entries.get(key).is_some_and(|e| e.inserted_at.elapsed() >= ttl);
+        if expired {
+            if let Some(old) = self.entries.remove(key) {
+                self.total_bytes = self.total_bytes.saturating_sub(key.len() + old.bytes.len());
+            }
+            return None;
+        }
+        let entry = self.entries.get_mut(key)?;
+        self.tick = self.tick.wrapping_add(1);
+        entry.last_used = self.tick;
+        Some(Arc::clone(&entry.bytes))
+    }
+
+    fn insert(&mut self, key: String, bytes: Arc<Vec<u8>>, ttl: Duration, max_entries: usize, max_bytes: usize) {
+        let cost = key.len() + bytes.len();
+        if cost > max_bytes || max_entries == 0 {
+            return;
+        }
+        if let Some(old) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(key.len() + old.bytes.len());
+        }
+        if self.entries.len() >= max_entries || self.total_bytes + cost > max_bytes {
+            let mut dropped = 0usize;
+            self.entries.retain(|k, e| {
+                let keep = e.inserted_at.elapsed() < ttl;
+                if !keep {
+                    dropped = dropped.saturating_add(k.len() + e.bytes.len());
+                }
+                keep
+            });
+            self.total_bytes = self.total_bytes.saturating_sub(dropped);
+        }
+        while self.entries.len() >= max_entries || self.total_bytes + cost > max_bytes {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(old) = self.entries.remove(&victim) {
+                self.total_bytes = self.total_bytes.saturating_sub(victim.len() + old.bytes.len());
+            }
+        }
+        self.tick = self.tick.wrapping_add(1);
+        self.total_bytes = self.total_bytes.saturating_add(cost);
+        self.entries.insert(
+            key,
+            CacheEntry {
+                inserted_at: Instant::now(),
+                last_used: self.tick,
+                bytes,
+            },
+        );
+    }
+}
+
+struct ImageDiskCache {
+    dir: PathBuf,
+    max_bytes: u64,
+    writes: AtomicU64,
+    pruning: Arc<AtomicBool>,
+    warned: AtomicBool,
+}
+
+impl ImageDiskCache {
+    fn new(dir: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            dir,
+            max_bytes,
+            writes: AtomicU64::new(0),
+            pruning: Arc::new(AtomicBool::new(false)),
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    async fn read(&self, size: &str, file: &str) -> Option<Vec<u8>> {
+        let path = self.dir.join(size).join(file);
+        tokio::fs::read(path).await.ok().filter(|b| !b.is_empty())
+    }
+
+    async fn write(&self, size: &str, file: &str, data: &[u8]) {
+        let sub = self.dir.join(size);
+        if let Err(e) = tokio::fs::create_dir_all(&sub).await {
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "image disk cache is not writable");
+            }
+            return;
+        }
+        let seq = self.writes.fetch_add(1, Ordering::Relaxed);
+        let tmp = sub.join(format!(".tmp-{}-{seq}", std::process::id()));
+        let dst = sub.join(file);
+        if let Err(e) = tokio::fs::write(&tmp, data).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "writing to image disk cache failed");
+            }
+            return;
+        }
+        if let Err(e) = tokio::fs::rename(&tmp, &dst).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if !self.warned.swap(true, Ordering::Relaxed) {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "committing image disk cache file failed");
+            }
+            return;
+        }
+        if seq % 64 == 0 && !self.pruning.swap(true, Ordering::AcqRel) {
+            let dir = self.dir.clone();
+            let max_bytes = self.max_bytes;
+            let flag = Arc::clone(&self.pruning);
+            tokio::spawn(async move {
+                prune_image_dir(dir, max_bytes).await;
+                flag.store(false, Ordering::Release);
+            });
+        }
+    }
+}
+
+async fn prune_image_dir(dir: PathBuf, max_bytes: u64) {
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total = 0u64;
+    let Ok(mut sizes) = tokio::fs::read_dir(&dir).await else {
+        return;
+    };
+    while let Ok(Some(sub)) = sizes.next_entry().await {
+        let Ok(mut entries) = tokio::fs::read_dir(sub.path()).await else {
+            continue;
+        };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with('.'))
+            {
+                continue;
+            }
+            if let Ok(meta) = entry.metadata().await {
+                if meta.is_file() {
+                    let len = meta.len();
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    total = total.saturating_add(len);
+                    files.push((path, len, mtime));
+                }
+            }
+        }
+    }
+    if total <= max_bytes {
+        return;
+    }
+    let target = (max_bytes.saturating_mul(85)) / 100;
+    files.sort_by_key(|(_, _, mtime)| *mtime);
+    for (path, len, _) in files {
+        if total <= target {
+            break;
+        }
+        if tokio::fs::remove_file(&path).await.is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+}
+
 pub struct TmdbCatalog {
     http: reqwest::Client,
     /// v3 API key or v4 read access token (starts with `eyJ`).
     key: String,
     language: String,
-    cache: Mutex<HashMap<String, (Instant, serde_json::Value)>>,
+    cache: Mutex<JsonCache>,
+    inflight: InflightMap,
+    image_cache: Option<Arc<ImageDiskCache>>,
+    image_inflight: InflightMap,
 }
 
 impl TmdbCatalog {
@@ -65,20 +285,61 @@ impl TmdbCatalog {
             key,
             language,
             cache: Mutex::default(),
+            inflight: Mutex::default(),
+            image_cache: None,
+            image_inflight: Mutex::default(),
         })
+    }
+
+    pub fn with_image_cache(mut self, dir: PathBuf, max_bytes: u64) -> Self {
+        self.image_cache = Some(Arc::new(ImageDiskCache::new(dir, max_bytes)));
+        self
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str, query: &[(&str, &str)]) -> Result<T, CatalogError> {
         let mut params: Vec<(&str, &str)> = vec![("language", self.language.as_str())];
         params.extend_from_slice(query);
         let cache_key = format!("{path}?{params:?}");
-        if let Some((at, v)) = self.cache.lock().expect("cache lock").get(&cache_key) {
-            if at.elapsed() < CACHE_TTL {
-                return serde_json::from_value(v.clone()).map_err(|e| CatalogError::Upstream(e.to_string()));
+
+        for attempt in 0..2 {
+            let hit = self
+                .cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&cache_key, CACHE_TTL);
+            if let Some(raw) = hit {
+                return serde_json::from_slice(&raw).map_err(|e| CatalogError::Upstream(e.to_string()));
+            }
+
+            match acquire_inflight(&self.inflight, cache_key.clone()) {
+                InflightSlot::Leader(_guard) => {
+                    return self.fetch_and_cache(path, &params, cache_key).await;
+                }
+                InflightSlot::Wait(notified) => {
+                    notified.await;
+                    if attempt == 1 {
+                        let hit = self
+                            .cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get(&cache_key, CACHE_TTL);
+                        if let Some(raw) = hit {
+                            return serde_json::from_slice(&raw).map_err(|e| CatalogError::Upstream(e.to_string()));
+                        }
+                    }
+                }
             }
         }
+        self.fetch_and_cache(path, &params, cache_key).await
+    }
 
-        let mut req = self.http.get(format!("{API}{path}")).query(&params);
+    async fn fetch_and_cache<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, &str)],
+        cache_key: String,
+    ) -> Result<T, CatalogError> {
+        let mut req = self.http.get(format!("{API}{path}")).query(params);
         req = if self.key.starts_with("eyJ") {
             req.bearer_auth(&self.key)
         } else {
@@ -91,14 +352,25 @@ impl TmdbCatalog {
         if !resp.status().is_success() {
             return Err(CatalogError::Upstream(format!("TMDB answered {}", resp.status())));
         }
-        let value: serde_json::Value = resp.json().await.map_err(net_error)?;
-        let parsed = serde_json::from_value(value.clone()).map_err(|e| CatalogError::Upstream(e.to_string()))?;
-        trim_insert(
-            &mut self.cache.lock().expect("cache lock"),
+        if resp.content_length().is_some_and(|n| n > MAX_JSON_BYTES as u64) {
+            return Err(CatalogError::Upstream("TMDB response exceeded size limit".into()));
+        }
+        let mut raw = Vec::with_capacity(resp.content_length().unwrap_or(0).min(64 * 1024) as usize);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(net_error)?;
+            if raw.len().saturating_add(chunk.len()) > MAX_JSON_BYTES {
+                return Err(CatalogError::Upstream("TMDB response exceeded size limit".into()));
+            }
+            raw.extend_from_slice(&chunk);
+        }
+        let parsed: T = serde_json::from_slice(&raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
+        self.cache.lock().unwrap_or_else(|e| e.into_inner()).insert(
             cache_key,
-            value,
+            Arc::new(raw),
             CACHE_TTL,
             CACHE_MAX,
+            CACHE_MAX_BYTES,
         );
         Ok(parsed)
     }
@@ -292,27 +564,6 @@ fn merge_unique(dst: &mut Vec<TitleSummary>, src: Vec<TitleSummary>) {
 
 fn prioritize_normalized_matches(items: &mut [TitleSummary], norm_query: &str) {
     items.sort_by_key(|item| !matches_normalized_query(&item.title, item.original_title.as_deref(), norm_query));
-}
-
-/// Stores an answer, first dropping what has expired and, when the cache is
-/// still full, the oldest answers, so it never grows past `max`.
-fn trim_insert(
-    cache: &mut HashMap<String, (Instant, serde_json::Value)>,
-    key: String,
-    value: serde_json::Value,
-    ttl: Duration,
-    max: usize,
-) {
-    if cache.len() >= max {
-        cache.retain(|_, (at, _)| at.elapsed() < ttl);
-    }
-    while cache.len() >= max {
-        let Some(oldest) = cache.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone()) else {
-            break;
-        };
-        cache.remove(&oldest);
-    }
-    cache.insert(key, (Instant::now(), value));
 }
 
 #[derive(Deserialize)]
@@ -745,7 +996,7 @@ const TMDB_SHELVES: &[TmdbShelf] = &[
         },
         path: "/discover/tv",
         query: &[
-            ("with_genres", "80,9648"),
+            ("with_genres", "80|9648"),
             ("sort_by", "popularity.desc"),
             ("vote_count.gte", "80"),
             ("include_adult", "false"),
@@ -936,7 +1187,7 @@ const TMDB_SHELVES: &[TmdbShelf] = &[
         },
         path: "/discover/movie",
         query: &[
-            ("with_genres", "14,12"),
+            ("with_genres", "14|12"),
             ("sort_by", "popularity.desc"),
             ("vote_count.gte", "300"),
             ("include_adult", "false"),
@@ -1137,13 +1388,21 @@ impl Catalog for TmdbCatalog {
                 list.iter()
                     .any(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), &norm_q))
             };
-            if items.is_empty() {
-                if let Some((title_q, year)) = split_query_year(trimmed) {
-                    items = self.search_by_year(title_q, year).await;
-                } else if !norm_q.is_empty() {
-                    self.search_with_yo_fallback(trimmed, &norm_q, &mut items).await;
+            if let Some((title_q, year)) = split_query_year(trimmed) {
+                if items.is_empty() || !has_match(&items) {
+                    let by_year = self.search_by_year(title_q, year).await;
+                    if !by_year.is_empty() {
+                        let mut merged = by_year;
+                        for it in items {
+                            if !merged.iter().any(|m| m.kind == it.kind && m.tmdb_id == it.tmdb_id) {
+                                merged.push(it);
+                            }
+                        }
+                        items = merged;
+                    }
                 }
-            } else if !norm_q.is_empty() && !has_match(&items) {
+            }
+            if !norm_q.is_empty() && (items.is_empty() || !has_match(&items)) {
                 self.search_with_yo_fallback(trimmed, &norm_q, &mut items).await;
             }
             items
@@ -1263,6 +1522,34 @@ impl Catalog for TmdbCatalog {
         if !ALLOWED_SIZES.contains(&size) || !is_image_file(file) {
             return Err(CatalogError::NotFound);
         }
+        if let Some(cache) = &self.image_cache {
+            if let Some(bytes) = cache.read(size, file).await {
+                return Ok((bytes, mime_for_image_ext(file).to_owned()));
+            }
+            match acquire_inflight(&self.image_inflight, format!("{size}/{file}")) {
+                InflightSlot::Leader(_guard) => {
+                    let (bytes, ctype) = self.fetch_image_upstream(size, file).await?;
+                    cache.write(size, file, &bytes).await;
+                    return Ok((bytes, ctype));
+                }
+                InflightSlot::Wait(notified) => {
+                    notified.await;
+                    if let Some(bytes) = cache.read(size, file).await {
+                        return Ok((bytes, mime_for_image_ext(file).to_owned()));
+                    }
+                }
+            }
+        }
+        let (bytes, ctype) = self.fetch_image_upstream(size, file).await?;
+        if let Some(cache) = &self.image_cache {
+            cache.write(size, file, &bytes).await;
+        }
+        Ok((bytes, ctype))
+    }
+}
+
+impl TmdbCatalog {
+    async fn fetch_image_upstream(&self, size: &str, file: &str) -> Result<(Vec<u8>, String), CatalogError> {
         let resp = self
             .http
             .get(format!("{IMAGES}/{size}/{file}"))
@@ -1272,18 +1559,39 @@ impl Catalog for TmdbCatalog {
         if !resp.status().is_success() {
             return Err(CatalogError::NotFound);
         }
+        if resp.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES as u64) {
+            return Err(CatalogError::Upstream("TMDB image exceeded size limit".into()));
+        }
         let ctype = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("image/jpeg")
-            .to_owned();
-        let bytes = resp.bytes().await.map_err(net_error)?;
-        Ok((bytes.to_vec(), ctype))
+            .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase())
+            .filter(|m| matches!(m.as_str(), "image/jpeg" | "image/png" | "image/webp"))
+            .unwrap_or_else(|| mime_for_image_ext(file).to_owned());
+
+        let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0).min(256 * 1024) as usize);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(net_error)?;
+            if bytes.len().saturating_add(chunk.len()) > MAX_IMAGE_BYTES {
+                return Err(CatalogError::Upstream("TMDB image exceeded size limit".into()));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok((bytes, ctype))
     }
 }
 
-/// `abc123.jpg` style names only, so the proxy can't be pointed elsewhere.
+fn mime_for_image_ext(file: &str) -> &'static str {
+    match file.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+/// `abc123.jpg` style raster names only, so the proxy can't be pointed elsewhere or serve active SVG.
 pub(crate) fn is_image_file(file: &str) -> bool {
     let (stem, ext) = match file.rsplit_once('.') {
         Some(p) => p,
@@ -1293,7 +1601,7 @@ pub(crate) fn is_image_file(file: &str) -> bool {
         && stem
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        && matches!(ext, "jpg" | "jpeg" | "png" | "webp" | "svg")
+        && matches!(ext, "jpg" | "jpeg" | "png" | "webp")
 }
 
 #[cfg(test)]
@@ -1418,25 +1726,44 @@ mod tests {
 
     #[test]
     fn the_cache_stays_small() {
-        let mut cache = HashMap::new();
+        let mut cache = JsonCache::default();
         for i in 0..50 {
-            trim_insert(&mut cache, format!("k{i}"), json!(i), CACHE_TTL, 10);
-            assert!(cache.len() <= 10);
+            cache.insert(
+                format!("k{i}"),
+                Arc::new(format!("{i}").into_bytes()),
+                CACHE_TTL,
+                10,
+                4096,
+            );
+            assert!(cache.entries.len() <= 10);
         }
-        // The newest are kept, the oldest are gone.
-        assert!(cache.contains_key("k49") && !cache.contains_key("k0"));
+        // Touching k40 makes it recently used, so inserting k50 evicts k41 instead of k40 (LRU).
+        assert!(cache.get("k40", CACHE_TTL).is_some());
+        cache.insert("k50".into(), Arc::new(b"50".to_vec()), CACHE_TTL, 10, 4096);
+        assert!(cache.entries.contains_key("k40") && !cache.entries.contains_key("k41"));
+
+        // Byte cap evicts oldest entries even when count is below max_entries.
+        let mut capped = JsonCache::default();
+        capped.insert("a".into(), Arc::new(vec![b'x'; 60]), CACHE_TTL, 10, 100);
+        capped.insert("b".into(), Arc::new(vec![b'y'; 60]), CACHE_TTL, 10, 100);
+        assert_eq!(capped.entries.len(), 1);
+        assert!(capped.entries.contains_key("b") && capped.total_bytes <= 100);
+
         // Expired answers go before live ones.
-        let mut cache = HashMap::new();
+        let mut exp = JsonCache::default();
         for i in 0..4 {
-            trim_insert(&mut cache, format!("k{i}"), json!(i), Duration::ZERO, 4);
+            exp.insert(format!("k{i}"), Arc::new(vec![b'z']), Duration::ZERO, 4, 4096);
         }
-        trim_insert(&mut cache, "new".into(), json!(1), Duration::ZERO, 4);
-        assert_eq!(cache.len(), 1, "all four had expired");
+        exp.insert("new".into(), Arc::new(vec![b'z']), Duration::ZERO, 4, 4096);
+        assert_eq!(exp.entries.len(), 1, "all four had expired");
     }
 
     #[test]
     fn image_names_are_restricted() {
         assert!(is_image_file("kqjL17yufvn9OVLyXYpvtyrFfak.jpg"));
+        assert!(is_image_file("poster_1.webp"));
+        assert!(is_image_file("logo-2.png"));
+        assert!(!is_image_file("logo.svg"));
         assert!(!is_image_file("../etc/passwd"));
         assert!(!is_image_file("a.jpg?x=1"));
         assert!(!is_image_file(".jpg"));

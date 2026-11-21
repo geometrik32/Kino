@@ -14,8 +14,8 @@ use axum::{
 use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
-    demo_releases, language_name, MediaKind, MediaTrack, PlayInfo, PlayRequest, ReleaseList, StreamProgress,
-    TitleDetails, UserPrefs,
+    demo_releases, language_name, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest, PlayRequest,
+    ReleaseList, StreamProgress, TitleDetails, UserPrefs,
 };
 use serde::Deserialize;
 use tower::ServiceExt;
@@ -52,20 +52,53 @@ pub struct Media {
     pub hw: HwAccel,
     /// Re-encoding is heavy: only a few at once on a small server.
     pub transcodes: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Subtitle extraction spawns ffmpeg too; cap it so requests cannot pile up.
+    pub subtitles: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
-/// How many videos the server re-encodes at the same time.
-const MAX_TRANSCODES: usize = 4;
+/// Default maximum videos re-encoded concurrently (configurable via `MAX_TRANSCODES`).
+const DEFAULT_MAX_TRANSCODES: usize = 2;
+/// How many subtitle extractions run concurrently.
+const MAX_SUBTITLES: usize = 2;
+/// Drops a paused/stalled transcode if the client stops reading for this long.
+const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 impl Media {
     pub fn new(c: &TorrentConfig) -> Self {
         let http = torrent::http_client();
         let or = |s: &str, d: &str| if s.is_empty() { d.to_owned() } else { s.to_owned() };
+        let transcodes = if c.max_transcodes > 0 {
+            c.max_transcodes
+        } else {
+            DEFAULT_MAX_TRANSCODES
+        };
+        let jackett = match (&c.jackett_url, &c.jackett_api_key) {
+            (Some(url), Some(key)) => {
+                let mut j = Jackett::new(http.clone(), url, key);
+                if let Some(wake_url) = &c.jackett_wake_url {
+                    let group = if c.jackett_wake_group.is_empty() {
+                        "jackett".to_owned()
+                    } else {
+                        c.jackett_wake_group.clone()
+                    };
+                    let duration = if c.jackett_wake_duration.is_empty() {
+                        "10m".to_owned()
+                    } else {
+                        c.jackett_wake_duration.clone()
+                    };
+                    j = j.with_wake(torrent::torznab::JackettWake::new(
+                        http.clone(),
+                        wake_url,
+                        group,
+                        duration,
+                    ));
+                }
+                Some(j)
+            }
+            _ => None,
+        };
         Self {
-            jackett: match (&c.jackett_url, &c.jackett_api_key) {
-                (Some(url), Some(key)) => Some(Jackett::new(http.clone(), url, key)),
-                _ => None,
-            },
+            jackett,
             torrserver: c.torrserver_url.as_ref().map(|url| {
                 let auth = c.torrserver_user.clone().zip(c.torrserver_password.clone());
                 TorrServer::new(url, auth)
@@ -83,8 +116,16 @@ impl Media {
             ffmpeg: or(&c.ffmpeg, "ffmpeg"),
             ffprobe: or(&c.ffprobe, "ffprobe"),
             hw: HwAccel::parse(&c.hwaccel),
-            transcodes: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_TRANSCODES)),
+            transcodes: std::sync::Arc::new(tokio::sync::Semaphore::new(transcodes)),
+            subtitles: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SUBTITLES)),
             http,
+        }
+    }
+
+    /// Proactively wakes a sleeping Jackett container in the background when a user starts browsing.
+    pub fn wake_jackett(&self) {
+        if let Some(j) = &self.jackett {
+            j.wake_in_background();
         }
     }
 }
@@ -93,6 +134,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/releases/{kind}/{tmdb_id}", get(releases))
         .route("/play", post(play))
+        .route("/play/probe", post(play_probe))
         .route("/play/progress/{release}", get(play_progress))
         .merge(
             // The stream links are signed and the apps play them from another origin,
@@ -176,14 +218,33 @@ async fn releases(
 }
 
 /// Starts the release search for a title in the background, so the list is ready
-/// by the time someone presses "Смотреть". Does nothing without an indexer, and
-/// nothing new when the title was searched recently.
-pub fn prefetch_releases(state: &AppState, details: TitleDetails) {
+/// by the time someone presses "Смотреть". Skips titles where the user already has
+/// a saved release choice (so "Продолжить просмотр" does not wake a sleeping indexer).
+pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) {
     if state.media.jackett.is_none() {
         return;
     }
     let state = state.clone();
     tokio::spawn(async move {
+        let kind = details.summary.kind;
+        let tmdb_id = details.summary.tmdb_id;
+        let has_saved: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM release_choice WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3
+             ) OR EXISTS (
+                 SELECT 1 FROM watch_progress
+                 WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND release_infohash IS NOT NULL
+             )",
+        )
+        .bind(user_id)
+        .bind(kind.as_str())
+        .bind(tmdb_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap_or(false);
+        if has_saved {
+            return;
+        }
         if let Some(jackett) = &state.media.jackett {
             if let Err(e) = torrent::search_cached(&state.media.searches, &state.pool, jackett, &details).await {
                 tracing::debug!(error = %e, "background release search failed");
@@ -212,7 +273,7 @@ async fn play(
         ));
     }
     let media = &state.media;
-    let src = torrent::resolve(&state.pool, &media.http, &key).await?;
+    let src = torrent::resolve(&state.pool, &media.http, &key, media.jackett.as_ref()).await?;
     let hash = src.infohash.clone().ok_or(TorrentError::Unknown)?;
     let episode = (req.kind == MediaKind::Tv).then_some((req.season.max(1), req.episode.max(1)));
 
@@ -221,7 +282,7 @@ async fn play(
     let (file, input, preloaded) = match local {
         Some((list, dir)) => {
             let f = files::pick(&list, episode).cloned().ok_or_else(no_file)?;
-            let path = safe_join(&dir, &f.path).ok_or_else(no_file)?;
+            let path = safe_join_canonical(&dir, &f.path).await.ok_or_else(no_file)?;
             let input = path.to_string_lossy().into_owned();
             (f, input, true)
         }
@@ -269,12 +330,7 @@ async fn play(
     };
     // Without ffprobe nothing is known; let the browser try mp4/webm files directly.
     // Native clients (Android/Desktop) decode MKV/HEVC/AC3/DTS directly on the client.
-    let direct = req.native
-        || if probe.container.is_empty() {
-            file.path.to_ascii_lowercase().ends_with(".mp4")
-        } else {
-            probe.browser_ok()
-        };
+    let direct = is_direct(&probe, &file.path, req.native);
 
     let claims = StreamClaims {
         uid: user.0,
@@ -293,13 +349,8 @@ async fn play(
         .find(|p| p.season == season && p.episode == ep && !p.finished)
         .map(|p| p.position_sec as i32)
         .unwrap_or(0);
-    let st = userdata::get_state(&state.pool, user.0, req.kind, req.tmdb_id).await?;
-    let prefs = userdata::get_prefs(&state.pool, user.0).await?;
     let (audio_track, subtitle_track) =
-        choose_tracks(&probe, st.audio_track.as_deref(), st.subtitle_track.as_deref(), &prefs);
-    // Extracting embedded WebVTT subtitles scans to EOF and blocks `<video default>` on live torrent streams;
-    // native players read subtitles inline from the stream.
-    let subtitle_track = if preloaded || req.native { subtitle_track } else { None };
+        preferred_tracks(&state, user.0, req.kind, req.tmdb_id, &probe, preloaded, req.native).await?;
     let next = match episode {
         Some(e) => next_episode(&state.catalog.details(MediaKind::Tv, req.tmdb_id).await?, e),
         None => None,
@@ -320,6 +371,86 @@ async fn play(
         next,
         preloaded,
         native: req.native,
+    }))
+}
+
+fn is_direct(probe: &Probe, file_path: &str, native: bool) -> bool {
+    native
+        || if probe.container.is_empty() {
+            file_path.to_ascii_lowercase().ends_with(".mp4")
+        } else {
+            probe.browser_ok()
+        }
+}
+
+async fn preferred_tracks(
+    state: &AppState,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    probe: &Probe,
+    preloaded: bool,
+    native: bool,
+) -> Result<(Option<i32>, Option<i32>), AppError> {
+    let st = userdata::get_state(&state.pool, user_id, kind, tmdb_id).await?;
+    let prefs = userdata::get_prefs(&state.pool, user_id).await?;
+    let (audio_track, subtitle_track) =
+        choose_tracks(probe, st.audio_track.as_deref(), st.subtitle_track.as_deref(), &prefs);
+    // Extracting embedded WebVTT subtitles scans to EOF and blocks `<video default>` on live torrent streams;
+    // native players read subtitles inline from the stream.
+    let subtitle_track = if preloaded || native { subtitle_track } else { None };
+    Ok((audio_track, subtitle_track))
+}
+
+fn extract_stream_token(stream: &str) -> &str {
+    stream
+        .rsplit_once("/api/stream/")
+        .map(|(_, t)| t)
+        .unwrap_or(stream)
+        .split('?')
+        .next()
+        .unwrap_or("")
+}
+
+/// Retries `ffprobe` for an active stream after TorrServer has buffered more data.
+async fn play_probe(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(req): Json<PlayProbeRequest>,
+) -> Result<Json<PlayProbe>, AppError> {
+    if req.tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
+    let token = extract_stream_token(&req.stream);
+    let c = claims(&state, token)?;
+    if c.uid != user.0 {
+        return Err(AppError::unauthorized("stream link belongs to another user"));
+    }
+    let input = input_of(&state, &c).await?;
+    let Ok(probe) = ffmpeg::probe_with_timeout(&state.media.ffprobe, &input, std::time::Duration::from_secs(25)).await
+    else {
+        return Ok(Json(PlayProbe::default()));
+    };
+    let preloaded = c.p.is_some();
+    let direct = is_direct(&probe, c.p.as_deref().unwrap_or(""), req.native);
+    let (audio_track, subtitle_track) =
+        preferred_tracks(&state, user.0, req.kind, req.tmdb_id, &probe, preloaded, req.native).await?;
+    let updated = StreamClaims {
+        v: probe.video_copyable(),
+        ..c
+    };
+    let stream = Some(format!(
+        "/api/stream/{}",
+        token::issue(&state.config.session_secret, &updated)
+    ));
+    Ok(Json(PlayProbe {
+        stream,
+        direct,
+        duration: probe.duration,
+        audio: probe.audio,
+        subtitles: probe.subtitles,
+        audio_track,
+        subtitle_track,
     }))
 }
 
@@ -381,12 +512,23 @@ async fn preloaded_files(state: &AppState, user_id: i64, hash: &str) -> Option<(
     }
 }
 
-/// `dir/rel` when `rel` stays inside `dir`.
+/// `dir/rel` when `rel` stays lexically inside `dir`.
 fn safe_join(dir: &FsPath, rel: &str) -> Option<PathBuf> {
     let rel = FsPath::new(rel);
-    rel.components()
-        .all(|c| matches!(c, Component::Normal(_)))
-        .then(|| dir.join(rel))
+    (!rel.as_os_str().is_empty() && rel.components().all(|c| matches!(c, Component::Normal(_)))).then(|| dir.join(rel))
+}
+
+/// Resolves `dir/rel` safely against symlink escapes (BEP-47 symlinks inside torrents).
+async fn safe_join_canonical(dir: &FsPath, rel: &str) -> Option<PathBuf> {
+    let joined = safe_join(dir, rel)?;
+    let meta = tokio::fs::symlink_metadata(&joined).await.ok()?;
+    if meta.file_type().is_symlink() {
+        tracing::warn!(path = %joined.display(), "refusing to serve symlink from preload directory");
+        return None;
+    }
+    let canon_dir = tokio::fs::canonicalize(dir).await.ok()?;
+    let canon_file = tokio::fs::canonicalize(&joined).await.ok()?;
+    canon_file.starts_with(&canon_dir).then_some(canon_file)
 }
 
 /// The remembered tracks, else the preferred voice-over and audio language.
@@ -473,8 +615,12 @@ async fn stream(
 ) -> Result<Response, AppError> {
     let c = claims(&state, &token)?;
     let media = &state.media;
-    let input = input_of(&state, &c)?;
+    let input = input_of(&state, &c).await?;
     if q.audio.is_some() || q.start.is_some() {
+        let audio = q.audio.unwrap_or(0);
+        if audio < 0 {
+            return Err(AppError::bad_request("audio track index must be >= 0"));
+        }
         // A seek drops the previous request (and its ffmpeg) first, so wait a moment for its slot.
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -484,7 +630,7 @@ async fn stream(
         .ok()
         .and_then(Result::ok)
         .ok_or_else(|| unavailable("Сервер уже перекодирует другие видео, попробуйте позже"))?;
-        let args = ffmpeg::transcode_args(&input, q.start.unwrap_or(0), q.audio.unwrap_or(0), c.v, media.hw);
+        let args = ffmpeg::transcode_args(&input, q.start.unwrap_or(0), audio, c.v, media.hw);
         let mut child = ffmpeg::spawn(&media.ffmpeg, &args).map_err(|e| {
             tracing::error!(error = %e, "ffmpeg did not start");
             unavailable("Перекодирование недоступно")
@@ -493,19 +639,62 @@ async fn stream(
             .stdout
             .take()
             .ok_or_else(|| unavailable("Перекодирование недоступно"))?;
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                let mut limited = (&mut err).take(4096);
+                let _ = limited.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).trim().to_owned()
+            })
+        });
         let mut reader = tokio_util::io::ReaderStream::new(out);
-        let first = tokio::time::timeout(std::time::Duration::from_secs(45), reader.next())
-            .await
-            .map_err(|_| unavailable("Поток не отвечает. Попробуйте другую раздачу или «Скачать заранее»."))?
-            .ok_or_else(|| unavailable("Не удалось запустить видео"))?
-            .map_err(|_| unavailable("Не удалось запустить видео"))?;
-        // The child lives as long as the response body; dropping it stops ffmpeg.
-        let body = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
-            .chain(reader)
-            .map(move |chunk| {
-                let _keep = (&child, &permit);
-                chunk
-            });
+        let first = match tokio::time::timeout(std::time::Duration::from_secs(45), reader.next()).await {
+            Ok(Some(Ok(bytes))) => bytes,
+            Ok(other) => {
+                if let Some(h) = stderr_handle {
+                    if let Ok(Ok(err)) = tokio::time::timeout(std::time::Duration::from_secs(2), h).await {
+                        if !err.is_empty() {
+                            tracing::warn!(stderr = %err, "ffmpeg exited before producing video");
+                        }
+                    }
+                }
+                let _ = other;
+                return Err(unavailable("Не удалось запустить видео"));
+            }
+            Err(_) => {
+                return Err(unavailable(
+                    "Поток не отвечает. Попробуйте другую раздачу или «Скачать заранее».",
+                ));
+            }
+        };
+        // Feed ffmpeg stdout through a bounded channel so client disconnects stop ffmpeg
+        // immediately (even while blocked on upstream) and idle clients release their slot.
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+        tokio::spawn(async move {
+            let _keep = (child, permit);
+            if tx.send(Ok(first)).await.is_err() {
+                return;
+            }
+            loop {
+                let next_chunk = tokio::select! {
+                    biased;
+                    _ = tx.closed() => break,
+                    chunk = reader.next() => chunk,
+                };
+                let Some(chunk) = next_chunk else { break };
+                match tokio::time::timeout(TRANSCODE_IDLE_TIMEOUT, tx.send(chunk)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) => break,
+                    Err(_) => {
+                        tracing::info!("stopping idle ffmpeg transcode after client stall");
+                        break;
+                    }
+                }
+            }
+            drop(stderr_handle);
+        });
+        let body = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
         return Ok((
             [(header::CONTENT_TYPE, "video/mp4"), (header::CACHE_CONTROL, "no-store")],
             Body::from_stream(body),
@@ -528,7 +717,7 @@ async fn stream(
 }
 
 /// Where the file is: on disk for a preload, else TorrServer's stream.
-fn input_of(state: &AppState, c: &StreamClaims) -> Result<String, AppError> {
+async fn input_of(state: &AppState, c: &StreamClaims) -> Result<String, AppError> {
     match &c.p {
         Some(rel) => {
             let dir = state
@@ -536,7 +725,8 @@ fn input_of(state: &AppState, c: &StreamClaims) -> Result<String, AppError> {
                 .preload_dir
                 .as_ref()
                 .ok_or_else(|| unavailable("Папка загрузок не настроена"))?;
-            Ok(safe_join(dir, rel)
+            Ok(safe_join_canonical(dir, rel)
+                .await
                 .ok_or_else(AppError::not_found)?
                 .to_string_lossy()
                 .into_owned())
@@ -602,7 +792,18 @@ async fn subtitle(
         .trim_end_matches(".vtt")
         .parse()
         .map_err(|_| AppError::bad_request("expected <number>.vtt"))?;
-    let input = input_of(&state, &c)?;
+    if index < 0 {
+        return Err(AppError::bad_request("subtitle index must be >= 0"));
+    }
+    let _permit = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.media.subtitles.clone().acquire_owned(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or_else(|| unavailable("Сервер занят извлечением субтитров, попробуйте позже"))?;
+    let input = input_of(&state, &c).await?;
     let out = tokio::time::timeout(
         std::time::Duration::from_secs(60),
         tokio::process::Command::new(&state.media.ffmpeg)
@@ -712,5 +913,15 @@ mod tests {
         assert_eq!(safe_join(d, "Show/e1.mkv"), Some(PathBuf::from("/data/Show/e1.mkv")));
         assert_eq!(safe_join(d, "../etc/passwd"), None);
         assert_eq!(safe_join(d, "/etc/passwd"), None);
+    }
+
+    #[test]
+    fn stream_token_extraction() {
+        assert_eq!(extract_stream_token("/api/stream/abc.def"), "abc.def");
+        assert_eq!(
+            extract_stream_token("https://kino.example.com/api/stream/abc.def?audio=1&start=10"),
+            "abc.def"
+        );
+        assert_eq!(extract_stream_token("abc.def"), "abc.def");
     }
 }

@@ -39,6 +39,8 @@ pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfi
         tmdb_proxy: None,
         tmdb_language: "ru-RU".into(),
         static_dir: None,
+        image_cache_dir: None,
+        image_cache_max_mb: 400,
         notify_every: std::time::Duration::from_secs(3600),
         preload_keep: chrono::Duration::days(7),
         torrents,

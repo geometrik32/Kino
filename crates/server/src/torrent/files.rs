@@ -11,13 +11,20 @@ pub fn is_video(path: &str) -> bool {
         .is_some_and(|(_, ext)| VIDEO.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-static SE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})[ ._-]?e(\d{1,3})\b|\b(\d{1,2})x(\d{2,3})\b").unwrap());
-static EP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:\be|серия[ ._]?|episode[ ._]?|эпизод[ ._]?)(\d{1,3})\b|^(\d{1,3})\b").unwrap()
+static SE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(?:^|[^a-z0-9])s(\d{1,2})[ ._-]?e(\d{1,3})(?:$|[^a-z0-9])|(?:^|[^a-z0-9])(\d{1,2})x(\d{2,3})(?:$|[^a-z0-9])",
+    )
+    .unwrap()
 });
-static SEASON_DIR: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bs(\d{1,2})\b|(?:season|сезон)[ ._]?(\d{1,2})|(\d{1,2})[ ._]?сезон").unwrap());
+static EP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:(?:^|[^a-z0-9])e|серия[ ._-]?|episode[ ._-]?|эпизод[ ._-]?)(\d{1,3})(?:$|[^a-z0-9])|^(\d{1,3})(?:$|[^a-z0-9])")
+        .unwrap()
+});
+static SEASON_DIR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)(?:^|[^a-z0-9])s(\d{1,2})(?:$|[^a-z0-9])|(?:season|сезон)[ ._-]?(\d{1,2})|(\d{1,2})[ ._-]?сезон")
+        .unwrap()
+});
 
 /// `(season, episode)` from a file path, when it says.
 pub fn episode_of(path: &str) -> (Option<i32>, Option<i32>) {
@@ -90,6 +97,8 @@ mod tests {
         assert_eq!(episode_of("BB/Season 3/03. Pilot.mkv"), (Some(3), Some(3)));
         assert_eq!(episode_of("Сезон 1/Серия 7.avi"), (Some(1), Some(7)));
         assert_eq!(episode_of("show.2x10.mp4"), (Some(2), Some(10)));
+        assert_eq!(episode_of("Season_01/s01e01_Pilot.avi"), (Some(1), Some(1)));
+        assert_eq!(episode_of("Season_02/Show_S02E05_720p.mkv"), (Some(2), Some(5)));
         assert_eq!(episode_of("Film.2024.mkv"), (None, None));
     }
 

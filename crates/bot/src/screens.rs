@@ -293,6 +293,21 @@ impl Screen {
             keyboard: InlineKeyboardMarkup::new(rows),
         }
     }
+
+    /// Telegram forbids `WebApp` inline buttons outside private chats (`400 BUTTON_TYPE_INVALID`).
+    /// Converts them to regular URL buttons when sending to a group or channel.
+    pub fn for_chat(mut self, is_private: bool) -> Self {
+        if !is_private {
+            for row in &mut self.keyboard.inline_keyboard {
+                for btn in row {
+                    if let teloxide::types::InlineKeyboardButtonKind::WebApp(w) = &btn.kind {
+                        btn.kind = teloxide::types::InlineKeyboardButtonKind::Url(w.url.clone());
+                    }
+                }
+            }
+        }
+        self
+    }
 }
 
 fn kind_badge(kind: MediaKind) -> &'static str {
@@ -739,11 +754,12 @@ fn progress_line(item: &ContinueItem) -> String {
             episode_code(last.season, last.episode),
             clock(last.position_sec)
         ),
-        (MediaKind::Movie, _) => format!(
+        (MediaKind::Movie, _) if last.duration_sec > 0.0 => format!(
             "остановились на {} из {}",
             clock(last.position_sec),
             clock(last.duration_sec)
         ),
+        (MediaKind::Movie, _) => format!("остановились на {}", clock(last.position_sec)),
     }
 }
 

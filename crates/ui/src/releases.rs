@@ -296,8 +296,22 @@ pub fn ReleasePicker(
     let f_all = filter.clone();
     let f_dp = filter.clone();
     rsx! {
-        div { class: "sheet-bg", onclick: move |_| on_close.call(()),
-            div { class: "sheet", onclick: move |e| e.stop_propagation(),
+        div {
+            class: "sheet-bg",
+            onclick: move |_| on_close.call(()),
+            div {
+                class: "sheet",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-label": "Выбор раздачи",
+                tabindex: -1,
+                onclick: move |e| e.stop_propagation(),
+                onkeydown: move |e| {
+                    if e.key() == Key::Escape {
+                        e.stop_propagation();
+                        on_close.call(());
+                    }
+                },
                 div { class: "sheet-head",
                     div {
                         h3 {

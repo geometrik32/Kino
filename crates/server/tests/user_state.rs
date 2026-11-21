@@ -6,7 +6,9 @@ mod common;
 
 use axum::http::{Method, StatusCode};
 use common::*;
-use kino_core::{ContinueItem, HistoryEntry, PreloadItem, PreloadState, TitleState, TitleStatus, UserPrefs};
+use kino_core::{
+    ContinueItem, HistoryEntry, PreloadItem, PreloadState, Progress, TitleState, TitleStatus, UserPrefs, VideoScale,
+};
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -147,7 +149,24 @@ async fn rating_tracks_prefs(pool: PgPool) {
     assert_eq!(st.rating, Some(5));
     assert_eq!(st.audio_track.as_deref(), Some("Дубляж"));
     assert_eq!(st.subtitle_track, None);
-    assert_eq!(st.status, None, "rating alone sets no status");
+    assert_eq!(st.video_scale, None);
+    let (code, st) = call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/27205/scale",
+        Some(&t),
+        Some(json!({"video_scale": "height"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let st: TitleState = serde_json::from_value(st).unwrap();
+    assert_eq!(st.video_scale, Some(VideoScale::FitHeight));
+    let (_, st) = call(&app, Method::GET, "/api/title/movie/27205/state", Some(&t), None).await;
+    let st: TitleState = serde_json::from_value(st).unwrap();
+    assert_eq!(st.video_scale, Some(VideoScale::FitHeight));
+    assert_eq!(st.status, Some(TitleStatus::Watched), "rating marks the title watched");
+    let (_, p) = call(&app, Method::GET, "/api/progress/movie/27205", Some(&t), None).await;
+    assert_eq!(p[0]["finished"], true);
 
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
     assert_eq!(serde_json::from_value::<UserPrefs>(p).unwrap(), UserPrefs::default());
@@ -305,4 +324,120 @@ async fn new_episode_notification(pool: PgPool) {
         Some(TitleStatus::Watching),
         "back to watching"
     );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn rating_marks_film_and_all_series_episodes_watched(pool: PgPool) {
+    let app = test_app(pool);
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+
+    // Half-watched movie dropped out of "continue" and marked finished once rated.
+    play(
+        &app,
+        &t,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 1200.0, "duration_sec": 8000.0}),
+    )
+    .await;
+    let (code, body) = call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/rating",
+        Some(&t),
+        Some(json!({"rating": 4})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    assert_eq!(st.status, Some(TitleStatus::Watched));
+    assert_eq!(st.rating, Some(4));
+
+    let (_, prog) = call(&app, Method::GET, "/api/progress/movie/603", Some(&t), None).await;
+    let prog: Vec<Progress> = serde_json::from_value(prog).unwrap();
+    assert_eq!(prog.len(), 1);
+    assert!(prog[0].finished);
+
+    // Series "Тьма" (70523): 3 seasons of 10, 8, 8 episodes = 26 episodes.
+    play(
+        &app,
+        &t,
+        json!({"kind": "tv", "tmdb_id": 70523, "season": 1, "episode": 2,
+               "position_sec": 300.0, "duration_sec": 3200.0}),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/status",
+        Some(&t),
+        Some(json!({"status": "dropped"})),
+    )
+    .await;
+    call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&t),
+        Some(json!({
+            "kind": "tv",
+            "tmdb_id": 70523,
+            "season": 2,
+            "infohash": "cd".repeat(20),
+            "title": "S02"
+        })),
+    )
+    .await;
+
+    let (code, body) = call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/rating",
+        Some(&t),
+        Some(json!({"rating": 5})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    assert_eq!(st.status, Some(TitleStatus::Watched));
+    assert_eq!(st.rating, Some(5));
+
+    let (_, prog) = call(&app, Method::GET, "/api/progress/tv/70523", Some(&t), None).await;
+    let prog: Vec<Progress> = serde_json::from_value(prog).unwrap();
+    let expected: Vec<(i32, i32)> = [(1, 10), (2, 8), (3, 8)]
+        .into_iter()
+        .flat_map(|(s, count)| (1..=count).map(move |e| (s, e)))
+        .collect();
+    assert_eq!(
+        prog.iter()
+            .filter(|p| p.finished)
+            .map(|p| (p.season, p.episode))
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    let (_, cont) = call(&app, Method::GET, "/api/continue", Some(&t), None).await;
+    assert_eq!(cont, json!([]), "rated titles leave continue watching");
+
+    let (_, preloads) = call(&app, Method::GET, "/api/preload", Some(&t), None).await;
+    let preloads: Vec<PreloadItem> = serde_json::from_value(preloads).unwrap();
+    assert!(
+        preloads[0].delete_after.is_some(),
+        "completed season preload scheduled for removal"
+    );
+
+    // Removing the rating keeps status and episode marks intact.
+    let (code, body) = call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/rating",
+        Some(&t),
+        Some(json!({"rating": null})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    assert_eq!(st.rating, None);
+    assert_eq!(st.status, Some(TitleStatus::Watched));
+    let (_, prog) = call(&app, Method::GET, "/api/progress/tv/70523", Some(&t), None).await;
+    let prog: Vec<Progress> = serde_json::from_value(prog).unwrap();
+    assert_eq!(prog.iter().filter(|p| p.finished).count(), 26);
 }

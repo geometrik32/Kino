@@ -33,6 +33,10 @@ pub struct Config {
     pub tmdb_language: String,
     /// Directory with the built Dioxus web app; served at `/` when set.
     pub static_dir: Option<PathBuf>,
+    /// Optional disk cache for TMDB posters/backdrops (keeps image cache out of RAM).
+    pub image_cache_dir: Option<PathBuf>,
+    /// Maximum disk budget for `image_cache_dir` in megabytes.
+    pub image_cache_max_mb: u64,
     /// How often to look for new episodes of followed series.
     pub notify_every: std::time::Duration,
     /// How long a preloaded release is kept after it was watched.
@@ -48,6 +52,12 @@ pub struct Config {
 pub struct TorrentConfig {
     pub jackett_url: Option<String>,
     pub jackett_api_key: Option<String>,
+    /// Optional Sablier URL to wake a sleeping Jackett container on demand.
+    pub jackett_wake_url: Option<String>,
+    /// Sablier group name for Jackett (default `jackett`).
+    pub jackett_wake_group: String,
+    /// How long Jackett stays awake after activity (default `10m`).
+    pub jackett_wake_duration: String,
     pub torrserver_url: Option<String>,
     pub torrserver_user: Option<String>,
     pub torrserver_password: Option<String>,
@@ -62,6 +72,8 @@ pub struct TorrentConfig {
     pub ffprobe: String,
     /// `none`, `qsv` (Intel Quick Sync) or `vaapi`.
     pub hwaccel: String,
+    /// Maximum concurrent ffmpeg transcodes (0 uses default = 2).
+    pub max_transcodes: usize,
 }
 
 impl TorrentConfig {
@@ -75,6 +87,9 @@ impl TorrentConfig {
         Self {
             jackett_url: opt("JACKETT_URL"),
             jackett_api_key: opt("JACKETT_API_KEY"),
+            jackett_wake_url: opt("JACKETT_WAKE_URL"),
+            jackett_wake_group: opt("JACKETT_WAKE_GROUP").unwrap_or_else(|| "jackett".into()),
+            jackett_wake_duration: opt("JACKETT_WAKE_DURATION").unwrap_or_else(|| "10m".into()),
             torrserver_url: opt("TORRSERVER_URL"),
             torrserver_user: opt("TORRSERVER_USER"),
             torrserver_password: opt("TORRSERVER_PASSWORD"),
@@ -86,6 +101,10 @@ impl TorrentConfig {
             ffmpeg: opt("FFMPEG").unwrap_or_else(|| "ffmpeg".into()),
             ffprobe: opt("FFPROBE").unwrap_or_else(|| "ffprobe".into()),
             hwaccel: opt("TRANSCODE_HWACCEL").unwrap_or_else(|| "none".into()),
+            max_transcodes: opt("MAX_TRANSCODES")
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(2)
+                .clamp(1, 8),
         }
     }
 }
@@ -104,10 +123,13 @@ impl std::fmt::Debug for Config {
             .field("telegram_proxy", &self.telegram_proxy.as_deref().map(redact_proxy))
             .field("tmdb_proxy", &self.tmdb_proxy.as_deref().map(redact_proxy))
             .field("static_dir", &self.static_dir)
+            .field("image_cache_dir", &self.image_cache_dir)
             .field("jackett", &self.torrents.jackett_url)
+            .field("jackett_wake", &self.torrents.jackett_wake_url)
             .field("torrserver", &self.torrents.torrserver_url)
             .field("qbittorrent", &self.torrents.qbittorrent_url)
             .field("hwaccel", &self.torrents.hwaccel)
+            .field("max_transcodes", &self.torrents.max_transcodes)
             .finish_non_exhaustive()
     }
 }
@@ -156,6 +178,11 @@ impl Config {
             tmdb_proxy: env_value("TMDB_PROXY"),
             tmdb_language: var_or("TMDB_LANGUAGE", "ru-RU"),
             static_dir: std::env::var("STATIC_DIR").ok().map(PathBuf::from),
+            image_cache_dir: env_value("IMAGE_CACHE_DIR").map(PathBuf::from),
+            image_cache_max_mb: var_or("IMAGE_CACHE_MAX_MB", "400")
+                .parse::<u64>()
+                .context("IMAGE_CACHE_MAX_MB must be a number")?
+                .clamp(32, 10_240),
             notify_every: std::time::Duration::from_secs(
                 3600 * var_or("NOTIFY_INTERVAL_HOURS", "6")
                     .parse::<u64>()

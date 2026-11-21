@@ -4,10 +4,11 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
-    SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState, TracksUpdate,
+    episode_code, MediaKind, MediaTrack, PlayInfo, PlayProbeRequest, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate,
+    ReleaseRef, StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState,
+    TracksUpdate,
 };
-use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView};
+use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, VideoScale};
 
 use crate::{
     api, native, platform,
@@ -32,6 +33,8 @@ pub struct PlayStart {
     pub explicit_episode: bool,
     /// True when the user explicitly picked a release in `ReleasePicker`.
     pub explicit_release: bool,
+    /// Remembered picture scaling mode for this title from the server DB.
+    pub video_scale: Option<VideoScale>,
 }
 
 /// How often the position is saved while playing, seconds of video.
@@ -40,10 +43,74 @@ const SAVE_EVERY: f64 = 10.0;
 /// How often the player sends a sync heartbeat & checks drift, milliseconds.
 const SYNC_TICK_MS: u32 = 2_000;
 
-/// How long the controls stay on screen while a film plays, milliseconds.
+/// How long the controls stay on screen after user activity, milliseconds.
 const CONTROLS_MS: u32 = 3_500;
 
+const SCALE_STORAGE_KEY: &str = "kino.player.scale";
+const MAX_SAVED_SCALES: usize = 200;
+
+fn scale_title_key(kind: MediaKind, tmdb_id: i64) -> String {
+    format!("{}:{tmdb_id}", kind.as_str())
+}
+
+fn scale_code(scale: VideoScale) -> u8 {
+    match scale {
+        VideoScale::FitWidth => 1,
+        VideoScale::FitHeight => 2,
+    }
+}
+
+fn scale_from_code(code: u8) -> VideoScale {
+    if code == 2 {
+        VideoScale::FitHeight
+    } else {
+        VideoScale::FitWidth
+    }
+}
+
+fn decode_saved_scales(raw: &str) -> Vec<(String, String)> {
+    serde_json::from_str::<Vec<(String, String)>>(raw).unwrap_or_default()
+}
+
+fn lookup_saved_scale(entries: &[(String, String)], key: &str) -> Option<VideoScale> {
+    entries
+        .iter()
+        .rev()
+        .find(|(k, _)| k == key)
+        .and_then(|(_, v)| VideoScale::parse(v))
+}
+
+fn upsert_saved_scale(entries: &mut Vec<(String, String)>, key: &str, scale: VideoScale) -> String {
+    entries.retain(|(k, _)| k != key);
+    entries.push((key.to_owned(), scale.as_str().to_owned()));
+    if entries.len() > MAX_SAVED_SCALES {
+        let drop_n = entries.len() - MAX_SAVED_SCALES;
+        entries.drain(..drop_n);
+    }
+    serde_json::to_string(entries).unwrap_or_else(|_| "[]".into())
+}
+
+fn apply_web_scale(saved: Option<VideoScale>) {
+    let mode = match saved {
+        Some(VideoScale::FitWidth) => "width",
+        Some(VideoScale::FitHeight) => "height",
+        None => "auto",
+    };
+    let _ = dioxus::document::eval(&format!(
+        "window.__kinoVideoScaleMode = '{mode}'; if (window.__kinoSyncVideoScale) window.__kinoSyncVideoScale();"
+    ));
+}
+
 pub use crate::platform::device_name;
+
+fn sync_audio_index(sync_state: &Option<SyncState>, tracks: &[MediaTrack], fallback: Option<i32>) -> Option<i32> {
+    sync_state
+        .as_ref()
+        .and_then(|st| st.audio_track.as_deref())
+        .and_then(|lbl| tracks.iter().find(|a| a.label() == lbl))
+        .map(|a| a.index)
+        .or(fallback)
+}
 
 fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
@@ -101,6 +168,17 @@ impl Drop for KeyGuard {
     }
 }
 
+/// Removes the player's video scaling observer when the player unmounts.
+struct ScaleGuard;
+
+impl Drop for ScaleGuard {
+    fn drop(&mut self) {
+        let _ = dioxus::document::eval(
+            "if (window.__kinoPlayerScaleStop) { try { window.__kinoPlayerScaleStop(); } catch (e) {} }",
+        );
+    }
+}
+
 /// Ensures the sync WebSocket closes cleanly if `Player` is unmounted directly.
 struct SyncGuard;
 
@@ -124,7 +202,9 @@ impl Drop for NativePlayerGuard {
 pub fn Player(
     token: String,
     start: PlayStart,
-    on_close: EventHandler<()>,
+    on_scale: EventHandler<VideoScale>,
+    on_close: EventHandler<bool>,
+    on_title: EventHandler<()>,
     /// The next season has no remembered release: pick one for `(season, episode)`.
     on_need_release: EventHandler<(i32, i32)>,
 ) -> Element {
@@ -156,8 +236,9 @@ pub fn Player(
     platform::video::use_bridge();
     // Finger or mouse: a tap on the picture shows the controls on a phone, pauses on a computer.
     let touch = use_resource(platform::touch_screen);
-    // Bumped on every touch so that a stale timer does not hide the controls.
-    let mut interaction = use_signal(|| 0u32);
+    // Tracks the last user interaction timestamp and whether the hide timer loop is active.
+    let mut last_activity_ms = use_signal(|| 0_i64);
+    let mut controls_timer = use_signal(|| false);
     let mut flash_gen = use_signal(|| 0u32);
     let mut play_gen = use_signal(|| 0u32);
     let mut stall_secs = use_signal(|| 0u32);
@@ -166,6 +247,12 @@ pub fn Player(
     let mut rate = use_signal(|| 1.0_f32);
     let mut volume = use_signal(|| 1.0_f32);
     let mut muted = use_signal(|| false);
+    let title_scale_key = scale_title_key(kind, id);
+    let db_scale = start.video_scale;
+    let mut saved_scale = use_signal(|| db_scale);
+    let mut active_scale = use_signal(|| db_scale.unwrap_or_default());
+    let mut scales_cache = use_signal(Vec::<(String, String)>::new);
+    let mut user_touched_scale = use_signal(|| false);
 
     // Synchronization state.
     let mut sync_state = use_signal(|| None::<SyncState>);
@@ -183,6 +270,8 @@ pub fn Player(
     let mut sync_init_done = use_signal(|| false);
     let mut auto_muted = use_signal(|| false);
     let mut last_prog_pause_ms = use_signal(|| 0_i64);
+    let mut last_sound_cmd_ms = use_signal(|| 0_i64);
+    let mut last_sync_unmute_ms = use_signal(|| 0_i64);
 
     let mut pause_video = move || {
         last_prog_pause_ms.set(platform::now_ms());
@@ -197,65 +286,104 @@ pub fn Player(
         }
         auto_muted.set(false);
         if let Some(v) = video() {
-            v.set_muted(muted());
+            v.set_muted(muted() || ui.peek().is_sync_muted());
         }
         ui.with_mut(|s| s.auto_muted = false);
+    };
+
+    // Shows the controls and hides them again after `CONTROLS_MS` of inactivity (even while paused).
+    let mut show_controls = move || {
+        last_activity_ms.set(platform::now_ms());
+        if !ui.peek().controls {
+            ui.with_mut(|s| s.controls = true);
+        }
+        if *controls_timer.peek() {
+            return;
+        }
+        controls_timer.set(true);
+        spawn(async move {
+            loop {
+                let elapsed = (platform::now_ms() - *last_activity_ms.peek()).max(0);
+                let remain = i64::from(CONTROLS_MS) - elapsed;
+                if remain <= 25 {
+                    if ui.peek().menu.is_none() && ui.peek().controls {
+                        ui.with_mut(|s| s.controls = false);
+                    }
+                    controls_timer.set(false);
+                    break;
+                }
+                platform::sleep(remain as u32).await;
+                if closing() || !ui.peek().controls || ui.peek().menu.is_some() {
+                    controls_timer.set(false);
+                    break;
+                }
+            }
+        });
+    };
+
+    let switch_sync_sound = {
+        let self_cid = client_id.clone();
+        move |target_cid: String| {
+            last_sound_cmd_ms.set(platform::now_ms());
+            let target_is_self = target_cid == self_cid;
+            if target_is_self {
+                auto_muted.set(false);
+                muted.set(false);
+                if volume() <= 0.001 {
+                    volume.set(0.7);
+                    if let Some(v) = video() {
+                        v.set_volume(0.7);
+                    }
+                }
+            }
+            ui.with_mut(|s| {
+                s.sync_sound_client_id = Some(target_cid.clone());
+                if target_is_self {
+                    s.auto_muted = false;
+                }
+            });
+            if let Some(v) = video() {
+                let should_mute = if target_is_self {
+                    false
+                } else {
+                    ui.peek().is_sync_muted()
+                };
+                v.set_muted(should_mute);
+            }
+            sync::send(&SyncClientMsg::Sound { client_id: target_cid });
+            show_controls();
+        }
     };
 
     let mut attempt_play = move |expected_gen: u32, from_user: bool| {
         let Some(v) = video() else { return };
         if from_user && auto_muted() {
             auto_muted.set(false);
-            v.set_muted(muted());
+            v.set_muted(muted() || ui.peek().is_sync_muted());
             ui.with_mut(|s| s.auto_muted = false);
         }
         v.play_checked(move |outcome| {
             if closing() || play_gen() != expected_gen || desired_paused() {
                 return;
             }
-            match outcome {
-                PlayOutcome::Ok | PlayOutcome::Aborted | PlayOutcome::Error => {}
-                PlayOutcome::NotAllowed => {
-                    let Some(vid) = video() else { return };
-                    if !muted() && !auto_muted() {
-                        auto_muted.set(true);
-                        vid.set_muted(true);
-                        ui.with_mut(|s| s.auto_muted = true);
-                        vid.play_checked(move |muted_outcome| {
-                            if closing() || play_gen() != expected_gen || desired_paused() {
-                                return;
-                            }
-                            if matches!(muted_outcome, PlayOutcome::NotAllowed | PlayOutcome::Error) {
-                                auto_muted.set(false);
-                                if let Some(v2) = video() {
-                                    v2.set_muted(muted());
-                                }
-                                let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
-                                if alone {
-                                    desired_paused.set(true);
-                                }
-                                ui.with_mut(|s| {
-                                    s.auto_muted = false;
-                                    s.paused = true;
-                                    s.waiting = false;
-                                    s.status = None;
-                                    s.progress = None;
-                                });
-                            }
-                        });
-                    } else {
-                        let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
-                        if alone {
-                            desired_paused.set(true);
-                        }
-                        ui.with_mut(|s| {
-                            s.paused = true;
-                            s.waiting = false;
-                            s.status = None;
-                            s.progress = None;
-                        });
-                    }
+            if outcome == PlayOutcome::NotAllowed {
+                // Keep audio unmuted and let the user start cleanly with one tap on Play.
+                auto_muted.set(false);
+                let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
+                if alone {
+                    desired_paused.set(true);
+                    sync::send(&SyncClientMsg::Pause {
+                        position_sec: ui.peek().position,
+                    });
                 }
+                ui.with_mut(|s| {
+                    s.auto_muted = false;
+                    s.paused = true;
+                    s.waiting = false;
+                    s.status = None;
+                    s.progress = None;
+                });
+                show_controls();
             }
         });
     };
@@ -295,30 +423,13 @@ pub fn Player(
         })
     };
 
-    // Shows the controls and hides them again after a few seconds of playing.
-    let mut show_controls = move || {
-        ui.with_mut(|s| s.controls = true);
-        let n = interaction() + 1;
-        interaction.set(n);
-        spawn(async move {
-            platform::sleep(CONTROLS_MS).await;
-            if interaction() == n {
-                ui.with_mut(|s| {
-                    if !s.paused && s.menu.is_none() {
-                        s.controls = false;
-                    }
-                });
-            }
-        });
-    };
-
     // Points the video at the right source for the given audio track and second.
     let mut load_source = move |at: f64| {
         let Some(i) = info() else { return };
         let audio = ui.peek().audio_track;
         let native = platform::video::supports_native() && !force_transcode();
         let transcode = !native && (force_transcode() || !i.plays_directly(audio));
-        let (src, off) = if transcode {
+        let (mut src, off) = if transcode {
             last_reload_ms.set(platform::now_ms());
             pending_seek.set(None);
             seeking_target.set(None);
@@ -329,13 +440,42 @@ pub fn Player(
             (i.stream.clone(), 0.0)
         };
         if transcode && ui.peek().src == src {
-            offset.set(off);
-            sync::set_stream_offset(off);
-            ui.with_mut(|s| s.position = at);
-            if !awaiting_ready() {
+            if (ui.peek().position - at).abs() <= 1.5 {
+                offset.set(off);
+                sync::set_stream_offset(off);
+                ui.with_mut(|s| s.position = at);
+                if !awaiting_ready() {
+                    let fi = info.peek().as_ref().map(|x| x.file_index);
+                    sync::send(&SyncClientMsg::Ready {
+                        position_sec: at,
+                        duration_sec: ui.peek().duration,
+                        file_index: fi,
+                    });
+                }
+                return;
+            }
+            // Seeking back to the same start second (e.g. 0:00): bust identical URL so `<video>` actually reloads.
+            let sep = if src.contains('?') { '&' } else { '?' };
+            src.push_str(&format!("{sep}r={}", platform::now_ms()));
+        }
+        if !native && !transcode && ui.peek().src == src {
+            if (ui.peek().position - at).abs() > 1.5 {
+                if let Some(v) = video() {
+                    if v.ready_state() >= 1 {
+                        awaiting_ready.set(true);
+                        canplay_seen.set(false);
+                        seeking_target.set(Some(at));
+                        v.set_current_time(at);
+                        ui.with_mut(|s| s.position = at);
+                    } else {
+                        pending_seek.set(Some(at));
+                        ui.with_mut(|s| s.position = at);
+                    }
+                }
+            } else if !awaiting_ready() {
                 let fi = info.peek().as_ref().map(|x| x.file_index);
                 sync::send(&SyncClientMsg::Ready {
-                    position_sec: at,
+                    position_sec: ui.peek().position,
                     duration_sec: ui.peek().duration,
                     file_index: fi,
                 });
@@ -351,10 +491,20 @@ pub fn Player(
                     v.set_current_time(at);
                     ui.with_mut(|s| s.position = at);
                 }
+            } else if !awaiting_ready() {
+                let fi = info.peek().as_ref().map(|x| x.file_index);
+                sync::send(&SyncClientMsg::Ready {
+                    position_sec: ui.peek().position,
+                    duration_sec: ui.peek().duration,
+                    file_index: fi,
+                });
             }
             return;
         }
-        let hold = sync_state.peek().as_ref().is_some_and(|st| st.paused || st.waiting);
+        let hold = sync_state
+            .peek()
+            .as_ref()
+            .map_or(*desired_paused.peek(), |st| st.paused || st.waiting);
         desired_paused.set(hold);
         awaiting_ready.set(true);
         canplay_seen.set(false);
@@ -371,6 +521,7 @@ pub fn Player(
         };
         offset.set(off);
         sync::set_stream_offset(off);
+        sync::set_playback_state(at, ui.peek().duration, false);
         stall_secs.set(0);
         played.set(false);
         let sub_track = if i.preloaded || native {
@@ -379,7 +530,12 @@ pub fn Player(
             None
         };
         if native {
-            platform::video::native_open(&src, at, f64::from(rate()), audio, sub_track, !hold);
+            let mode = saved_scale.peek().map_or(0, scale_code);
+            platform::video::native_open(&src, at, f64::from(rate()), audio, sub_track, !hold, mode);
+            if let Some(v) = video() {
+                v.set_volume(f64::from(volume()));
+                v.set_muted(muted() || auto_muted() || ui.peek().is_sync_muted());
+            }
             let _ = dioxus::document::eval("document.documentElement.classList.add('native-video');");
         } else {
             platform::video::native_close();
@@ -409,8 +565,8 @@ pub fn Player(
             let (Some(i), s) = (info.peek().clone(), ui.peek().clone()) else {
                 return;
             };
-            let duration = s.duration.unwrap_or(0.0);
-            if duration <= 0.0 {
+            let duration = s.duration.unwrap_or(0.0).max(0.0);
+            if !finished && duration <= 0.0 && s.position < 1.0 {
                 return;
             }
             let (season, episode) = target();
@@ -420,7 +576,11 @@ pub fn Player(
                 tmdb_id: id,
                 season: if kind == MediaKind::Tv { season } else { 0 },
                 episode: if kind == MediaKind::Tv { episode } else { 0 },
-                position_sec: if finished { duration } else { s.position },
+                position_sec: if finished && duration > 0.0 {
+                    duration
+                } else {
+                    s.position
+                },
                 duration_sec: duration,
                 release: Some(ReleaseRef {
                     infohash: i.infohash.clone(),
@@ -442,7 +602,7 @@ pub fn Player(
         stall_secs.set(0);
         waiting_gen.set(waiting_gen() + 1);
         let st_opt = sync_state.peek().clone();
-        let paused_by_user = st_opt.as_ref().is_some_and(|st| st.paused);
+        let paused_by_user = st_opt.as_ref().map_or(*desired_paused.peek(), |st| st.paused);
         let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
         let hold = paused_by_user || waiting_peer;
         desired_paused.set(hold);
@@ -459,6 +619,9 @@ pub fn Player(
                 s.progress = None;
                 s.status = msg;
             });
+            if paused_by_user {
+                show_controls();
+            }
         } else {
             ui.with_mut(|s| {
                 s.waiting = false;
@@ -482,8 +645,10 @@ pub fn Player(
     // Fetches `/api/play` for `(season, episode, rel)` and loads the resulting stream.
     let start_play_fetch = {
         let token = token.clone();
+        let save = save.clone();
         move |season: i32, episode: i32, rel: ReleaseChoiceUpdate, initial_pos: f64, my_gen: u32| {
             let t = token.clone();
+            let save_for_probe = save.clone();
             spawn(async move {
                 platform::sleep(95_000).await;
                 if play_gen() != my_gen || closing() {
@@ -542,13 +707,10 @@ pub fn Player(
                 connecting.set(false);
                 match res {
                     Ok(i) => {
-                        let synced_audio = sync_state
-                            .peek()
-                            .as_ref()
-                            .and_then(|st| st.audio_track.as_deref())
-                            .and_then(|lbl| i.audio.iter().find(|a| a.label() == lbl))
-                            .map(|a| a.index)
-                            .or(i.audio_track);
+                        let synced_audio = sync_audio_index(&sync_state.peek(), &i.audio, i.audio_track);
+                        let should_probe = i.duration.is_none();
+                        let probe_stream = i.stream.clone();
+                        let probe_native = i.native;
                         ui.with_mut(|s| {
                             s.duration = i.duration;
                             s.audio = i.audio.clone();
@@ -565,11 +727,101 @@ pub fn Player(
                         let at = sync_state
                             .peek()
                             .as_ref()
+                            .filter(|st| kind != MediaKind::Tv || (st.season == season && st.episode == episode))
                             .map(|st| clock.peek().expected_position(st, platform::now_ms()))
                             .unwrap_or_else(|| f64::from(i.start_at));
                         last_saved.set(at);
                         info.set(Some(i));
                         load_source(at);
+
+                        if should_probe {
+                            let probe_token = t.clone();
+                            let mut save_after_probe = save_for_probe;
+                            spawn(async move {
+                                for delay in [5_000_u32, 8_000, 12_000, 15_000, 20_000, 30_000] {
+                                    platform::sleep(delay).await;
+                                    if play_gen() != my_gen || closing() || ui.peek().duration.is_some() {
+                                        break;
+                                    }
+                                    let probe_req = PlayProbeRequest {
+                                        kind,
+                                        tmdb_id: id,
+                                        stream: probe_stream.clone(),
+                                        native: probe_native,
+                                    };
+                                    let Ok(p) = api::play_probe(&probe_token, &probe_req).await else {
+                                        continue;
+                                    };
+                                    if play_gen() != my_gen || closing() {
+                                        break;
+                                    }
+                                    if p.duration.is_none() && p.audio.is_empty() && p.subtitles.is_empty() {
+                                        continue;
+                                    }
+                                    // Playback already started with track 0 (or default when direct),
+                                    // so display the active track in the menu without jarring mid-stream reloads.
+                                    let fallback_audio = if ui.peek().transcoded {
+                                        p.audio
+                                            .iter()
+                                            .find(|a| a.index == 0)
+                                            .or(p.audio.first())
+                                            .map(|a| a.index)
+                                    } else {
+                                        p.audio.iter().find(|a| a.default).or(p.audio.first()).map(|a| a.index)
+                                    };
+                                    let synced_audio = sync_audio_index(&sync_state.peek(), &p.audio, fallback_audio);
+                                    info.with_mut(|cur| {
+                                        if let Some(cur) = cur.as_mut() {
+                                            if cur.duration.is_none() {
+                                                cur.duration = p.duration;
+                                            }
+                                            cur.direct = p.direct;
+                                            if let Some(s) = p.stream.clone() {
+                                                cur.stream = s;
+                                            }
+                                            if cur.audio.is_empty() && !p.audio.is_empty() {
+                                                cur.audio = p.audio.clone();
+                                            }
+                                            if cur.subtitles.is_empty() && !p.subtitles.is_empty() {
+                                                cur.subtitles = p.subtitles.clone();
+                                            }
+                                        }
+                                    });
+                                    ui.with_mut(|s| {
+                                        if s.duration.is_none() {
+                                            s.duration = p.duration;
+                                        }
+                                        if s.audio.is_empty() && !p.audio.is_empty() {
+                                            s.audio = p.audio.clone();
+                                            if s.audio_track.is_none() {
+                                                s.audio_track = synced_audio;
+                                            }
+                                        }
+                                        if s.subtitle_tracks.is_empty() && !p.subtitles.is_empty() {
+                                            s.subtitle_tracks = p.subtitles.clone();
+                                            if (probe_native || s.preloaded) && s.subtitle_track.is_none() {
+                                                s.subtitle_track = p.subtitle_track;
+                                            }
+                                        }
+                                    });
+                                    if ui.peek().duration.is_some() {
+                                        let s = ui.peek().clone();
+                                        if sync_connected() && played() && !awaiting_ready() {
+                                            sync::send(&SyncClientMsg::Report {
+                                                position_sec: s.position,
+                                                duration_sec: s.duration,
+                                                paused: desired_paused(),
+                                                rate: rate(),
+                                            });
+                                        }
+                                        if s.position >= 1.0 {
+                                            save_after_probe(false);
+                                        }
+                                        break;
+                                    }
+                                }
+                            });
+                        }
                     }
                     Err(e) => {
                         // Do not keep another peer blocked if this device failed to load the stream.
@@ -681,6 +933,7 @@ pub fn Player(
                         s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(cur_season, cur_episode));
                         s.sync_members = resp.state.members.clone();
                         s.sync_waiting_for = resp.state.waiting_for.clone();
+                        s.sync_sound_client_id = resp.state.sound_client_id.clone();
                     });
 
                     // Start WebSocket bridge loop with automatic reconnect while Player is open.
@@ -693,6 +946,7 @@ pub fn Player(
                     let mut ws_start_fetch = start_play_fetch.clone();
                     spawn(async move {
                         let mut ticket = initial_ticket;
+                        let mut backoff_ms: u32 = 1_500;
                         loop {
                             if ws_gen() != my_ws || closing() {
                                 break;
@@ -707,6 +961,7 @@ pub fn Player(
                                 };
                                 match ev {
                                     sync::WsBridgeEvent::Open => {
+                                        backoff_ms = 1_500;
                                         sync_connected.set(true);
                                         sync::send(&SyncClientMsg::Ping {
                                             client_ms: platform::now_ms(),
@@ -733,21 +988,62 @@ pub fn Player(
                                             }
                                             SyncServerMsg::State(st) => {
                                                 let st = *st;
-                                                ui.with_mut(|s| {
-                                                    s.sync_members = st.members.clone();
-                                                    s.sync_waiting_for = st.waiting_for.clone();
-                                                    if st.members.len() <= 1 && s.menu == Some(PlayerMenu::Sync) {
-                                                        s.menu = None;
-                                                    }
-                                                });
                                                 if st.revision < last_revision() {
                                                     continue;
                                                 }
                                                 let is_self = st.updated_by.as_deref() == Some(ws_cid.as_str());
+                                                let now_ms = platform::now_ms();
+                                                let apply_sound = st.event == SyncEventKind::Sound
+                                                    || now_ms - last_sound_cmd_ms() > 1_500
+                                                    || st.sound_client_id == ui.peek().sync_sound_client_id;
+                                                let was_sync_muted = ui.peek().is_sync_muted();
+                                                ui.with_mut(|s| {
+                                                    s.sync_members = st.members.clone();
+                                                    s.sync_waiting_for = st.waiting_for.clone();
+                                                    if apply_sound {
+                                                        s.sync_sound_client_id = st.sound_client_id.clone();
+                                                    }
+                                                    if st.members.len() <= 1 && s.menu == Some(PlayerMenu::Sync) {
+                                                        s.menu = None;
+                                                    }
+                                                });
+                                                let now_sync_muted = ui.peek().is_sync_muted();
+                                                if apply_sound {
+                                                    if now_sync_muted {
+                                                        if let Some(v) = video() {
+                                                            v.set_muted(true);
+                                                        }
+                                                    } else if was_sync_muted {
+                                                        if st.event == SyncEventKind::Sound
+                                                            && st.sound_client_id.as_deref() == Some(ws_cid.as_str())
+                                                        {
+                                                            muted.set(false);
+                                                            auto_muted.set(false);
+                                                            if volume() <= 0.001 {
+                                                                volume.set(0.7);
+                                                                if let Some(v) = video() {
+                                                                    v.set_volume(0.7);
+                                                                }
+                                                            }
+                                                            ui.with_mut(|s| s.auto_muted = false);
+                                                        }
+                                                        if !is_self
+                                                            && !ui.peek().native_video
+                                                            && !muted()
+                                                            && !auto_muted()
+                                                        {
+                                                            last_sync_unmute_ms.set(now_ms);
+                                                        }
+                                                        if let Some(v) = video() {
+                                                            v.set_muted(muted() || auto_muted());
+                                                        }
+                                                    }
+                                                }
                                                 last_revision.set(st.revision);
                                                 sync_state.set(Some(st.clone()));
 
                                                 let hold = st.paused || st.waiting;
+                                                let was_paused = ui.peek().paused;
                                                 desired_paused.set(hold);
                                                 ui.with_mut(|s| {
                                                     s.paused = st.paused;
@@ -761,6 +1057,9 @@ pub fn Player(
                                                         s.status = None;
                                                     }
                                                 });
+                                                if !is_self && st.paused != was_paused {
+                                                    show_controls();
+                                                }
 
                                                 if video().is_some() {
                                                     if hold {
@@ -811,6 +1110,13 @@ pub fn Player(
                                                             ui.with_mut(|s| s.audio_track = target_idx);
                                                             load_source(at);
                                                             continue;
+                                                        }
+                                                        if !awaiting_ready() {
+                                                            sync::send(&SyncClientMsg::Ready {
+                                                                position_sec: ui.peek().position,
+                                                                duration_sec: ui.peek().duration,
+                                                                file_index: Some(i.file_index),
+                                                            });
                                                         }
                                                     }
                                                 }
@@ -881,45 +1187,58 @@ pub fn Player(
                                 }
                             }
 
-                            // Reconnect cleanly if the player is still open.
+                            // Reconnect cleanly with exponential backoff until a fresh ticket arrives.
                             sync_connected.set(false);
-                            if ws_gen() != my_ws || closing() {
-                                break;
-                            }
-                            platform::sleep(1_500).await;
-                            if ws_gen() != my_ws || closing() {
-                                break;
-                            }
-                            let (rs, re) = *target.peek();
-                            let rrel = release.peek().clone();
-                            let rejoin_req = SyncJoinRequest {
-                                client_id: ws_cid.clone(),
-                                device: ws_dev.clone(),
-                                kind,
-                                tmdb_id: id,
-                                season: if kind == MediaKind::Tv { rs } else { 0 },
-                                episode: if kind == MediaKind::Tv { re } else { 0 },
-                                release: rrel,
-                                explicit_episode: false,
-                                explicit_release: false,
-                                reconnect_pos: Some(ui.peek().position),
-                            };
-                            match api::sync_join(&ws_token, &rejoin_req).await {
-                                Ok(rejoin) => {
-                                    clock.with_mut(|c| {
-                                        c.seed_from_server(rejoin.state.server_now_ms, platform::now_ms());
-                                    });
-                                    last_revision.set(rejoin.state.revision);
-                                    sync_state.set(Some(rejoin.state.clone()));
-                                    ui.with_mut(|s| {
-                                        s.sync_members = rejoin.state.members.clone();
-                                        s.sync_waiting_for = rejoin.state.waiting_for.clone();
-                                    });
-                                    ticket = rejoin.ticket;
+                            let mut reconnected = false;
+                            while ws_gen() == my_ws && !closing() {
+                                platform::sleep(backoff_ms).await;
+                                if ws_gen() != my_ws || closing() {
+                                    break;
                                 }
-                                Err(_) => {
-                                    platform::sleep(2_000).await;
+                                let (rs, re) = *target.peek();
+                                let rrel = release.peek().clone();
+                                let rejoin_req = SyncJoinRequest {
+                                    client_id: ws_cid.clone(),
+                                    device: ws_dev.clone(),
+                                    kind,
+                                    tmdb_id: id,
+                                    season: if kind == MediaKind::Tv { rs } else { 0 },
+                                    episode: if kind == MediaKind::Tv { re } else { 0 },
+                                    release: rrel,
+                                    explicit_episode: false,
+                                    explicit_release: false,
+                                    reconnect_pos: Some(ui.peek().position),
+                                };
+                                match api::sync_join(&ws_token, &rejoin_req).await {
+                                    Ok(rejoin) => {
+                                        clock.with_mut(|c| {
+                                            c.seed_from_server(rejoin.state.server_now_ms, platform::now_ms());
+                                        });
+                                        last_revision.set(rejoin.state.revision);
+                                        sync_state.set(Some(rejoin.state.clone()));
+                                        let was_sync_muted = ui.peek().is_sync_muted();
+                                        ui.with_mut(|s| {
+                                            s.sync_members = rejoin.state.members.clone();
+                                            s.sync_waiting_for = rejoin.state.waiting_for.clone();
+                                            s.sync_sound_client_id = rejoin.state.sound_client_id.clone();
+                                        });
+                                        let now_sync_muted = ui.peek().is_sync_muted();
+                                        if now_sync_muted != was_sync_muted {
+                                            if let Some(v) = video() {
+                                                v.set_muted(now_sync_muted || muted() || auto_muted());
+                                            }
+                                        }
+                                        ticket = rejoin.ticket;
+                                        reconnected = true;
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        backoff_ms = (backoff_ms.saturating_mul(2)).min(15_000);
+                                    }
                                 }
+                            }
+                            if !reconnected {
+                                break;
                             }
                         }
                     });
@@ -1020,7 +1339,14 @@ pub fn Player(
             }
             let now_ms = platform::now_ms();
             sync::send(&SyncClientMsg::Ping { client_ms: now_ms });
-            if info.peek().is_none() || connecting() {
+            if info.peek().is_none()
+                || connecting()
+                || awaiting_ready()
+                || seeking_target.peek().is_some()
+                || pending_seek.peek().is_some()
+                || !played()
+                || ui.peek().waiting
+            {
                 continue;
             }
             let Some(v) = video() else { continue };
@@ -1029,7 +1355,7 @@ pub fn Player(
             sync::send(&SyncClientMsg::Report {
                 position_sec: local_pos,
                 duration_sec: dur,
-                paused: v.paused(),
+                paused: desired_paused(),
                 rate: rate(),
             });
 
@@ -1146,10 +1472,12 @@ pub fn Player(
                     ui.with_mut(|s| s.paused = false);
                     attempt_play(play_gen(), true);
                 }
+                show_controls();
             } else {
                 desired_paused.set(true);
                 pause_video();
                 ui.with_mut(|s| s.paused = true);
+                show_controls();
                 sync::send(&SyncClientMsg::Pause { position_sec: cur_pos });
                 save(false);
             }
@@ -1157,6 +1485,9 @@ pub fn Player(
     };
 
     let mut seek_to = move |at: f64| {
+        if ui.peek().controls {
+            show_controls();
+        }
         let s = ui.peek().clone();
         let at = match s.duration {
             Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
@@ -1167,15 +1498,21 @@ pub fn Player(
         if s.transcoded {
             load_source(at);
         } else if let Some(v) = video() {
-            if (v.current_time() - at).abs() > 0.25 {
+            if !s.native_video && v.ready_state() < 1 {
+                pending_seek.set(Some(at));
+                ui.with_mut(|s| s.position = at);
+                sync::set_playback_state(at, ui.peek().duration, played());
+            } else if (v.current_time() - at).abs() > 0.25 {
                 awaiting_ready.set(true);
                 canplay_seen.set(false);
                 seeking_target.set(Some(at));
                 v.set_current_time(at);
                 ui.with_mut(|s| s.position = at);
+                sync::set_playback_state(at, ui.peek().duration, played());
             } else {
                 seeking_target.set(None);
                 ui.with_mut(|s| s.position = at);
+                sync::set_playback_state(at, ui.peek().duration, played());
                 if canplay_seen() || v.ready_state() >= 2 {
                     mark_media_ready();
                 }
@@ -1192,19 +1529,28 @@ pub fn Player(
             let Some(v) = video() else { return };
             match ev {
                 "time" => {
+                    if pending_seek.peek().is_some() || seeking_target.peek().is_some() || awaiting_ready() {
+                        return;
+                    }
                     let pos = offset() + v.current_time();
                     let direct_len = (!ui.peek().transcoded && v.duration().is_finite()).then(|| v.duration());
+                    let mut eff_dur = ui.peek().duration;
                     ui.with_mut(|s| {
                         s.position = pos;
                         if s.duration.is_none() {
                             s.duration = direct_len;
+                            eff_dur = s.duration;
                         }
                     });
+                    sync::set_playback_state(pos, eff_dur, played());
                     if (pos - last_saved()).abs() >= SAVE_EVERY {
                         save(false);
                     }
                 }
                 "metadata" => {
+                    if !ui.peek().native_video {
+                        apply_web_scale(*saved_scale.peek());
+                    }
                     if let Some(at) = pending_seek.take() {
                         if (v.current_time() - at).abs() > 0.25 {
                             canplay_seen.set(false);
@@ -1219,7 +1565,7 @@ pub fn Player(
                         v.set_rate(f64::from(rate()));
                     }
                     v.set_volume(f64::from(volume()));
-                    v.set_muted(muted() || auto_muted());
+                    v.set_muted(muted() || auto_muted() || ui.peek().is_sync_muted());
                     if desired_paused() {
                         pause_video();
                     }
@@ -1232,7 +1578,7 @@ pub fn Player(
                 }
                 "seeked" => {
                     if let Some(tgt) = seeking_target() {
-                        if ui.peek().native_video || (v.current_time() - tgt).abs() < 8.0 {
+                        if ui.peek().native_video || (v.current_time() - tgt).abs() < 20.0 {
                             seeking_target.set(None);
                         }
                     }
@@ -1292,6 +1638,9 @@ pub fn Player(
                     }
                 }
                 "playing" => {
+                    if !ui.peek().native_video {
+                        apply_web_scale(*saved_scale.peek());
+                    }
                     played.set(true);
                     canplay_seen.set(true);
                     seeking_target.set(None);
@@ -1316,7 +1665,11 @@ pub fn Player(
                             });
                         }
                     }
+                    let was_paused = ui.peek().paused;
                     ui.with_mut(|s| s.paused = false);
+                    if was_paused {
+                        show_controls();
+                    }
                 }
                 "pause" => {
                     if closing() || awaiting_ready() || seeking_target.peek().is_some() || pending_seek.peek().is_some()
@@ -1330,7 +1683,17 @@ pub fn Player(
                         }
                     }
                     if desired_paused() {
-                        ui.with_mut(|s| s.paused = sync_state.peek().as_ref().is_some_and(|st| st.paused));
+                        let paused_state = sync_state.peek().as_ref().map_or(true, |st| st.paused);
+                        ui.with_mut(|s| s.paused = paused_state);
+                        return;
+                    }
+                    if platform::now_ms() - last_sync_unmute_ms() < 800 {
+                        // Browser blocked unmuting without a local user gesture: keep playing muted
+                        // with the "Включить звук" prompt instead of pausing synchronized peers.
+                        auto_muted.set(true);
+                        v.set_muted(true);
+                        ui.with_mut(|s| s.auto_muted = true);
+                        attempt_play(play_gen(), false);
                         return;
                     }
                     if !v.paused() || platform::now_ms() - last_prog_pause_ms() < 600 {
@@ -1339,12 +1702,24 @@ pub fn Player(
                     // External pause trigger (e.g. MediaSession / headphone disconnect).
                     desired_paused.set(true);
                     ui.with_mut(|s| s.paused = true);
+                    show_controls();
                     sync::send(&SyncClientMsg::Pause { position_sec: pos });
                     save(false);
                 }
                 "ended" => {
                     save(true);
-                    go_next();
+                    if info.peek().as_ref().and_then(|i| i.next).is_some() {
+                        go_next();
+                    } else {
+                        desired_paused.set(true);
+                        ui.with_mut(|s| s.paused = true);
+                        show_controls();
+                    }
+                }
+                "scale" => {
+                    if saved_scale.peek().is_none() {
+                        active_scale.set(scale_from_code(platform::video::native_scale_mode()));
+                    }
                 }
                 "error" => {
                     let s = ui.peek().clone();
@@ -1402,14 +1777,15 @@ pub fn Player(
     let on_video = use_callback(on_video);
     platform::video::use_native_events(on_video);
 
-    let close = Callback::new({
+    let finish_close = Callback::new({
         let mut save = save.clone();
         let token = token.clone();
         let client_id = client_id.clone();
-        move |_: ()| {
+        move |to_title: bool| {
             if closing() {
                 return;
             }
+            let from_pop = !to_title && telegram::in_popstate();
             closing.set(true);
             ws_gen.set(ws_gen() + 1);
             let s = ui.peek().clone();
@@ -1438,12 +1814,19 @@ pub fn Player(
                 finished: false,
             };
             let t = token.clone();
-            spawn(async move {
+            // Detach HTTP leave so a slow/offline network never traps the user on a black screen.
+            dioxus::core::spawn_forever(async move {
                 let _ = api::sync_leave(&t, &leave_req).await;
-                on_close.call(());
             });
+            if to_title {
+                on_title.call(());
+            } else {
+                on_close.call(from_pop);
+            }
         }
     });
+    let close = Callback::new(move |_: ()| finish_close.call(false));
+    let open_title = Callback::new(move |_: ()| finish_close.call(true));
 
     // On a phone in Telegram the film takes the whole screen, and Telegram's Back closes it.
     use_hook(|| {
@@ -1487,35 +1870,193 @@ pub fn Player(
         muted.set(is_muted);
         if let Some(vid) = video() {
             vid.set_volume(f64::from(clamped));
-            vid.set_muted(is_muted);
+            vid.set_muted(is_muted || ui.peek().is_sync_muted());
         }
+        show_controls();
     };
-    let mut toggle_mute = move || {
-        if auto_muted() {
-            unmute_auto();
-            return;
-        }
-        let next = !muted();
-        muted.set(next);
-        if !next && volume() <= 0.001 {
-            volume.set(0.7);
-            if let Some(vid) = video() {
-                vid.set_volume(0.7);
+    let mut toggle_mute = {
+        let mut switch_sync_sound = switch_sync_sound.clone();
+        let self_cid = client_id.clone();
+        move || {
+            if ui.peek().is_sync_muted() {
+                switch_sync_sound(self_cid.clone());
+                return;
             }
-        }
-        if let Some(vid) = video() {
-            vid.set_muted(next);
+            if auto_muted() {
+                unmute_auto();
+                show_controls();
+                return;
+            }
+            let next = !muted();
+            muted.set(next);
+            if !next && volume() <= 0.001 {
+                volume.set(0.7);
+                if let Some(vid) = video() {
+                    vid.set_volume(0.7);
+                }
+            }
+            if let Some(vid) = video() {
+                vid.set_muted(next);
+            }
+            show_controls();
         }
     };
-    let toggle_fullscreen = move || {
+    let mut toggle_fullscreen = move || {
         platform::toggle_fullscreen();
+        if ui.peek().controls {
+            show_controls();
+        }
     };
+    let mut toggle_scale = {
+        let key = title_scale_key.clone();
+        move || {
+            let current = saved_scale().unwrap_or_else(|| active_scale());
+            let next = current.toggle();
+            user_touched_scale.set(true);
+            saved_scale.set(Some(next));
+            active_scale.set(next);
+            if platform::video::supports_native() {
+                platform::video::native_set_scale(scale_code(next));
+            }
+            apply_web_scale(Some(next));
+            let encoded = scales_cache.with_mut(|entries| upsert_saved_scale(entries, &key, next));
+            platform::storage_set(SCALE_STORAGE_KEY, &encoded);
+            on_scale.call(next);
+            show_controls();
+        }
+    };
+
+    // Load per-title video scale (DB takes precedence; localStorage acts as fallback/cache)
+    // and track HTML `<video>` aspect fit.
+    {
+        let key = title_scale_key.clone();
+        use_hook(move || {
+            spawn(async move {
+                let mut entries = platform::storage_get(SCALE_STORAGE_KEY)
+                    .await
+                    .map(|raw| decode_saved_scales(&raw))
+                    .unwrap_or_default();
+                if user_touched_scale() {
+                    if let Some(picked) = *saved_scale.peek() {
+                        let encoded = upsert_saved_scale(&mut entries, &key, picked);
+                        scales_cache.set(entries);
+                        platform::storage_set(SCALE_STORAGE_KEY, &encoded);
+                    } else {
+                        scales_cache.set(entries);
+                    }
+                    return;
+                }
+                if let Some(s) = db_scale {
+                    let encoded = upsert_saved_scale(&mut entries, &key, s);
+                    scales_cache.set(entries);
+                    platform::storage_set(SCALE_STORAGE_KEY, &encoded);
+                    return;
+                }
+                let loaded = lookup_saved_scale(&entries, &key);
+                scales_cache.set(entries);
+                if let Some(s) = loaded {
+                    saved_scale.set(Some(s));
+                    active_scale.set(s);
+                    if platform::video::supports_native() {
+                        platform::video::native_set_scale(scale_code(s));
+                    }
+                    apply_web_scale(Some(s));
+                }
+            });
+        });
+    }
+    use_hook(move || {
+        let initial_js_mode = match db_scale {
+            Some(VideoScale::FitWidth) => "width",
+            Some(VideoScale::FitHeight) => "height",
+            None => "auto",
+        };
+        spawn(async move {
+            let mut bridge = dioxus::document::eval(&format!(
+                "if (window.__kinoPlayerScaleStop) {{ try {{ window.__kinoPlayerScaleStop(); }} catch (e) {{}} }}
+                 window.__kinoVideoScaleMode = window.__kinoVideoScaleMode || '{initial_js_mode}';
+                 var lastSent = '';
+                 var ro = null;
+                 var observed = false;
+                 var ensureObs = function() {{
+                   if (ro && !observed) {{
+                     var p = document.querySelector('.player');
+                     if (p) {{ ro.observe(p); observed = true; }}
+                   }}
+                 }};
+                 var sync = function() {{
+                   ensureObs();
+                   var mode = window.__kinoVideoScaleMode || 'auto';
+                   var v = document.getElementById('kino-video');
+                   if (!v || v.tagName !== 'VIDEO') return;
+                   var vw = v.videoWidth || 0;
+                   var vh = v.videoHeight || 0;
+                   var cw = v.clientWidth || 0;
+                   var ch = v.clientHeight || 0;
+                   var fit = 'contain';
+                   var eff = mode === 'height' ? 'height' : 'width';
+                   if (vw > 0 && vh > 0 && cw > 0 && ch > 0) {{
+                     var vr = vw / vh;
+                     var cr = cw / ch;
+                     if (mode === 'width') {{
+                       eff = 'width';
+                       fit = (vr < cr - 0.01) ? 'cover' : 'contain';
+                     }} else if (mode === 'height') {{
+                       eff = 'height';
+                       fit = (vr > cr + 0.01) ? 'cover' : 'contain';
+                     }} else {{
+                       eff = (vr >= cr) ? 'width' : 'height';
+                       fit = 'contain';
+                     }}
+                   }}
+                   if (v.style.objectFit !== fit) v.style.objectFit = fit;
+                   if (mode === 'auto' && eff !== lastSent) {{
+                     lastSent = eff;
+                     dioxus.send(eff);
+                   }}
+                 }};
+                 window.__kinoSyncVideoScale = sync;
+                 var onMeta = function(e) {{
+                   if (e && e.target && e.target.id === 'kino-video') sync();
+                 }};
+                 var onResize = function() {{ sync(); }};
+                 document.addEventListener('loadedmetadata', onMeta, true);
+                 document.addEventListener('loadeddata', onMeta, true);
+                 document.addEventListener('resize', onMeta, true);
+                 document.addEventListener('fullscreenchange', onResize);
+                 window.addEventListener('resize', onResize);
+                 if (typeof ResizeObserver === 'function') {{
+                   ro = new ResizeObserver(function() {{ sync(); }});
+                 }}
+                 sync();
+                 if (typeof requestAnimationFrame === 'function') requestAnimationFrame(sync);
+                 window.__kinoPlayerScaleStop = function() {{
+                   document.removeEventListener('loadedmetadata', onMeta, true);
+                   document.removeEventListener('loadeddata', onMeta, true);
+                   document.removeEventListener('resize', onMeta, true);
+                   document.removeEventListener('fullscreenchange', onResize);
+                   window.removeEventListener('resize', onResize);
+                   if (ro) ro.disconnect();
+                   delete window.__kinoSyncVideoScale;
+                   delete window.__kinoVideoScaleMode;
+                 }};"
+            ));
+            while let Ok(eff) = bridge.recv::<String>().await {
+                if saved_scale.peek().is_none() {
+                    if let Some(s) = VideoScale::parse(&eff) {
+                        active_scale.set(s);
+                    }
+                }
+            }
+        });
+        std::rc::Rc::new(ScaleGuard)
+    });
 
     // Desktop keyboard shortcuts (Space/K, ←/→/J/L, ↑/↓ volume, M mute, F fullscreen, Esc).
     {
         let mut flash_jump = flash_jump;
         let mut set_vol = set_vol;
-        let mut toggle_mute = toggle_mute;
+        let mut toggle_mute = toggle_mute.clone();
         let mut show_controls = show_controls;
         let mut toggle_play = toggle_play.clone();
         use_hook(move || {
@@ -1524,7 +2065,8 @@ pub fn Player(
                     "if (window.__kinoPlayerKeysStop) { try { window.__kinoPlayerKeysStop(); } catch (e) {} }
                      var handler = function(e) {
                        var tag = e.target && e.target.tagName;
-                       if (tag === 'INPUT' || tag === 'TEXTAREA' || e.ctrlKey || e.metaKey || e.altKey) return;
+                       var isText = (tag === 'INPUT' && e.target.type !== 'range') || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable);
+                       if (isText || e.ctrlKey || e.metaKey || e.altKey) return;
                        var code = e.code;
                        if (code === 'Space' || code === 'KeyK') { e.preventDefault(); dioxus.send('toggle'); }
                        else if (code === 'ArrowLeft' || code === 'KeyJ') { e.preventDefault(); dioxus.send('back'); }
@@ -1533,7 +2075,15 @@ pub fn Player(
                        else if (code === 'ArrowDown') { e.preventDefault(); dioxus.send('vol_dn'); }
                        else if (code === 'KeyM') { e.preventDefault(); dioxus.send('mute'); }
                        else if (code === 'KeyF') { e.preventDefault(); dioxus.send('full'); }
-                       else if (code === 'Escape') { e.preventDefault(); dioxus.send('esc'); }
+                       else if (code === 'Escape') {
+                         if (document.fullscreenElement && document.exitFullscreen) {
+                           e.preventDefault();
+                           document.exitFullscreen().catch(function(){});
+                         } else {
+                           e.preventDefault();
+                           dioxus.send('esc');
+                         }
+                       }
                      };
                      window.addEventListener('keydown', handler);
                      window.__kinoPlayerKeysStop = function() { window.removeEventListener('keydown', handler); };",
@@ -1568,6 +2118,7 @@ pub fn Player(
                         "esc" => {
                             if ui.peek().menu.is_some() {
                                 ui.with_mut(|s| s.menu = None);
+                                show_controls();
                             } else {
                                 close.call(());
                             }
@@ -1588,6 +2139,7 @@ pub fn Player(
             let (season, current) = target();
             if n == current {
                 ui.with_mut(|s| s.menu = None);
+                show_controls();
                 return;
             }
             save(false);
@@ -1609,6 +2161,7 @@ pub fn Player(
         st.season = season;
         st.episode = episode;
         st.rate = rate();
+        st.scale = saved_scale().unwrap_or_else(|| active_scale());
         st.volume = volume();
         st.muted = muted();
         st.show_volume = !finger;
@@ -1632,6 +2185,7 @@ pub fn Player(
                     }
                     if ui.peek().menu.is_some() {
                         ui.with_mut(|s| s.menu = None);
+                        show_controls();
                     } else if finger {
                         if ui.peek().controls {
                             ui.with_mut(|s| s.controls = false);
@@ -1648,6 +2202,7 @@ pub fn Player(
             on_speed: move |r: f32| {
                 rate.set(r);
                 ui.with_mut(|s| s.menu = None);
+                show_controls();
                 if let Some(v) = video() {
                     v.set_rate(f64::from(r));
                 }
@@ -1657,9 +2212,13 @@ pub fn Player(
                 });
             },
             on_episode: move |n: i32| play_episode(n),
-            on_pick_release: move |_| {
-                let (season, episode) = target();
-                on_need_release.call((season, episode));
+            on_pick_release: {
+                let mut save = save.clone();
+                move |_| {
+                    save(false);
+                    let (season, episode) = target();
+                    on_need_release.call((season, episode));
+                }
             },
             on_toggle: move |_| toggle_play(),
             on_seek: move |at: f64| seek_to(at),
@@ -1679,6 +2238,11 @@ pub fn Player(
             on_audio: {
                 let save_tracks = save_tracks.clone();
                 move |a: i32| {
+                    if ui.peek().audio_track == Some(a) {
+                        ui.with_mut(|s| s.menu = None);
+                        show_controls();
+                        return;
+                    }
                     let at = ui.peek().position;
                     let label = ui
                         .peek()
@@ -1690,6 +2254,7 @@ pub fn Player(
                         s.audio_track = Some(a);
                         s.menu = None;
                     });
+                    show_controls();
                     sync::send(&SyncClientMsg::Audio {
                         audio_track: label,
                         position_sec: at,
@@ -1719,16 +2284,81 @@ pub fn Player(
                         s.subtitles_src = url;
                         s.menu = None;
                     });
+                    show_controls();
                     save_tracks();
                 }
             },
             on_next: move |_| go_next(),
+            on_scale: move |_| toggle_scale(),
             on_fullscreen: move |_| toggle_fullscreen(),
             on_close: close,
+            on_title: open_title,
             on_video,
             on_volume: move |v: f32| set_vol(v),
             on_mute: move |_| toggle_mute(),
             on_unmute: move |_| unmute_auto(),
+            on_sync_sound: {
+                let mut switch_sync_sound = switch_sync_sound;
+                move |cid: String| switch_sync_sound(cid)
+            },
+            on_activity: move |_| show_controls(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scale_storage_round_trips_and_evicts_oldest() {
+        let k1 = scale_title_key(MediaKind::Movie, 27205);
+        let k2 = scale_title_key(MediaKind::Tv, 1396);
+        assert_eq!(k1, "movie:27205");
+        assert_eq!(k2, "tv:1396");
+
+        let mut entries = decode_saved_scales("not json");
+        assert!(entries.is_empty());
+
+        let raw = upsert_saved_scale(&mut entries, &k1, VideoScale::FitHeight);
+        let raw = {
+            let mut e = decode_saved_scales(&raw);
+            upsert_saved_scale(&mut e, &k2, VideoScale::FitWidth)
+        };
+        let mut parsed = decode_saved_scales(&raw);
+        assert_eq!(lookup_saved_scale(&parsed, &k1), Some(VideoScale::FitHeight));
+        assert_eq!(lookup_saved_scale(&parsed, &k2), Some(VideoScale::FitWidth));
+        assert_eq!(lookup_saved_scale(&parsed, "movie:999"), None);
+
+        // Updating an existing key refreshes its value without duplicating it.
+        let updated = upsert_saved_scale(&mut parsed, &k1, VideoScale::FitWidth);
+        let parsed = decode_saved_scales(&updated);
+        assert_eq!(parsed.iter().filter(|(k, _)| k == &k1).count(), 1);
+        assert_eq!(lookup_saved_scale(&parsed, &k1), Some(VideoScale::FitWidth));
+
+        // Capacity stays bounded to MAX_SAVED_SCALES.
+        let mut many = Vec::new();
+        for i in 0..(MAX_SAVED_SCALES + 5) {
+            upsert_saved_scale(&mut many, &format!("movie:{i}"), VideoScale::FitHeight);
+        }
+        assert_eq!(many.len(), MAX_SAVED_SCALES);
+        assert_eq!(lookup_saved_scale(&many, "movie:0"), None);
+        assert_eq!(
+            lookup_saved_scale(&many, &format!("movie:{}", MAX_SAVED_SCALES + 4)),
+            Some(VideoScale::FitHeight)
+        );
+    }
+
+    #[test]
+    fn scale_codes_map_between_native_and_ui() {
+        assert_eq!(scale_code(VideoScale::FitWidth), 1);
+        assert_eq!(scale_code(VideoScale::FitHeight), 2);
+        assert_eq!(scale_from_code(1), VideoScale::FitWidth);
+        assert_eq!(scale_from_code(2), VideoScale::FitHeight);
+        assert_eq!(serde_json::to_string(&VideoScale::FitHeight).unwrap(), "\"height\"");
+        assert_eq!(
+            serde_json::from_str::<VideoScale>("\"width\"").unwrap(),
+            VideoScale::FitWidth
+        );
     }
 }

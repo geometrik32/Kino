@@ -59,7 +59,29 @@ impl ClockSync {
 }
 
 pub fn set_stream_offset(offset_sec: f64) {
-    let _ = dioxus::document::eval(&format!("window.__kinoSyncOffset = {offset_sec};"));
+    let off = if offset_sec.is_finite() && offset_sec >= 0.0 {
+        offset_sec
+    } else {
+        0.0
+    };
+    let _ = dioxus::document::eval(&format!("window.__kinoSyncOffset = {off};"));
+}
+
+/// Mirrors validated full playback position/duration from Rust for the unload handler
+/// (prevents transcoded segment duration or native `<div>` slot from corrupting progress).
+pub fn set_playback_state(position_sec: f64, duration_sec: Option<f64>, played: bool) {
+    let pos = if position_sec.is_finite() && position_sec >= 0.0 {
+        position_sec
+    } else {
+        0.0
+    };
+    let dur = match duration_sec {
+        Some(d) if d.is_finite() && d > 0.0 => format!("{d}"),
+        _ => "null".to_owned(),
+    };
+    let _ = dioxus::document::eval(&format!(
+        "window.__kinoSyncState = {{ pos: {pos}, dur: {dur}, played: {played} }};"
+    ));
 }
 
 pub fn send(msg: &SyncClientMsg) {
@@ -109,24 +131,33 @@ pub fn start_bridge(
           var unloadHandler = function() {{
             if (stopped) return;
             stopped = true;
+            var st = window.__kinoSyncState;
             var v = document.getElementById('kino-video');
+            var hasVideo = !!(v && v.tagName === 'VIDEO');
             var off = Number(window.__kinoSyncOffset || 0);
-            var pos = off + ((v && isFinite(v.currentTime)) ? v.currentTime : 0);
-            var dur = (v && isFinite(v.duration)) ? v.duration : null;
+            var pos = (st && isFinite(st.pos)) ? st.pos : (hasVideo && isFinite(v.currentTime) ? (off + v.currentTime) : 0);
+            var dur = (st && isFinite(st.dur) && st.dur > 0) ? st.dur : (hasVideo && off === 0 && isFinite(v.duration) && v.duration > 0 ? v.duration : null);
+            var ready = !!(st && st.played) || pos >= 1.0;
+            if (!ready) {{
+              try {{ if (ws && ws.readyState === 1) ws.close(1000, 'unload'); }} catch (e) {{}}
+              return;
+            }}
             try {{
               if (ws && ws.readyState === 1) {{
                 ws.send(JSON.stringify({{ type: 'leave', position_sec: pos, duration_sec: dur, finished: false }}));
                 ws.close(1000, 'unload');
               }}
             }} catch (e) {{}}
-            try {{
-              fetch({leave_js}, {{
-                method: 'POST',
-                headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + {token_js} }},
-                body: JSON.stringify({{ client_id: {cid_js}, kind: {kind_js}, tmdb_id: {tmdb_id}, position_sec: pos, duration_sec: dur, finished: false }}),
-                keepalive: true
-              }});
-            }} catch (e) {{}}
+            if (location.protocol === 'http:' || location.protocol === 'https:') {{
+              try {{
+                fetch({leave_js}, {{
+                  method: 'POST',
+                  headers: {{ 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + {token_js} }},
+                  body: JSON.stringify({{ client_id: {cid_js}, kind: {kind_js}, tmdb_id: {tmdb_id}, position_sec: pos, duration_sec: dur, finished: false }}),
+                  keepalive: true
+                }});
+              }} catch (e) {{}}
+            }}
           }};
           window.addEventListener('pagehide', unloadHandler);
           window.addEventListener('beforeunload', unloadHandler);

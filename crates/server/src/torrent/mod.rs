@@ -29,13 +29,20 @@ pub enum TorrentError {
     #[error(transparent)]
     Indexer(#[from] torznab::TorznabError),
     #[error("could not download the .torrent: {0}")]
-    Fetch(#[from] reqwest::Error),
+    Fetch(String),
     #[error(transparent)]
     Bencode(#[from] bencode::BencodeError),
     #[error("unknown release")]
     Unknown,
     #[error(transparent)]
     Db(#[from] sqlx::Error),
+}
+
+impl From<reqwest::Error> for TorrentError {
+    fn from(e: reqwest::Error) -> Self {
+        // Strip the URL so Jackett download links with `jackett_apikey` never end up in logs.
+        Self::Fetch(e.without_url().to_string())
+    }
 }
 
 /// The key a release is known by before its `.torrent` is downloaded.
@@ -613,22 +620,51 @@ pub async fn search_cached(
         .await
 }
 
-/// Remembers where each release can be downloaded from.
+/// Remembers where each release can be downloaded from using a single batch upsert.
 pub async fn save_sources(pool: &PgPool, items: &[TorznabItem]) -> Result<(), sqlx::Error> {
-    for it in items {
-        sqlx::query(
-            "INSERT INTO torrent_source (key, title, link, magnet, infohash) VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT (key) DO UPDATE SET title = EXCLUDED.title, link = EXCLUDED.link,
-                 magnet = COALESCE(EXCLUDED.magnet, torrent_source.magnet), updated_at = now()",
-        )
-        .bind(release_key(it))
-        .bind(&it.title)
-        .bind(&it.link)
-        .bind(&it.magnet)
-        .bind(&it.infohash)
-        .execute(pool)
-        .await?;
+    if items.is_empty() {
+        return Ok(());
     }
+    let mut seen = std::collections::HashMap::<String, usize>::with_capacity(items.len());
+    let mut keys: Vec<String> = Vec::with_capacity(items.len());
+    let mut titles: Vec<String> = Vec::with_capacity(items.len());
+    let mut links: Vec<Option<String>> = Vec::with_capacity(items.len());
+    let mut magnets: Vec<Option<String>> = Vec::with_capacity(items.len());
+    let mut hashes: Vec<Option<String>> = Vec::with_capacity(items.len());
+    for it in items {
+        let key = release_key(it);
+        if let Some(&idx) = seen.get(&key) {
+            titles[idx] = it.title.clone();
+            links[idx] = it.link.clone();
+            if it.magnet.is_some() {
+                magnets[idx] = it.magnet.clone();
+            }
+            if it.infohash.is_some() {
+                hashes[idx] = it.infohash.clone();
+            }
+        } else {
+            let idx = keys.len();
+            seen.insert(key.clone(), idx);
+            keys.push(key);
+            titles.push(it.title.clone());
+            links.push(it.link.clone());
+            magnets.push(it.magnet.clone());
+            hashes.push(it.infohash.clone());
+        }
+    }
+    sqlx::query(
+        "INSERT INTO torrent_source (key, title, link, magnet, infohash)
+         SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+         ON CONFLICT (key) DO UPDATE SET title = EXCLUDED.title, link = EXCLUDED.link,
+             magnet = COALESCE(EXCLUDED.magnet, torrent_source.magnet), updated_at = now()",
+    )
+    .bind(&keys)
+    .bind(&titles)
+    .bind(&links)
+    .bind(&magnets)
+    .bind(&hashes)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -651,7 +687,12 @@ pub async fn source(pool: &PgPool, key: &str) -> Result<Option<Source>, sqlx::Er
 
 /// Turns a release key into its info-hash, downloading the `.torrent` when the
 /// indexer did not give the hash. Also keeps the `.torrent` for TorrServer.
-pub async fn resolve(pool: &PgPool, http: &reqwest::Client, key: &str) -> Result<Source, TorrentError> {
+pub async fn resolve(
+    pool: &PgPool,
+    http: &reqwest::Client,
+    key: &str,
+    jackett: Option<&Jackett>,
+) -> Result<Source, TorrentError> {
     let src = source(pool, key).await?;
     if let Some(s) = src.as_ref().filter(|s| s.infohash.is_some() && s.torrent.is_some()) {
         return Ok(s.clone());
@@ -672,6 +713,9 @@ pub async fn resolve(pool: &PgPool, http: &reqwest::Client, key: &str) -> Result
         };
     };
     if let Some(link) = src.link.clone() {
+        if let Some(j) = jackett.filter(|j| j.owns_link(&link)) {
+            j.ensure_ready().await;
+        }
         match fetch(http, &link).await {
             Ok(Fetched::Torrent(bytes)) => {
                 src.infohash = Some(bencode::parse_torrent(&bytes)?.infohash);
@@ -683,7 +727,7 @@ pub async fn resolve(pool: &PgPool, http: &reqwest::Client, key: &str) -> Result
             }
             // The magnet is enough when the indexer gave one.
             Err(e) if src.infohash.is_none() => return Err(e),
-            Err(e) => tracing::warn!(key, "no .torrent, using the magnet: {e}"),
+            Err(e) => tracing::warn!(key, error = %e, "no .torrent, using the magnet"),
         }
     }
     let hash = src.infohash.clone().ok_or(TorrentError::Unknown)?;
@@ -710,8 +754,77 @@ enum Fetched {
     Magnet(String),
 }
 
+/// Maximum `.torrent` file size accepted to prevent OOM from malformed responses.
+const MAX_TORRENT_BYTES: usize = 2 * 1024 * 1024;
+
+fn is_non_public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let oct = v4.octets();
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_unspecified()
+                || v4.is_multicast()
+                || (oct[0] == 100 && (oct[1] & 0xC0) == 64) // CGNAT 100.64.0.0/10
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || v6.to_ipv4_mapped().is_some_and(|v4| is_non_public_ip(v4.into()))
+        }
+    }
+}
+
+/// Rejects redirects to loopback, private, link-local, or internal Docker hosts (SSRF guard).
+async fn validate_redirect_target(next: &reqwest::Url, initial_host: Option<&str>) -> Result<(), TorrentError> {
+    if !matches!(next.scheme(), "http" | "https") {
+        return Err(TorrentError::Unknown);
+    }
+    let Some(host) = next.host_str() else {
+        return Err(TorrentError::Unknown);
+    };
+    // Allow staying on the same trusted host as the initial link (e.g., internal Jackett).
+    if initial_host.is_some_and(|h| h.eq_ignore_ascii_case(host)) {
+        return Ok(());
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost" || lower.ends_with(".local") || lower.ends_with(".internal") || !lower.contains('.') {
+        return Err(TorrentError::Fetch("redirect to internal host blocked".into()));
+    }
+    if let Ok(ip) = host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+        if is_non_public_ip(ip) {
+            return Err(TorrentError::Fetch("redirect to non-public IP blocked".into()));
+        }
+        return Ok(());
+    }
+    let port = next.port_or_known_default().unwrap_or(80);
+    let addrs = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| TorrentError::Fetch("redirect host resolution failed".into()))?;
+    let mut any = false;
+    for addr in addrs {
+        any = true;
+        if is_non_public_ip(addr.ip()) {
+            return Err(TorrentError::Fetch("redirect to non-public IP blocked".into()));
+        }
+    }
+    if !any {
+        return Err(TorrentError::Fetch("redirect host resolved to no addresses".into()));
+    }
+    Ok(())
+}
+
 /// Downloads a `.torrent`. Jackett answers some links with a redirect to a magnet.
 async fn fetch(http: &reqwest::Client, link: &str) -> Result<Fetched, TorrentError> {
+    use futures_util::StreamExt;
+    let initial_host = reqwest::Url::parse(link)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned));
     let mut url = link.to_owned();
     for _ in 0..5 {
         let resp = http
@@ -720,7 +833,20 @@ async fn fetch(http: &reqwest::Client, link: &str) -> Result<Fetched, TorrentErr
             .send()
             .await?;
         if !resp.status().is_redirection() {
-            return Ok(Fetched::Torrent(resp.error_for_status()?.bytes().await?.to_vec()));
+            let resp = resp.error_for_status()?;
+            if resp.content_length().is_some_and(|n| n > MAX_TORRENT_BYTES as u64) {
+                return Err(TorrentError::Fetch("torrent file exceeded size limit".into()));
+            }
+            let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0).min(128 * 1024) as usize);
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                if bytes.len().saturating_add(chunk.len()) > MAX_TORRENT_BYTES {
+                    return Err(TorrentError::Fetch("torrent file exceeded size limit".into()));
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            return Ok(Fetched::Torrent(bytes));
         }
         let to = resp
             .headers()
@@ -730,7 +856,9 @@ async fn fetch(http: &reqwest::Client, link: &str) -> Result<Fetched, TorrentErr
         if to.starts_with("magnet:") {
             return Ok(Fetched::Magnet(to.to_owned()));
         }
-        url = resp.url().join(to).map_err(|_| TorrentError::Unknown)?.to_string();
+        let next = resp.url().join(to).map_err(|_| TorrentError::Unknown)?;
+        validate_redirect_target(&next, initial_host.as_deref()).await?;
+        url = next.to_string();
     }
     Err(TorrentError::Unknown)
 }

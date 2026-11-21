@@ -273,8 +273,9 @@ pub async fn take_login_link(pool: &PgPool, token: &str) -> Result<LoginLinkStat
         return Ok(LoginLinkState::Expired);
     };
     let telegram_id: Option<i64> = row.try_get("telegram_id")?;
+    let fresh: bool = row.try_get("fresh")?;
     match telegram_id {
-        Some(id) => {
+        Some(id) if fresh => {
             let deleted = sqlx::query("DELETE FROM login_link WHERE token = $1")
                 .bind(token)
                 .execute(pool)
@@ -292,7 +293,14 @@ pub async fn take_login_link(pool: &PgPool, token: &str) -> Result<LoginLinkStat
             };
             Ok(LoginLinkState::Confirmed(tg, row.try_get("invite")?))
         }
-        None if row.try_get::<bool, _>("fresh")? => Ok(LoginLinkState::Pending),
+        Some(_) => {
+            let _ = sqlx::query("DELETE FROM login_link WHERE token = $1")
+                .bind(token)
+                .execute(pool)
+                .await;
+            Ok(LoginLinkState::Expired)
+        }
+        None if fresh => Ok(LoginLinkState::Pending),
         None => Ok(LoginLinkState::Expired),
     }
 }
@@ -338,7 +346,7 @@ pub async fn save_progress(pool: &PgPool, user_id: i64, u: &ProgressUpdate) -> R
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
          ON CONFLICT (user_id, media_kind, tmdb_id, season, episode) DO UPDATE SET
            position_sec = EXCLUDED.position_sec,
-           duration_sec = EXCLUDED.duration_sec,
+           duration_sec = CASE WHEN EXCLUDED.duration_sec > 0 THEN EXCLUDED.duration_sec ELSE watch_progress.duration_sec END,
            finished = watch_progress.finished OR EXCLUDED.finished,
            release_infohash = COALESCE(EXCLUDED.release_infohash, watch_progress.release_infohash),
            release_file = COALESCE(EXCLUDED.release_file, watch_progress.release_file),

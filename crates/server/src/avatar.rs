@@ -7,7 +7,6 @@
 use std::time::Duration;
 
 use axum::{
-    body::Bytes,
     extract::{Path, State},
     http::header,
     response::{IntoResponse, Response},
@@ -248,7 +247,7 @@ async fn fetch_via_bot_api(client: &reqwest::Client, api_base: &str, bot_token: 
     {
         Ok(r) => r,
         Err(e) => {
-            tracing::debug!(telegram_id, error = %e, "getUserProfilePhotos failed");
+            tracing::debug!(telegram_id, error = %e.without_url(), "getUserProfilePhotos failed");
             return BotResult::Error;
         }
     };
@@ -262,7 +261,7 @@ async fn fetch_via_bot_api(client: &reqwest::Client, api_base: &str, bot_token: 
     let body: BotApiResponse<UserProfilePhotos> = match resp.json().await {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!(telegram_id, error = %e, "getUserProfilePhotos decode failed");
+            tracing::debug!(telegram_id, error = %e.without_url(), "getUserProfilePhotos decode failed");
             return BotResult::Error;
         }
     };
@@ -291,7 +290,7 @@ async fn fetch_via_bot_api(client: &reqwest::Client, api_base: &str, bot_token: 
             return BotResult::Error;
         }
         Err(e) => {
-            tracing::debug!(telegram_id, error = %e, "getFile failed");
+            tracing::debug!(telegram_id, error = %e.without_url(), "getFile failed");
             return BotResult::Error;
         }
     };
@@ -311,7 +310,7 @@ async fn fetch_via_bot_api(client: &reqwest::Client, api_base: &str, bot_token: 
 }
 
 async fn download_image(client: &reqwest::Client, url: &str, trust_bytes: bool) -> Option<(Vec<u8>, String)> {
-    let resp = client.get(url).send().await.ok()?;
+    let mut resp = client.get(url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
@@ -325,16 +324,29 @@ async fn download_image(client: &reqwest::Client, url: &str, trust_bytes: bool) 
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|v| v.split(';').next().unwrap_or(v).trim().to_ascii_lowercase());
-    let bytes: Bytes = resp.bytes().await.ok()?;
-    if bytes.is_empty() || bytes.len() > MAX_AVATAR_BYTES {
+    let mut bytes = Vec::with_capacity(
+        resp.content_length()
+            .and_then(|n| usize::try_from(n).ok())
+            .map(|n| n.min(MAX_AVATAR_BYTES))
+            .unwrap_or(0),
+    );
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_AVATAR_BYTES {
+            return None;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.is_empty() {
         return None;
     }
+    let sniffed = sniff_image_mime(&bytes);
     let mime = match header_mime.as_deref() {
-        Some(m) if m.starts_with("image/") => m.to_owned(),
-        _ if trust_bytes => sniff_image_mime(&bytes)?.to_owned(),
+        Some(m @ ("image/jpeg" | "image/png" | "image/webp" | "image/gif")) => m.to_owned(),
+        _ if trust_bytes => sniffed?.to_owned(),
         _ => return None,
     };
-    Some((bytes.to_vec(), mime))
+    let _ = sniffed;
+    Some((bytes, mime))
 }
 
 fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {

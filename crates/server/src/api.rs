@@ -1,19 +1,75 @@
 //! HTTP routes under `/api`.
 
-use std::sync::Arc;
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::{Arc, LazyLock, Mutex},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{FromRequestParts, Path, State},
-    http::{request::Parts, StatusCode},
+    http::{request::Parts, HeaderMap, StatusCode},
     routing::{get, post, put},
     Json, Router,
 };
+
+struct IpLimiter {
+    window: Duration,
+    max_requests: usize,
+    hits: Mutex<HashMap<String, VecDeque<Instant>>>,
+}
+
+impl IpLimiter {
+    fn new(window: Duration, max_requests: usize) -> Self {
+        Self {
+            window,
+            max_requests,
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn check(&self, key: &str) -> bool {
+        let now = Instant::now();
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= 4096 && !map.contains_key(key) {
+            map.retain(|_, q| q.back().is_some_and(|t| now.duration_since(*t) < self.window));
+            if map.len() >= 4096 {
+                map.clear();
+            }
+        }
+        let q = map.entry(key.to_owned()).or_default();
+        while q.front().is_some_and(|t| now.duration_since(*t) >= self.window) {
+            q.pop_front();
+        }
+        if q.len() >= self.max_requests {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+}
+
+static AUTH_LIMITER: LazyLock<IpLimiter> = LazyLock::new(|| IpLimiter::new(Duration::from_secs(60), 30));
+static IMG_LIMITER: LazyLock<IpLimiter> = LazyLock::new(|| IpLimiter::new(Duration::from_secs(60), 600));
+
+fn client_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-real-ip")
+        .or_else(|| headers.get("x-forwarded-for"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .unwrap_or("direct")
+        .to_owned()
+}
 use chrono::Utc;
 use kino_core::{
     AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
     MarkWatched, Me, MediaKind, PersonDetails, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
-    ReleaseChoice, ReleaseChoiceUpdate, Role, SearchResults, Season, ShelfPage, StatusUpdate, TitleDetails,
-    TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    ReleaseChoice, ReleaseChoiceUpdate, Role, ScaleUpdate, SearchResults, Season, ShelfPage, StatusUpdate,
+    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest,
+    WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +111,7 @@ pub fn router() -> Router<AppState> {
         .route("/title/{kind}/{tmdb_id}/status", put(put_status))
         .route("/title/{kind}/{tmdb_id}/rating", put(put_rating))
         .route("/title/{kind}/{tmdb_id}/tracks", put(put_tracks))
+        .route("/title/{kind}/{tmdb_id}/scale", put(put_scale))
         .route("/my", get(my_titles))
         .route("/marks", post(post_marks))
         .route("/history", get(history))
@@ -152,8 +209,16 @@ async fn auth_widget(
 /// presses the button in the bot, and the site's poll gets the session.
 async fn start_login_link(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<LoginLinkRequest>,
 ) -> Result<Json<LoginLink>, AppError> {
+    if !AUTH_LIMITER.check(&client_key(&headers)) {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Слишком много попыток входа. Попробуйте через минуту.",
+        ));
+    }
     let Some(bot) = &state.config.bot_username else {
         return Err(AppError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -199,15 +264,24 @@ async fn continue_watching(
     State(state): State<AppState>,
     user: CurrentUser,
 ) -> Result<Json<Vec<ContinueItem>>, AppError> {
+    use futures_util::stream::{self, StreamExt};
     let mut items = db::continue_watching(&state.pool, user.0, 20).await?;
-    // Names and posters; a title the catalog can't resolve still shows, just without them.
-    for item in &mut items {
-        item.title = state
-            .catalog
-            .details(item.last.kind, item.last.tmdb_id)
-            .await
-            .ok()
-            .map(|d| d.summary);
+    // Fetch titles concurrently while preserving recency order.
+    let keys: Vec<(usize, MediaKind, i64)> = items
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (i, it.last.kind, it.last.tmdb_id))
+        .collect();
+    let catalog = &state.catalog;
+    let summaries = stream::iter(keys.into_iter().map(|(i, kind, id)| async move {
+        let title = catalog.details(kind, id).await.ok().map(|d| d.summary);
+        (i, title)
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    for (i, title) in summaries {
+        items[i].title = title;
     }
     Ok(Json(items))
 }
@@ -352,6 +426,9 @@ async fn put_status(
     Path((kind, tmdb_id)): Path<(String, i64)>,
     Json(u): Json<StatusUpdate>,
 ) -> Result<Json<TitleState>, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
     let kind = parse_kind(&kind)?;
     let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, u.status).await?;
     // Marking a film "Просмотрено" by hand also marks it watched for "Continue watching".
@@ -369,18 +446,113 @@ async fn put_status(
     Ok(Json(st))
 }
 
+/// Collects all aired regular-season `(season, episode)` targets and fully completed
+/// seasons for a series so rating it marks every aired episode watched.
+async fn series_episodes_to_mark(
+    catalog: &dyn Catalog,
+    tmdb_id: i64,
+    details: &TitleDetails,
+) -> (Vec<(i32, i32)>, Vec<i32>) {
+    use futures_util::stream::{self, StreamExt};
+
+    let last_aired = details.last_episode.filter(|(s, _)| *s > 0);
+    let seasons: Vec<(i32, i32)> = details
+        .seasons
+        .iter()
+        .filter(|s| s.number > 0 && s.episode_count > 0 && last_aired.is_none_or(|(ls, _)| s.number <= ls))
+        .map(|s| (s.number, s.episode_count))
+        .collect();
+
+    let fetched = stream::iter(seasons.into_iter().map(|(season_num, ep_count)| async move {
+        let res = catalog.season(tmdb_id, season_num).await;
+        (season_num, ep_count, res)
+    }))
+    .buffer_unordered(6)
+    .collect::<Vec<_>>()
+    .await;
+
+    let mut targets = Vec::new();
+    let mut done_seasons = Vec::new();
+    for (season_num, ep_count, res) in fetched {
+        match res {
+            Ok(season) if !season.episodes.is_empty() => {
+                let max_ep = season.episodes.iter().map(|e| e.number).max();
+                let mut added_max = false;
+                for ep in season.episodes {
+                    if ep.number >= 1 && last_aired.is_none_or(|last| (season_num, ep.number) <= last) {
+                        if Some(ep.number) == max_ep {
+                            added_max = true;
+                        }
+                        targets.push((season_num, ep.number));
+                    }
+                }
+                if added_max {
+                    done_seasons.push(season_num);
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    tmdb_id,
+                    season = season_num,
+                    "falling back to episode_count after catalog.season failed"
+                );
+                let count = match last_aired {
+                    Some((ls, le)) if season_num == ls => ep_count.min(le),
+                    _ => ep_count,
+                };
+                for ep in 1..=count {
+                    targets.push((season_num, ep));
+                }
+                if count >= ep_count && ep_count > 0 {
+                    done_seasons.push(season_num);
+                }
+            }
+        }
+    }
+    (targets, done_seasons)
+}
+
 async fn put_rating(
     State(state): State<AppState>,
     user: CurrentUser,
     Path((kind, tmdb_id)): Path<(String, i64)>,
     Json(u): Json<RatingUpdate>,
 ) -> Result<Json<TitleState>, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
     if u.rating.is_some_and(|r| !(1..=5).contains(&r)) {
         return Err(AppError::bad_request("rating must be 1 to 5"));
     }
-    Ok(Json(
-        userdata::set_rating(&state.pool, user.0, parse_kind(&kind)?, tmdb_id, u.rating).await?,
-    ))
+    let kind = parse_kind(&kind)?;
+    let (targets, done_seasons) = if u.rating.is_some() {
+        match kind {
+            MediaKind::Movie => (vec![(0, 0)], vec![0]),
+            MediaKind::Tv => match state.catalog.details(kind, tmdb_id).await {
+                Ok(details) => series_episodes_to_mark(&*state.catalog, tmdb_id, &details).await,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        tmdb_id,
+                        "could not load series details to mark episodes watched on rating"
+                    );
+                    (Vec::new(), Vec::new())
+                }
+            },
+        }
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let st = userdata::rate_and_mark(&state.pool, user.0, kind, tmdb_id, u.rating, &targets).await?;
+    if u.rating.is_some() && !done_seasons.is_empty() {
+        let at = Utc::now() + state.config.preload_keep;
+        for season in done_seasons {
+            userdata::preload_schedule_removal(&state.pool, user.0, kind, tmdb_id, season, at).await?;
+        }
+    }
+    Ok(Json(st))
 }
 
 async fn put_tracks(
@@ -389,6 +561,9 @@ async fn put_tracks(
     Path((kind, tmdb_id)): Path<(String, i64)>,
     Json(u): Json<TracksUpdate>,
 ) -> Result<Json<TitleState>, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
     let too_long = |t: &Option<String>| t.as_ref().is_some_and(|t| t.chars().count() > 200);
     if too_long(&u.audio_track) || too_long(&u.subtitle_track) {
         return Err(AppError::bad_request("track names must be at most 200 characters"));
@@ -406,6 +581,20 @@ async fn put_tracks(
     ))
 }
 
+async fn put_scale(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Json(u): Json<ScaleUpdate>,
+) -> Result<Json<TitleState>, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
+    Ok(Json(
+        userdata::set_scale(&state.pool, user.0, parse_kind(&kind)?, tmdb_id, u.video_scale).await?,
+    ))
+}
+
 #[derive(Deserialize)]
 struct MyQuery {
     status: Option<String>,
@@ -417,13 +606,26 @@ async fn my_titles(
     user: CurrentUser,
     axum::extract::Query(q): axum::extract::Query<MyQuery>,
 ) -> Result<Json<Vec<TitleState>>, AppError> {
+    use futures_util::stream::{self, StreamExt};
     let status = match q.status.as_deref() {
         None | Some("") => None,
         Some(s) => Some(TitleStatus::parse(s).ok_or_else(|| AppError::bad_request("unknown status"))?),
     };
     let mut list = userdata::list_states(&state.pool, user.0, status).await?;
-    for item in &mut list {
-        item.title = summary_of(&state, item.kind, item.tmdb_id).await;
+    let keys: Vec<(usize, MediaKind, i64)> = list
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (i, it.kind, it.tmdb_id))
+        .collect();
+    let summaries = stream::iter(keys.into_iter().map(|(i, kind, id)| {
+        let state = &state;
+        async move { (i, summary_of(state, kind, id).await) }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    for (i, title) in summaries {
+        list[i].title = title;
     }
     Ok(Json(list))
 }
@@ -460,15 +662,26 @@ async fn history(
     user: CurrentUser,
     axum::extract::Query(q): axum::extract::Query<HistoryQuery>,
 ) -> Result<Json<Vec<HistoryEntry>>, AppError> {
+    use futures_util::stream::{self, StreamExt};
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let mut list = userdata::history(&state.pool, user.0, limit).await?;
-    let mut cache = std::collections::HashMap::new();
-    for item in &mut list {
+    let mut unique: Vec<(MediaKind, i64)> = Vec::new();
+    for item in &list {
         let key = (item.kind, item.tmdb_id);
-        if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(key) {
-            e.insert(summary_of(&state, item.kind, item.tmdb_id).await);
+        if !unique.contains(&key) {
+            unique.push(key);
         }
-        item.title = cache[&key].clone();
+    }
+    let fetched = stream::iter(unique.into_iter().map(|(kind, id)| {
+        let state = &state;
+        async move { ((kind, id), summary_of(state, kind, id).await) }
+    }))
+    .buffer_unordered(8)
+    .collect::<Vec<_>>()
+    .await;
+    let cache: HashMap<_, _> = fetched.into_iter().collect();
+    for item in &mut list {
+        item.title = cache.get(&(item.kind, item.tmdb_id)).cloned().flatten();
     }
     Ok(Json(list))
 }
@@ -497,6 +710,8 @@ async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Js
     Ok(Json(userdata::preloads(&state.pool, user.0).await?))
 }
 
+const MAX_ACTIVE_PRELOADS: usize = 10;
+
 async fn add_preload(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -508,12 +723,29 @@ async fn add_preload(
         ));
     }
     r.infohash.make_ascii_lowercase();
+    let existing = userdata::preloads(&state.pool, user.0).await?;
+    let active_count = existing
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.state,
+                kino_core::PreloadState::Downloading | kino_core::PreloadState::Ready
+            ) && p.infohash != r.infohash
+        })
+        .count();
+    if active_count >= MAX_ACTIVE_PRELOADS {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "preload_limit",
+            "Достигнут лимит одновременных загрузок (10). Удалите ненужные в профиле.",
+        ));
+    }
     let media = &state.media;
     let Some(qbit) = &media.qbit else {
         // Without a downloader the request is only recorded (demo mode).
         return Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?));
     };
-    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash).await?;
+    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, media.jackett.as_ref()).await?;
     r.infohash = src.infohash.clone().unwrap_or(r.infohash);
     if r.title.is_none() && !src.title.is_empty() {
         r.title = Some(src.title.clone());
@@ -564,6 +796,9 @@ async fn watchlist_add(
     user: CurrentUser,
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<StatusCode, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
     db::watchlist_add(&state.pool, user.0, parse_kind(&kind)?, tmdb_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -573,6 +808,9 @@ async fn watchlist_remove(
     user: CurrentUser,
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<StatusCode, AppError> {
+    if tmdb_id <= 0 {
+        return Err(AppError::bad_request("tmdb_id must be positive"));
+    }
     if db::watchlist_remove(&state.pool, user.0, parse_kind(&kind)?, tmdb_id).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -626,6 +864,8 @@ impl From<CatalogError> for AppError {
 }
 
 async fn catalog_home(State(state): State<AppState>, user: CurrentUser) -> Result<Json<HomeFeed>, AppError> {
+    // Opening the home screen means the user is browsing for a title: wake Jackett in the background.
+    state.media.wake_jackett();
     let signals = userdata::taste_signals(&state.pool, user.0).await?;
     let taste = personalize::build_taste(&*state.catalog, &signals).await;
     Ok(Json(state.catalog.home_for(&taste).await?))
@@ -692,17 +932,20 @@ async fn catalog_search(
     if query.q.chars().count() > 200 {
         return Err(AppError::bad_request("query is too long"));
     }
+    if !query.q.trim().is_empty() {
+        state.media.wake_jackett();
+    }
     Ok(Json(state.catalog.search(&query.q).await?))
 }
 
 async fn catalog_details(
     State(state): State<AppState>,
-    _user: CurrentUser,
+    user: CurrentUser,
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleDetails>, AppError> {
     let details = state.catalog.details(parse_kind(&kind)?, tmdb_id).await?;
-    // Whoever opens a title is likely to press "Смотреть": look for releases meanwhile.
-    crate::play::prefetch_releases(&state, details.clone());
+    // Whoever opens a new title is likely to press "Смотреть": look for releases meanwhile.
+    crate::play::prefetch_releases(&state, user.0, details.clone());
     Ok(Json(details))
 }
 
@@ -737,9 +980,17 @@ async fn catalog_season(
 /// since TMDB image paths never change content.
 async fn image(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path((size, file)): Path<(String, String)>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
+    if !IMG_LIMITER.check(&client_key(&headers)) {
+        return Err(AppError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "Too many image requests",
+        ));
+    }
     let (bytes, ctype) = state.catalog.image(&size, &file).await?;
     Ok((
         [
@@ -748,8 +999,175 @@ async fn image(
                 axum::http::header::CACHE_CONTROL,
                 "public, max-age=31536000, immutable".to_owned(),
             ),
+            (axum::http::header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_owned(),
+            ),
         ],
         bytes,
     )
         .into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use kino_core::{Episode, SeasonSummary, TitleSummary};
+    use std::collections::HashMap;
+
+    struct MockSeriesCatalog {
+        seasons: HashMap<i32, Result<Season, CatalogError>>,
+    }
+
+    #[async_trait]
+    impl Catalog for MockSeriesCatalog {
+        async fn home_for(&self, _: &personalize::UserTaste) -> Result<HomeFeed, CatalogError> {
+            unreachable!()
+        }
+        async fn home_shelves(
+            &self,
+            _: &[String],
+            _: &personalize::UserTaste,
+        ) -> Result<Vec<CatalogRow>, CatalogError> {
+            unreachable!()
+        }
+        async fn shelf_page(&self, _: &str, _: u32, _: &personalize::UserTaste) -> Result<ShelfPage, CatalogError> {
+            unreachable!()
+        }
+        async fn search(&self, _: &str) -> Result<SearchResults, CatalogError> {
+            unreachable!()
+        }
+        async fn random_movie(
+            &self,
+            _: &crate::catalog::RandomMovieFilter,
+        ) -> Result<crate::catalog::RandomMoviePick, CatalogError> {
+            unreachable!()
+        }
+        async fn details(&self, _: MediaKind, _: i64) -> Result<TitleDetails, CatalogError> {
+            unreachable!()
+        }
+        async fn extras(&self, _: MediaKind, _: i64) -> Result<TitleExtras, CatalogError> {
+            unreachable!()
+        }
+        async fn person(&self, _: i64) -> Result<PersonDetails, CatalogError> {
+            unreachable!()
+        }
+        async fn season(&self, _: i64, number: i32) -> Result<Season, CatalogError> {
+            match self.seasons.get(&number) {
+                Some(Ok(s)) => Ok(s.clone()),
+                Some(Err(CatalogError::NotFound)) | None => Err(CatalogError::NotFound),
+                Some(Err(CatalogError::Upstream(msg))) => Err(CatalogError::Upstream(msg.clone())),
+            }
+        }
+        async fn image(&self, _: &str, _: &str) -> Result<(Vec<u8>, String), CatalogError> {
+            unreachable!()
+        }
+    }
+
+    fn ep(number: i32) -> Episode {
+        Episode {
+            number,
+            name: format!("Серия {number}"),
+            overview: None,
+            still_path: None,
+            runtime_min: None,
+            air_date: None,
+        }
+    }
+
+    fn season_sum(number: i32, episode_count: i32) -> SeasonSummary {
+        SeasonSummary {
+            number,
+            name: format!("S{number}"),
+            episode_count,
+            year: None,
+        }
+    }
+
+    fn test_details(seasons: Vec<SeasonSummary>, last_episode: Option<(i32, i32)>) -> TitleDetails {
+        TitleDetails {
+            summary: TitleSummary {
+                kind: MediaKind::Tv,
+                tmdb_id: 42,
+                title: "Тест".into(),
+                original_title: None,
+                year: Some(2024),
+                poster_path: None,
+                backdrop_path: None,
+                rating: None,
+                overview: None,
+            },
+            genres: vec![],
+            runtime_min: None,
+            tagline: None,
+            seasons,
+            imdb_id: None,
+            last_episode,
+        }
+    }
+
+    #[tokio::test]
+    async fn series_episodes_to_mark_skips_specials_and_unaired_episodes() {
+        let mut seasons_map = HashMap::new();
+        seasons_map.insert(
+            0,
+            Ok(Season {
+                number: 0,
+                name: "Спецматериалы".into(),
+                episodes: vec![ep(1), ep(2)],
+            }),
+        );
+        seasons_map.insert(
+            1,
+            Ok(Season {
+                number: 1,
+                name: "Сезон 1".into(),
+                episodes: vec![ep(1), ep(2), ep(3)],
+            }),
+        );
+        seasons_map.insert(
+            2,
+            Ok(Season {
+                number: 2,
+                name: "Сезон 2".into(),
+                // Continuous numbering starting at 4, with 6 still unaired.
+                episodes: vec![ep(4), ep(5), ep(6)],
+            }),
+        );
+        let cat = MockSeriesCatalog { seasons: seasons_map };
+        let details = test_details(
+            vec![season_sum(1, 3), season_sum(2, 3), season_sum(3, 5), season_sum(0, 2)],
+            Some((2, 5)),
+        );
+
+        let (mut targets, mut done_seasons) = series_episodes_to_mark(&cat, 42, &details).await;
+        targets.sort_unstable();
+        done_seasons.sort_unstable();
+        assert_eq!(targets, vec![(1, 1), (1, 2), (1, 3), (2, 4), (2, 5)]);
+        assert_eq!(done_seasons, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn series_episodes_to_mark_falls_back_on_season_error_and_ignores_special_last_ep() {
+        let mut seasons_map = HashMap::new();
+        seasons_map.insert(1, Err(CatalogError::Upstream("timeout".into())));
+        seasons_map.insert(
+            2,
+            Ok(Season {
+                number: 2,
+                name: "Сезон 2".into(),
+                episodes: vec![ep(1), ep(2)],
+            }),
+        );
+        let cat = MockSeriesCatalog { seasons: seasons_map };
+        let details = test_details(vec![season_sum(1, 2), season_sum(2, 2), season_sum(0, 1)], Some((0, 1)));
+
+        let (mut targets, mut done_seasons) = series_episodes_to_mark(&cat, 42, &details).await;
+        targets.sort_unstable();
+        done_seasons.sort_unstable();
+        assert_eq!(targets, vec![(1, 1), (1, 2), (2, 1), (2, 2)]);
+        assert_eq!(done_seasons, vec![1, 2]);
+    }
 }

@@ -167,6 +167,7 @@ fn select_seed_candidates<'a>(
         .enumerate()
         .filter(|(_, s)| {
             s.status != Some(TitleStatus::Dropped)
+                && s.status != Some(TitleStatus::Want)
                 && !s.rating.is_some_and(|r| r <= 2)
                 && details_map.contains_key(&(s.kind, s.tmdb_id))
         })

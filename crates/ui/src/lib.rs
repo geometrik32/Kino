@@ -102,10 +102,28 @@ pub(crate) fn fallback_bg(id: i64) -> String {
     format!("linear-gradient(160deg, hsl({h} 55% 38%), hsl({h2} 60% 16%))")
 }
 
+fn is_safe_tmdb_path(p: &str) -> bool {
+    p.starts_with('/')
+        && p.len() <= 128
+        && p.bytes()
+            .skip(1)
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+fn is_valid_imdb_id(id: &str) -> bool {
+    id.starts_with("tt") && id.len() >= 4 && id.len() <= 16 && id[2..].bytes().all(|b| b.is_ascii_digit())
+}
+
 fn backdrop_style(t: &TitleSummary) -> String {
     match &t.backdrop_path {
-        Some(p) => format!("background-image: url('{}')", image_url(p, ImageSize::Backdrop)),
-        None => format!("background-image: {}", fallback_bg(t.tmdb_id)),
+        Some(p) if is_safe_tmdb_path(p) => {
+            let url = image_url(p, ImageSize::Backdrop);
+            if !url.contains(['\'', '"', '\\', '(', ')', ';', '\n', '\r']) {
+                return format!("background-image: url('{url}')");
+            }
+            format!("background-image: {}", fallback_bg(t.tmdb_id))
+        }
+        _ => format!("background-image: {}", fallback_bg(t.tmdb_id)),
     }
 }
 
@@ -202,11 +220,12 @@ pub fn Shell(
                 }
             }
             div { class: "top-right",
-                label { class: "search-box",
-                    span { class: "muted", Icon { svg: icons::SEARCH, class: "ic sm" } }
+                div { class: "search-box",
+                    span { class: "muted", "aria-hidden": "true", Icon { svg: icons::SEARCH, class: "ic sm" } }
                     input {
                         id: "kino-search-input",
                         r#type: "search",
+                        "aria-label": "Поиск фильмов и сериалов",
                         placeholder: "Поиск фильмов и сериалов…",
                         value: "{query}",
                         oninput: move |e| on_query.call(e.value()),
@@ -537,8 +556,14 @@ pub fn ScrollRow(
                     let left = e.scroll_left();
                     let width = f64::from(e.scroll_width());
                     let client = f64::from(e.client_width());
-                    can_prev.set(left > 8.0);
-                    can_next.set(left + client < width - 8.0);
+                    let next_prev = left > 8.0;
+                    let next_next = left + client < width - 8.0;
+                    if next_prev != *can_prev.peek() {
+                        can_prev.set(next_prev);
+                    }
+                    if next_next != *can_next.peek() {
+                        can_next.set(next_next);
+                    }
                     if has_more && left + client >= width - 360.0 {
                         if let Some(cb) = on_near_end {
                             cb.call(());
@@ -562,6 +587,7 @@ pub fn ScrollRow(
 
 #[component]
 pub fn PosterRow(
+    #[props(default)] shelf_id: String,
     title: String,
     #[props(default)] subtitle: Option<String>,
     items: Vec<TitleSummary>,
@@ -570,8 +596,26 @@ pub fn PosterRow(
     on_open: EventHandler<TitleSummary>,
     #[props(default)] on_load_more: Option<EventHandler<()>>,
     #[props(default)] on_open_all: Option<EventHandler<()>>,
+    #[props(default)] on_load_more_shelf: Option<EventHandler<String>>,
+    #[props(default)] on_open_shelf: Option<EventHandler<(String, String, Option<String>)>>,
 ) -> Element {
     let items_len = items.len();
+    let has_open_all = on_open_all.is_some() || (on_open_shelf.is_some() && !shelf_id.is_empty());
+    let sid_more = shelf_id.clone();
+    let near_end = use_callback(move |_: ()| {
+        if let Some(cb) = on_load_more {
+            cb.call(());
+        } else if let Some(cb) = on_load_more_shelf {
+            cb.call(sid_more.clone());
+        }
+    });
+    let near_end_opt = (on_load_more.is_some() || on_load_more_shelf.is_some()).then_some(near_end);
+    let sid_btn = shelf_id.clone();
+    let title_btn = title.clone();
+    let sub_btn = subtitle.clone();
+    let sid_card = shelf_id;
+    let title_card = title.clone();
+    let sub_card = subtitle.clone();
     rsx! {
         section { class: "section",
             div { class: "row-head",
@@ -581,8 +625,16 @@ pub fn PosterRow(
                         span { class: "row-sub", "{sub}" }
                     }
                 }
-                if let Some(open_all) = on_open_all {
-                    button { class: "row-all", onclick: move |_| open_all.call(()),
+                if has_open_all {
+                    button {
+                        class: "row-all",
+                        onclick: move |_| {
+                            if let Some(open_all) = on_open_all {
+                                open_all.call(());
+                            } else if let Some(cb) = on_open_shelf {
+                                cb.call((sid_btn.clone(), title_btn.clone(), sub_btn.clone()));
+                            }
+                        },
                         "Все"
                         Icon { svg: icons::CHEV_R, class: "ic sm" }
                     }
@@ -592,7 +644,7 @@ pub fn PosterRow(
                 row_class: "row".to_owned(),
                 items_len,
                 has_more,
-                on_near_end: on_load_more,
+                on_near_end: near_end_opt,
                 for item in items {
                     PosterCard { key: "{item.kind.as_str()}{item.tmdb_id}", item, on_open }
                 }
@@ -605,8 +657,16 @@ pub fn PosterRow(
                         }
                     }
                 }
-                if let Some(open_all) = on_open_all {
-                    button { class: "poster poster-all", onclick: move |_| open_all.call(()),
+                if has_open_all {
+                    button {
+                        class: "poster poster-all",
+                        onclick: move |_| {
+                            if let Some(open_all) = on_open_all {
+                                open_all.call(());
+                            } else if let Some(cb) = on_open_shelf {
+                                cb.call((sid_card.clone(), title_card.clone(), sub_card.clone()));
+                            }
+                        },
                         div { class: "img",
                             div { class: "all-box",
                                 span { class: "all-arrow", Icon { svg: icons::CHEV_R, class: "ic lg" } }
@@ -673,21 +733,12 @@ pub fn HomeView(
                 }
                 ScrollRow { row_class: "row".to_owned(), items_len: cont_len,
                     for item in continue_items {
-                        {
-                            let open_cb = on_open_title.or_else(|| {
-                                item.title.clone().map(|t| {
-                                    Callback::new(move |_| on_open.call(t.clone()))
-                                })
-                            });
-                            rsx! {
-                                ContinueCard {
-                                    key: "{item.last.kind.as_str()}{item.last.tmdb_id}",
-                                    item,
-                                    on_play,
-                                    on_drop,
-                                    on_open: open_cb,
-                                }
-                            }
+                        ContinueCard {
+                            key: "{item.last.kind.as_str()}{item.last.tmdb_id}",
+                            item,
+                            on_play,
+                            on_drop,
+                            on_open: on_open_title,
                         }
                     }
                 }
@@ -750,31 +801,19 @@ pub fn HomeView(
                     }
                     for row in loaded_rows {
                         {
-                            let sid = row.id.clone();
-                            let sid_more = row.id.clone();
-                            let stitle = row.title.clone();
-                            let ssub = row.subtitle.clone();
-                            let row_loading = loading_row_pages.iter().any(|id| id == &sid);
-                            let load_more_cb = on_load_more_items.map(|cb| {
-                                Callback::new(move |_| cb.call(sid_more.clone()))
-                            });
-                            let open_all_cb = on_open_shelf.map(|cb| {
-                                let id = sid.clone();
-                                let title = stitle.clone();
-                                let sub = ssub.clone();
-                                Callback::new(move |_| cb.call((id.clone(), title.clone(), sub.clone())))
-                            });
+                            let row_loading = loading_row_pages.iter().any(|id| id == &row.id);
                             rsx! {
                                 PosterRow {
                                     key: "{row.id}-{row.title}",
+                                    shelf_id: row.id,
                                     title: row.title,
                                     subtitle: row.subtitle,
                                     items: row.items,
                                     has_more: row.has_more,
                                     loading_more: row_loading,
                                     on_open,
-                                    on_load_more: load_more_cb,
-                                    on_open_all: open_all_cb,
+                                    on_load_more_shelf: on_load_more_items,
+                                    on_open_shelf,
                                 }
                             }
                         }
@@ -928,6 +967,37 @@ pub struct PlayTarget {
     pub position_sec: f64,
 }
 
+fn first_regular_season(details: &TitleDetails) -> i32 {
+    details
+        .seasons
+        .iter()
+        .map(|s| s.number)
+        .filter(|n| *n > 0)
+        .min()
+        .unwrap_or(1)
+}
+
+fn next_play_episode(details: &TitleDetails, season: i32, episode: i32) -> Option<(i32, i32)> {
+    if details.seasons.is_empty() {
+        return Some((season, episode + 1));
+    }
+    let cur = details.seasons.iter().find(|s| s.number == season)?;
+    let next = if episode < cur.episode_count {
+        (season, episode + 1)
+    } else {
+        let next_s = details
+            .seasons
+            .iter()
+            .filter(|s| s.number > season.max(0) && s.episode_count > 0)
+            .min_by_key(|s| s.number)?;
+        (next_s.number, 1)
+    };
+    match details.last_episode.filter(|(s, _)| *s > 0) {
+        Some(last) if next > last => None,
+        _ => Some(next),
+    }
+}
+
 /// The main button: resume where the user stopped, the next episode, or start.
 pub fn play_target(details: &TitleDetails, progress: &[Progress]) -> (PlayTarget, String) {
     let last = progress.iter().max_by_key(|p| p.updated_at);
@@ -960,22 +1030,20 @@ pub fn play_target(details: &TitleDetails, progress: &[Progress]) -> (PlayTarget
                 clock(p.position_sec)
             ),
         ),
-        (MediaKind::Tv, Some(p)) => (
-            PlayTarget {
-                season: p.season,
-                episode: p.episode + 1,
-                position_sec: 0.0,
-            },
-            format!("Смотреть {}", episode_code(p.season, p.episode + 1)),
-        ),
+        (MediaKind::Tv, Some(p)) => {
+            let (season, episode) =
+                next_play_episode(details, p.season, p.episode).unwrap_or((first_regular_season(details), 1));
+            (
+                PlayTarget {
+                    season,
+                    episode,
+                    position_sec: 0.0,
+                },
+                format!("Смотреть {}", episode_code(season, episode)),
+            )
+        }
         (MediaKind::Tv, None) => {
-            let first = details
-                .seasons
-                .iter()
-                .map(|s| s.number)
-                .filter(|n| *n > 0)
-                .min()
-                .unwrap_or(1);
+            let first = first_regular_season(details);
             (
                 PlayTarget {
                     season: first,
@@ -1117,12 +1185,12 @@ pub fn TitleView(
                             }
                         }
                         for m in meta { span { "{m}" } }
-                        if let Some(id) = &details.imdb_id {
+                        if let Some(id) = details.imdb_id.as_deref().filter(|id| is_valid_imdb_id(id)) {
                             a {
                                 class: "imdb-pill",
                                 href: "https://www.imdb.com/title/{id}/",
                                 target: "_blank",
-                                rel: "noopener",
+                                rel: "noopener noreferrer",
                                 "IMDb"
                                 Icon { svg: icons::EXT, class: "ic xs" }
                             }
@@ -1424,6 +1492,7 @@ fn EpisodeRow(
                 match &progress {
                     Some(p) if p.finished => rsx! { div { class: "ep-state done", "Просмотрено" } },
                     Some(p) if p.duration_sec > 0.0 => rsx! { div { class: "ep-state", "{clock(p.position_sec)} из {clock(p.duration_sec)}" } },
+                    Some(p) if p.position_sec > 0.0 => rsx! { div { class: "ep-state", "на {clock(p.position_sec)}" } },
                     _ => rsx! {},
                 }
                 div { class: "ep-acts",
@@ -1562,6 +1631,8 @@ pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element
                             button {
                                 key: "{pop_key}",
                                 class: "{cls}",
+                                role: "radio",
+                                "aria-checked": if rating == Some(n) { "true" } else { "false" },
                                 title: if rating == Some(n) { "Убрать оценку" } else { "Поставить {n} из 5" },
                                 "aria-label": "{n} из 5",
                                 onmouseenter: move |_| hover.set(Some(n)),
@@ -1658,5 +1729,55 @@ mod tests {
         assert_eq!(plural(11, "сезон", "сезона", "сезонов"), "сезонов");
         assert_eq!(ru_date("2013-08-01"), "1 авг 2013");
         assert_eq!(ru_date("soon"), "soon");
+    }
+
+    #[test]
+    fn play_target_handles_next_season_and_finished_series() {
+        use chrono::Utc;
+        use kino_core::SeasonSummary;
+
+        let season_sum = |number, episode_count| SeasonSummary {
+            number,
+            name: format!("S{number}"),
+            episode_count,
+            year: None,
+        };
+        let details = TitleDetails {
+            summary: TitleSummary {
+                kind: MediaKind::Tv,
+                tmdb_id: 1,
+                title: "Сериал".into(),
+                original_title: None,
+                year: Some(2020),
+                poster_path: None,
+                backdrop_path: None,
+                rating: None,
+                overview: None,
+            },
+            genres: vec![],
+            runtime_min: None,
+            tagline: None,
+            seasons: vec![season_sum(1, 2), season_sum(2, 3)],
+            imdb_id: None,
+            last_episode: Some((2, 3)),
+        };
+        let ep = |season, episode, finished| Progress {
+            kind: MediaKind::Tv,
+            tmdb_id: 1,
+            season,
+            episode,
+            position_sec: 100.0,
+            duration_sec: 200.0,
+            finished,
+            release: None,
+            updated_at: Utc::now(),
+        };
+
+        let (_, lbl) = play_target(&details, &[ep(1, 2, true)]);
+        assert_eq!(lbl, "Смотреть S02E01");
+
+        let (t, lbl) = play_target(&details, &[ep(1, 1, true), ep(2, 3, true)]);
+        assert_eq!((t.season, t.episode), (1, 1));
+        assert_eq!(lbl, "Смотреть S01E01");
     }
 }

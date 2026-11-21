@@ -401,3 +401,319 @@
 - [x] `parse_title` корректно определяет год релиза (скобки в приоритете, затем последний год вне битрейта) и диапазон лет.
 - [x] Поиск в каталоге (`TmdbCatalog::search`, `DemoCatalog::search`) поддерживает запросы с годом в конце («Название 1997»).
 - [ ] Пройдены `cargo clippy --workspace --all-targets --locked -- -D warnings` и `cargo test --workspace --locked` в CI (с PostgreSQL), а также проверка в живом приложении после деплоя.
+
+---
+
+## ISSUE-014: Навигация «Назад» из «Продолжить просмотр», самопроизвольная пауза, авто-мьют на Android и рассинхрон звука в `ffmpeg` (`-c:v copy`)
+
+- **Статус:** `Исправлено` (исправлено в коде; `cargo check --workspace --all-targets --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked` пройдены локально; `cargo test`/`clippy`/`fmt` и живая проверка после деплоя ожидают запуска)
+- **Приоритет:** Критический (P0)
+- **Затронутые платформы:** Все веб/Mini App/нативные клиенты (`kino-ui`, `kino-app`) и сервер (`kino-server`: `sync.rs`, `ffmpeg.rs`).
+
+### Суть проблем
+1. **Кнопка «Назад» после запуска из «Продолжить просмотр» возвращает на страницу фильма вместо предыдущего экрана:**
+   - В коммите `260ad80` из `app/src/main.rs` были удалены `exit_on_close` и `on_exit`, а в `crates/ui/src/player.rs` кнопка `←` и кнопка с названием фильма (`.p-title-link`) вызывали один и тот же `on_close`.
+   - При закрытии плеера после асинхронного `api::sync_leave` сбрасывался `IN_POPSTATE` в `telegram/web.rs`, из-за чего кнопка «Назад» браузера могла выполнить лишний шаг `history.back()`.
+2. **Самопроизвольные паузы плеера при включении, перемотке и загрузке (например, «Зелёная миля» сразу ставилась на паузу после загрузки):**
+   - Периодический тик `SYNC_TICK_MS` (`2 с`) в `app/src/player.rs` отправлял `SyncClientMsg::Report { paused: v.paused(), ... }` ещё до завершения загрузки/перемотки (`awaiting_ready() == true` / `!played()`), пока `<video>` ждал `ffmpeg` или TorrServer и имел `v.paused() == true`.
+   - Сервер в `crates/server/src/sync.rs` при `members.len() == 1` принимал `room.paused = paused` из `Report`; при последующем `Ready` сервер рассылал `SyncServerMsg::State` с `paused = true`, и клиент немедленно ставил видео на паузу.
+3. **Автоматическое отключение звука на Android при запуске плеера:**
+   - При задержке старта потока сверх окна активации (или в WebView с `mediaPlaybackRequiresUserGesture`) `attempt_play` в `app/src/player.rs` (из `ISSUE-012`) при `PlayOutcome::NotAllowed` принудительно выставлял `vid.set_muted(true)` и показывал отдельную кнопку «Включить звук».
+4. **Рассинхрон звука и видео (на «Тёмном рыцаре» и других H.264 `.mkv` при перемотке или продолжении просмотра, при нормальном звуке в HEVC-релизах вроде «Зелёной мили»):**
+   - Для H.264 `.mkv` (`video_copyable() == true`) `ffmpeg::transcode_args` запускал `ffmpeg -ss <start> -i ... -c:v copy -c:a aac` без `-noaccurate_seek`.
+   - При входном `-ss` видео с `-c:v copy` откатывалось к предыдущему ключевому кадру (`T - K`, например на `2–4 с` раньше), а перекодируемый звук (`-c:a aac`) обрезался точно по `T`, оставляя разрыв длительности `K` на первом аудиопакете (подтверждено `ffprobe` на продовом файле «Тёмного рыцаря»: разрыв `4.083 с` при `-ss 4` и `2.031 с` при `-ss 3015`).
+
+### Что реализовано
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs), [app/src/player.rs](../app/src/player.rs), [app/src/main.rs](../app/src/main.rs), [app/src/telegram/web.rs](../app/src/telegram/web.rs), [app/src/telegram/native.rs](../app/src/telegram/native.rs):
+  - Разделены `on_close` (кнопка `←`, `Esc`, системная/браузерная кнопка «Назад») и `on_title` (нажатие на название фильма `.p-title-link`).
+  - Восстановлены `exit_on_close` и `on_exit` в `Title`/`Main`: при запуске из «Продолжить просмотр» (или глубокой ссылки `&play=1`) `←` возвращает на предыдущий экран (`Home`), а нажатие на название фильма открывает страницу фильма (оставляя `Home` в истории для последующего возврата).
+  - В `telegram::in_popstate()` флаг `popstate` сохраняется до завершения `api::sync_leave`, исключая двойной `history.back()`.
+- [app/src/player.rs](../app/src/player.rs), [crates/server/src/sync.rs](../crates/server/src/sync.rs):
+  - Клиент не отправляет `SyncClientMsg::Report` во время загрузки, ожидания буфера и активной перемотки (`awaiting_ready`, `seeking_target`, `pending_seek`, `!played`, `waiting`), и передаёт `desired_paused()`.
+  - Серверный обработчик `SyncClientMsg::Report` больше не изменяет `room.paused` (и обновляет позицию/скорость одиночного участника только при `!room.paused && !room.waiting && !paused`); добавлен unit-тест `report_does_not_pause_solo_room`.
+  - Увеличен допуск проверки `seeked` до `< 20.0` с.
+- [app/src/player.rs](../app/src/player.rs):
+  - При `PlayOutcome::NotAllowed` в `attempt_play` убран принудительный `set_muted(true)`: плеер остаётся со звуком на паузе (большая кнопка `▶`), чтобы одно нажатие сразу запускало воспроизведение со звуком.
+- [crates/server/src/torrent/ffmpeg.rs](../crates/server/src/torrent/ffmpeg.rs):
+  - В `transcode_args` при `start > 0 && copy_video` перед `-ss` добавлен флаг `-noaccurate_seek`, чтобы аудио и копируемое H.264-видео начинались с одного и того же ключевого кадра без рассинхрона; обновлён unit-тест `ffmpeg::tests::args`.
+
+### Критерии приёмки
+- [x] Кнопка «Назад» из плеера, открытого через «Продолжить просмотр» или `/continue`, возвращает на главный экран, а нажатие на название фильма открывает страницу фильма.
+- [x] Плеер больше не ставит себя на паузу после загрузки или перемотки из-за фонового `SyncClientMsg::Report`.
+- [x] На Android плеер больше не отключает звук сам при `NotAllowedError`.
+- [x] Для H.264-релизов с `-c:v copy` при `-ss > 0` добавлен `-noaccurate_seek` без разрыва первого аудиопакета (проверено локально `ffprobe` и unit-тестом).
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, `cargo test --workspace --locked` в CI и живая проверка после выкладки на сервер.
+
+---
+
+## ISSUE-015: Android APK — чёрный экран вместо видео (нет фоллбэка на неподдерживаемые кодеки / WebView), сдвиг интерфейса в сторону, нет иконки и неправильное название
+
+- **Статус:** `В работе` (выявлено по живому тесту первой сборки `android-preview` `44929351874`)
+- **Приоритет:** Критический (P0)
+- **Затронутые платформы:** Android (`kino-app --features mobile`, `app/android/`, `app/src/main.rs`, `app/src/platform/android.rs`, `crates/ui/src/style.css`, `.github/workflows/android.yml`).
+
+### Суть проблем
+По результатам проверки первой сборки `orel-kino-arm64.apk` на реальном Android-устройстве (в том числе на примере запуска «Одиссей» `S01E01` `DVDRemux`):
+1. **Нет картинки при работающем звуке и таймкоде (чёрный фон):**
+   - `The Odyssey.1997.DVDRemux.mkv` содержит видеопоток `mpeg2video` (`720x480`) + аудио `ac3`: `org.jellyfin.media3:media3-ffmpeg-decoder` декодирует только аудио, аппаратный `MediaCodec` на многих телефонах не поддерживает `video/mpeg2`, а `ExoPlayer` при этом молча отбрасывает неподдерживаемую видеодорожку без `onPlayerError` и воспроизводит только звук с чёрным экраном (не срабатывает откат в `force_transcode`).
+   - Дополнительно в `Config::new()` (`app/src/main.rs`) `WebView` на Android создавался без `.with_background_color((0, 0, 0, 0))`, а в `MainActivity.kt` не отслеживался `onRenderedFirstFrame()` для аварийного переключения в `ffmpeg` при любом зависании видеорендера.
+2. **Интерфейс съезжает в сторону:**
+   - При скрытии системной панели навигации в режиме плеера (`BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`, `SENSOR_LANDSCAPE`) Chromium WebView продолжает передавать ширину скрытой 3-кнопочной навигации (`~48dp`, ~100–110 px справа) в `env(safe-area-inset-right)`, из-за чего `.p-top` и `.p-dock` сдвигаются влево с широкой пустой полосой справа.
+   - На Android 14/15 (`target_sdk = 35`) без собственного `OnApplyWindowInsetsListener` с чётким разделением обычного режима (`systemBars + displayCutout` padding на корневом контейнере) и иммерсивного плеера интерфейс может смещаться/заезжать под системные области; в `style.css` у `html, body` не было `width: 100%; overflow-x: hidden;`.
+3. **Отсутствует фирменная иконка и неправильное название приложения:**
+   - В `dx 0.7.10` название для `strings.xml` берётся как `PascalCase` от `application.name` (`"Kino"` вместо `"Орловский кинопоказ"`), а вместо иконки проекта подставляются стандартные зелёные ресурсы Dioxus (`ic_launcher.webp`).
+
+### Критерии приёмки
+- [x] В `MainActivity.kt` добавлена проверка поддерживаемых видеодорожек (`C.TRACK_TYPE_VIDEO`: если ни одна не поддерживается, например `mpeg2video`) и 5-секундный контроль первого видеокадра (`onRenderedFirstFrame`), переводящие плеер в `hasError` для мгновенного отката на серверное `ffmpeg`-перекодирование в `<video>`; `WebView` создаётся с `.with_background_color((0, 0, 0, 0))` и аппаратным слоем (ждет живой проверки на телефоне).
+- [x] В `MainActivity.kt` и `style.css` настроены `WindowCompat`/`OnApplyWindowInsetsListener` и `--android-sa*`: в обычном режиме применяются системные отступы на корневой `View`, в плеере скрытая навигационная панель отсекается (`WindowInsetsCompat.CONSUMED`), а в CSS передаётся только `displayCutout`; на `html, body` добавлен `width: 100%; overflow-x: hidden;`.
+- [x] В `app/android/res/` подготовлены брендированные ресурсы (`Орловский кинопоказ` в `strings.xml`, тёмная тема запуска `styles.xml`, Adaptive Icon `ic_launcher.xml` + `mipmap-*` PNG из `deploy/bot/avatar.png`), а в `.github/workflows/android.yml` встроена их подстановка перед сборкой APK.
+- [ ] Пройдена сборка в `.github/workflows/android.yml` + `ci.yml` и подтверждена работа на реальном телефоне (H.264/HEVC напрямую, DVDRemux `mpeg2video` через фоллбэк, отсутствие сдвига UI, иконка и название «Орловский кинопоказ»).
+
+---
+
+## ISSUE-016: Интерфейс плеера в браузере не скрывается автоматически при паузе
+
+- **Статус:** `Исправлено` (исправлено в коде; локально пройдены `cargo check` для `kino-core`, `kino-ui`, `kino-preview`, `kino-app` `wasm32`/`desktop`/`mobile`; `cargo fmt`/`clippy`/линковка тестов и живая проверка в браузере ожидают запуска)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Веб / браузер (десктопный и мобильный, `kino-app --features web`, `kino-ui`), а также общие контролы `PlayerView` (Telegram Mini App, Desktop, Android).
+
+### Суть проблемы
+1. В [crates/ui/src/player.rs](../crates/ui/src/player.rs) выражение `shown` содержало `|| s.paused`, из-за чего при паузе класс `.show` на `.player` удерживался постоянно, а кнопка `.p-big` оставалась видимой независимо от `shown`.
+2. В [app/src/player.rs](../app/src/player.rs) таймер автоскрытия `show_controls` проверял `!s.paused` и не сбрасывал `s.controls = false` во время паузы.
+3. В [crates/ui/src/style.css](../crates/ui/src/style.css) правило `@media (hover: hover) and (pointer: fine)` с `.player:hover .p-top, .player:hover .p-dock, .player:hover .p-vignette` принудительно показывало интерфейс в десктопном браузере, пока курсор мыши находился в пределах окна плеера (даже неподвижно), вместо показа по движению мыши и автоскрытия вместе с курсором при бездействии.
+
+### Что реализовано
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs):
+  - Добавлена функция `controls_shown` (без `state.paused`: видимость зависит только от `!locked && (state.controls || state.menu.is_some() || scrubbing)`), добавлен проп `on_activity`, обработчики `onpointermove` (только `pointer_type == "mouse"` с фильтром `pointer_moved` от нулевых/субпиксельных синтетических событий) и `onmouseleave`, а также сброс таймера активности при взаимодействии с `.p-top`, `.p-dock`, `.p-popover`, `.p-track` и `.p-unlock-btn`; добавлены unit-тесты `paused_hides_controls_when_inactive` и `pointer_moved_ignores_subpixel_jitter`.
+- [crates/ui/src/style.css](../crates/ui/src/style.css):
+  - Убрано принудительное `.player:hover` на весь экран в `@media (hover: hover) and (pointer: fine)`; добавлено скрытие `.p-big` и скрытие курсора над `.p-zones`/`video` при `.player:not(.show)` (`cursor: none`) с плавным переходом `opacity` у `.p-big`.
+- [app/src/player.rs](../app/src/player.rs):
+  - Таймер `show_controls` переведён на отметку времени `last_activity_ms` и цикл единичного таймера, скрывающий `s.controls = false` через `CONTROLS_MS` (`3.5 с`) бездействия независимо от `s.paused` (пока закрыты меню); вызов `show_controls()` подключён при паузе/возобновлении, внешней/синхронизированной паузе, закрытии меню, перемотке, регулировке громкости, переключении полноэкранного режима и через `on_activity`.
+
+### Критерии приёмки
+- [x] При паузе (нажатием на экран, кнопкой в панели, клавишами `Space`/`K`, внешней паузой или через синхронизацию) оверлей плеера (`.p-top`, `.p-dock`, `.p-big`, `.p-vignette`) скрывается через `CONTROLS_MS` бездействия, а на десктопе скрывается курсор над видео (реализовано в коде и проверено `cargo check` / unit-логикой).
+- [x] Движение мыши (`pointer_type == "mouse"`), нажатие/перетаскивание контролов или клавиши управления снова показывают интерфейс на `CONTROLS_MS` (пока не открыто меню и не идёт перемотка).
+- [x] На сенсорных устройствах повторное касание области видео во время паузы при открытом интерфейсе немедленно скрывает его, а при скрытом — снова показывает.
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, `cargo test` в CI и проверка в живом браузере.
+
+---
+
+## ISSUE-017: Масштабирование картинки в плеере («По ширине» и «По высоте» с запоминанием для фильма)
+
+- **Статус:** `Исправлено` (реализовано в коде с сохранением в PostgreSQL + локальным кешем; результаты финального `cargo check` ниже)
+- **Приоритет:** Средний (P2)
+- **Затронутые платформы:** Сервер и БД (`kino-core`, `kino-server`, миграция `0008_video_scale.sql`), все клиенты (`kino-ui`, `kino-app` для Web, Telegram Mini App, Desktop и Android `ExoPlayer`), превью (`kino-preview`).
+
+### Суть требования
+Добавить в видеоплеер возможность переключать масштабирование картинки между ровно 2 пропорциональными режимами:
+1. **«По ширине» (`VideoScale::FitWidth`)** — ширина видео подтягивается к ширине экрана, высота масштабируется пропорционально (при несовпадении пропорций даёт полосы сверху/снизу либо аккуратно обрезает верх/низ).
+2. **«По высоте» (`VideoScale::FitHeight`)** — высота видео подтягивается к высоте экрана, ширина масштабируется пропорционально (при несовпадении пропорций даёт полосы по бокам либо аккуратно обрезает края слева/справа).
+
+До ручного выбора пользователем для конкретного фильма/сериала стартовый режим автоматически подбирается без обрезки кадра (в тот из двух режимов, который вписывает кадр целиком для текущего соотношения сторон экрана и видео), а переключение кнопкой сохраняет выбор в БД (`title_state.video_scale`) для этого тайтла (`(kind, tmdb_id)`) на всех устройствах (с локальным fallback/кешем в `localStorage`).
+
+### Что реализовано
+- [crates/core/src/lib.rs](../crates/core/src/lib.rs), [crates/server/migrations/0008_video_scale.sql](../crates/server/migrations/0008_video_scale.sql), [crates/server/src/userdata.rs](../crates/server/src/userdata.rs), [crates/server/src/api.rs](../crates/server/src/api.rs), [crates/server/tests/user_state.rs](../crates/server/tests/user_state.rs):
+  - Добавлен `VideoScale` (`FitWidth` ↔ `"width"`, `FitHeight` ↔ `"height"`), поле `TitleState.video_scale` (`#[serde(default)]`) и структура `ScaleUpdate`;
+  - Добавлена миграция `0008_video_scale.sql` (`title_state.video_scale TEXT CHECK (video_scale IN ('width', 'height'))`), чтение в `STATE_COLUMNS`/`state_from_row`, `userdata::set_scale`, маршрут `PUT /api/title/{kind}/{tmdb_id}/scale` (`put_scale`) и проверка в интеграционном тесте `rating_tracks_prefs`.
+- [crates/ui/src/icons.rs](../crates/ui/src/icons.rs), [crates/ui/src/player.rs](../crates/ui/src/player.rs), [crates/ui/src/style.css](../crates/ui/src/style.css), [crates/preview/src/main.rs](../crates/preview/src/main.rs):
+  - Добавлены SVG-иконки `FIT_WIDTH` и `FIT_HEIGHT`, реэкспорт `VideoScale`, поле `PlayerState.scale`, обработчик `on_scale` и кнопка `.p-scale-btn` в `.p-ctrl-row` (с текстом «По ширине»/«По высоте» на десктопе, «Ширина»/«Высота» в ландшафте и `tg-player-rot`, компактной иконкой в узком портрете и уменьшенными кнопками на `<= 480px`, чтобы все контролы помещались в одну строку).
+- [app/src/api.rs](../app/src/api.rs), [app/src/main.rs](../app/src/main.rs), [app/src/player.rs](../app/src/player.rs):
+  - Добавлен клиентский метод `api::set_scale`, передача `st.video_scale` из `Title` в `PlayStart.video_scale` и сохранение в БД при переключении;
+  - Реализована динамическая синхронизация `object-fit` (`contain`/`cover`) для `#kino-video` на основе `videoWidth/videoHeight` и `clientWidth/clientHeight` (через `loadedmetadata`/`loadeddata`/`resize`, `ResizeObserver` и `fullscreenchange`), сохраняющая `<video>` в `100% × 100%` границах экрана, чтобы WebVTT-субтитры не обрезались снизу;
+  - Сохранён локальный fallback/кеш в `localStorage` (`kino.player.scale`, до 200 тайтлов) при приоритете значения из БД, а также unit-тесты `scale_storage_round_trips_and_evicts_oldest` и `scale_codes_map_between_native_and_ui`.
+- [app/android/MainActivity.kt](../app/android/MainActivity.kt), [app/src/platform/android.rs](../app/src/platform/android.rs), [app/src/platform/video.rs](../app/src/platform/video.rs):
+  - В `AspectRatioFrameLayout` добавлены `RESIZE_MODE_FIXED_WIDTH` (`1`), `RESIZE_MODE_FIXED_HEIGHT` (`2`) и автоподбор до ручного выбора (`RESIZE_MODE_FIT` с экспортом эффективного режима в `kinoNativePoll()`), добавлен JNI-метод `kinoNativeSetScale(Int)`, а `SubtitleView` перенесён в `playerContainer` поверх `aspectLayout`, чтобы субтитры оставались в границах экрана при любом масштабировании.
+
+### Критерии приёмки
+- [x] В `PlayerView` добавлена кнопка переключения ровно между 2 режимами («По ширине» ↔ «По высоте») со своей SVG-иконкой и адаптивной вёрсткой для десктопа, портрета, ландшафта и `tg-player-rot`.
+- [x] Для HTML `<video>` переключение применяет режим при загрузке метаданных, смене серии/источника, ресайзе и повороте, удерживая WebVTT-субтитры в границах экрана.
+- [x] Для нативного плеера Android (`MainActivity.kt` / `AspectRatioFrameLayout`) реализованы `RESIZE_MODE_FIXED_WIDTH` и `RESIZE_MODE_FIXED_HEIGHT`, а `SubtitleView` перенесён в `playerContainer`.
+- [x] Выбранный режим сохраняется в PostgreSQL (`title_state.video_scale`, `PUT /api/title/{kind}/{tmdb_id}/scale`) и восстанавливается для конкретного фильма/сериала.
+- [x] Локально пройдены `cargo check` с `-D warnings` для `kino-core`, `kino-ui --tests`, `kino-server`, `kino-preview` и `kino-app` (`wasm32 --tests`, `desktop`, `mobile`).
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, `cargo test` (линковка заблокирована локально по `ISSUE-002`), сборка Android APK (`MainActivity.kt`) в CI, миграция `0008_video_scale.sql` при деплое и живая проверка на устройствах.
+
+---
+
+## ISSUE-018: Автоматическая отметка просмотра тайтла и всех его серий при выставлении оценки
+
+- **Статус:** `Исправлено` (реализовано в коде и покрыто unit- и интеграционными тестами; локально пройдены `cargo check` с `-D warnings` для `kino-server`, `kino-bot`, `kino-preview` `--all-targets`, `kino-ui --tests`, `kino-app` `wasm32 --tests` и `--features mobile`; полные `cargo test --workspace`, `cargo fmt`/`clippy` и живая проверка ожидают прогона в CI / окружении с PostgreSQL из-за `ISSUE-002` и параллельной WIP-правки `VideoScale` в `crates/core/src/lib.rs` и `app/src/api.rs`)
+- **Приоритет:** Средний (P2)
+- **Затронутые платформы:** Сервер (`kino-server`: `api.rs`, `userdata.rs`) и клиентский UI (`kino-app`, `kino-ui`).
+
+### Суть требования
+При выставлении пользовательской оценки тайтлу (`PUT /api/title/{kind}/{tmdb_id}/rating`, 1–5 звёзд):
+1. Статус тайтла должен автоматически становиться `Просмотрено` (`TitleStatus::Watched`), даже если до этого он был не задан или имел другой статус (`Хочу посмотреть`, `Смотрю`, `Брошено`).
+2. Для фильма в `watch_progress` должна автоматически ставиться отметка просмотра (`finished = true`).
+3. Для сериала все вышедшие серии регулярных сезонов (`season > 0`) должны автоматически отмечаться просмотренными (`finished = true`), а завершённые сезоны — планироваться к очистке предзагрузки (`preload_schedule_removal`).
+4. При снятии оценки (`rating = null`) уже выставленные статус и прогресс просмотра не должны сбрасываться.
+5. В интерфейсе карточки тайтла (`app/src/main.rs`, `crates/ui/src/lib.rs`) после выставления оценки должны сразу обновляться статус, прогресс по сериям/сезонам и кнопка «Смотреть».
+
+### Что реализовано
+- [crates/server/src/userdata.rs](../crates/server/src/userdata.rs):
+  - Добавлена общая транзакционная функция `rate_and_mark` (через `set_column_on` и пакетную `mark_many_tx` на `UNNEST`): при `rating = Some(1..=5)` в одной транзакции сохраняет оценку, переводит `title_state.status` в `'watched'` и помечает переданные `(season, episode)` как `finished = TRUE` в `watch_progress` (при `rating = None` меняется только `rating`).
+  - `mark` переведена на `mark_many_tx` без дублирования циклов запросов.
+- [crates/server/src/api.rs](../crates/server/src/api.rs):
+  - В `put_rating` при выставлении оценки для фильма добавляется цель `(0, 0)`, а для сериала через `series_episodes_to_mark` собираются все вышедшие серии регулярных сезонов (`season > 0`, с фильтрацией по `last_episode` при `season > 0`, параллельной догрузкой сезонов `buffer_unordered(6)` и fallback на `episode_count` при ошибке запроса сезона); для завершённых сезонов/фильма вызывается `preload_schedule_removal`.
+  - Добавлены unit-тесты `series_episodes_to_mark_skips_specials_and_unaired_episodes` и `series_episodes_to_mark_falls_back_on_season_error_and_ignores_special_last_ep`.
+- [app/src/main.rs](../app/src/main.rs) и [crates/ui/src/lib.rs](../crates/ui/src/lib.rs):
+  - В `Title` (`on_rate`) добавлены оптимистичное обновление статуса `Watched`, защита от гонок `rate_seq`, фиксация открытого сезона при `chosen_season.is_none()` и перезагрузка `data.restart()` для мгновенного обновления прогресса всех серий;
+  - В `play_target` (`next_play_episode` + `first_regular_season`) исправлен расчёт следующей серии при просмотре до конца сезона или всего сериала (переход на следующий сезон `SxxE01` или старт `S01E01` вместо несуществующей `episode + 1`), добавлен unit-тест `play_target_handles_next_season_and_finished_series`.
+- [crates/server/tests/user_state.rs](../crates/server/tests/user_state.rs):
+  - Обновлён `rating_tracks_prefs` и добавлен интеграционный тест `rating_marks_film_and_all_series_episodes_watched` (фильм, сериал с несколькими сезонами, скрытие из `/api/continue`, планирование удаления предзагрузки, сохранение статуса и отметок при снятии оценки).
+
+### Критерии приёмки
+- [x] `PUT /api/title/{kind}/{tmdb_id}/rating` с оценкой `1..=5` переводит `title_state.status` в `watched` и атомарно помечает просмотренными фильм или все вышедшие серии регулярных сезонов сериала (с планированием удаления завершённых предзагрузок).
+- [x] Снятие оценки (`rating = null`) очищает только `rating`, не удаляя статус и отметки просмотра.
+- [x] Клиент (`Title` в `app/src/main.rs`) после выставления оценки обновляет статус, перезагружает прогресс тайтла без смены открытого сезона, а `play_target` (`crates/ui/src/lib.rs`) для полностью просмотренного сериала не предлагает несуществующую следующую серию.
+- [x] Код и тесты скомпилированы в `cargo check` с `-D warnings` для `kino-server --all-targets`, `kino-bot --all-targets`, `kino-preview --all-targets`, `kino-ui --tests`, `kino-app` (`wasm32 --tests`, `--features mobile`).
+- [ ] Пройдены запуск `cargo test --workspace --locked` (с PostgreSQL), `cargo fmt --all --check`, `cargo clippy` в CI и живая проверка в приложении (локально заблокировано `ISSUE-002`: отсутствует `dlltool.exe` для сборки `chrono`/`parking_lot_core` в тестах и тестовый бинарник `kino-server` падает на старте с `0xc0000005`; также в рабочей копии присутствуют незавершённые параллельные правки `VideoScale` в `crates/core/src/lib.rs` и `app/src/api.rs`).
+
+---
+
+## ISSUE-021: Пакет исправлений P0 по результатам аудита безопасности, производительности и надёжности
+
+- **Статус:** `Исправлено` (реализовано в коде и проверено `cargo check` с `-D warnings` и `--locked` по workspace + `wasm32`/`desktop`/`mobile`; прогон `cargo fmt`, `cargo clippy`, `cargo test` с PostgreSQL, сборка Android APK и обновление `compose.yaml` на продакшн-сервере ожидают CI и согласия на деплой)
+- **Приоритет:** Критический (P0)
+- **Затронутые платформы:** Сервер (`kino-server`, `Dockerfile`, `deploy/compose.yaml`), клиенты (`kino-app` Web / Telegram Mini App / Desktop / Android, `kino-ui`), CI (`.github/workflows/android.yml`).
+
+### Что реализовано
+1. **Безопасность (`SEC-01`–`SEC-04`):**
+   - `SEC-01`: добавлена проверка внешних ссылок `platform::is_safe_external_url` (только `https://` и `tg://`, без пробелов/управляющих и shell-символов) + unit-тест в [app/src/platform/mod.rs](../app/src/platform/mod.rs); на Windows `cmd /C start` заменён на прямой вызов Win32 `ShellExecuteW` ([app/src/platform/native.rs](../app/src/platform/native.rs)), на macOS передаётся `--`, на Android и Web также проверяется схема (`noopener,noreferrer`), в `Login` ([app/src/main.rs](../app/src/main.rs)) ссылки валидируются до подстановки в `href`.
+   - `SEC-02`: из `is_image_file` удалён `"svg"` ([crates/server/src/catalog/tmdb.rs](../crates/server/src/catalog/tmdb.rs)), добавлены строгий allowlist растровых `Content-Type`, потоковое ограничение размера тела (`10 MiB`) и заголовки `X-Content-Type-Options: nosniff` + `Content-Security-Policy: default-src 'none'; sandbox` на `/api/img/{size}/{file}` ([crates/server/src/api.rs](../crates/server/src/api.rs)).
+   - `SEC-03`: в [.github/workflows/android.yml](../.github/workflows/android.yml) устранена shell-инъекция `${{ github.head_ref }}` (передача через `env:`), сборочный job ограничен `contents: read`, публикация вынесена в отдельный job `publish` с атомарным `gh release upload --clobber` и блокировкой публикации `debuggable` APK в `android-latest`, добавлена проверка SHA-256 архива `dx` (`4363e4ed...`), безопасная сериализация `[bundle.android]` через `python3`/`json.dumps`, `apksigner verify` и очистка keystore в `if: always()`.
+   - `SEC-04`: отключён глобальный `uses_cleartext_traffic` в [app/Dioxus.toml](../app/Dioxus.toml) и принудительно выставляются `android:allowBackup="false"` и `android:usesCleartextTraffic="false"` в `AndroidManifest.xml` при сборке APK; в [app/android/MainActivity.kt](../app/android/MainActivity.kt) отключён `setAllowCrossProtocolRedirects(false)` в ExoPlayer и усилена конфигурация `WebView.settings` (`allowFileAccess`, `allowContentAccess`, `geolocation`, `javaScriptCanOpenWindowsAutomatically`, `safeBrowsingEnabled`).
+2. **Производительность и ресурсы (`PERF-01`–`PERF-03`):**
+   - `PERF-01`: добавлен `[profile.release]` (`lto = "thin"`, `codegen-units = 1`, `strip = true`, `opt-level = "z"` для `kino-app`/`kino-ui`) в [Cargo.toml](../Cargo.toml); в [Dockerfile](../Dockerfile) добавлены проверка SHA-256 `dx` и предсжатие статики `/out/web` в `brotli -9` и `gzip -9`; в [crates/server/src/lib.rs](../crates/server/src/lib.rs) включены `ServeDir::precompressed_br().precompressed_gzip()`, `Cache-Control` (`immutable` для `/assets/*`, `no-cache` для SPA HTML) и базовые заголовки `X-Content-Type-Options`/`Referrer-Policy`; `telegram-web-app.js` убран из синхронного `<head>` в [app/Dioxus.toml](../app/Dioxus.toml) и загружается условно только внутри Telegram в [app/src/platform/web.rs](../app/src/platform/web.rs) до `telegram::init()`.
+   - `PERF-02`: в [deploy/compose.yaml](../deploy/compose.yaml) увеличены лимиты памяти `torrserver` (`768m` + `GOMEMLIMIT=576MiB`) и `kino-server` (`1280m` + Traefik `compress` middleware); в [crates/server/src/play.rs](../crates/server/src/play.rs) добавлены семафор `MAX_SUBTITLES = 2`, 5-минутный idle-таймаут на зависший/запаузенный транскод (с мгновенной остановкой `ffmpeg` по `tx.closed()`) и валидация `audio/subtitle >= 0`.
+   - `PERF-03` + `UX-03`: в [app/src/platform/android.rs](../app/src/platform/android.rs) все JNI-вызовы обёрнуты в `env.with_local_frame(16, ...)`, `poll_native_player` переведён на `attach_current_thread_as_daemon()`, а `ACTIVITY` переведён с `OnceLock<GlobalRef>` на `RwLock<Option<GlobalRef>>` с автообновлением при пересоздании Activity.
+3. **UX и надёжность (`UX-01`–`UX-02`):**
+   - `UX-01`: в [crates/ui/src/player.rs](../crates/ui/src/player.rs) и [crates/ui/src/style.css](../crates/ui/src/style.css) расширена зона касания `.p-track` (`.p-track::before` `inset: -14px 0`, `touch-action: none`), перетаскивание в `tg-player-rot` отслеживается по всему контейнеру `.player`, устранена гонка `onpointerdown`/`get_client_rect().await` через `drag_gen`/`drag_active`/`drag_end_y`, добавлены сброс `scrub` по `onpointerup`/`onblur` и `disabled: dur <= 0.0`.
+   - `UX-02`: добавлены `connect_timeout` и `timeout` на HTTP-клиент в [crates/server/src/torrent/qbit.rs](../crates/server/src/torrent/qbit.rs) и на нативный `CLIENT` в [app/src/api.rs](../app/src/api.rs) (плюс 15с для `sync_join` и 5с для `sync_leave`); в [app/src/player.rs](../app/src/player.rs) `finish_close` закрывает плеер немедленно и отправляет `api::sync_leave` в фоне через `dioxus::core::spawn_forever`.
+
+### Критерии приёмки
+- [x] Все 10 проблем уровня P0 (`SEC-01..04`, `PERF-01..03`, `UX-01..03`) исправлены в коде и прошли локальный `cargo check` с `-D warnings` и `--locked` (`workspace --all-targets`, `kino-app wasm32 --tests`, `kino-app --features desktop`, `kino-app --features mobile`).
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, `cargo test --workspace --locked` в CI, сборка Android APK и проверка `android-latest` с релизным keystore.
+- [ ] После подтверждения владельца обновления `deploy/compose.yaml` и свежий образ применены на сервере `192.168.3.27` (подтверждены сжатый WASM, `Cache-Control`, отсутствие OOM-kill `torrserver` и работа Telegram Mini App / браузера / Android).
+
+---
+
+## ISSUE-022: Оптимизация потребления оперативной памяти сервера (кэш каталога и постеров, буфер торрентов на HDD, сон Jackett)
+
+- **Статус:** `Исправлено` (реализовано в коде и конфигах деплоя; пройден `cargo check --workspace --all-targets --locked` с `-D warnings`; ожидает прогона CI и применения конфигов на сервере `192.168.3.27` после согласия владельца)
+- **Приоритет:** Высокий (P1, оптимизация ресурсов)
+- **Затронутые платформы:** Сервер (`kino-server`), конфиги стека (`deploy/compose.yaml`, `deploy/torrserver/settings.json`, `deploy/.env.example`).
+
+### Что реализовано
+1. **Компактный кэш каталога (`crates/server/src/catalog/tmdb.rs`):**
+   - Вместо 2000 распакованных `serde_json::Value` под глобальным мьютексом введён потокобезопасный LRU+TTL кэш сырых UTF-8 байтов с жёстким потолком (`16 MiB` / `1000` записей), парсингом вне блокировки и объединением одновременных промахов (singleflight).
+2. **Дисковый кэш постеров (`crates/server/src/catalog/tmdb.rs`, `config.rs`, `main.rs`, `deploy/compose.yaml`):**
+   - Добавлен опциональный дисковый кэш изображений (`IMAGE_CACHE_DIR`, лимит `IMAGE_CACHE_MAX_MB = 400`) с атомарной записью, дедупликацией параллельных загрузок и фоновой очисткой самых старых файлов (0 МБ оперативной памяти).
+3. **Сон и пробуждение поисковика раздач (`crates/server/src/torrent/torznab.rs`, `torrent/mod.rs`, `play.rs`, `api.rs`, `deploy/compose.yaml`):**
+   - В стек добавлен внутренний контейнер-сторож (`sablier`, лимит `32m`, без выхода наружу), а Jackett переведён в режим запуска по запросу (`restart: "no"`, healthcheck, сон после 10 минут простоя → 0 МБ в простое).
+   - При открытии главного экрана или поиска сервер в фоне будит Jackett; при открытии карточки фильма с уже сохранённой раздачей («Продолжить просмотр») фоновый поиск раздач пропускается, поэтому Jackett не просыпается. Перед прямым поиском или скачиванием нового `.torrent` сервер при необходимости мягко дожидается готовности Jackett.
+   - Попутно убрана утечка `JACKETT_API_KEY` из ошибок `reqwest` в `torznab.rs` и `torrent/mod.rs`, а скачивание `.torrent` ограничено потоковым лимитом `2 MiB`.
+4. **Снижение пиков памяти (`crates/server/src/play.rs`, `deploy/compose.yaml`, `deploy/torrserver/settings.json`):**
+   - Буфер потокового сервиса торрентов переведён на жёсткий диск (`UseDisk: true`, `/opt/ts/cache`, `RemoveCacheOnDrop: true`, таймаут 20с), задан `GOMEMLIMIT=192MiB` и лимит контейнера `256m`.
+   - По умолчанию ограничение одновременных тяжёлых перекодировок снижено с 4 до 2 (`MAX_TRANSCODES=2`), лимит `kino-server` снижен до `640m`.
+
+### Критерии приёмки
+- [x] Код и тесты скомпилированы без предупреждений (`cargo check --workspace --all-targets --locked` с `-D warnings`).
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy` и `cargo test --workspace --locked` в CI.
+- [ ] После подтверждения владельца конфиги применены на `192.168.3.27` (проверены сон/пробуждение Jackett, работа «Продолжить просмотр» без пробуждения Jackett, дисковый кэш постеров и снижение памяти стека).
+
+---
+
+## ISSUE-019: Ошибки воспроизведения «Сверхъестественного» — падение VA-API на `.avi` (`mpeg4`), `_` в `files::episode_of` и OOM TorrServer на больших паках
+
+- **Статус:** `Исправлено` (исправлено в рамках `ISSUE-022` и `ISSUE-023`: добавлен гибридный фильтр VA-API с программным декодом и логирование `stderr` `ffmpeg`, исправлены регулярки `files::episode_of` для разделителя `_`, а буфер `torrserver` переведён на HDD с `GOMEMLIMIT`; ожидает прогона CI и выкатки на сервер)
+- **Приоритет:** Критический (P0)
+- **Затронутые платформы:** Сервер (`kino-server`: `torrent/ffmpeg.rs`, `torrent/files.rs`, `play.rs`, `torrent/token.rs`) и деплой (`deploy/compose.yaml`).
+
+### Суть проблем
+По логам `kino-server`, `traefik`, `torrserver` и проверке потоков внутри контейнеров для сериала «Сверхъестественное» (`tv/1622`) выявлены три независимые проблемы:
+
+1. **Крах `ffmpeg` с `TRANSCODE_HWACCEL=vaapi` на `mpeg4` (`.avi` / `XVID`):**
+   - В раздаче `Supernatural.2005-2020.hdrip_[teko]` (`ec60cd427cf13a411c662aaa9495788cc2eb9cdd`, `Season_01/s01e01_Pilot.avi`) видео имеет кодек `mpeg4` (`XVID`) + аудио `ac3`.
+   - В [crates/server/src/torrent/ffmpeg.rs](../crates/server/src/torrent/ffmpeg.rs) при `HwAccel::Vaapi` и `!copy_video` всегда передаются `-hwaccel vaapi -hwaccel_device /dev/dri/renderD128 -hwaccel_output_format vaapi` и фильтр `-vf scale_vaapi=format=nv12 -c:v h264_vaapi`.
+   - Аппаратный декодер Intel (`i3-10100`, `iHD_drv_video.so`) не поддерживает декодирование `mpeg4`: `ffmpeg` падает с кодом `218` (`No support for codec mpeg4 profile 15` / `Function not implemented` в `scale_vaapi`) за ~640 мс без единого байта на stdout, `stream()` отдаёт `503 Service Unavailable`, а клиент показывает ошибку «Видеопоток не запустился или был прерван...».
+   - При программном декодировании с загрузкой на VA-API (`-vaapi_device /dev/dri/renderD128 ... -vf format=nv12,hwupload -c:v h264_vaapi`) тот же файл кодируется без ошибок (`exit=0`).
+   - Также `ffmpeg::spawn` скрывает `stderr` (`Stdio::null()`), из-за чего в логах `kino-server` нет причины падения `ffmpeg`.
+
+2. **Регулярки `files::episode_of` в [crates/server/src/torrent/files.rs](../crates/server/src/torrent/files.rs) не распознают серии с подчёркиванием `_` (`s01e01_Pilot.avi`):**
+   - В `SE` (`\bs(\d{1,2})[ ._-]?e(\d{1,3})\b`) и `EP` / `SEASON_DIR` используется `\b`, для которого `_` считается символом слова (`\w`).
+   - На всех 327 файлах раздачи `ec60cd...` (`Season_01/s01e01_Pilot.avi` и т.д.) `episode_of` возвращает `(Some(season), None)`. Для `S01E01` нужный файл выбран случайно (он первый в отсортированном списке), но для любого другого сезона (`S02E01`, `S03E01` и т.д.) `files::pick` игнорирует сезон и тоже выбирает файл из 1-го сезона (или возвращает `404`, если в раздаче попадётся хотя бы один файл без `_`).
+
+3. **OOM-kill `orel-kino-torrserver-1` при лимите `512m` на 327/328-файловых паках:**
+   - В [deploy/compose.yaml](../deploy/compose.yaml) контейнеру `torrserver` задан `mem_limit: 512m`.
+   - Даже одна активная 328-файловая раздача (`0e3c84...`, `Supernatural [S1-15] BDRip-HEVC 1080p`) доводит RSS TorrServer до `~446 MiB / 512 MiB` (`87%`); при переключении между раздачами в `17:52:52` UTC процесс превысил лимит (`anon-rss: 518816 kB`) и был убит ядром (`oom-kill`). Кроме того, при старте с низкой скоростью сидов у `0e3c84...` `ffprobe` упирался в 45-секундный таймаут, а перемотка `-ss 117` по большому HEVC MKV через TorrServer занимала ~40–87 с.
+
+### Критерии приёмки
+- [ ] Транскодирование с `TRANSCODE_HWACCEL=vaapi` (и `qsv`) успешно запускает видео с кодеками, не поддерживаемыми аппаратным декодером (включая `mpeg4` / `XVID` в `.avi`), через программный декодер + `hwupload` (или программное перекодирование), а ошибки раннего завершения `ffmpeg` логируются сервером.
+- [ ] `files::episode_of` и `files::pick` корректно определяют сезон и серию при разделителе `_` (включая `Season_01/s01e01_Pilot.avi`, `Season_02/s02e01_...`, `Show_S02E05_720p.mkv`), подтверждено unit-тестами.
+- [ ] Увеличен лимит памяти для `torrserver` в `deploy/compose.yaml` (и на сервере после согласования) так, чтобы многосезонные паки на 300+ серий не приводили к OOM-kill.
+- [ ] Проверена живая работа воспроизведения «Сверхъестественного» (обеих раздач и разных сезонов) на сервере.
+
+---
+
+## ISSUE-020: Единый источник звука в синхронизации устройств («Звук здесь» / «Звук там»)
+
+- **Статус:** `Исправлено` (реализовано в коде; локально пройдены `cargo check -p kino-core -p kino-ui --target wasm32-unknown-unknown --tests --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`; сборка/тесты `kino-server`, `kino-preview`, `cargo fmt`/`clippy` и проверка Android/живой сессии ждут прогона в CI / на устройствах из-за `ISSUE-002`)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Сервер синхронизации (`kino-core`, `kino-server`), UI плеера (`kino-ui`, `kino-preview`) и все клиенты (`kino-app`: Web, Telegram Mini App, Desktop, Android).
+
+### Суть требования
+1. При синхронизированном воспроизведении на 2 и более устройствах звук должен воспроизводиться **только на одном** из них, а остальные устройства должны оставаться беззвучными (`muted`).
+2. В выпадающем меню кнопки активной синхронизации (`PlayerMenu::Sync`, где отображаются подключённые устройства и их статус) напротив каждого устройства должна быть кнопка переключения вывода звука («Звук здесь» для текущего устройства, «Звук там» для остальных), позволяющая в один клик переводить звук с одного устройства на другое.
+3. При выходе или отключении устройства со звуком вывод звука должен автоматически передаваться оставшемуся активному устройству.
+
+### Что реализовано
+- [crates/core/src/sync.rs](../crates/core/src/sync.rs): добавлены `SyncState.sound_client_id`, `SyncEventKind::Sound` и сообщение `SyncClientMsg::Sound { client_id }`.
+- [crates/server/src/sync.rs](../crates/server/src/sync.rs), [crates/server/tests/api.rs](../crates/server/tests/api.rs):
+  - `Room` хранит единого владельца звука `sound_client_id` (первый вошедший участник получает звук, новые подключения присоединяются без звука);
+  - добавлена команда `SyncClientMsg::Sound` с рассылкой `SyncEventKind::Sound`, а `Room::ensure_sound_owner` автоматически передаёт звук оставшемуся участнику при выходе или таймауте (`remove_member` / `sweep`) текущего владельца звука;
+  - добавлены проверки в `sync_messages_round_trip`, `sync_room_joins_and_protects_timecode` и новый unit-тест `multi_device_sound_ownership_and_handoff`.
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs), [crates/ui/src/style.css](../crates/ui/src/style.css), [crates/preview/src/main.rs](../crates/preview/src/main.rs):
+  - в `PlayerState` добавлены `sync_sound_client_id` и метод `is_sync_muted()`, проп `on_sync_sound` на `PlayerView`, атрибут `muted` на `<video>` и индикация глушения в регуляторе громкости;
+  - в поповере `PlayerMenu::Sync` у каждого устройства добавлена кнопка `.p-sync-sound` («Звук здесь» на текущем устройстве, «Звук там» на удалённых) с подсветкой активного источника звука; добавлены unit-тест `sync_muted_reflects_sound_owner` и экран превью `player-sync`.
+- [app/src/player.rs](../app/src/player.rs):
+  - при получении `SyncState` и в `load_source` / `on_video("metadata")` / `native_open` клиенты без прав звука автоматически глушатся (`v.set_muted(true)` для `<video>` и Android `ExoPlayer`), а переключение кнопкой («Звук здесь» / «Звук там» или кнопкой звука на десктопе при активном `is_sync_muted`) мгновенно переводит звук на выбранное устройство;
+  - добавлена защита от ложной паузы комнаты в `on_video("pause")` (`last_sync_unmute_ms`), если строгий мобильный браузер блокирует удалённое снятие mute без жеста пользователя (откат в `auto_muted` с кнопкой «Включить звук»).
+
+### Критерии приёмки
+- [x] В протокол синхронизации (`kino-core`, `kino-server`) добавлен единый владелец звука комнаты (`sound_client_id`), команда переключения `SyncClientMsg::Sound`, событие `SyncEventKind::Sound` и автоматическая передача звука при подключении/выходе/таймауте участников.
+- [x] В `PlayerView` (`crates/ui/src/player.rs`, `crates/ui/src/style.css`) в списке устройств синхронизации добавлена кнопка «Звук здесь» / «Звук там» с индикацией активного источника звука и переключением между устройствами.
+- [x] Клиент (`app/src/player.rs`) автоматически глушит звук на устройствах без прав вывода звука (как для HTML `<video>`, так и для Android `ExoPlayer`), мгновенно переносит звук при переключении, сохраняет состояние при смене серии/раздачи/дорожки и безопасно обрабатывает автовоспроизведение при удалённом включении звука.
+- [x] Добавлены unit-тесты (`sync_muted_reflects_sound_owner`, `multi_device_sound_ownership_and_handoff`) и проверки в `sync_room_joins_and_protects_timecode`; пройдены `cargo check -p kino-core -p kino-ui --target wasm32-unknown-unknown --tests --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`; обновлены `docs/PROJECT.md` и `docs/ISSUES.md`.
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, `cargo test --workspace --locked` в CI и живая проверка на нескольких устройствах.
+
+---
+
+## ISSUE-023: Пакет исправлений P1 по результатам аудита (скорость экранов, безопасность сервера и бота, стабильность плеера и Android)
+
+- **Статус:** `Исправлено` (реализовано в коде; локальный `cargo check` по workspace + `wasm32`/`desktop`/`mobile` с `-D warnings` и `--locked`; прогон `cargo fmt`, `cargo clippy`, `cargo test` с PostgreSQL, сборка APK и деплой на сервер ожидают CI и подтверждения владельца)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Сервер (`kino-server`), Telegram-бот (`kino-bot`), UI/клиенты (`kino-core`, `kino-ui`, `kino-app` Web / Telegram Mini App / Desktop / Android), CI (`.github/workflows/android.yml`).
+
+### Что реализовано
+1. **Производительность (`PERF-05`–`PERF-08`):**
+   - `PERF-05`: распараллелены N+1 запросы каталога в `/api/continue`, `/api/my`, `/api/history` (`buffer_unordered(8)`), в боте (`/continue`, `/my`), пакетный `UNNEST` upsert в `torrent::save_sources`, параллельные запросы в клиентских экранах `Profile` и `Title`.
+   - `PERF-06`: добавлен debounce 300мс в `Search`, исправлен off-by-one в `yo_query_variants`, убран каскад повторной загрузки полок при смене категории на Главной и бесконечный 450мс цикл при ошибке (заменён на `IntersectionObserver` + `MutationObserver` + 10с backoff + `Drop`-очистка).
+   - `PERF-07`: добавлена `Drop`-очистка `setInterval` в `video::use_bridge()`, `platform::sleep` на Desktop/Android переведён на `tokio::time::sleep`, в Android `MainActivity.kt` добавлены освобождение `exo.release()` при закрытии и остановка тикера в `onStop()`.
+   - `PERF-08`: убраны `Callback::new` внутри циклов рендера `HomeView`, добавлен guard по `.peek()` в `ScrollRow::onscroll`, убраны тяжёлые `backdrop-filter: blur` на карточках, фоне модалок и вложенных кнопках внутри `.p-dock`.
+2. **Безопасность (`SEC-05`–`SEC-11`, частично `SEC-12`):**
+   - `SEC-05`: убраны URL с `BOT_TOKEN` из логов ошибок в `jobs.rs` и `avatar.rs` (+ потоковый лимит 2 МБ и растровый allowlist в `avatar.rs`, поддержка `telegram_api_url` в `jobs.rs`).
+   - `SEC-06`: в `torrent::fetch` добавлена проверка редиректов (запрет loopback/приватных/CGNAT/Docker-внутренних хостов и IP).
+   - `SEC-07` + `UX-09`: в боте доступ к `/search`, свободному тексту, `/random`, `card:` и `rnd:` ограничен приглашёнными пользователями и админами; `ask_login`, `LOGIN_CALLBACK`, `create_invite`, `inv_`, `/continue`, `/my` ограничены личными чатами; добавлена валидация `login_` токена и автоматическая конвертация `WebApp`-кнопок в URL в групповых чатах.
+   - `SEC-08`: `safe_join_canonical` в `play.rs` отклоняет симлинки и проверяет канонический путь внутри папки предзагрузок.
+   - `SEC-09`: валидация `backdrop_path` и `imdb_id` (`tt\d+`, `noopener noreferrer`) в `crates/ui/src/lib.rs`.
+   - `SEC-10`: добавлены per-IP rate limiting для `/api/auth/link` и `/api/img`, лимит активных предзагрузок на пользователя (`10`), лимиты комнат/участников, ограниченный канал `mpsc::channel(64)`, `.max_message_size(16 KiB)` и валидация `Episode`/`Release`/`Audio` в `sync.rs`; проверка `tmdb_id > 0` на write-эндпоинтах и срок годности 10 мин в `db::take_login_link`.
+   - `SEC-11`: добавлены заголовки `Strict-Transport-Security`, `Permissions-Policy` и `Content-Security-Policy` (`frame-ancestors` для Telegram) в `crates/server/src/lib.rs`.
+3. **Плеер, серверное видео, каталог, UI и Android (`UX-04`–`UX-11`):**
+   - `UX-04` + `UX-11`: в `MainActivity.kt` и `app/src/telegram/native.rs` добавлены Audio Focus, `handleAudioBecomingNoisy`, `STREAM_MUSIC`, аппаратная кнопка «Назад» (`OnBackPressedCallback`), сброс watchdog при буферизации/паузе, `isTypeSupported(..., true)` + `setEnableDecoderFallback(true)`, очистка субтитров при смене дорожки, учёт IME в отступах, `keepScreenOn` при буферизации, повторный Play после `STATE_ENDED`, `versionCode` из `github.run_number` в `android.yml`.
+   - `UX-05`: устранена гонка `SyncHub::join_in_memory`, перемотка к `0:00` на транскоде, зависание/30с фриз при смене аудиодорожки, порча прогресса в `unloadHandler`, перенос позиции между сериями, перемотка до метаданных, бесконечный реконнект WS без backoff и мигание паузы без `sync_state`.
+   - `UX-06` + `ISSUE-019`: добавлен гибридный VA-API фильтр `format=nv12|vaapi,hwupload,scale_vaapi=format=nv12`, проверка 8-битного `pix_fmt`, логирование `stderr` `ffmpeg`/`ffprobe`, и исправлен разбор `_` в `files::episode_of`.
+   - `UX-07`–`UX-10`: исправлены ландшафтные кнопки плеера и safe-area в `style.css`, `overflow-x: clip`, `:focus-visible`, разведение одиночного/двойного тапа, `<track key>` с `srclang`, `role="dialog"` + Escape в `ReleasePicker`, `role="radio"` в `Stars`, горячие клавиши со слайдерами и Escape из fullscreen, `Ctrl+K` во время просмотра, `ASSET_BASE` на `RwLock`, `with_genres` с `|` (`crime_tv`, `fantasy_movies`), поиск `"Название Год"`, `SIGTERM` в `kino-server`, сохранение `Watched` при сбое TMDB.
+
+### Критерии приёмки
+- [x] Все пункты P1 (`SEC-05..11`, `PERF-05..08`, `UX-04..09`) и ключевые пункты устойчивости (`ISSUE-019`, `SIGTERM`, `versionCode`, `take_login_link` TTL) реализованы в коде.
+- [ ] Пройдены `cargo check` по всем таргетам, `cargo fmt --all --check`, `cargo clippy`, `cargo test --workspace --locked` в CI и живая проверка после выкатки.

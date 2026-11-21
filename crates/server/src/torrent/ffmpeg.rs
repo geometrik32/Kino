@@ -13,15 +13,25 @@ pub struct Probe {
     /// ffprobe format names, e.g. "matroska,webm" or "mov,mp4,m4a,3gp,3g2,mj2".
     pub container: String,
     pub video_codec: Option<String>,
+    pub video_pix_fmt: Option<String>,
     pub audio: Vec<MediaTrack>,
     pub subtitles: Vec<MediaTrack>,
 }
 
 impl Probe {
+    /// Whether the video stream is standard 8-bit 4:2:0 that browsers can decode.
+    fn video_is_8bit(&self) -> bool {
+        match self.video_pix_fmt.as_deref() {
+            None => true,
+            Some("yuv420p" | "yuvj420p" | "nv12") => true,
+            Some(_) => false,
+        }
+    }
+
     /// Whether a browser plays the file without our help, with the default audio.
     pub fn browser_ok(&self) -> bool {
         let container = self.container.starts_with("mov,mp4");
-        let video = matches!(self.video_codec.as_deref(), Some("h264" | "vp9" | "av1"));
+        let video = matches!(self.video_codec.as_deref(), Some("h264" | "vp9" | "av1")) && self.video_is_8bit();
         let audio = self
             .audio
             .iter()
@@ -33,7 +43,7 @@ impl Probe {
 
     /// Whether the video stream can be copied as it is when re-packing.
     pub fn video_copyable(&self) -> bool {
-        self.video_codec.as_deref() == Some("h264")
+        self.video_codec.as_deref() == Some("h264") && self.video_is_8bit()
     }
 }
 
@@ -54,11 +64,36 @@ struct RawFormat {
 struct RawStream {
     codec_type: Option<String>,
     codec_name: Option<String>,
+    pix_fmt: Option<String>,
     channels: Option<i32>,
+    duration: Option<String>,
     #[serde(default)]
     tags: std::collections::HashMap<String, String>,
     #[serde(default)]
     disposition: std::collections::HashMap<String, i32>,
+}
+
+/// Parses either plain seconds (`"2820.5"`) or `HH:MM:SS(.frac)` (Matroska `DURATION` tag).
+fn parse_duration_str(raw: &str) -> Option<f64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Ok(sec) = s.parse::<f64>() {
+        return (sec.is_finite() && sec > 0.0).then_some(sec);
+    }
+    let mut parts = s.rsplit(':');
+    let sec: f64 = parts.next()?.parse().ok()?;
+    let min: f64 = parts.next()?.parse().ok()?;
+    let hrs: f64 = match parts.next() {
+        Some(h) => h.parse().ok()?,
+        None => 0.0,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    let total = hrs * 3600.0 + min * 60.0 + sec;
+    (total.is_finite() && total > 0.0).then_some(total)
 }
 
 /// Subtitle formats that can become WebVTT (not pictures like PGS).
@@ -67,12 +102,23 @@ const TEXT_SUBS: &[&str] = &["subrip", "ass", "ssa", "webvtt", "mov_text", "text
 pub fn parse_probe(json: &[u8]) -> Result<Probe, serde_json::Error> {
     let raw: Raw = serde_json::from_slice(json)?;
     let mut p = Probe {
-        duration: raw.format.as_ref().and_then(|f| f.duration.as_deref()?.parse().ok()),
+        duration: raw
+            .format
+            .as_ref()
+            .and_then(|f| f.duration.as_deref().and_then(parse_duration_str)),
         container: raw.format.and_then(|f| f.format_name).unwrap_or_default(),
         ..Probe::default()
     };
     let (mut a, mut s) = (0, 0);
     for st in raw.streams {
+        if p.duration.is_none() {
+            p.duration = st.duration.as_deref().and_then(parse_duration_str).or_else(|| {
+                st.tags
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("duration"))
+                    .and_then(|(_, v)| parse_duration_str(v))
+            });
+        }
         let codec = st.codec_name.unwrap_or_default();
         let track = |index| MediaTrack {
             index,
@@ -84,7 +130,8 @@ pub fn parse_probe(json: &[u8]) -> Result<Probe, serde_json::Error> {
         };
         match st.codec_type.as_deref() {
             Some("video") if p.video_codec.is_none() && st.disposition.get("attached_pic") != Some(&1) => {
-                p.video_codec = Some(codec.clone())
+                p.video_codec = Some(codec.clone());
+                p.video_pix_fmt = st.pix_fmt.clone();
             }
             Some("audio") => {
                 p.audio.push(track(a));
@@ -107,19 +154,28 @@ fn is_http(input: &str) -> bool {
     input.starts_with("http://") || input.starts_with("https://")
 }
 
-/// Runs ffprobe on a file or URL.
+/// Runs ffprobe on a file or URL with the default 45-second timeout.
 pub async fn probe(ffprobe: &str, input: &str) -> anyhow::Result<Probe> {
-    let mut args = vec!["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format"];
+    probe_with_timeout(ffprobe, input, std::time::Duration::from_secs(45)).await
+}
+
+/// Runs ffprobe on a file or URL with an explicit timeout.
+pub async fn probe_with_timeout(ffprobe: &str, input: &str, timeout: std::time::Duration) -> anyhow::Result<Probe> {
+    let mut args = vec!["-v", "error", "-print_format", "json", "-show_streams", "-show_format"];
     if is_http(input) {
         args.extend(["-rw_timeout", "30000000"]);
     }
     args.push(input);
-    let out = tokio::time::timeout(
-        std::time::Duration::from_secs(45),
-        Command::new(ffprobe).args(args).kill_on_drop(true).output(),
-    )
-    .await??;
-    anyhow::ensure!(out.status.success(), "ffprobe failed");
+    let out = tokio::time::timeout(timeout, Command::new(ffprobe).args(args).kill_on_drop(true).output()).await??;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tail = stderr.trim();
+        anyhow::bail!(
+            "ffprobe failed ({}): {}",
+            out.status,
+            tail.chars().take(240).collect::<String>()
+        );
+    }
     Ok(parse_probe(&out.stdout)?)
 }
 
@@ -166,6 +222,10 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
         }
     }
     if start > 0 {
+        if copy_video {
+            // Keep audio in sync with copied video when `-ss` snaps back to a preceding keyframe.
+            a.push("-noaccurate_seek".into());
+        }
         a.extend(["-ss".into(), start.to_string()]);
     }
     a.extend(["-i".into(), input.into()]);
@@ -178,7 +238,18 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
                 a.extend(["-c:v", "h264_qsv", "-preset", "veryfast", "-global_quality", "23"].map(String::from))
             }
             HwAccel::Vaapi => {
-                a.extend(["-vf", "scale_vaapi=format=nv12", "-c:v", "h264_vaapi", "-qp", "23"].map(String::from))
+                // Works both for hardware-decoded VAAPI surfaces and software-decoded fallback (AV1, MPEG4, 10-bit H.264).
+                a.extend(
+                    [
+                        "-vf",
+                        "format=nv12|vaapi,hwupload,scale_vaapi=format=nv12",
+                        "-c:v",
+                        "h264_vaapi",
+                        "-qp",
+                        "23",
+                    ]
+                    .map(String::from),
+                )
             }
             HwAccel::None => a.extend(
                 [
@@ -243,7 +314,7 @@ pub fn spawn(ffmpeg: &str, args: &[String]) -> std::io::Result<Child> {
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
 }
@@ -274,15 +345,35 @@ mod tests {
         let a = transcode_args("http://ts/stream", 600, 1, false, HwAccel::Qsv).join(" ");
         assert!(a.contains("-rw_timeout 30000000"));
         assert!(a.contains("-hwaccel qsv"));
+        assert!(!a.contains("-noaccurate_seek"));
         assert!(a.contains("-ss 600 -i http://ts/stream"));
         assert!(a.contains("-map 0:a:1?"));
         assert!(a.contains("h264_qsv"));
         assert!(a.contains("-dn"));
+        let a = transcode_args("f.mkv", 600, 0, true, HwAccel::Vaapi).join(" ");
+        assert!(a.contains("-noaccurate_seek -ss 600 -i f.mkv"));
+        assert!(a.contains("-c:v copy"));
         let a = transcode_args("f.mkv", 0, 0, true, HwAccel::Qsv).join(" ");
         assert!(!a.contains("rw_timeout") && !a.contains("hwaccel") && !a.contains("-ss") && a.contains("-c:v copy"));
         assert_eq!(subtitle_args("f.mkv", 2, 0)[6], "0:s:2");
         let s = subtitle_args("http://ts/stream", 0, 90).join(" ");
         assert!(s.contains("-rw_timeout 30000000") && s.contains("-ss 90 -i http://ts/stream"));
         assert!(s.contains("-vn -an -dn"));
+    }
+
+    #[test]
+    fn duration_fallback_from_stream_tags() {
+        let json = br#"{
+            "format": { "format_name": "matroska,webm" },
+            "streams": [
+                {
+                    "codec_type": "video",
+                    "codec_name": "hevc",
+                    "tags": { "DURATION": "00:42:15.500000000" }
+                }
+            ]
+        }"#;
+        let p = parse_probe(json).unwrap();
+        assert_eq!(p.duration, Some(42.0 * 60.0 + 15.5));
     }
 }

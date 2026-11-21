@@ -104,10 +104,15 @@ mod imp {
         _audio: Option<i32>,
         _subtitle: Option<i32>,
         _autoplay: bool,
+        _scale_mode: u8,
     ) {
     }
     pub fn native_set_audio(_audio: Option<i32>) {}
     pub fn native_set_subtitle(_subtitle: Option<i32>) {}
+    pub fn native_set_scale(_mode: u8) {}
+    pub fn native_scale_mode() -> u8 {
+        1
+    }
     pub fn native_close() {}
 
     /// Starts mirroring (nothing to do in a browser).
@@ -120,7 +125,7 @@ mod imp {
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Mutex,
     };
 
@@ -150,6 +155,7 @@ mod imp {
     });
 
     static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+    static NATIVE_SCALE_MODE: AtomicU8 = AtomicU8::new(1);
 
     #[cfg(target_os = "android")]
     static NATIVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -166,6 +172,7 @@ mod imp {
         paused: bool,
         ended_sent: bool,
         error_sent: bool,
+        last_scale_mode: u8,
         last_time_sec: f64,
         ignore_paused_until: Option<Instant>,
         ignore_seek_until: Option<Instant>,
@@ -182,6 +189,7 @@ mod imp {
         paused: true,
         ended_sent: false,
         error_sent: false,
+        last_scale_mode: 0,
         last_time_sec: -1.0,
         ignore_paused_until: None,
         ignore_seek_until: None,
@@ -209,6 +217,7 @@ mod imp {
         audio: Option<i32>,
         subtitle: Option<i32>,
         autoplay: bool,
+        scale_mode: u8,
     ) {
         let start = start_sec.max(0.0);
         *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
@@ -217,7 +226,8 @@ mod imp {
             paused: !autoplay,
             ready_state: 0,
         };
-        let seq = super::super::android::native_open(url, start, rate as f32, audio, subtitle, autoplay);
+        NATIVE_SCALE_MODE.store(if scale_mode == 2 { 2 } else { 1 }, Ordering::Relaxed);
+        let seq = super::super::android::native_open(url, start, rate as f32, audio, subtitle, autoplay, scale_mode);
         NATIVE_SEQ.store(seq, Ordering::Relaxed);
         *POLL_STATE.lock().expect("poll state") = PollState {
             seq,
@@ -236,6 +246,7 @@ mod imp {
         _audio: Option<i32>,
         _subtitle: Option<i32>,
         _autoplay: bool,
+        _scale_mode: u8,
     ) {
     }
 
@@ -255,6 +266,20 @@ mod imp {
         }
         #[cfg(not(target_os = "android"))]
         let _ = subtitle;
+    }
+
+    pub fn native_set_scale(mode: u8) {
+        if mode == 1 || mode == 2 {
+            NATIVE_SCALE_MODE.store(mode, Ordering::Relaxed);
+        }
+        #[cfg(target_os = "android")]
+        if is_native_active() {
+            super::super::android::native_set_scale(mode);
+        }
+    }
+
+    pub fn native_scale_mode() -> u8 {
+        NATIVE_SCALE_MODE.load(Ordering::Relaxed)
     }
 
     pub fn native_close() {
@@ -292,6 +317,10 @@ mod imp {
             snapshot().ready_state
         }
         pub fn set_current_time(&self, t: f64) {
+            if !t.is_finite() {
+                return;
+            }
+            let t = t.max(0.0);
             SNAPSHOT.lock().expect("video snapshot").time = t;
             #[cfg(target_os = "android")]
             if is_native_active() {
@@ -303,7 +332,7 @@ mod imp {
                 return;
             }
             run(format!(
-                "var v=document.getElementById('{VIDEO_ID}'); if(v) v.currentTime={t};"
+                "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.currentTime={t};"
             ));
         }
         pub fn play_checked(&self, on_done: impl FnOnce(PlayOutcome) + 'static) {
@@ -313,6 +342,7 @@ mod imp {
                 {
                     let mut st = POLL_STATE.lock().expect("poll state");
                     st.paused = false;
+                    st.ended_sent = false;
                     st.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
                 }
                 super::super::android::native_play();
@@ -321,7 +351,7 @@ mod imp {
             }
             spawn(async move {
                 let res = eval(&format!(
-                    "var v=document.getElementById('{VIDEO_ID}'); if(!v) return 'none'; \
+                    "var v=document.getElementById('{VIDEO_ID}'); if(!v || typeof v.play!=='function') return 'none'; \
                      return await v.play().then(function(){{return 'ok';}}, function(e){{return (e&&e.name)||'err';}});"
                 ))
                 .join::<String>()
@@ -351,28 +381,34 @@ mod imp {
                 super::super::android::native_pause();
                 return;
             }
-            run(format!("var v=document.getElementById('{VIDEO_ID}'); if(v) v.pause();"));
+            run(format!(
+                "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.pause==='function') v.pause();"
+            ));
         }
         /// Playback speed (1.0 is normal).
         pub fn set_rate(&self, rate: f64) {
+            if !rate.is_finite() {
+                return;
+            }
+            let rate = rate.clamp(0.25, 4.0);
             #[cfg(target_os = "android")]
             if is_native_active() {
                 super::super::android::native_set_rate(rate as f32);
                 return;
             }
             run(format!(
-                "var v=document.getElementById('{VIDEO_ID}'); if(v) {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
+                "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
             ));
         }
         pub fn set_volume(&self, vol: f64) {
-            let vol = vol.clamp(0.0, 1.0);
+            let vol = if vol.is_finite() { vol.clamp(0.0, 1.0) } else { 1.0 };
             #[cfg(target_os = "android")]
             if is_native_active() {
                 super::super::android::native_set_volume(vol as f32);
                 return;
             }
             run(format!(
-                "var v=document.getElementById('{VIDEO_ID}'); if(v) v.volume={vol};"
+                "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.volume={vol};"
             ));
         }
         pub fn set_muted(&self, muted: bool) {
@@ -382,8 +418,18 @@ mod imp {
                 return;
             }
             run(format!(
-                "var v=document.getElementById('{VIDEO_ID}'); if(v) v.muted={muted};"
+                "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.muted={muted};"
             ));
+        }
+    }
+
+    struct VideoBridgeGuard;
+    impl Drop for VideoBridgeGuard {
+        fn drop(&mut self) {
+            run(
+                "if (window.__kinoVideoBridgeTimer) { clearInterval(window.__kinoVideoBridgeTimer); window.__kinoVideoBridgeTimer = null; }"
+                    .into(),
+            );
         }
     }
 
@@ -392,7 +438,8 @@ mod imp {
         use_hook(|| {
             spawn(async move {
                 let mut bridge = eval(&format!(
-                    "setInterval(function () {{ \
+                    "if (window.__kinoVideoBridgeTimer) {{ clearInterval(window.__kinoVideoBridgeTimer); }} \
+                     window.__kinoVideoBridgeTimer = setInterval(function () {{ \
                        var v = document.getElementById('{VIDEO_ID}'); \
                        if (v && typeof v.play === 'function') dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState]); \
                      }}, 250);"
@@ -408,6 +455,7 @@ mod imp {
                     }
                 }
             });
+            std::rc::Rc::new(VideoBridgeGuard)
         });
     }
 
@@ -519,10 +567,19 @@ mod imp {
             events.push("time");
         }
 
+        if !snap.ended && st.ended_sent {
+            st.ended_sent = false;
+        }
         if snap.ended && !st.ended_sent {
             st.ended_sent = true;
             cur.paused = true;
             events.push("ended");
+        }
+
+        if (snap.scale_mode == 1 || snap.scale_mode == 2) && snap.scale_mode != st.last_scale_mode {
+            st.last_scale_mode = snap.scale_mode;
+            NATIVE_SCALE_MODE.store(snap.scale_mode, Ordering::Relaxed);
+            events.push("scale");
         }
 
         events
@@ -551,6 +608,6 @@ mod imp {
 }
 
 pub use imp::{
-    native_close, native_open, native_set_audio, native_set_subtitle, supports_native, use_bridge, use_native_events,
-    video,
+    native_close, native_open, native_scale_mode, native_set_audio, native_set_scale, native_set_subtitle,
+    supports_native, use_bridge, use_native_events, video,
 };

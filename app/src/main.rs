@@ -15,7 +15,7 @@ use player::{PlayStart, Player};
 use dioxus::prelude::*;
 use kino_core::{
     image_url, AuthResponse, HomeFeed, ImageSize, MarkWatched, MediaKind, PreloadRequest, PreloadState,
-    ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs, WidgetAuthRequest,
+    ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs, VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
     icons, play_target, HomeView, Icon, LoginView, MyFilters, MyView, PersonView, PickerPanel, PlayTarget, ProfileView,
@@ -34,19 +34,19 @@ fn main() {
         // (the screens add the safe-area padding themselves), and apply saved theme early.
         const HEAD: &str = r#"<script>
             var m = document.querySelector('meta[name=viewport]');
-            if (m) { m.content += ', viewport-fit=cover'; }
+            if (m) { m.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover'; }
             try {
                 var t = localStorage.getItem('kino.theme');
                 if (t === 'dark' || t === 'light') { document.documentElement.dataset.theme = t; }
             } catch (e) {}
         </script>"#;
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
-        use dioxus::desktop::Config;
+        let config = dioxus::desktop::Config::new().with_custom_head(HEAD.to_owned());
         #[cfg(feature = "mobile")]
-        use dioxus::mobile::Config;
-        dioxus::LaunchBuilder::new()
-            .with_cfg(Config::new().with_custom_head(HEAD.to_owned()))
-            .launch(App);
+        let config = dioxus::mobile::Config::new()
+            .with_background_color((0, 0, 0, 0))
+            .with_custom_head(HEAD.to_owned());
+        dioxus::LaunchBuilder::new().with_cfg(config).launch(App);
     }
 
     #[cfg(not(any(feature = "mobile", feature = "desktop")))]
@@ -137,8 +137,9 @@ fn App() -> Element {
         }
     });
     use_effect(move || {
-        telegram::init();
         spawn(async move {
+            platform::init().await;
+            telegram::init();
             let in_tg = telegram::is_telegram();
             let saved = platform::storage_get(THEME_KEY).await;
             let initial = Theme::parse(saved.as_deref(), in_tg);
@@ -196,6 +197,10 @@ enum LinkLogin {
 
 /// In the apps a link must be handed to the system; a page opens it by itself.
 fn open_link(e: &Event<MouseData>, url: &str) {
+    if !platform::is_safe_external_url(url) {
+        e.prevent_default();
+        return;
+    }
     if !platform::is_web() {
         e.prevent_default();
         platform::open_external(url);
@@ -246,6 +251,9 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
     };
     let link_error = match &*link.read() {
         Some(Err(f)) => Some(f.message.clone()),
+        Some(Ok(l)) if !platform::is_safe_external_url(&l.url) => {
+            Some("Сервер вернул некорректную ссылку для входа.".into())
+        }
         _ => None,
     };
     let shown_error = match state() {
@@ -253,7 +261,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
         _ => link_error.or(error),
     };
     let ready = match &*link.read() {
-        Some(Ok(l)) => Some(l.clone()),
+        Some(Ok(l)) if platform::is_safe_external_url(&l.url) => Some(l.clone()),
         _ => None,
     };
     let server_host = platform::server_base()
@@ -269,7 +277,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                         class: "btn glass",
                         href: "{l.url}",
                         target: "_blank",
-                        rel: "noopener",
+                        rel: "noopener noreferrer",
                         onclick: move |e: Event<MouseData>| open_link(&e, &l.url),
                         Icon { svg: icons::TG, class: "ic sm" }
                         "Открыть Telegram ещё раз"
@@ -287,7 +295,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                             oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
                         }
                     }
-                    a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener",
+                    a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener noreferrer",
                         onclick: move |e: Event<MouseData>| {
                             open_link(&e, &l.url);
                             wait(l.token.clone());
@@ -387,12 +395,13 @@ fn Main(
             }
         });
     });
-    // Global Ctrl+K / Cmd+K focuses the search box.
+    // Global Ctrl+K / Cmd+K focuses the search box (disabled while playing video).
     use_hook(|| {
         let _ = dioxus::document::eval(
             "if (!window.__kinoSearchShortcut) {
                window.__kinoSearchShortcut = true;
                window.addEventListener('keydown', function(e) {
+                 if (document.documentElement.classList.contains('kino-playing')) return;
                  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
                    var el = document.getElementById('kino-search-input');
                    if (el) { e.preventDefault(); el.focus(); el.select(); }
@@ -591,6 +600,18 @@ fn Main(
                         autoplay: play,
                         on_open: open,
                         on_person: open_person,
+                        // Closing a player started directly from Home / deep-link returns to the previous screen.
+                        on_exit: move |from_pop: bool| {
+                            if let Some(prev) = trail.with_mut(|t| t.pop()) {
+                                if matches!(prev, View::Tab(Tab::Home)) && trail.peek().is_empty() {
+                                    query.set(String::new());
+                                }
+                                view.set(prev);
+                                if !from_pop {
+                                    telegram::pop_history();
+                                }
+                            }
+                        },
                     }
                 },
                 View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, on_open: open } },
@@ -675,6 +696,9 @@ fn Home(
         }
     });
 
+    let mut lazy_backoff_until_ms = use_signal(|| 0i64);
+    let mut init_cat_loaded = use_signal(|| false);
+
     let load_batch = {
         let token = token.clone();
         move |limit: usize, cat: String| {
@@ -704,22 +728,28 @@ fn Home(
             loading_more_rows.set(true);
             let t = token.clone();
             spawn(async move {
-                let res = api::home_shelves(&t, &batch_ids).await;
-                if let Ok(loaded) = res {
-                    feed_state.with_mut(|maybe| {
-                        let Some(feed) = maybe.as_mut() else { return };
-                        for id in &batch_ids {
-                            if let Some(pos) = feed.rows.iter().position(|r| &r.id == id) {
-                                if let Some(fresh) = loaded.iter().find(|r| &r.id == id) {
-                                    feed.rows[pos] = fresh.clone();
-                                } else {
-                                    feed.rows[pos].loaded = true;
-                                    feed.rows[pos].has_more = false;
+                match api::home_shelves(&t, &batch_ids).await {
+                    Ok(loaded) => {
+                        lazy_backoff_until_ms.set(0);
+                        feed_state.with_mut(|maybe| {
+                            let Some(feed) = maybe.as_mut() else { return };
+                            for id in &batch_ids {
+                                if let Some(pos) = feed.rows.iter().position(|r| &r.id == id) {
+                                    if let Some(fresh) = loaded.iter().find(|r| &r.id == id) {
+                                        feed.rows[pos] = fresh.clone();
+                                    } else {
+                                        feed.rows[pos].loaded = true;
+                                        feed.rows[pos].has_more = false;
+                                    }
                                 }
                             }
-                        }
-                        feed.rows.retain(|r| !r.loaded || !r.items.is_empty());
-                    });
+                            feed.rows.retain(|r| !r.loaded || !r.items.is_empty());
+                        });
+                    }
+                    Err(_) => {
+                        // Cool down for 10s after a transient failure so scroll observers don't storm the server.
+                        lazy_backoff_until_ms.set(platform::now_ms() + 10_000);
+                    }
                 }
                 loading_shelves.with_mut(|v| v.retain(|id| !batch_ids.contains(id)));
                 loading_more_rows.set(false);
@@ -727,12 +757,14 @@ fn Home(
         }
     };
 
-    // If restored category isn't "for_you", load its hidden shelves right after feed arrives.
+    // If restored category isn't "for_you", load its hidden shelves once after feed arrives.
     {
         let mut load_batch = load_batch.clone();
         use_effect(move || {
             let cat = active_category();
-            if feed_state().is_some() && cat != "for_you" {
+            let has_feed = feed_state.read().is_some();
+            if has_feed && cat != "for_you" && !*init_cat_loaded.peek() {
+                init_cat_loaded.set(true);
                 load_batch(6, cat);
             }
         });
@@ -742,53 +774,54 @@ fn Home(
     {
         let mut load_batch = load_batch.clone();
         use_hook(move || {
+            struct HomeScrollGuard;
+            impl Drop for HomeScrollGuard {
+                fn drop(&mut self) {
+                    let _ = dioxus::document::eval(
+                        "if (window.__kinoHomeStop) { try { window.__kinoHomeStop(); } catch (e) {} window.__kinoHomeStop = null; }",
+                    );
+                }
+            }
             spawn(async move {
                 let mut bridge = dioxus::document::eval(
                     "if (window.__kinoHomeStop) { try { window.__kinoHomeStop(); } catch (e) {} }
-                     var obs = null, timer = null, lastSent = 0, observedEl = null;
-                     var check = function() {
-                       var el = document.getElementById('home-lazy-sentinel');
-                       if (!el) return;
-                       var r = el.getBoundingClientRect();
-                       if (r.top <= window.innerHeight + 350) {
-                         var now = Date.now();
-                         if (now - lastSent > 350) {
-                           lastSent = now;
-                           dioxus.send(true);
-                         }
+                     var obs = null, mo = null, lastSent = 0, observedEl = null;
+                     var emit = function() {
+                       var now = Date.now();
+                       if (now - lastSent > 500) {
+                         lastSent = now;
+                         dioxus.send(true);
                        }
+                     };
+                     var attach = function() {
+                       var el = document.getElementById('home-lazy-sentinel');
+                       if (el === observedEl) return;
+                       if (obs && observedEl) obs.unobserve(observedEl);
+                       observedEl = el;
+                       if (obs && el) obs.observe(el);
                      };
                      if (typeof IntersectionObserver !== 'undefined') {
                        obs = new IntersectionObserver(function(entries) {
-                         if (entries.some(function(e) { return e.isIntersecting; })) check();
+                         if (entries.some(function(e) { return e.isIntersecting; })) emit();
                        }, { rootMargin: '350px 0px' });
                      }
-                     timer = setInterval(function() {
-                       if (!document.getElementById('home-active-marker')) {
-                         window.__kinoHomeStop();
-                         return;
-                       }
-                       var el = document.getElementById('home-lazy-sentinel');
-                       if (el !== observedEl) {
-                         if (obs && observedEl) obs.unobserve(observedEl);
-                         observedEl = el;
-                         if (obs && el) obs.observe(el);
-                       }
-                       check();
-                     }, 450);
-                     window.addEventListener('scroll', check, { passive: true });
+                     if (typeof MutationObserver !== 'undefined') {
+                       mo = new MutationObserver(attach);
+                       mo.observe(document.body, { childList: true, subtree: true });
+                     }
+                     attach();
                      window.__kinoHomeStop = function() {
                        if (obs) obs.disconnect();
-                       if (timer) clearInterval(timer);
-                       window.removeEventListener('scroll', check);
+                       if (mo) mo.disconnect();
                      };",
                 );
                 while let Ok(true) = bridge.recv::<bool>().await {
-                    if !*loading_more_rows.peek() {
+                    if !*loading_more_rows.peek() && platform::now_ms() >= *lazy_backoff_until_ms.peek() {
                         load_batch(HOME_LAZY_BATCH, active_category.peek().clone());
                     }
                 }
             });
+            std::rc::Rc::new(HomeScrollGuard)
         });
     }
 
@@ -990,9 +1023,26 @@ fn Shelf(
 
 #[component]
 fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSummary>) -> Element {
+    let mut debounced = use_signal(|| query.peek().clone());
+    let mut gen = use_signal(|| 0u64);
+    use_effect(move || {
+        let q = query();
+        let next = *gen.peek() + 1;
+        gen.set(next);
+        if q.trim().is_empty() {
+            debounced.set(q);
+            return;
+        }
+        spawn(async move {
+            platform::sleep(300).await;
+            if *gen.peek() == next {
+                debounced.set(q);
+            }
+        });
+    });
     let results = use_resource(move || {
         let t = token.clone();
-        let q = query();
+        let q = debounced();
         async move {
             if q.trim().is_empty() {
                 return Ok(None);
@@ -1035,6 +1085,88 @@ fn Mine(
     }
 }
 
+async fn join3<A, B, C, FA, FB, FC>(fa: FA, fb: FB, fc: FC) -> (A, B, C)
+where
+    FA: std::future::Future<Output = A>,
+    FB: std::future::Future<Output = B>,
+    FC: std::future::Future<Output = C>,
+{
+    let mut fa = std::pin::pin!(fa);
+    let mut fb = std::pin::pin!(fb);
+    let mut fc = std::pin::pin!(fc);
+    let (mut ra, mut rb, mut rc) = (None, None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let std::task::Poll::Ready(v) = fa.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rb.is_none() {
+            if let std::task::Poll::Ready(v) = fb.as_mut().poll(cx) {
+                rb = Some(v);
+            }
+        }
+        if rc.is_none() {
+            if let std::task::Poll::Ready(v) = fc.as_mut().poll(cx) {
+                rc = Some(v);
+            }
+        }
+        if ra.is_some() && rb.is_some() && rc.is_some() {
+            std::task::Poll::Ready((ra.take().unwrap(), rb.take().unwrap(), rc.take().unwrap()))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+async fn join4<A, B, C, D, FA, FB, FC, FD>(fa: FA, fb: FB, fc: FC, fd: FD) -> (A, B, C, D)
+where
+    FA: std::future::Future<Output = A>,
+    FB: std::future::Future<Output = B>,
+    FC: std::future::Future<Output = C>,
+    FD: std::future::Future<Output = D>,
+{
+    let mut fa = std::pin::pin!(fa);
+    let mut fb = std::pin::pin!(fb);
+    let mut fc = std::pin::pin!(fc);
+    let mut fd = std::pin::pin!(fd);
+    let (mut ra, mut rb, mut rc, mut rd) = (None, None, None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let std::task::Poll::Ready(v) = fa.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rb.is_none() {
+            if let std::task::Poll::Ready(v) = fb.as_mut().poll(cx) {
+                rb = Some(v);
+            }
+        }
+        if rc.is_none() {
+            if let std::task::Poll::Ready(v) = fc.as_mut().poll(cx) {
+                rc = Some(v);
+            }
+        }
+        if rd.is_none() {
+            if let std::task::Poll::Ready(v) = fd.as_mut().poll(cx) {
+                rd = Some(v);
+            }
+        }
+        if ra.is_some() && rb.is_some() && rc.is_some() && rd.is_some() {
+            std::task::Poll::Ready((
+                ra.take().unwrap(),
+                rb.take().unwrap(),
+                rc.take().unwrap(),
+                rd.take().unwrap(),
+            ))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 #[component]
 fn Profile(
     token: String,
@@ -1049,10 +1181,8 @@ fn Profile(
     let mut data = use_resource(move || {
         let t = t1.clone();
         async move {
-            let history = api::history(&t).await?;
-            let preloads = api::preloads(&t).await?;
-            let prefs = api::prefs(&t).await?;
-            Ok::<_, api::Failure>((history, preloads, prefs))
+            let (history, preloads, prefs) = join3(api::history(&t), api::preloads(&t), api::prefs(&t)).await;
+            Ok::<_, api::Failure>((history?, preloads?, prefs?))
         }
     });
     let mut prefs_now = use_signal(|| None::<UserPrefs>);
@@ -1116,16 +1246,20 @@ fn Title(
     autoplay: bool,
     on_open: EventHandler<TitleSummary>,
     on_person: EventHandler<i64>,
+    on_exit: EventHandler<bool>,
 ) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
         async move {
-            let details = api::details(&t, kind, id).await?;
-            let progress = api::title_progress(&t, kind, id).await?;
-            let st = api::title_state(&t, kind, id).await?;
-            let choices = api::release_choices(&t, kind, id).await?;
-            Ok::<_, api::Failure>((details, progress, st, choices))
+            let (details, progress, st, choices) = join4(
+                api::details(&t, kind, id),
+                api::title_progress(&t, kind, id),
+                api::title_state(&t, kind, id),
+                api::release_choices(&t, kind, id),
+            )
+            .await;
+            Ok::<_, api::Failure>((details?, progress?, st?, choices?))
         }
     });
     // Cast and suggestions come apart from the title: if TMDB is slow or fails, the page still works.
@@ -1157,6 +1291,8 @@ fn Title(
     // Optimistic edits; cleared when the data reloads.
     let mut status_now = use_signal(|| None::<Option<TitleStatus>>);
     let mut rating_now = use_signal(|| None::<Option<i16>>);
+    let mut scale_now = use_signal(|| None::<VideoScale>);
+    let mut rate_seq = use_signal(|| 0u32);
     let mut notice = use_signal(|| None::<String>);
     // Choices made in this visit, newest first; they override the loaded ones.
     let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
@@ -1176,6 +1312,7 @@ fn Title(
     let mut panel = use_signal(|| None::<PickerPanel>);
     let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate, bool, bool)>);
     let mut auto = use_signal(|| autoplay);
+    let mut exit_on_close = use_signal(|| autoplay);
     let mut overlay_pushed = use_signal(|| false);
     let mut notice_pushed = use_signal(|| false);
     let t0 = token.clone();
@@ -1312,6 +1449,7 @@ fn Title(
             defaults_pending.set(true);
             defaults_relaxed.set(false);
             panel.set(None);
+            exit_on_close.set(false);
             if picker.peek().is_none() && !*overlay_pushed.peek() {
                 overlay_pushed.set(true);
                 telegram::push_history(None);
@@ -1341,7 +1479,7 @@ fn Title(
             telegram::haptic(telegram::Haptic::Tap);
             match choice_for(season_key(&t)) {
                 Some(c) => {
-                    if !*overlay_pushed.peek() {
+                    if !*exit_on_close.peek() && !*overlay_pushed.peek() {
                         overlay_pushed.set(true);
                         telegram::push_history(None);
                     }
@@ -1421,10 +1559,37 @@ fn Title(
                 let token = token.clone();
                 move |r: Option<i16>| {
                     telegram::haptic(telegram::Haptic::Select);
+                    let seq = *rate_seq.peek() + 1;
+                    rate_seq.set(seq);
                     rating_now.set(Some(r));
+                    if r.is_some() {
+                        status_now.set(Some(Some(TitleStatus::Watched)));
+                        if kind == MediaKind::Tv && chosen_season.peek().is_none() {
+                            if let Some(Some(s)) = season.peek().as_ref() {
+                                chosen_season.set(Some(s.number));
+                            }
+                        }
+                    }
                     let t = token.clone();
                     spawn(async move {
-                        let _ = api::set_rating(&t, kind, id, r).await;
+                        match api::set_rating(&t, kind, id, r).await {
+                            Ok(updated) if *rate_seq.peek() == seq => {
+                                rating_now.set(Some(updated.rating));
+                                if r.is_some() && *status_now.peek() == Some(Some(TitleStatus::Watched)) {
+                                    status_now.set(Some(updated.status));
+                                }
+                                if r.is_some() {
+                                    data.restart();
+                                }
+                            }
+                            Err(_) if *rate_seq.peek() == seq => {
+                                rating_now.set(None);
+                                if r.is_some() && *status_now.peek() == Some(Some(TitleStatus::Watched)) {
+                                    status_now.set(None);
+                                }
+                            }
+                            _ => {}
+                        }
                     });
                 }
             },
@@ -1572,9 +1737,36 @@ fn Title(
                     release: rel,
                     explicit_episode,
                     explicit_release,
+                    video_scale: scale_now().or(st.video_scale),
                 },
-                on_close: move |_| {
+                on_scale: {
+                    let t = token.clone();
+                    move |next: VideoScale| {
+                        scale_now.set(Some(next));
+                        let tok = t.clone();
+                        spawn(async move {
+                            let _ = api::set_scale(&tok, kind, id, Some(next)).await;
+                        });
+                    }
+                },
+                on_close: move |from_pop: bool| {
                     playing.set(None);
+                    if exit_on_close() {
+                        exit_on_close.set(false);
+                        on_exit.call(from_pop);
+                    } else {
+                        if *overlay_pushed.peek() {
+                            overlay_pushed.set(false);
+                            if !from_pop {
+                                telegram::pop_history();
+                            }
+                        }
+                        data.restart();
+                    }
+                },
+                on_title: move |_| {
+                    playing.set(None);
+                    exit_on_close.set(false);
                     if *overlay_pushed.peek() {
                         overlay_pushed.set(false);
                         telegram::pop_history();

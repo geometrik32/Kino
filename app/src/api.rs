@@ -4,10 +4,11 @@ use std::sync::LazyLock;
 
 use kino_core::{
     ApiError, AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest,
-    LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayRequest, PreloadItem, PreloadRequest,
-    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season,
-    ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse, SyncLeaveRequest, TitleDetails,
-    TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayProbe, PlayProbeRequest, PlayRequest,
+    PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
+    ReleaseList, SearchResults, Season, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse,
+    SyncLeaveRequest, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, VideoScale,
+    WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -28,6 +29,16 @@ pub fn forget_token() {
     platform::storage_remove(TOKEN_KEY);
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+static CLIENT: LazyLock<Client> = LazyLock::new(|| {
+    Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(95))
+        .build()
+        .expect("HTTP client")
+});
+
+#[cfg(target_arch = "wasm32")]
 static CLIENT: LazyLock<Client> = LazyLock::new(Client::new);
 
 /// A request to `path` (e.g. `/api/me`), with the user's token when there is one.
@@ -37,6 +48,16 @@ fn request(method: reqwest::Method, path: &str, token: Option<&str>) -> RequestB
         Some(t) => r.bearer_auth(t),
         None => r,
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn with_timeout(req: RequestBuilder, secs: u64) -> RequestBuilder {
+    req.timeout(std::time::Duration::from_secs(secs))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn with_timeout(req: RequestBuilder, _secs: u64) -> RequestBuilder {
+    req
 }
 
 /// An API failure, with the server's code (`not_invited`, `unauthorized`, ...) when there is one.
@@ -171,12 +192,25 @@ async fn send<T: DeserializeOwned>(
     token: &str,
     body: Option<&impl serde::Serialize>,
 ) -> Result<T, Failure> {
+    send_timeout(method, path, token, body, None).await
+}
+
+async fn send_timeout<T: DeserializeOwned>(
+    method: &str,
+    path: &str,
+    token: &str,
+    body: Option<&impl serde::Serialize>,
+    timeout_secs: Option<u64>,
+) -> Result<T, Failure> {
     let method = match method {
         "PUT" => reqwest::Method::PUT,
         "POST" => reqwest::Method::POST,
         _ => reqwest::Method::DELETE,
     };
-    let builder = request(method, path, Some(token));
+    let mut builder = request(method, path, Some(token));
+    if let Some(secs) = timeout_secs {
+        builder = with_timeout(builder, secs);
+    }
     let req = match body {
         Some(b) => builder.json(b),
         None => builder,
@@ -251,6 +285,15 @@ pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {
     Ok(info)
 }
 
+/// Retries `ffprobe` for an active stream whose metadata was unavailable at start.
+pub async fn play_probe(token: &str, r: &PlayProbeRequest) -> Result<PlayProbe, Failure> {
+    let mut probe: PlayProbe = send("POST", "/api/play/probe", token, Some(r)).await?;
+    if let Some(s) = &mut probe.stream {
+        *s = platform::abs(s);
+    }
+    Ok(probe)
+}
+
 /// How far connecting to a release has got.
 pub async fn play_progress(token: &str, release: &str) -> Result<StreamProgress, Failure> {
     get(&format!("/api/play/progress/{release}"), token).await
@@ -265,10 +308,20 @@ pub async fn set_tracks(token: &str, kind: MediaKind, id: i64, t: &TracksUpdate)
     send("PUT", &path, token, Some(t)).await
 }
 
+pub async fn set_scale(
+    token: &str,
+    kind: MediaKind,
+    id: i64,
+    video_scale: Option<VideoScale>,
+) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/{}/{id}/scale", kind.as_str());
+    send("PUT", &path, token, Some(&kino_core::ScaleUpdate { video_scale })).await
+}
+
 pub async fn sync_join(token: &str, req: &SyncJoinRequest) -> Result<SyncJoinResponse, Failure> {
-    send("POST", "/api/sync/join", token, Some(req)).await
+    send_timeout("POST", "/api/sync/join", token, Some(req), Some(15)).await
 }
 
 pub async fn sync_leave(token: &str, req: &SyncLeaveRequest) -> Result<(), Failure> {
-    send("POST", "/api/sync/leave", token, Some(req)).await
+    send_timeout("POST", "/api/sync/leave", token, Some(req), Some(5)).await
 }

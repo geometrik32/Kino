@@ -44,8 +44,13 @@ struct RawFile {
 
 impl QBittorrent {
     pub fn new(base: &str, user: &str, password: &str, save_path: Option<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("qBittorrent HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             base: base.trim_end_matches('/').to_owned(),
             user: user.to_owned(),
             password: password.to_owned(),

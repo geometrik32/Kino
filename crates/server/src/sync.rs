@@ -42,6 +42,10 @@ const JOIN_HANDSHAKE_TIMEOUT_MS: i64 = 15_000;
 const HEARTBEAT_TIMEOUT_MS: i64 = 18_000;
 const BARRIER_TIMEOUT_MS: i64 = 30_000;
 const AUTO_SAVE_INTERVAL_MS: i64 = 10_000;
+const MAX_ROOMS_PER_USER: usize = 8;
+const MAX_MEMBERS_PER_ROOM: usize = 16;
+const WS_OUTBOUND_CAPACITY: usize = 64;
+const WS_MAX_MESSAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncTicketClaims {
@@ -89,7 +93,7 @@ struct Member {
     ready: bool,
     buffering: bool,
     waiting_since_ms: Option<i64>,
-    tx: Option<mpsc::UnboundedSender<SyncServerMsg>>,
+    tx: Option<mpsc::Sender<SyncServerMsg>>,
 }
 
 struct Room {
@@ -107,6 +111,7 @@ struct Room {
     waiting_for: Vec<String>,
     rate: f32,
     audio_track: Option<String>,
+    sound_client_id: Option<String>,
     last_device: String,
     last_saved_ms: i64,
     members: Vec<Member>,
@@ -168,6 +173,16 @@ impl Room {
         self.waiting_for = names;
     }
 
+    fn ensure_sound_owner(&mut self) {
+        let valid = self
+            .sound_client_id
+            .as_deref()
+            .is_some_and(|cid| self.members.iter().any(|m| m.client_id == cid));
+        if !valid {
+            self.sound_client_id = self.members.first().map(|m| m.client_id.clone());
+        }
+    }
+
     fn snapshot(&self, now_ms: i64, updated_by: Option<String>, event: SyncEventKind) -> SyncState {
         SyncState {
             revision: self.revision,
@@ -187,6 +202,7 @@ impl Room {
             },
             rate: self.rate,
             audio_track: self.audio_track.clone(),
+            sound_client_id: self.sound_client_id.clone(),
             server_now_ms: now_ms,
             updated_by,
             event,
@@ -207,21 +223,22 @@ impl Room {
         let msg = SyncServerMsg::State(Box::new(state.clone()));
         for m in &self.members {
             if let Some(tx) = &m.tx {
-                let _ = tx.send(msg.clone());
+                let _ = tx.try_send(msg.clone());
             }
         }
     }
 
     fn make_save_job(&mut self, now_ms: i64, pos_override: Option<f64>, finished: bool) -> Option<SaveJob> {
         let duration = self.duration_sec.unwrap_or(0.0);
-        if duration <= 0.0 && !finished {
-            return None;
-        }
-        let pos = if finished && duration > 0.0 {
+        let raw_pos = if finished && duration > 0.0 {
             duration
         } else {
             pos_override.unwrap_or_else(|| self.current_pos(now_ms))
         };
+        let pos = sanitize_pos(raw_pos, Some(duration).filter(|d| *d > 0.0));
+        if duration <= 0.0 && !finished && pos < 1.0 {
+            return None;
+        }
         self.last_saved_ms = now_ms;
         Some(SaveJob {
             user_id: self.key.user_id,
@@ -234,7 +251,7 @@ impl Room {
                 } else {
                     0
                 },
-                position_sec: sanitize_pos(pos, Some(duration).filter(|d| *d > 0.0)),
+                position_sec: pos,
                 duration_sec: duration.max(0.0),
                 release: self.file_index.map(|file_index| ReleaseRef {
                     infohash: self.release.infohash.clone(),
@@ -327,54 +344,50 @@ impl SyncHub {
             req.device.trim().chars().take(64).collect()
         };
 
-        let rooms = self.rooms.lock().expect("sync rooms lock");
-        let existing_room = rooms.get(&key).cloned();
-        drop(rooms);
+        let initial_pos = req
+            .reconnect_pos
+            .filter(|p| p.is_finite() && *p >= 0.0)
+            .unwrap_or_else(|| saved_pos_for(season, episode));
 
-        if let Some(room_arc) = existing_room {
-            let mut room = room_arc.lock().expect("sync room lock");
-            if !room.members.is_empty() {
-                if req.explicit_episode && (room.season != season || room.episode != episode) {
-                    room.season = season;
-                    room.episode = episode;
-                    room.release = req.release.clone();
-                    room.file_index = None;
-                    room.anchor_pos = saved_pos_for(season, episode);
-                    room.anchor_at_ms = now_ms;
-                    room.duration_sec = None;
-                    room.paused = false;
-                    for m in &mut room.members {
-                        m.ready = false;
-                        m.buffering = true;
-                        m.waiting_since_ms = Some(now_ms);
-                    }
-                } else if req.explicit_release && room.release.infohash != req.release.infohash {
-                    room.anchor_pos = room.current_pos(now_ms);
-                    room.anchor_at_ms = now_ms;
-                    room.release = req.release.clone();
-                    room.file_index = None;
-                    room.duration_sec = None;
-                    for m in &mut room.members {
-                        m.ready = false;
-                        m.buffering = true;
-                        m.waiting_since_ms = Some(now_ms);
+        // Look up or insert the room atomically under `self.rooms` to eliminate join TOCTOU races.
+        let (room_arc, created_new) = {
+            let mut rooms = self.rooms.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = rooms.get(&key).cloned() {
+                (existing, false)
+            } else {
+                // Cap active rooms per user so a single account cannot bloat hub memory.
+                let user_rooms = rooms.keys().filter(|k| k.user_id == user_id).count();
+                if user_rooms >= MAX_ROOMS_PER_USER {
+                    if let Some(oldest_key) = rooms
+                        .iter()
+                        .filter(|(k, _)| k.user_id == user_id)
+                        .min_by_key(|(_, r)| r.lock().unwrap_or_else(|e| e.into_inner()).anchor_at_ms)
+                        .map(|(k, _)| *k)
+                    {
+                        rooms.remove(&oldest_key);
                     }
                 }
-
-                room.last_device = device.clone();
-                if let Some(m) = room.members.iter_mut().find(|m| m.client_id == req.client_id) {
-                    m.device = device;
-                    m.joined_at_ms = now_ms;
-                    m.last_seen_ms = now_ms;
-                    if req.reconnect_pos.is_none() {
-                        m.ready = false;
-                        m.buffering = true;
-                        m.waiting_since_ms = Some(now_ms);
-                    }
-                } else {
-                    room.members.push(Member {
+                let room = Room {
+                    key,
+                    revision: 1,
+                    season,
+                    episode,
+                    release: req.release.clone(),
+                    file_index: None,
+                    anchor_pos: initial_pos,
+                    anchor_at_ms: now_ms,
+                    duration_sec: None,
+                    paused: false,
+                    waiting: false,
+                    waiting_for: Vec::new(),
+                    rate: 1.0,
+                    audio_track: saved_audio_track.clone(),
+                    sound_client_id: Some(req.client_id.clone()),
+                    last_device: device.clone(),
+                    last_saved_ms: now_ms,
+                    members: vec![Member {
                         client_id: req.client_id.clone(),
-                        device,
+                        device: device.clone(),
                         conn_id: 0,
                         connected: false,
                         joined_at_ms: now_ms,
@@ -383,39 +396,38 @@ impl SyncHub {
                         buffering: true,
                         waiting_since_ms: Some(now_ms),
                         tx: None,
-                    });
-                }
-                room.recompute_waiting(now_ms);
-                room.revision += 1;
-                let state = room.snapshot(now_ms, Some(req.client_id.clone()), SyncEventKind::Members);
-                room.broadcast(&state);
-                return (state, true);
+                    }],
+                };
+                let arc = Arc::new(Mutex::new(room));
+                rooms.insert(key, arc.clone());
+                (arc, true)
             }
+        };
+
+        let mut room = room_arc.lock().unwrap_or_else(|e| e.into_inner());
+        if created_new {
+            let state = room.snapshot(now_ms, Some(req.client_id.clone()), SyncEventKind::Snapshot);
+            return (state, false);
         }
 
-        let initial_pos = req
-            .reconnect_pos
-            .filter(|p| p.is_finite() && *p >= 0.0)
-            .unwrap_or_else(|| saved_pos_for(season, episode));
-
-        let room = Room {
-            key,
-            revision: 1,
-            season,
-            episode,
-            release: req.release.clone(),
-            file_index: None,
-            anchor_pos: initial_pos,
-            anchor_at_ms: now_ms,
-            duration_sec: None,
-            paused: false,
-            waiting: false,
-            waiting_for: Vec::new(),
-            rate: 1.0,
-            audio_track: saved_audio_track,
-            last_device: device.clone(),
-            last_saved_ms: now_ms,
-            members: vec![Member {
+        if room.members.is_empty() {
+            room.revision += 1;
+            room.season = season;
+            room.episode = episode;
+            room.release = req.release.clone();
+            room.file_index = None;
+            room.anchor_pos = initial_pos;
+            room.anchor_at_ms = now_ms;
+            room.duration_sec = None;
+            room.paused = false;
+            room.waiting = false;
+            room.waiting_for.clear();
+            room.rate = 1.0;
+            room.audio_track = saved_audio_track;
+            room.sound_client_id = Some(req.client_id.clone());
+            room.last_device = device.clone();
+            room.last_saved_ms = now_ms;
+            room.members.push(Member {
                 client_id: req.client_id.clone(),
                 device,
                 conn_id: 0,
@@ -426,18 +438,80 @@ impl SyncHub {
                 buffering: true,
                 waiting_since_ms: Some(now_ms),
                 tx: None,
-            }],
-        };
-        let state = room.snapshot(now_ms, Some(req.client_id.clone()), SyncEventKind::Snapshot);
-        let mut rooms = self.rooms.lock().expect("sync rooms lock");
-        rooms.insert(key, Arc::new(Mutex::new(room)));
-        (state, false)
+            });
+            let state = room.snapshot(now_ms, Some(req.client_id.clone()), SyncEventKind::Snapshot);
+            return (state, false);
+        }
+
+        if req.explicit_episode && (room.season != season || room.episode != episode) {
+            room.season = season;
+            room.episode = episode;
+            room.release = req.release.clone();
+            room.file_index = None;
+            room.anchor_pos = saved_pos_for(season, episode);
+            room.anchor_at_ms = now_ms;
+            room.duration_sec = None;
+            room.paused = false;
+            for m in &mut room.members {
+                m.ready = false;
+                m.buffering = true;
+                m.waiting_since_ms = Some(now_ms);
+            }
+        } else if req.explicit_release && room.release.infohash != req.release.infohash {
+            room.anchor_pos = room.current_pos(now_ms);
+            room.anchor_at_ms = now_ms;
+            room.release = req.release.clone();
+            room.file_index = None;
+            room.duration_sec = None;
+            for m in &mut room.members {
+                m.ready = false;
+                m.buffering = true;
+                m.waiting_since_ms = Some(now_ms);
+            }
+        }
+
+        room.last_device = device.clone();
+        if let Some(m) = room.members.iter_mut().find(|m| m.client_id == req.client_id) {
+            m.device = device;
+            m.joined_at_ms = now_ms;
+            m.last_seen_ms = now_ms;
+            if req.reconnect_pos.is_none() {
+                m.ready = false;
+                m.buffering = true;
+                m.waiting_since_ms = Some(now_ms);
+            }
+        } else {
+            if room.members.len() >= MAX_MEMBERS_PER_ROOM {
+                // Evict the stalest member to keep broadcast work bounded.
+                if let Some((stale_idx, _)) = room.members.iter().enumerate().min_by_key(|(_, m)| m.last_seen_ms) {
+                    room.members.remove(stale_idx);
+                }
+            }
+            room.members.push(Member {
+                client_id: req.client_id.clone(),
+                device,
+                conn_id: 0,
+                connected: false,
+                joined_at_ms: now_ms,
+                last_seen_ms: now_ms,
+                ready: false,
+                buffering: true,
+                waiting_since_ms: Some(now_ms),
+                tx: None,
+            });
+        }
+        room.ensure_sound_owner();
+        room.recompute_waiting(now_ms);
+        room.revision += 1;
+        let state = room.snapshot(now_ms, Some(req.client_id.clone()), SyncEventKind::Members);
+        room.broadcast(&state);
+        (state, true)
     }
 
     pub fn attach_ws(
         &self,
         claims: &SyncTicketClaims,
-        tx: mpsc::UnboundedSender<SyncServerMsg>,
+        tx: mpsc::Sender<SyncServerMsg>,
         now_ms: i64,
     ) -> Option<(RoomKey, u64, SyncState)> {
         let key = RoomKey {
@@ -485,7 +559,7 @@ impl SyncHub {
         match msg {
             SyncClientMsg::Ping { client_ms } => {
                 if let Some(tx) = &room.members[member_idx].tx {
-                    let _ = tx.send(SyncServerMsg::Pong {
+                    let _ = tx.try_send(SyncServerMsg::Pong {
                         client_ms,
                         server_ms: now_ms,
                     });
@@ -623,7 +697,14 @@ impl SyncHub {
                 room.last_device = device;
                 room.season = season;
                 room.episode = episode;
-                if let Some(rel) = release {
+                if let Some(mut rel) = release {
+                    if !infohash_ok(&rel.infohash) {
+                        return None;
+                    }
+                    rel.infohash.make_ascii_lowercase();
+                    rel.title = rel.title.map(|s| s.chars().take(300).collect());
+                    rel.quality = rel.quality.map(|s| s.chars().take(64).collect());
+                    rel.voice = rel.voice.map(|s| s.chars().take(128).collect());
                     room.release = rel;
                     room.file_index = None;
                 }
@@ -642,10 +723,14 @@ impl SyncHub {
                 room.broadcast(&state);
                 None
             }
-            SyncClientMsg::Release { release } => {
+            SyncClientMsg::Release { mut release } => {
                 if !infohash_ok(&release.infohash) {
                     return None;
                 }
+                release.infohash.make_ascii_lowercase();
+                release.title = release.title.map(|s| s.chars().take(300).collect());
+                release.quality = release.quality.map(|s| s.chars().take(64).collect());
+                release.voice = release.voice.map(|s| s.chars().take(128).collect());
                 room.last_device = device;
                 room.anchor_pos = room.current_pos(now_ms);
                 room.anchor_at_ms = now_ms;
@@ -672,7 +757,7 @@ impl SyncHub {
                 room.last_device = device;
                 room.anchor_pos = sanitize_pos(position_sec, room.duration_sec);
                 room.anchor_at_ms = now_ms;
-                room.audio_track = audio_track;
+                room.audio_track = audio_track.map(|s| s.chars().take(200).collect());
                 if room.members.len() > 1 {
                     for m in &mut room.members {
                         m.ready = false;
@@ -686,6 +771,20 @@ impl SyncHub {
                 room.broadcast(&state);
                 None
             }
+            SyncClientMsg::Sound { client_id: target_id } => {
+                if !room.members.iter().any(|m| m.client_id == target_id) {
+                    return None;
+                }
+                if room.sound_client_id.as_deref() == Some(target_id.as_str()) {
+                    return None;
+                }
+                room.last_device = device;
+                room.sound_client_id = Some(target_id);
+                room.revision += 1;
+                let state = room.snapshot(now_ms, Some(client_id.to_owned()), SyncEventKind::Sound);
+                room.broadcast(&state);
+                None
+            }
             SyncClientMsg::Report {
                 position_sec,
                 duration_sec,
@@ -695,10 +794,11 @@ impl SyncHub {
                 if let Some(d) = sanitize_duration(duration_sec) {
                     room.duration_sec = Some(d);
                 }
-                if room.members.len() == 1 {
+                // Play/pause state transitions come explicitly from `Play`/`Pause`:
+                // a periodic telemetry `Report` (e.g. while loading or seeking) must never pause the room.
+                if room.members.len() == 1 && !room.paused && !room.waiting && !paused {
                     room.anchor_pos = sanitize_pos(position_sec, room.duration_sec);
                     room.anchor_at_ms = now_ms;
-                    room.paused = paused;
                     room.rate = sanitize_rate(rate);
                 }
                 if !room.paused && !room.waiting && now_ms - room.last_saved_ms >= AUTO_SAVE_INTERVAL_MS {
@@ -781,8 +881,10 @@ impl SyncHub {
             let was_waiting = room.waiting;
             room.members.remove(idx);
             if room.members.is_empty() {
+                room.sound_client_id = None;
                 true
             } else {
+                room.ensure_sound_owner();
                 room.recompute_waiting(now_ms);
                 room.revision += 1;
                 let event = if was_waiting && !room.waiting {
@@ -851,6 +953,7 @@ impl SyncHub {
             }
 
             if room.members.len() != before || barrier_released {
+                room.ensure_sound_owner();
                 room.recompute_waiting(now_ms);
                 room.revision += 1;
                 let event = if was_waiting && !room.waiting {
@@ -890,9 +993,12 @@ pub fn spawn_reaper(state: AppState) {
             tick.tick().await;
             let jobs = state.sync.sweep(SyncHub::now_ms());
             for job in jobs {
-                if let Err(e) = persist_progress(&state, job.user_id, job.update).await {
-                    tracing::debug!(error = ?e, "sync background progress save failed");
-                }
+                let st = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = persist_progress(&st, job.user_id, job.update).await {
+                        tracing::debug!(error = ?e, "sync background progress save failed");
+                    }
+                });
             }
         }
     });
@@ -971,11 +1077,13 @@ pub async fn ws(
 ) -> Result<Response, AppError> {
     let claims = verify_ticket(&state.config.session_secret, &q.ticket, Utc::now())
         .ok_or_else(|| AppError::unauthorized("invalid or expired sync ticket"))?;
-    Ok(ws.on_upgrade(move |socket| handle_socket(state, claims, socket)))
+    Ok(ws
+        .max_message_size(WS_MAX_MESSAGE_BYTES)
+        .on_upgrade(move |socket| handle_socket(state, claims, socket)))
 }
 
 async fn handle_socket(state: AppState, claims: SyncTicketClaims, socket: WebSocket) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<SyncServerMsg>();
+    let (tx, mut rx) = mpsc::channel::<SyncServerMsg>(WS_OUTBOUND_CAPACITY);
     let Some((key, conn_id, initial)) = state.sync.attach_ws(&claims, tx, SyncHub::now_ms()) else {
         return;
     };
@@ -1030,8 +1138,17 @@ async fn handle_socket(state: AppState, claims: SyncTicketClaims, socket: WebSoc
             .sync
             .handle_ws_msg(key, &claims.cid, conn_id, msg, episode_resume, SyncHub::now_ms());
         if let Some(job) = job {
-            if let Err(e) = persist_progress(&state, job.user_id, job.update).await {
-                tracing::debug!(error = ?e, "sync progress save failed");
+            if is_leave {
+                if let Err(e) = persist_progress(&state, job.user_id, job.update).await {
+                    tracing::debug!(error = ?e, "sync progress save failed");
+                }
+            } else {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = persist_progress(&st, job.user_id, job.update).await {
+                        tracing::debug!(error = ?e, "sync progress save failed");
+                    }
+                });
             }
         }
         if is_leave {
@@ -1106,6 +1223,7 @@ mod tests {
                 audio_track: Some("LostFilm · Русский".into()),
                 position_sec: 305.0,
             },
+            SyncClientMsg::Sound { client_id: "c1".into() },
             SyncClientMsg::Report {
                 position_sec: 310.0,
                 duration_sec: Some(1200.0),
@@ -1141,6 +1259,7 @@ mod tests {
             waiting_for: vec!["Телефон".into()],
             rate: 1.25,
             audio_track: Some("Дубляж".into()),
+            sound_client_id: Some("c1".into()),
             server_now_ms: 1_700_000_000_500,
             updated_by: Some("c1".into()),
             event: SyncEventKind::Seek,
@@ -1197,7 +1316,7 @@ mod tests {
         assert!(!s1.waiting);
         assert_eq!(s1.position_sec, 120.0);
 
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
         let claims_a = SyncTicketClaims {
             uid: 1,
             kind: MediaKind::Movie,
@@ -1258,7 +1377,7 @@ mod tests {
             }
         ));
 
-        let (tx_b, _rx_b) = mpsc::unbounded_channel();
+        let (tx_b, _rx_b) = mpsc::channel(WS_OUTBOUND_CAPACITY);
         let claims_b = SyncTicketClaims {
             uid: 1,
             kind: MediaKind::Movie,
@@ -1333,7 +1452,7 @@ mod tests {
         let hub = SyncHub::new();
         let mut t = 2_000_000_i64;
         hub.join_in_memory(1, &join_req("a", "ПК"), &[], None, t);
-        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_a, mut rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
         let claims_a = SyncTicketClaims {
             uid: 1,
             kind: MediaKind::Movie,
@@ -1356,7 +1475,7 @@ mod tests {
         );
 
         hub.join_in_memory(1, &join_req("b", "Телефон"), &[], None, t);
-        let (tx_b, _) = mpsc::unbounded_channel();
+        let (tx_b, _) = mpsc::channel(WS_OUTBOUND_CAPACITY);
         let claims_b = SyncTicketClaims {
             uid: 1,
             kind: MediaKind::Movie,
@@ -1388,5 +1507,267 @@ mod tests {
             }
             _ => panic!("expected barrier timeout resume"),
         }
+    }
+
+    #[test]
+    fn report_does_not_pause_solo_room() {
+        let hub = SyncHub::new();
+        let t = 3_000_000_i64;
+        let (s1, _) = hub.join_in_memory(1, &join_req("a", "ПК"), &[], None, t);
+        assert!(!s1.paused);
+
+        let (tx_a, _rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_a = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
+
+        // A transient `paused: true` telemetry report (e.g. while loading/seeking)
+        // must not flip `room.paused` or reset anchor_pos to 0.
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Seek { position_sec: 1942.0 },
+            None,
+            t + 500,
+        );
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Report {
+                position_sec: 0.0,
+                duration_sec: Some(7200.0),
+                paused: true,
+                rate: 1.0,
+            },
+            None,
+            t + 1_000,
+        );
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Ready {
+                position_sec: 1942.0,
+                duration_sec: Some(7200.0),
+                file_index: Some(0),
+            },
+            None,
+            t + 1_500,
+        );
+
+        let (_, rejoined) = hub.join_in_memory(1, &join_req("b", "Телефон"), &[], None, t + 1_600);
+        assert!(rejoined);
+        let state = hub.join_in_memory(1, &join_req("b", "Телефон"), &[], None, t + 1_600).0;
+        assert!(!state.paused);
+        assert!((state.position_sec - 1942.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn multi_device_sound_ownership_and_handoff() {
+        let hub = SyncHub::new();
+        let mut t = 4_000_000_i64;
+
+        // First device owns sound by default.
+        let (s1, _) = hub.join_in_memory(1, &join_req("a", "ПК"), &[], None, t);
+        assert_eq!(s1.sound_client_id.as_deref(), Some("a"));
+
+        let (tx_a, mut rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_a = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
+
+        // Second device joins -> existing owner ("a") retains sound.
+        let (s2, joined) = hub.join_in_memory(1, &join_req("b", "Телефон"), &[], None, t + 100);
+        assert!(joined);
+        assert_eq!(s2.sound_client_id.as_deref(), Some("a"));
+
+        let (tx_b, mut rx_b) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_b = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            cid: "b".into(),
+            exp: 9_999_999_999,
+        };
+        let (_, conn_b, _) = hub.attach_ws(&claims_b, tx_b, t + 100).unwrap();
+        while rx_a.try_recv().is_ok() {}
+        while rx_b.try_recv().is_ok() {}
+
+        // Invalid target is ignored.
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Sound {
+                client_id: "ghost".into(),
+            },
+            None,
+            t + 200,
+        );
+        assert!(rx_a.try_recv().is_err());
+
+        // Switching sound to "b" broadcasts SyncEventKind::Sound to both devices.
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Sound { client_id: "b".into() },
+            None,
+            t + 300,
+        );
+        for rx in [&mut rx_a, &mut rx_b] {
+            match rx.try_recv().unwrap() {
+                SyncServerMsg::State(st) => {
+                    assert_eq!(st.event, SyncEventKind::Sound);
+                    assert_eq!(st.sound_client_id.as_deref(), Some("b"));
+                    assert_eq!(st.updated_by.as_deref(), Some("a"));
+                }
+                _ => panic!("expected state"),
+            }
+        }
+
+        // Redundant switch to the same owner does not emit an extra broadcast.
+        hub.handle_ws_msg(
+            key,
+            "b",
+            conn_b,
+            SyncClientMsg::Sound { client_id: "b".into() },
+            None,
+            t + 400,
+        );
+        assert!(rx_a.try_recv().is_err());
+
+        // Sound owner leaves -> sound automatically hands off to remaining member ("a").
+        hub.remove_member(key, "b", Some(conn_b), t + 500);
+        match rx_a.try_recv().unwrap() {
+            SyncServerMsg::State(st) => {
+                assert_eq!(st.members.len(), 1);
+                assert_eq!(st.sound_client_id.as_deref(), Some("a"));
+            }
+            _ => panic!("expected member leave handoff"),
+        }
+
+        // Rejoin "b", switch sound to "b", then let "b" time out in sweep() -> handoff back to "a".
+        t += 1_000;
+        hub.join_in_memory(1, &join_req("b", "Телефон"), &[], None, t);
+        let (_, conn_b2, _) = hub
+            .attach_ws(&claims_b, mpsc::channel(WS_OUTBOUND_CAPACITY).0, t)
+            .unwrap();
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Sound { client_id: "b".into() },
+            None,
+            t + 100,
+        );
+        while rx_a.try_recv().is_ok() {}
+        let _ = conn_b2;
+        t += HEARTBEAT_TIMEOUT_MS + 1_000;
+        hub.handle_ws_msg(key, "a", conn_a, SyncClientMsg::Ping { client_ms: t }, None, t);
+        let _ = rx_a.try_recv(); // Pong
+        hub.sweep(t);
+        match rx_a.try_recv().unwrap() {
+            SyncServerMsg::State(st) => {
+                assert_eq!(st.members.len(), 1);
+                assert_eq!(st.sound_client_id.as_deref(), Some("a"));
+            }
+            _ => panic!("expected sweep handoff"),
+        }
+    }
+
+    #[test]
+    fn saves_position_without_duration() {
+        let hub = SyncHub::new();
+        let t = 5_000_000_i64;
+        let mut req = join_req("a", "ПК");
+        req.kind = MediaKind::Tv;
+        req.tmdb_id = 1622;
+        req.season = 1;
+        req.episode = 1;
+        hub.join_in_memory(1, &req, &[], None, t);
+        let (tx_a, _rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_a = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Tv,
+            tmdb_id: 1622,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Ready {
+                position_sec: 0.0,
+                duration_sec: None,
+                file_index: Some(1),
+            },
+            None,
+            t,
+        );
+        // At 0s with unknown duration, nothing meaningful to persist yet.
+        assert!(hub
+            .leave_http(
+                1,
+                &SyncLeaveRequest {
+                    client_id: "a".into(),
+                    kind: MediaKind::Tv,
+                    tmdb_id: 1622,
+                    position_sec: 0.2,
+                    duration_sec: None,
+                    finished: false,
+                },
+                t,
+            )
+            .is_none());
+
+        // Rejoin and watch past 1s with unknown duration -> timecode must be saved.
+        hub.join_in_memory(1, &req, &[], None, t);
+        let (tx_a2, _rx_a2) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let (_, conn_a2, _) = hub.attach_ws(&claims_a, tx_a2, t).unwrap();
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a2,
+            SyncClientMsg::Ready {
+                position_sec: 125.0,
+                duration_sec: None,
+                file_index: Some(1),
+            },
+            None,
+            t,
+        );
+        let job = hub
+            .leave_http(
+                1,
+                &SyncLeaveRequest {
+                    client_id: "a".into(),
+                    kind: MediaKind::Tv,
+                    tmdb_id: 1622,
+                    position_sec: 125.0,
+                    duration_sec: None,
+                    finished: false,
+                },
+                t + 5_000,
+            )
+            .expect("expected save job when position >= 1s even without duration");
+        assert!((job.update.position_sec - 125.0).abs() < 0.01);
+        assert_eq!(job.update.duration_sec, 0.0);
+        assert_eq!(job.update.season, 1);
+        assert_eq!(job.update.episode, 1);
     }
 }

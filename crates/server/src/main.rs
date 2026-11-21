@@ -26,10 +26,15 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("binding {}", config.bind_addr))?;
     tracing::info!("listening on {}", config.bind_addr);
 
-    let catalog = catalog::from_settings(
+    let image_cache = config
+        .image_cache_dir
+        .clone()
+        .map(|dir| (dir, config.image_cache_max_mb));
+    let catalog = catalog::from_settings_with_image_cache(
         config.tmdb_api_key.as_deref(),
         &config.tmdb_language,
         config.tmdb_proxy.as_deref(),
+        image_cache,
     )?;
     let media = Arc::new(kino_server::play::Media::new(&config.torrents));
     let telegram =
@@ -49,9 +54,25 @@ async fn main() -> anyhow::Result<()> {
     kino_server::jobs::spawn(state.clone(), state.config.notify_every);
     kino_server::sync::spawn_reaper(state.clone());
     axum::serve(listener, app(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sig) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            sig.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

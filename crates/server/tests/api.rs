@@ -776,6 +776,7 @@ async fn sync_room_joins_and_protects_timecode(pool: PgPool) {
     assert!(!j1.joined_existing);
     assert!((j1.state.position_sec - 240.0).abs() < 2.0);
     assert_eq!(j1.state.members.len(), 1);
+    assert_eq!(j1.state.sound_client_id.as_deref(), Some("dev-1"));
 
     // Device 2 opens the same movie -> joins existing room, adopts its release, enters barrier.
     let other_hash = "f".repeat(40);
@@ -801,6 +802,7 @@ async fn sync_room_joins_and_protects_timecode(pool: PgPool) {
     assert!(j2.state.waiting);
     assert_eq!(j2.state.release.infohash, HASH);
     assert_eq!(j2.state.members.len(), 2);
+    assert_eq!(j2.state.sound_client_id.as_deref(), Some("dev-1"));
 
     // Stale HTTP progress (e.g. 5.0s while room is around 240s) must NOT overwrite DB progress.
     let (status, body_stale) = call(

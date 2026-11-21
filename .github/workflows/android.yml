@@ -20,13 +20,22 @@ on:
       - ".github/workflows/android.yml"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   android:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.ver.outputs.v }}
+      signed: ${{ steps.sign.outputs.signed }}
     env:
-      GH_TOKEN: ${{ github.token }}
       CI: "true"
     steps:
       - uses: actions/checkout@v4
@@ -81,9 +90,12 @@ jobs:
 
       - name: Install dx (Dioxus CLI 0.7.10)
         shell: bash
+        env:
+          DX_SHA256: "4363e4ed2a3f1eb7f4d38d2d59aed59ce43271c44c16b425e92c89a64761fbe7"
         run: |
           TMP_DX="$(mktemp -d)"
           curl -fsSL "https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10/dx-x86_64-unknown-linux-gnu.tar.gz" -o "$TMP_DX/dx.tar.gz"
+          echo "${DX_SHA256}  ${TMP_DX}/dx.tar.gz" | sha256sum -c -
           tar -xzf "$TMP_DX/dx.tar.gz" -C "$TMP_DX"
           DX_BIN="$(find "$TMP_DX" -type f -name dx | head -n 1)"
           install -m 755 "$DX_BIN" /usr/local/bin/dx
@@ -100,6 +112,7 @@ jobs:
         run: cargo clippy -p kino-app --no-default-features --features mobile --target aarch64-linux-android --all-targets --locked -- -D warnings
 
       - name: Configure optional release keystore
+        id: sign
         env:
           ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -108,29 +121,111 @@ jobs:
         shell: bash
         run: |
           if [ -n "${ANDROID_KEYSTORE_B64:-}" ]; then
-            echo "$ANDROID_KEYSTORE_B64" | base64 -d > app/android/release.jks
-            cat >> app/Dioxus.toml <<EOF
-
-          [bundle.android]
-          jks_file = "android/release.jks"
-          jks_password = "$ANDROID_KEYSTORE_PASSWORD"
-          key_alias = "$ANDROID_KEY_ALIAS"
-          key_password = "$ANDROID_KEY_PASSWORD"
-          EOF
+            printf '%s' "$ANDROID_KEYSTORE_B64" | base64 -d > app/android/release.jks
+            chmod 600 app/android/release.jks
+            python3 - <<'PY'
+          import json, os
+          lines = [
+              "",
+              "[bundle.android]",
+              'jks_file = "android/release.jks"',
+              f'jks_password = {json.dumps(os.environ.get("ANDROID_KEYSTORE_PASSWORD", ""))}',
+              f'key_alias = {json.dumps(os.environ.get("ANDROID_KEY_ALIAS", ""))}',
+              f'key_password = {json.dumps(os.environ.get("ANDROID_KEY_PASSWORD", ""))}',
+              "",
+          ]
+          with open("app/Dioxus.toml", "a", encoding="utf-8") as f:
+              f.write("\n".join(lines))
+          PY
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build Android APK
         shell: bash
+        env:
+          APP_VERSION_NAME: ${{ steps.ver.outputs.v }}
+          APP_VERSION_CODE: ${{ github.run_number }}
         run: |
-          dx bundle --package kino-app --platform android --target aarch64-linux-android --release --package-types apk --out-dir dist
-          APK_IN="$(find dist target/dx -type f -name '*.apk' | head -n 1)"
+          dx build --package kino-app --platform android --target aarch64-linux-android --release
+          GRADLE_DIR="$(find target/dx -maxdepth 6 -type f -name gradlew -exec dirname {} \; | head -n 1)"
+          if [ -z "$GRADLE_DIR" ]; then
+            echo "Gradle project not found under target/dx" >&2
+            exit 1
+          fi
+          RES_DIR="$GRADLE_DIR/app/src/main/res"
+          rm -f "$RES_DIR"/mipmap-*/ic_launcher*.webp \
+                "$RES_DIR"/drawable*/ic_launcher_foreground.xml \
+                "$RES_DIR"/drawable*/ic_launcher_background.xml
+          cp -rf app/android/res/* "$RES_DIR/"
+
+          BUILD_GRADLE="$GRADLE_DIR/app/build.gradle.kts"
+          [ -f "$BUILD_GRADLE" ] || BUILD_GRADLE="$GRADLE_DIR/app/build.gradle"
+          if [ -f "$BUILD_GRADLE" ]; then
+            python3 - "$BUILD_GRADLE" <<'PY'
+          import os, re, sys
+          path = sys.argv[1]
+          vc = os.environ["APP_VERSION_CODE"]
+          vn = os.environ["APP_VERSION_NAME"]
+          with open(path, "r", encoding="utf-8") as f:
+              txt = f.read()
+          txt = re.sub(r'(\bversionCode\s*=?\s*)\d+', rf'\g<1>{vc}', txt, count=1)
+          txt = re.sub(r'(\bversionName\s*=?\s*)"[^"]*"', rf'\g<1>"{vn}"', txt, count=1)
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(txt)
+          PY
+          fi
+
+          MANIFEST="$GRADLE_DIR/app/src/main/AndroidManifest.xml"
+          if [ -f "$MANIFEST" ]; then
+            python3 - "$MANIFEST" <<'PY'
+          import re, sys
+          path = sys.argv[1]
+          with open(path, "r", encoding="utf-8") as f:
+              xml = f.read()
+          def set_app_attr(text, attr, value):
+              pat = rf'(\bandroid:{attr}=")[^"]*(")'
+              if re.search(pat, text):
+                  return re.sub(pat, rf'\g<1>{value}\g<2>', text, count=1)
+              return re.sub(r'(<application\b)', rf'\1 android:{attr}="{value}"', text, count=1)
+          xml = set_app_attr(xml, "allowBackup", "false")
+          xml = set_app_attr(xml, "usesCleartextTraffic", "false")
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(xml)
+          PY
+          fi
+
+          if [ -f app/android/release.jks ]; then
+            TASK="assembleRelease"
+            APK_DIR="$GRADLE_DIR/app/build/outputs/apk/release"
+          else
+            TASK="assembleDebug"
+            APK_DIR="$GRADLE_DIR/app/build/outputs/apk/debug"
+          fi
+          (cd "$GRADLE_DIR" && chmod +x gradlew && ./gradlew "$TASK")
+
+          APK_IN="$(find "$APK_DIR" -type f -name '*.apk' ! -name '*-unsigned.apk' 2>/dev/null | head -n 1 || true)"
           if [ -z "$APK_IN" ]; then
-            echo "No APK generated" >&2
+            echo "No signed APK generated under $APK_DIR" >&2
             exit 1
           fi
           mkdir -p out
           cp "$APK_IN" out/orel-kino-arm64.apk
           ls -lh out/orel-kino-arm64.apk
+          if [ -f app/android/release.jks ] && [ -x "$ANDROID_HOME/build-tools/35.0.0/apksigner" ]; then
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose out/orel-kino-arm64.apk
+          fi
+          if [ -x "$ANDROID_HOME/build-tools/35.0.0/aapt2" ]; then
+            "$ANDROID_HOME/build-tools/35.0.0/aapt2" dump badging out/orel-kino-arm64.apk | head -n 10 || true
+          fi
+
+      - name: Cleanup keystore and modified config
+        if: always()
+        shell: bash
+        run: |
+          rm -f app/android/release.jks
+          git checkout -- app/Dioxus.toml || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -138,16 +233,48 @@ jobs:
           path: out/orel-kino-arm64.apk
           retention-days: 30
 
+  publish:
+    needs: [android]
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: orel-kino-android
+          path: out
+
       - name: Publish release
-        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          COMMIT_SHA: ${{ github.sha }}
+          APP_VERSION: ${{ needs.android.outputs.version }}
+          IS_SIGNED: ${{ needs.android.outputs.signed }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            tag=android-latest; title="Android: последняя сборка из main"
+          if [ "$EVENT_NAME" = "push" ]; then
+            if [ "$IS_SIGNED" != "true" ]; then
+              echo "Refusing to publish an unsigned/debuggable APK to android-latest; configure ANDROID_KEYSTORE_B64 secrets first." >&2
+              exit 1
+            fi
+            tag="android-latest"
+            title="Android: последняя сборка из main, ${APP_VERSION}"
           else
-            tag=android-preview; title="Android: пробная сборка (ветка ${{ github.head_ref }})"
+            tag="android-preview"
+            suffix=""
+            if [ "$IS_SIGNED" != "true" ]; then
+              suffix=" [debug]"
+            fi
+            title="Android: пробная сборка (ветка ${HEAD_REF})${suffix}, ${APP_VERSION}"
           fi
-          gh release delete "$tag" --yes --cleanup-tag || true
-          gh release create "$tag" out/orel-kino-arm64.apk \
-            --prerelease --title "$title, ${{ steps.ver.outputs.v }}" \
-            --notes "APK «Орловского кинопоказа» (arm64, ExoPlayer + Jellyfin FFmpeg). Коммит ${{ github.sha }}."
+          notes="APK «Орловского кинопоказа» (arm64, ExoPlayer + Jellyfin FFmpeg). Коммит ${COMMIT_SHA}."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" out/orel-kino-arm64.apk --clobber
+            gh release edit "$tag" --prerelease --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" out/orel-kino-arm64.apk \
+              --prerelease --title "$title" --notes "$notes"
+          fi
