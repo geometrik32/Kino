@@ -18,17 +18,25 @@ use kino_core::{
 };
 use kino_ui::{
     play_target, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter,
-    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, TitleExtrasView, TitleView, STYLE,
+    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI,
+    STYLE,
 };
+
+const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
+const THEME_KEY: &str = "kino.theme";
 
 fn main() {
     #[cfg(any(feature = "mobile", feature = "desktop"))]
     {
         // The WebView's own page: let the picture go under the notch and system bars
-        // (the screens add the safe-area padding themselves).
+        // (the screens add the safe-area padding themselves), and apply saved theme early.
         const HEAD: &str = r#"<script>
             var m = document.querySelector('meta[name=viewport]');
             if (m) { m.content += ', viewport-fit=cover'; }
+            try {
+                var t = localStorage.getItem('kino.theme');
+                if (t === 'dark' || t === 'light') { document.documentElement.dataset.theme = t; }
+            } catch (e) {}
         </script>"#;
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
         use dioxus::desktop::Config;
@@ -111,12 +119,41 @@ async fn establish() -> Session {
 #[component]
 fn App() -> Element {
     let mut session = use_signal(|| Session::Checking);
+    let mut theme = use_signal(|| {
+        if telegram::is_telegram() {
+            Theme::Auto
+        } else {
+            Theme::Dark
+        }
+    });
     use_effect(move || {
         telegram::init();
-        spawn(async move { session.set(establish().await) });
+        spawn(async move {
+            let in_tg = telegram::is_telegram();
+            let saved = platform::storage_get(THEME_KEY).await;
+            let initial = Theme::parse(saved.as_deref(), in_tg);
+            theme.set(initial);
+            platform::apply_theme(initial);
+            session.set(establish().await);
+        });
     });
 
+    let on_theme = move |next: Theme| {
+        telegram::haptic(telegram::Haptic::Select);
+        theme.set(next);
+        if next == Theme::Auto {
+            platform::storage_remove(THEME_KEY);
+        } else {
+            platform::storage_set(THEME_KEY, next.as_str());
+        }
+        platform::apply_theme(next);
+    };
+
     rsx! {
+        document::Link { rel: "icon", r#type: "image/svg+xml", href: FAVICON_URI }
+        document::Link { rel: "preconnect", href: "https://fonts.googleapis.com" }
+        document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
+        document::Link { rel: "stylesheet", href: FONTS_URL, media: "print", onload: "this.media='all'" }
         style { "{STYLE}" }
         match session() {
             Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
@@ -125,6 +162,8 @@ fn App() -> Element {
                 Main {
                     token,
                     name,
+                    theme: theme(),
+                    on_theme,
                     on_logout: move |_| {
                         api::forget_token();
                         session.set(Session::LoggedOut { error: None });
@@ -253,7 +292,13 @@ enum View {
 }
 
 #[component]
-fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
+fn Main(
+    token: String,
+    name: String,
+    theme: Theme,
+    on_theme: EventHandler<Theme>,
+    on_logout: EventHandler<()>,
+) -> Element {
     // A link to a title (from a bot message) opens it, with Home behind it.
     let link = use_hook(telegram::open_target);
     let mut view = use_signal(|| match link {
@@ -329,6 +374,8 @@ fn Main(token: String, name: String, on_logout: EventHandler<()>) -> Element {
                     Profile {
                         token: token.clone(),
                         name: name.clone(),
+                        theme,
+                        on_theme,
                         on_open: move |(k, id)| open_title(k, id, false),
                         on_logout,
                     }
@@ -467,6 +514,8 @@ fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
 fn Profile(
     token: String,
     name: String,
+    theme: Theme,
+    on_theme: EventHandler<Theme>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
@@ -495,8 +544,11 @@ fn Profile(
             history,
             preloads,
             prefs: prefs_now().unwrap_or(prefs),
+            theme,
+            in_telegram: telegram::is_telegram(),
             now,
             utc_offset_min,
+            on_theme,
             on_prefs: move |p: UserPrefs| {
                 // The studio is no longer chosen here, so an old one must not linger unseen.
                 let p = UserPrefs { voice: None, ..p };

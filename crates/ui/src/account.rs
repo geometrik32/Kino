@@ -73,15 +73,54 @@ const QUALITIES: [&str; 3] = ["2160p", "1080p", "720p"];
 const LANGUAGES: [&str; 3] = ["Русский", "Английский", "Украинский"];
 const SUBTITLES: [&str; 2] = ["Русский", "Английский"];
 
+/// Colour theme selected in the profile (`dark` / `light`, or `auto` inside Telegram).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Theme {
+    Dark,
+    Light,
+    Auto,
+}
+
+impl Theme {
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Dark => "Тёмная",
+            Theme::Light => "Светлая",
+            Theme::Auto => "Как в Telegram",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Theme::Dark => "dark",
+            Theme::Light => "light",
+            Theme::Auto => "auto",
+        }
+    }
+
+    pub fn parse(s: Option<&str>, in_telegram: bool) -> Self {
+        match s {
+            Some("dark") => Theme::Dark,
+            Some("light") => Theme::Light,
+            Some("auto") if in_telegram => Theme::Auto,
+            _ if in_telegram => Theme::Auto,
+            _ => Theme::Dark,
+        }
+    }
+}
+
 #[component]
 pub fn ProfileView(
     name: String,
     history: Vec<HistoryEntry>,
     preloads: Vec<PreloadItem>,
     prefs: UserPrefs,
+    theme: Theme,
+    in_telegram: bool,
     /// Current time and the viewer's UTC offset in minutes, for dates.
     now: DateTime<Utc>,
     utc_offset_min: i32,
+    on_theme: EventHandler<Theme>,
     on_prefs: EventHandler<UserPrefs>,
     on_delete_preload: EventHandler<i64>,
     on_open: EventHandler<(MediaKind, i64)>,
@@ -95,6 +134,30 @@ pub fn ProfileView(
             div {
                 h2 { "{name}" }
                 button { class: "link", onclick: move |_| on_logout.call(()), "Выйти" }
+            }
+        }
+        section { class: "section",
+            h2 { "Оформление" }
+            div { class: "panel",
+                div { class: "frow",
+                    div { class: "fname", "Тема" }
+                    div { class: "fopts",
+                        for t in [Theme::Dark, Theme::Light] {
+                            button {
+                                class: if theme == t { "chip sm active" } else { "chip sm" },
+                                onclick: move |_| on_theme.call(t),
+                                "{t.label()}"
+                            }
+                        }
+                        if in_telegram {
+                            button {
+                                class: if theme == Theme::Auto { "chip sm active" } else { "chip sm" },
+                                onclick: move |_| on_theme.call(Theme::Auto),
+                                "{Theme::Auto.label()}"
+                            }
+                        }
+                    }
+                }
             }
         }
         section { class: "section",
@@ -231,7 +294,7 @@ fn PreloadRow(item: PreloadItem, now: DateTime<Utc>, on_delete: EventHandler<i64
     let id = item.id;
     let cls = match item.state {
         PreloadState::Ready => "tag ok",
-        PreloadState::Failed => "tag warn",
+        PreloadState::Failed => "tag err",
         _ => "tag",
     };
     rsx! {

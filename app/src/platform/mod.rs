@@ -53,6 +53,19 @@ pub async fn touch_screen() -> bool {
         .unwrap_or(false)
 }
 
+/// Applies the chosen colour theme to `<html data-theme>` and system/Telegram bars.
+pub fn apply_theme(theme: kino_ui::Theme) {
+    let js = match theme {
+        kino_ui::Theme::Dark => "document.documentElement.dataset.theme = 'dark';",
+        kino_ui::Theme::Light => "document.documentElement.dataset.theme = 'light';",
+        kino_ui::Theme::Auto => "delete document.documentElement.dataset.theme;",
+    };
+    let _ = dioxus::document::eval(js);
+    crate::telegram::paint_bars();
+    #[cfg(target_os = "android")]
+    android::style_bars(theme == kino_ui::Theme::Light);
+}
+
 /// The player takes the screen: on a phone the picture turns to landscape and the
 /// system bars go away; `false` gives everything back.
 pub fn player_mode(on: bool) {

@@ -21,7 +21,7 @@ pub async fn init() {
     let saved = storage_get(SERVER_KEY).await.filter(|s| s.starts_with("http"));
     super::set_server_base(saved.as_deref().unwrap_or(DEFAULT_SERVER));
     #[cfg(target_os = "android")]
-    super::android::style_bars();
+    super::android::style_bars(false);
 }
 
 /// Remembers a server address chosen by the user; takes effect after restart of the app.

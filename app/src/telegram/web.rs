@@ -51,13 +51,39 @@ fn call(path: &[&str], method: &str, args: &[JsValue]) {
     let _ = f.apply(&target, &args);
 }
 
-/// Dark palette of the app, used where Telegram's own colours cannot be.
-const APP_BG: &str = "#0d0f14";
+/// Palette colours of the app, used where Telegram's own colours cannot be.
+const DARK_BG: &str = "#0E1621";
+const LIGHT_BG: &str = "#F7F2E8";
+const DARK_ACCENT: (&str, &str) = ("#38C6BD", "#0B141B");
+const LIGHT_ACCENT: (&str, &str) = ("#0B6B65", "#FAF7F0");
+
+/// True only inside a real Telegram Mini App session (the WebApp JS bridge also loads on the web).
+pub fn is_telegram() -> bool {
+    init_data().is_some()
+}
+
+fn is_light_now() -> bool {
+    let override_theme = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .and_then(|r| r.get_attribute("data-theme"));
+    match override_theme.as_deref() {
+        Some("light") => true,
+        Some("dark") => false,
+        _ => web_app()
+            .and_then(|w| get(&w, "colorScheme"))
+            .and_then(|v| v.as_string())
+            .is_some_and(|s| s == "light"),
+    }
+}
 
 /// Makes the page behave like part of Telegram: full height, no swipe-to-close while
 /// scrolling, native bars in the page colour, and CSS classes (`tg`, `tg-dark`/`tg-light`,
 /// `tg-<platform>`) that the stylesheet uses. Does nothing in a normal browser.
 pub fn init() {
+    if !is_telegram() {
+        return;
+    }
     let Some(w) = web_app() else { return };
     let Some(root) = web_sys::window()
         .and_then(|w| w.document())
@@ -116,12 +142,25 @@ fn cover_notch() {
 }
 
 /// Header, background and bottom bar of Telegram in the colour of the page.
-fn paint_bars() {
+pub fn paint_bars() {
+    if !is_telegram() {
+        return;
+    }
     let Some(w) = web_app() else { return };
-    let params = get(&w, "themeParams");
-    let dark = get(&w, "colorScheme").and_then(|v| v.as_string()).as_deref() != Some("light");
-    let from_theme = |key: &str| params.as_ref().and_then(|p| get(p, key)).and_then(|v| v.as_string());
-    let bg = from_theme("bg_color").unwrap_or_else(|| if dark { APP_BG.into() } else { "#ffffff".into() });
+    let override_theme = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.document_element())
+        .and_then(|r| r.get_attribute("data-theme"));
+    let bg = match override_theme.as_deref() {
+        Some("dark") => DARK_BG.into(),
+        Some("light") => LIGHT_BG.into(),
+        _ => {
+            let params = get(&w, "themeParams");
+            let dark = get(&w, "colorScheme").and_then(|v| v.as_string()).as_deref() != Some("light");
+            let from_theme = |key: &str| params.as_ref().and_then(|p| get(p, key)).and_then(|v| v.as_string());
+            from_theme("bg_color").unwrap_or_else(|| if dark { DARK_BG.into() } else { "#ffffff".into() })
+        }
+    };
     for method in ["setHeaderColor", "setBackgroundColor", "setBottomBarColor"] {
         call(&[], method, &[JsValue::from_str(&bg)]);
     }
@@ -183,10 +222,11 @@ pub fn show_main_button(text: &str, on_click: impl FnMut() + 'static) {
     let closure = Closure::<dyn FnMut()>::new(on_click);
     call(&["MainButton"], "onClick", &[closure.as_ref().clone()]);
     MAIN.with(|m| *m.borrow_mut() = Some(closure));
+    let (accent, fg) = if is_light_now() { LIGHT_ACCENT } else { DARK_ACCENT };
     let params = js_sys::Object::new();
     let _ = Reflect::set(&params, &"text".into(), &text.into());
-    let _ = Reflect::set(&params, &"color".into(), &ACCENT.into());
-    let _ = Reflect::set(&params, &"text_color".into(), &"#ffffff".into());
+    let _ = Reflect::set(&params, &"color".into(), &accent.into());
+    let _ = Reflect::set(&params, &"text_color".into(), &fg.into());
     let _ = Reflect::set(&params, &"is_visible".into(), &true.into());
     let _ = Reflect::set(&params, &"is_active".into(), &true.into());
     set_root_class("tg-main", true);
@@ -218,9 +258,6 @@ fn set_root_class(name: &str, on: bool) {
         };
     }
 }
-
-/// Brand red, as in the stylesheet.
-const ACCENT: &str = "#e5484d";
 
 // --- Haptics -----------------------------------------------------------------
 

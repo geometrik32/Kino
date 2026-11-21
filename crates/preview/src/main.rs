@@ -18,9 +18,11 @@ use kino_core::{
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
     mock_releases, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayerEpisode, PlayerMenu, PlayerState,
-    PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab,
-    TitleExtrasView, TitleView, STYLE,
+    PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, Theme,
+    TitleExtrasView, TitleView, FAVICON_URI, STYLE,
 };
+
+const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
 
 #[derive(Clone, PartialEq)]
 struct Picker {
@@ -59,6 +61,7 @@ enum Screen {
 #[derive(Props, Clone, PartialEq)]
 struct PageProps {
     screen: Screen,
+    light: bool,
 }
 
 fn Page(props: PageProps) -> Element {
@@ -98,7 +101,7 @@ fn Page(props: PageProps) -> Element {
         Screen::Login => {
             return rsx! {
                 LoginView { invite: Some("demo".to_string()),
-                    button { class: "tg-btn", "✈ Войти через Telegram" }
+                    button { class: "btn primary", "Войти через Telegram" }
                 }
             }
         }
@@ -114,8 +117,11 @@ fn Page(props: PageProps) -> Element {
                 history,
                 preloads,
                 prefs,
+                theme: if props.light { Theme::Light } else { Theme::Dark },
+                in_telegram: false,
                 now: Utc::now(),
                 utc_offset_min: 180,
+                on_theme: |_| {},
                 on_prefs: |_| {},
                 on_delete_preload: |_| {},
                 on_open: |_| {},
@@ -206,13 +212,19 @@ fn release(hash: char, title: &str) -> ReleaseRef {
     }
 }
 
-fn page(screen: Screen, title: &str) -> String {
-    let mut dom = VirtualDom::new_with_props(Page, PageProps { screen });
+fn page(screen: Screen, title: &str, light: bool) -> String {
+    let mut dom = VirtualDom::new_with_props(Page, PageProps { screen, light });
     dom.rebuild_in_place();
     let body = dioxus_ssr::render(&dom);
+    let theme_attr = if light { " data-theme=\"light\"" } else { "" };
     format!(
-        "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\
+        "<!doctype html><html lang=\"ru\"{theme_attr}><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <link rel=\"icon\" type=\"image/svg+xml\" href=\"{FAVICON_URI}\">\
+         <link rel=\"preconnect\" href=\"https://fonts.googleapis.com\">\
+         <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\
+         <link rel=\"stylesheet\" href=\"{FONTS_URL}\" media=\"print\" onload=\"this.media='all'\">\
+         <noscript><link rel=\"stylesheet\" href=\"{FONTS_URL}\"></noscript>\
          <title>{title} — Орловский кинопоказ</title><style>{STYLE}</style></head><body>{body}</body></html>"
     )
 }
@@ -666,9 +678,18 @@ async fn main() -> anyhow::Result<()> {
         ("login", "Вход", Screen::Login),
     ];
     for (file, title, screen) in pages {
+        let light_pair = match file {
+            "home" | "movie" | "person" | "profile" | "login" | "player-loading" => Some(screen.clone()),
+            _ => None,
+        };
         let path = out.join(format!("{file}.html"));
-        std::fs::write(&path, page(screen, title))?;
+        std::fs::write(&path, page(screen, title, false))?;
         println!("{}", path.display());
+        if let Some(s) = light_pair {
+            let lpath = out.join(format!("{file}-light.html"));
+            std::fs::write(&lpath, page(s, title, true))?;
+            println!("{}", lpath.display());
+        }
     }
     Ok(())
 }

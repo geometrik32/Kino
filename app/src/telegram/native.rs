@@ -5,7 +5,11 @@ use std::collections::BTreeMap;
 pub fn init_data() -> Option<String> {
     None
 }
+pub fn is_telegram() -> bool {
+    false
+}
 pub fn init() {}
+pub fn paint_bars() {}
 pub fn push_back(_handler: impl FnMut() + 'static) -> u64 {
     0
 }

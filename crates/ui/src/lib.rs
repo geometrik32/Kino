@@ -15,6 +15,21 @@ use kino_core::{
 /// The stylesheet all components rely on.
 pub const STYLE: &str = include_str!("style.css");
 
+/// Browser tab favicon: pure turquoise ring adapting to light/dark chrome.
+pub const FAVICON_URI: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3Ecircle%7Bstroke:%230B6B65%7D@media(prefers-color-scheme:dark)%7Bcircle%7Bstroke:%2338C6BD%7D%7D%3C/style%3E%3Ccircle cx='16' cy='16' r='10.5' fill='none' stroke-width='5'/%3E%3C/svg%3E";
+
+/// Large brand mark (smooth eagle profile inside a turquoise film-reel ring).
+#[component]
+pub fn BrandMark() -> Element {
+    rsx! { div { class: "brand-mark", dangerous_inner_html: include_str!("brand.svg") } }
+}
+
+/// Compact turquoise ring mark without the eagle for small topbar sizes.
+#[component]
+pub fn RingMark() -> Element {
+    rsx! { span { class: "ring-mark", dangerous_inner_html: include_str!("ring.svg") } }
+}
+
 /// Top-level sections of the app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
@@ -111,7 +126,11 @@ pub fn Shell(
 ) -> Element {
     rsx! {
         header { class: "topbar",
-            button { class: "logo", onclick: move |_| on_tab.call(Tab::Home), "Орловский", span { " кинопоказ" } }
+            button { class: "logo", onclick: move |_| on_tab.call(Tab::Home),
+                RingMark {}
+                "Орловский"
+                span { "кинопоказ" }
+            }
             nav { class: "nav",
                 for t in TABS {
                     button {
@@ -739,7 +758,8 @@ pub fn LoginView(invite: Option<String>, error: Option<String>, children: Elemen
     rsx! {
         div { class: "login",
             div { class: "box",
-                div { class: "logo", "Орловский", span { " кинопоказ" } }
+                BrandMark {}
+                div { class: "logo", "Орловский", span { "кинопоказ" } }
                 p { "Фильмы и сериалы с вашего сервера. Прогресс просмотра синхронизируется между телефоном, компьютером и телевизором." }
                 if invite.is_some() {
                     p { class: "rating", "Вас пригласили. Войдите через Telegram, чтобы принять приглашение." }
