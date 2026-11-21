@@ -162,19 +162,15 @@ impl TmdbCatalog {
 
     async fn search_typed_with_year(&self, query: &str, year: i32) -> Vec<TitleSummary> {
         let y = year.to_string();
+        let movie_params = [("query", query), ("year", y.as_str()), ("include_adult", "false")];
+        let tv_params = [
+            ("query", query),
+            ("first_air_date_year", y.as_str()),
+            ("include_adult", "false"),
+        ];
         let (movies, tv) = tokio::join!(
-            self.get::<Page>(
-                "/search/movie",
-                &[("query", query), ("year", y.as_str()), ("include_adult", "false")],
-            ),
-            self.get::<Page>(
-                "/search/tv",
-                &[
-                    ("query", query),
-                    ("first_air_date_year", y.as_str()),
-                    ("include_adult", "false"),
-                ],
-            ),
+            self.get::<Page>("/search/movie", &movie_params),
+            self.get::<Page>("/search/tv", &tv_params),
         );
         let mut out = Vec::new();
         if let Ok(p) = movies {
