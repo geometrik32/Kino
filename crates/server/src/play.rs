@@ -55,7 +55,7 @@ pub struct Media {
 }
 
 /// How many videos the server re-encodes at the same time.
-const MAX_TRANSCODES: usize = 2;
+const MAX_TRANSCODES: usize = 4;
 
 impl Media {
     pub fn new(c: &TorrentConfig) -> Self {
@@ -295,6 +295,8 @@ async fn play(
     let prefs = userdata::get_prefs(&state.pool, user.0).await?;
     let (audio_track, subtitle_track) =
         choose_tracks(&probe, st.audio_track.as_deref(), st.subtitle_track.as_deref(), &prefs);
+    // Extracting embedded subtitles scans to EOF and blocks `<video default>` on live torrent streams.
+    let subtitle_track = if preloaded { subtitle_track } else { None };
     let next = match episode {
         Some(e) => next_episode(&state.catalog.details(MediaKind::Tv, req.tmdb_id).await?, e),
         None => None,
@@ -383,7 +385,8 @@ fn safe_join(dir: &FsPath, rel: &str) -> Option<PathBuf> {
         .then(|| dir.join(rel))
 }
 
-/// The remembered tracks, else the preferred voice-over and subtitle language.
+/// The remembered tracks, else the preferred voice-over and audio language.
+/// Subtitles stay off unless the user explicitly picked a track for this title.
 pub fn choose_tracks(
     probe: &Probe,
     audio: Option<&str>,
@@ -422,15 +425,8 @@ pub fn choose_tracks(
                 .map(|t| t.index)
         });
     let subtitle = match subtitle {
-        Some("off") => None,
-        Some(l) if by_label(&probe.subtitles, Some(l)).is_some() => by_label(&probe.subtitles, Some(l)),
-        _ => prefs.subtitle_lang.as_deref().and_then(|want| {
-            probe
-                .subtitles
-                .iter()
-                .find(|t| t.language.as_deref().map(language_name) == Some(want))
-                .map(|t| t.index)
-        }),
+        Some("off") | None => None,
+        Some(l) => by_label(&probe.subtitles, Some(l)),
     };
     (audio, subtitle)
 }
@@ -477,7 +473,7 @@ async fn stream(
     if q.audio.is_some() || q.start.is_some() {
         // A seek drops the previous request (and its ffmpeg) first, so wait a moment for its slot.
         let permit = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(10),
             media.transcodes.clone().acquire_owned(),
         )
         .await
@@ -593,13 +589,18 @@ async fn subtitle(
     Query(q): Query<StreamQuery>,
 ) -> Result<Response, AppError> {
     let c = claims(&state, &token)?;
+    if c.p.is_none() {
+        return Err(unavailable(
+            "Встроенные субтитры недоступны при потоковом просмотре с торрента",
+        ));
+    }
     let index: i32 = file
         .trim_end_matches(".vtt")
         .parse()
         .map_err(|_| AppError::bad_request("expected <number>.vtt"))?;
     let input = input_of(&state, &c)?;
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(60),
         tokio::process::Command::new(&state.media.ffmpeg)
             .args(ffmpeg::subtitle_args(&input, index, q.start.unwrap_or(0)))
             .kill_on_drop(true)
@@ -644,7 +645,11 @@ mod tests {
             subtitle_lang: Some("Русский".into()),
             ..none
         };
-        assert_eq!(choose_tracks(&probe, None, None, &prefs), (Some(1), Some(1)));
+        assert_eq!(choose_tracks(&probe, None, None, &prefs), (Some(1), None));
+        assert_eq!(
+            choose_tracks(&probe, None, Some("Полные · Русский"), &prefs),
+            (Some(1), Some(1))
+        );
         // Just a language in the profile: the first audio track in it, studio or not.
         let by_language = UserPrefs {
             language: Some("Русский".into()),

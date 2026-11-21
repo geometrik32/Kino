@@ -10,22 +10,30 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{Duration as ChronoDuration, Utc};
+use futures_util::future::join_all;
 use kino_core::{
     CastMember, CatalogRow, Episode, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, SeasonSummary,
-    TitleDetails, TitleExtras, TitleSummary,
+    ShelfPage, TitleDetails, TitleExtras, TitleSummary,
 };
+use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize};
 
 use super::{
-    anchor_word_query, matches_normalized_query, normalize_search_text, year_of, yo_query_variants, Catalog,
-    CatalogError,
+    anchor_word_query, matches_normalized_query, normalize_search_text,
+    personalize::{
+        because_shelf_page, because_shelf_row, categories_for, deferred_stub, filter_excluded, parse_because_id,
+        rank_shelves, ShelfMeta, UserTaste, INITIAL_HOME_ROWS,
+    },
+    year_of, yo_query_variants, Catalog, CatalogError, RandomMovieFilter, RandomMoviePick,
 };
 
 const API: &str = "https://api.themoviedb.org/3";
 const IMAGES: &str = "https://image.tmdb.org/t/p";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 /// Answers kept at most; the oldest are dropped first.
-const CACHE_MAX: usize = 400;
+const CACHE_MAX: usize = 2000;
+const MAX_SHELF_PAGE: u32 = 20;
 const ALLOWED_SIZES: [&str; 5] = ["w185", "w300", "w342", "w780", "w1280"];
 
 /// A network error without the request URL, which carries the API key.
@@ -95,9 +103,54 @@ impl TmdbCatalog {
         Ok(parsed)
     }
 
-    async fn list(&self, path: &str, kind: Option<MediaKind>) -> Result<Vec<TitleSummary>, CatalogError> {
-        let page: Page = self.get(path, &[]).await?;
-        Ok(page.results.into_iter().filter_map(|r| r.into_summary(kind)).collect())
+    async fn fetch_shelf_raw(&self, spec: &TmdbShelf, page: u32) -> Result<(Vec<TitleSummary>, bool), CatalogError> {
+        let page_num = page.clamp(1, MAX_SHELF_PAGE);
+        let page_str = page_num.to_string();
+        let mut owned: Vec<(&str, String)> = Vec::new();
+        owned.push(("page", page_str));
+        if let Some(days) = spec.recent_days {
+            let today = Utc::now().date_naive();
+            let since = today - ChronoDuration::days(days);
+            let date_field = match spec.meta.kind {
+                Some(MediaKind::Tv) => ("first_air_date.gte", "first_air_date.lte"),
+                _ => ("primary_release_date.gte", "primary_release_date.lte"),
+            };
+            owned.push((date_field.0, since.format("%Y-%m-%d").to_string()));
+            owned.push((date_field.1, today.format("%Y-%m-%d").to_string()));
+        }
+        let mut query: Vec<(&str, &str)> = spec.query.to_vec();
+        for (k, v) in &owned {
+            query.push((k, v.as_str()));
+        }
+        let res: DiscoverPage = self.get(spec.path, &query).await?;
+        let items = res
+            .results
+            .into_iter()
+            .filter_map(|r| r.into_summary(spec.meta.kind))
+            .filter(|t| t.poster_path.is_some())
+            .collect();
+        let total = res.total_pages.max(1).min(MAX_SHELF_PAGE);
+        Ok((items, page_num < total))
+    }
+
+    async fn fetch_shelf_filtered(
+        &self,
+        spec: &TmdbShelf,
+        page: u32,
+        taste: &UserTaste,
+    ) -> Result<(Vec<TitleSummary>, u32, bool), CatalogError> {
+        let mut page_num = page.clamp(1, MAX_SHELF_PAGE);
+        let (raw, mut has_more) = self.fetch_shelf_raw(spec, page_num).await?;
+        let mut items = filter_excluded(raw, &taste.excluded);
+        // If exclusions trimmed page 1 aggressively, top up once from page 2.
+        if page == 1 && items.len() < 8 && has_more {
+            if let Ok((more, next_has_more)) = self.fetch_shelf_raw(spec, 2).await {
+                merge_unique(&mut items, filter_excluded(more, &taste.excluded));
+                page_num = 2;
+                has_more = next_has_more;
+            }
+        }
+        Ok((items, page_num, has_more))
     }
 
     async fn search_page(&self, query: &str) -> Result<Vec<TitleSummary>, CatalogError> {
@@ -105,6 +158,40 @@ impl TmdbCatalog {
             .get("/search/multi", &[("query", query), ("include_adult", "false")])
             .await?;
         Ok(page.results.into_iter().filter_map(|r| r.into_summary(None)).collect())
+    }
+
+    async fn discover_movie_page(
+        &self,
+        genre_id: Option<i32>,
+        runtime: Option<(i32, i32)>,
+        min_rating: Option<f32>,
+        page: u32,
+    ) -> Result<(Vec<TitleSummary>, u32), CatalogError> {
+        let mut params = vec![
+            ("include_adult", "false".to_owned()),
+            ("include_video", "false".to_owned()),
+            ("sort_by", "popularity.desc".to_owned()),
+            ("vote_count.gte", "50".to_owned()),
+            ("page", page.to_string()),
+        ];
+        if let Some(g) = genre_id {
+            params.push(("with_genres", g.to_string()));
+        }
+        if let Some((lo, hi)) = runtime {
+            params.push(("with_runtime.gte", lo.to_string()));
+            params.push(("with_runtime.lte", hi.to_string()));
+        }
+        if let Some(r) = min_rating {
+            params.push(("vote_average.gte", format!("{r:.1}")));
+        }
+        let refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let page: DiscoverPage = self.get("/discover/movie", &refs).await?;
+        let items = page
+            .results
+            .into_iter()
+            .filter_map(|r| r.into_summary(Some(MediaKind::Movie)))
+            .collect();
+        Ok((items, page.total_pages))
     }
 }
 
@@ -147,6 +234,13 @@ fn trim_insert(
 #[derive(Deserialize)]
 struct Page {
     results: Vec<ListItem>,
+}
+
+#[derive(Deserialize)]
+struct DiscoverPage {
+    results: Vec<ListItem>,
+    #[serde(default)]
+    total_pages: u32,
 }
 
 /// A movie or TV result; TMDB uses different field names for each.
@@ -398,30 +492,553 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
     })
 }
 
+struct TmdbShelf {
+    meta: ShelfMeta,
+    path: &'static str,
+    query: &'static [(&'static str, &'static str)],
+    recent_days: Option<i64>,
+}
+
+const TMDB_SHELVES: &[TmdbShelf] = &[
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "trending_tv",
+            title: "Популярные сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &[],
+            base_priority: 95,
+        },
+        path: "/trending/tv/week",
+        query: &[],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "trending_movie",
+            title: "Популярные фильмы",
+            subtitle: None,
+            categories: &["for_you", "movies"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &[],
+            base_priority: 95,
+        },
+        path: "/trending/movie/week",
+        query: &[],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "fresh_movies",
+            title: "Свежие новинки кино",
+            subtitle: None,
+            categories: &["for_you", "movies", "fresh"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &[],
+            base_priority: 88,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "40"),
+            ("include_adult", "false"),
+        ],
+        recent_days: Some(450),
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "fresh_tv",
+            title: "Новые и актуальные сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "fresh"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &[],
+            base_priority: 88,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "25"),
+            ("include_adult", "false"),
+        ],
+        recent_days: Some(450),
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "top_movies",
+            title: "С высоким рейтингом",
+            subtitle: None,
+            categories: &["for_you", "movies"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &[],
+            base_priority: 82,
+        },
+        path: "/movie/top_rated",
+        query: &[],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "top_tv",
+            title: "Культовые сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &[],
+            base_priority: 82,
+        },
+        path: "/tv/top_rated",
+        query: &[],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "scifi_movies",
+            title: "Фантастика и киберпанк",
+            subtitle: None,
+            categories: &["for_you", "movies", "scifi"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["фантастика"],
+            base_priority: 72,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "878"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "250"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "scifi_tv",
+            title: "Фантастические и фэнтези-сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "scifi"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &["фантастика", "фэнтези"],
+            base_priority: 72,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_genres", "10765"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "100"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "thriller_movies",
+            title: "Напряжённые триллеры",
+            subtitle: None,
+            categories: &["for_you", "movies", "thriller"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["триллер"],
+            base_priority: 70,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "53"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "250"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "crime_tv",
+            title: "Детективы и криминальные сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "thriller"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &["криминал", "детектив", "триллер"],
+            base_priority: 70,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_genres", "80,9648"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "80"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "comedy_movies",
+            title: "Комедии для лёгкого вечера",
+            subtitle: None,
+            categories: &["for_you", "movies", "comedy"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["комедия"],
+            base_priority: 68,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "35"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "250"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "comedy_tv",
+            title: "Комедийные сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "comedy"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &["комедия"],
+            base_priority: 66,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_genres", "35"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "100"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "action_movies",
+            title: "Зрелищные боевики",
+            subtitle: None,
+            categories: &["for_you", "movies", "action"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["боевик"],
+            base_priority: 68,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "28"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "250"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "drama_movies",
+            title: "Сильные драмы",
+            subtitle: None,
+            categories: &["for_you", "movies", "drama"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["драма"],
+            base_priority: 64,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "18"),
+            ("sort_by", "vote_average.desc"),
+            ("vote_count.gte", "1000"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "drama_tv",
+            title: "Драматические сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "drama"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &["драма"],
+            base_priority: 64,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_genres", "18"),
+            ("sort_by", "vote_average.desc"),
+            ("vote_count.gte", "500"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "anime_tv",
+            title: "Аниме-сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "animation"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &["мультфильм", "аниме"],
+            base_priority: 65,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_genres", "16"),
+            ("with_original_language", "ja"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "40"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "animation_movies",
+            title: "Мультфильмы для всей семьи",
+            subtitle: None,
+            categories: &["for_you", "movies", "animation"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["мультфильм", "семейный"],
+            base_priority: 63,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "16"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "250"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "ru_movies",
+            title: "Российское кино",
+            subtitle: None,
+            categories: &["for_you", "movies", "ru"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &[],
+            base_priority: 62,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_original_language", "ru"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "25"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "ru_tv",
+            title: "Российские сериалы",
+            subtitle: None,
+            categories: &["for_you", "tv", "ru"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &[],
+            base_priority: 62,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_original_language", "ru"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "15"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "fantasy_movies",
+            title: "Фэнтези и приключения",
+            subtitle: None,
+            categories: &["for_you", "movies", "scifi"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["фэнтези", "приключения"],
+            base_priority: 60,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "14,12"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "300"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "horror_movies",
+            title: "Ужасы и мистика",
+            subtitle: None,
+            categories: &["for_you", "movies", "thriller"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["ужасы"],
+            base_priority: 58,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "27"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "200"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "hidden_gems",
+            title: "Неочевидные шедевры",
+            subtitle: Some("Высокая оценка зрителей"),
+            categories: &["for_you", "movies"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &[],
+            base_priority: 59,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("sort_by", "vote_average.desc"),
+            ("vote_average.gte", "7.7"),
+            ("vote_count.gte", "400"),
+            ("vote_count.lte", "4500"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "doc_movies",
+            title: "Документальное кино",
+            subtitle: None,
+            categories: &["for_you", "movies"],
+            kind: Some(MediaKind::Movie),
+            genre_tags: &["документальный"],
+            base_priority: 52,
+        },
+        path: "/discover/movie",
+        query: &[
+            ("with_genres", "99"),
+            ("sort_by", "vote_average.desc"),
+            ("vote_count.gte", "150"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+    TmdbShelf {
+        meta: ShelfMeta {
+            id: "kdrama_tv",
+            title: "Корейские дорамы и хиты",
+            subtitle: None,
+            categories: &["for_you", "tv"],
+            kind: Some(MediaKind::Tv),
+            genre_tags: &[],
+            base_priority: 56,
+        },
+        path: "/discover/tv",
+        query: &[
+            ("with_original_language", "ko"),
+            ("sort_by", "popularity.desc"),
+            ("vote_count.gte", "40"),
+            ("include_adult", "false"),
+        ],
+        recent_days: None,
+    },
+];
+
+fn find_tmdb_shelf(id: &str) -> Option<&'static TmdbShelf> {
+    TMDB_SHELVES.iter().find(|s| s.meta.id == id)
+}
+
 #[async_trait]
 impl Catalog for TmdbCatalog {
-    async fn home(&self) -> Result<HomeFeed, CatalogError> {
-        let (tv, movies, top) = tokio::try_join!(
-            self.list("/trending/tv/week", Some(MediaKind::Tv)),
-            self.list("/trending/movie/week", Some(MediaKind::Movie)),
-            self.list("/movie/top_rated", Some(MediaKind::Movie)),
-        )?;
+    async fn home_for(&self, taste: &UserTaste) -> Result<HomeFeed, CatalogError> {
+        let metas: Vec<ShelfMeta> = TMDB_SHELVES.iter().map(|s| s.meta).collect();
+        let ranked = rank_shelves(&metas, taste);
+        let initial_needed = INITIAL_HOME_ROWS.saturating_sub(taste.personal_rows.len());
+
+        let (initial_metas, deferred_metas) = ranked.split_at(initial_needed.min(ranked.len()));
+        let initial_specs: Vec<&'static TmdbShelf> =
+            initial_metas.iter().filter_map(|m| find_tmdb_shelf(m.id)).collect();
+
+        let fetched = join_all(
+            initial_specs
+                .iter()
+                .map(|spec| self.fetch_shelf_filtered(spec, 1, taste)),
+        )
+        .await;
+
+        let mut rows: Vec<CatalogRow> = taste.personal_rows.iter().take(INITIAL_HOME_ROWS).cloned().collect();
+        let mut first_err: Option<CatalogError> = None;
+        for (spec, res) in initial_specs.into_iter().zip(fetched) {
+            match res {
+                Ok((items, page, has_more)) if !items.is_empty() => rows.push(CatalogRow {
+                    id: spec.meta.id.to_owned(),
+                    title: spec.meta.title.to_owned(),
+                    subtitle: spec.meta.subtitle.map(str::to_owned),
+                    categories: spec.meta.categories.iter().map(|c| (*c).to_owned()).collect(),
+                    loaded: true,
+                    has_more,
+                    page,
+                    items,
+                }),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(shelf = spec.meta.id, error = %e, "initial home shelf failed");
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+        }
+        if rows.is_empty() {
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+        for meta in deferred_metas {
+            rows.push(deferred_stub(meta));
+        }
+
+        let categories = categories_for(&rows);
         Ok(HomeFeed {
-            rows: vec![
-                CatalogRow {
-                    title: "Популярные сериалы".into(),
-                    items: tv,
-                },
-                CatalogRow {
-                    title: "Популярные фильмы".into(),
-                    items: movies,
-                },
-                CatalogRow {
-                    title: "С высоким рейтингом".into(),
-                    items: top,
-                },
-            ],
+            rows,
+            categories,
             demo: false,
+        })
+    }
+
+    async fn home_shelves(&self, ids: &[String], taste: &UserTaste) -> Result<Vec<CatalogRow>, CatalogError> {
+        let futs = ids.iter().map(|id| async move {
+            if let Some((kind, tmdb_id)) = parse_because_id(id) {
+                return because_shelf_row(self, kind, tmdb_id, taste).await.ok();
+            }
+            let spec = find_tmdb_shelf(id)?;
+            match self.fetch_shelf_filtered(spec, 1, taste).await {
+                Ok((items, page, has_more)) => Some(CatalogRow {
+                    id: spec.meta.id.to_owned(),
+                    title: spec.meta.title.to_owned(),
+                    subtitle: spec.meta.subtitle.map(str::to_owned),
+                    categories: spec.meta.categories.iter().map(|c| (*c).to_owned()).collect(),
+                    loaded: true,
+                    has_more,
+                    page,
+                    items,
+                }),
+                Err(e) => {
+                    tracing::warn!(shelf = id, error = %e, "lazy home shelf failed");
+                    None
+                }
+            }
+        });
+        Ok(join_all(futs).await.into_iter().flatten().collect())
+    }
+
+    async fn shelf_page(&self, id: &str, page: u32, taste: &UserTaste) -> Result<ShelfPage, CatalogError> {
+        if let Some((kind, tmdb_id)) = parse_because_id(id) {
+            return because_shelf_page(self, kind, tmdb_id, taste).await;
+        }
+        let spec = find_tmdb_shelf(id).ok_or(CatalogError::NotFound)?;
+        let (items, page_num, has_more) = self.fetch_shelf_filtered(spec, page, taste).await?;
+        Ok(ShelfPage {
+            id: spec.meta.id.to_owned(),
+            title: spec.meta.title.to_owned(),
+            subtitle: spec.meta.subtitle.map(str::to_owned),
+            page: page_num,
+            has_more,
+            items,
         })
     }
 
@@ -463,6 +1080,67 @@ impl Catalog for TmdbCatalog {
             query: query.to_owned(),
             items,
         })
+    }
+
+    async fn random_movie(&self, filter: &RandomMovieFilter) -> Result<RandomMoviePick, CatalogError> {
+        let bounds = filter.effective_bounds();
+        let (mut active_genre, mut active_runtime, mut active_rating) =
+            (bounds.genre_id, bounds.runtime_range, bounds.min_rating);
+        let (mut items, mut total_pages) = self
+            .discover_movie_page(active_genre, active_runtime, active_rating, 1)
+            .await?;
+        let mut relaxed = false;
+
+        if items.is_empty() && (active_runtime.is_some() || active_rating.is_some()) {
+            active_runtime = None;
+            active_rating = None;
+            (items, total_pages) = self.discover_movie_page(active_genre, None, None, 1).await?;
+            relaxed = true;
+        }
+        if items.is_empty() && active_genre.is_some() {
+            active_genre = None;
+            (items, total_pages) = self.discover_movie_page(None, None, None, 1).await?;
+            relaxed = true;
+        }
+        if items.is_empty() {
+            return Err(CatalogError::NotFound);
+        }
+
+        let max_page = total_pages.clamp(1, 20);
+        if max_page > 1 {
+            let page_num = rand::rng().random_range(1..=max_page);
+            if page_num != 1 {
+                if let Ok((page_items, _)) = self
+                    .discover_movie_page(active_genre, active_runtime, active_rating, page_num)
+                    .await
+                {
+                    if !page_items.is_empty() {
+                        items = page_items;
+                    }
+                }
+            }
+        }
+
+        let with_poster: Vec<&TitleSummary> = items.iter().filter(|i| i.poster_path.is_some()).collect();
+        let pool: Vec<&TitleSummary> = if with_poster.is_empty() {
+            items.iter().collect()
+        } else {
+            with_poster
+        };
+        let chosen = pool[rand::rng().random_range(0..pool.len())].clone();
+        let details = match self.details(MediaKind::Movie, chosen.tmdb_id).await {
+            Ok(d) => d,
+            Err(_) => TitleDetails {
+                summary: chosen,
+                genres: Vec::new(),
+                runtime_min: None,
+                tagline: None,
+                seasons: Vec::new(),
+                imdb_id: None,
+                last_episode: None,
+            },
+        };
+        Ok(RandomMoviePick { details, relaxed })
     }
 
     async fn details(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleDetails, CatalogError> {

@@ -43,6 +43,8 @@ mod commands {
         Start(String),
         #[command(description = "найти фильм или сериал")]
         Search(String),
+        #[command(description = "случайный фильм по параметрам")]
+        Random,
         #[command(description = "продолжить просмотр")]
         Continue,
         #[command(description = "мои списки: смотрю, хочу, просмотрено")]
@@ -134,6 +136,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
             .map(|m| m.chat.id)
             .unwrap_or_else(|| ChatId(q.from.id.0 as i64));
         return send_title_card(&bot, chat, kind, tmdb_id, &state).await;
+    }
+    if let Some(suffix) = data.strip_prefix(screens::RANDOM_CALLBACK) {
+        bot.answer_callback_query(q.id.clone()).await?;
+        let Some(action) = screens::parse_random_callback(suffix) else {
+            return Ok(());
+        };
+        return handle_random_callback(&bot, &q, action, &state).await;
     }
     let Some(token) = data.strip_prefix(LOGIN_CALLBACK) else {
         bot.answer_callback_query(q.id).await?;
@@ -493,6 +502,69 @@ async fn create_invite(
     Ok(())
 }
 
+async fn send_random_movie(
+    bot: &Bot,
+    chat: ChatId,
+    filter_state: Option<screens::RandomState>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let _ = bot.send_chat_action(chat, ChatAction::Typing).await;
+    let filter = filter_state.map(screens::RandomState::to_filter).unwrap_or_default();
+    match tokio::time::timeout(CATALOG_WAIT, state.catalog.random_movie(&filter)).await {
+        Ok(Ok(pick)) => {
+            let poster = fetch_poster(state.catalog.as_ref(), pick.details.summary.poster_path.as_deref())
+                .await
+                .map(|(b, _)| b);
+            let card = screens::random_movie_card(&state.public_url, &pick, filter_state);
+            send_card(bot, chat, card, pick.details.summary.poster_path.as_deref(), poster).await
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "random movie failed");
+            say(bot, chat, "Не удалось подобрать фильм, попробуйте ещё раз чуть позже.").await
+        }
+        Err(_) => say(bot, chat, "Каталог отвечает слишком долго, попробуйте чуть позже.").await,
+    }
+}
+
+async fn show_or_edit_screen(bot: &Bot, q: &CallbackQuery, screen: Screen) -> ResponseResult<()> {
+    if let Some(message) = q.regular_message() {
+        if message.photo().is_none_or(<[_]>::is_empty) {
+            let mut req = bot
+                .edit_message_text(message.chat.id, message.id, screen.text)
+                .parse_mode(ParseMode::Html);
+            if !screen.keyboard.inline_keyboard.is_empty() {
+                req = req.reply_markup(screen.keyboard);
+            }
+            if let Err(e) = req.await {
+                tracing::debug!(error = %e, "editing random filter message");
+            }
+            return Ok(());
+        }
+        return send_screen(bot, message.chat.id, screen).await;
+    }
+    send_screen(bot, ChatId(q.from.id.0 as i64), screen).await
+}
+
+async fn handle_random_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    action: screens::RandomCallback,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let chat = q
+        .regular_message()
+        .map(|m| m.chat.id)
+        .unwrap_or_else(|| ChatId(q.from.id.0 as i64));
+    match action {
+        screens::RandomCallback::Any => send_random_movie(bot, chat, None, state).await,
+        screens::RandomCallback::Go(st) => send_random_movie(bot, chat, Some(st), state).await,
+        screens::RandomCallback::Menu(st) => show_or_edit_screen(bot, q, screens::random_menu(st)).await,
+        screens::RandomCallback::Submenu(sub, st) => {
+            show_or_edit_screen(bot, q, screens::random_submenu(sub, st)).await
+        }
+    }
+}
+
 async fn run_action(
     bot: &Bot,
     chat: ChatId,
@@ -502,6 +574,7 @@ async fn run_action(
     state: &BotState,
 ) -> ResponseResult<()> {
     match action {
+        BotAction::Random => send_screen(bot, chat, screens::random_menu(screens::RandomState::default())).await,
         BotAction::Search => say(bot, chat, &screens::search_prompt()).await,
         BotAction::Continue => continue_watching(bot, chat, from, state).await,
         BotAction::My => my(bot, chat, from, state).await,
@@ -546,6 +619,7 @@ async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> R
             let url = app_url(&state.public_url, &payload);
             if is_private {
                 bot.send_message(msg.chat.id, screens::start_welcome_text())
+                    .parse_mode(ParseMode::Html)
                     .reply_markup(screens::main_reply_keyboard(&url, admin))
                     .await?;
             } else {
@@ -554,6 +628,7 @@ async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> R
         }
         Command::Help => run_action(&bot, msg.chat.id, is_private, from, BotAction::Help, &state).await?,
         Command::Search(query) => search(&bot, &msg, &query, &state).await?,
+        Command::Random => run_action(&bot, msg.chat.id, is_private, from, BotAction::Random, &state).await?,
         Command::Continue => run_action(&bot, msg.chat.id, is_private, from, BotAction::Continue, &state).await?,
         Command::My => run_action(&bot, msg.chat.id, is_private, from, BotAction::My, &state).await?,
         Command::Login => run_action(&bot, msg.chat.id, is_private, from, BotAction::Login, &state).await?,
@@ -691,7 +766,10 @@ mod tests {
     #[test]
     fn menu_names_have_no_slash_and_invite_is_admin_only() {
         let names = |admin| menu(admin).into_iter().map(|c| c.command).collect::<Vec<_>>();
-        assert_eq!(names(false), ["start", "search", "continue", "my", "login", "help"]);
+        assert_eq!(
+            names(false),
+            ["start", "search", "random", "continue", "my", "login", "help"]
+        );
         assert_eq!(names(true).last().map(String::as_str), Some("invite"));
     }
 }

@@ -13,17 +13,18 @@ use player::{PlayStart, Player};
 
 use dioxus::prelude::*;
 use kino_core::{
-    image_url, AuthResponse, ImageSize, MarkWatched, MediaKind, PreloadRequest, ReleaseChoiceUpdate, TitleStatus,
-    TitleSummary, UserPrefs, WidgetAuthRequest,
+    image_url, AuthResponse, HomeFeed, ImageSize, MarkWatched, MediaKind, PreloadRequest, PreloadState,
+    ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs, WidgetAuthRequest,
 };
 use kino_ui::{
-    play_target, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter,
-    ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI,
-    STYLE,
+    icons, play_target, HomeView, Icon, LoginView, MyFilters, MyView, PersonView, PickerPanel, PlayTarget, ProfileView,
+    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell, Tab, Theme,
+    TitleExtrasView, TitleView, FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
 const THEME_KEY: &str = "kino.theme";
+const MY_FILTERS_KEY: &str = "kino.my_filters";
 
 fn main() {
     #[cfg(any(feature = "mobile", feature = "desktop"))]
@@ -207,6 +208,8 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
     // opened after a network round trip.
     let mut invite = use_signal(telegram::invite);
     let mut link = use_resource(move || api::start_login_link(invite()));
+    let mut edit_server = use_signal(|| false);
+    let mut server_input = use_signal(platform::server_base);
     let mut wait = move |token: String| {
         state.set(LinkLogin::Waiting);
         spawn(async move {
@@ -252,40 +255,84 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
         Some(Ok(l)) => Some(l.clone()),
         _ => None,
     };
+    let server_host = platform::server_base()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .to_owned();
     rsx! {
         LoginView { invite: telegram::invite(), error: shown_error,
             match (state(), ready) {
                 (LinkLogin::Waiting, Some(l)) => rsx! {
-                    p { "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
+                    p { class: "login-wait-txt", "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
                     a {
-                        class: "btn ghost",
+                        class: "btn glass",
                         href: "{l.url}",
                         target: "_blank",
                         rel: "noopener",
                         onclick: move |e: Event<MouseData>| open_link(&e, &l.url),
+                        Icon { svg: icons::TG, class: "ic sm" }
                         "Открыть Telegram ещё раз"
                     }
-                    p {
-                        a { href: "#", onclick: move |e: Event<MouseData>| { e.prevent_default(); state.set(LinkLogin::Idle) }, "Отмена" }
+                    p { class: "login-cancel",
+                        a { class: "link", href: "#", onclick: move |e: Event<MouseData>| { e.prevent_default(); state.set(LinkLogin::Idle) }, "Отмена" }
                     }
                 },
                 (_, Some(l)) => rsx! {
+                    if !platform::is_web() {
+                        input {
+                            class: "input-field",
+                            placeholder: "Код приглашения (если есть)",
+                            value: "{invite().unwrap_or_default()}",
+                            oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
+                        }
+                    }
                     a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener",
                         onclick: move |e: Event<MouseData>| {
                             open_link(&e, &l.url);
                             wait(l.token.clone());
                         },
+                        Icon { svg: icons::TG, class: "ic sm" }
                         "Войти через Telegram"
-                    }
-                    if !platform::is_web() {
-                        input {
-                            class: "field",
-                            placeholder: "Код приглашения (если есть)",
-                            oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
-                        }
                     }
                 },
                 (_, None) => rsx! { p { class: "muted", "Готовим вход…" } },
+            }
+            if !platform::is_web() {
+                div { class: "server-row",
+                    button {
+                        class: "server-toggle",
+                        onclick: move |_| {
+                            server_input.set(platform::server_base());
+                            edit_server.toggle();
+                        },
+                        "Адрес сервера: {server_host} · Сменить"
+                    }
+                    if edit_server() {
+                        div { class: "server-editor",
+                            input {
+                                class: "input-field",
+                                placeholder: "https://kino.example.ru",
+                                value: "{server_input()}",
+                                oninput: move |e| server_input.set(e.value()),
+                            }
+                            button {
+                                class: "btn glass sm",
+                                style: "width: auto",
+                                onclick: move |_| {
+                                    let url = server_input().trim().trim_end_matches('/').to_owned();
+                                    if url.starts_with("http://") || url.starts_with("https://") {
+                                        platform::save_server(&url);
+                                        platform::set_server_base(&url);
+                                        edit_server.set(false);
+                                        state.set(LinkLogin::Idle);
+                                        link.restart();
+                                    }
+                                },
+                                "Сохранить"
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -299,6 +346,12 @@ enum View {
     Title(MediaKind, i64, bool),
     /// An actor's page.
     Person(i64),
+    /// Full grid of a home shelf ("Смотреть все").
+    Shelf {
+        id: String,
+        title: String,
+        subtitle: Option<String>,
+    },
 }
 
 #[component]
@@ -323,6 +376,43 @@ fn Main(
     // Where "Back" goes from a title page.
     let mut trail = use_signal(|| link.map(|_| vec![View::Tab(Tab::Home)]).unwrap_or_default());
     let mut query = use_signal(String::new);
+    let mut home_category = use_signal(|| "for_you".to_owned());
+    let mut my_filters = use_signal(MyFilters::default);
+    // Restore saved "Мои" filters on startup.
+    use_effect(move || {
+        spawn(async move {
+            if let Some(saved) = platform::storage_get(MY_FILTERS_KEY).await {
+                my_filters.set(MyFilters::decode(&saved));
+            }
+        });
+    });
+    // Global Ctrl+K / Cmd+K focuses the search box.
+    use_hook(|| {
+        let _ = dioxus::document::eval(
+            "if (!window.__kinoSearchShortcut) {
+               window.__kinoSearchShortcut = true;
+               window.addEventListener('keydown', function(e) {
+                 if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+                   var el = document.getElementById('kino-search-input');
+                   if (el) { e.preventDefault(); el.focus(); el.select(); }
+                 }
+               });
+             }",
+        );
+    });
+    // Lightweight active-download check for the topbar badge / mobile avatar dot.
+    let t_dl = token.clone();
+    let active_preloads = use_resource(move || {
+        let t = t_dl.clone();
+        async move { api::preloads(&t).await.ok() }
+    });
+    let dl_percent: Option<u8> = active_preloads
+        .read()
+        .as_ref()
+        .and_then(Option::as_ref)
+        .and_then(|list| list.iter().find(|p| p.state == PreloadState::Downloading))
+        .map(|p| (p.progress * 100.0).clamp(0.0, 100.0).round() as u8);
+
     let initial = name
         .chars()
         .next()
@@ -330,7 +420,7 @@ fn Main(
         .unwrap_or_default();
     let tab = match view() {
         View::Tab(t) => Some(t),
-        View::Title(..) | View::Person(_) => None,
+        View::Title(..) | View::Person(_) | View::Shelf { .. } => None,
     };
     let mut open_title = move |kind: MediaKind, id: i64, play: bool| {
         // Coming back to a title must not start it again.
@@ -356,6 +446,17 @@ fn Main(
         view.set(View::Person(id));
         telegram::push_history(Some("/"));
     };
+    let open_shelf = move |(id, title, subtitle): (String, String, Option<String>)| {
+        telegram::haptic(telegram::Haptic::Tap);
+        trail.with_mut(|t| {
+            t.push(match view() {
+                View::Title(k, i, _) => View::Title(k, i, false),
+                v => v,
+            })
+        });
+        view.set(View::Shelf { id, title, subtitle });
+        telegram::push_history(Some("/"));
+    };
     let go_back = move |_: ()| {
         telegram::haptic(telegram::Haptic::Tap);
         if let Some(prev) = trail.with_mut(|t| t.pop()) {
@@ -376,11 +477,21 @@ fn Main(
             query: query(),
             user_initial: initial,
             avatar_url: avatar_url.clone(),
-            on_back: can_back.then(|| Callback::new(go_back)),
+            dl_percent,
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
-                query.set(String::new());
+                if t != Tab::Search {
+                    query.set(String::new());
+                }
+                if t == Tab::Home {
+                    home_category.set("for_you".to_owned());
+                }
                 if view() == View::Tab(t) && (t != Tab::Home || trail.peek().is_empty()) {
+                    if t == Tab::Search {
+                        let _ = dioxus::document::eval(
+                            "var el = document.getElementById('kino-search-input'); if (el) el.focus();",
+                        );
+                    }
                     return;
                 }
                 if t == Tab::Home || telegram::is_telegram() {
@@ -398,11 +509,21 @@ fn Main(
                     view.set(View::Tab(t));
                     telegram::push_history(Some("/"));
                 }
+                if t == Tab::Search {
+                    spawn(async move {
+                        platform::sleep(60).await;
+                        let _ = dioxus::document::eval(
+                            "var el = document.getElementById('kino-search-input'); if (el) el.focus();",
+                        );
+                    });
+                }
             },
             on_query: move |q: String| {
                 let empty = q.trim().is_empty();
                 if empty {
-                    if matches!(view(), View::Tab(Tab::Search)) {
+                    // On phones Search is a dedicated tab: clearing the box keeps you on Search.
+                    // On desktop, clearing the topbar search box returns to the previous screen.
+                    if matches!(view(), View::Tab(Tab::Search)) && !telegram::is_mobile() {
                         if let Some(prev) = trail.with_mut(|tr| tr.pop()) {
                             view.set(prev);
                             telegram::pop_history();
@@ -427,10 +548,28 @@ fn Main(
             },
             match view() {
                 View::Tab(Tab::Home) => rsx! {
-                    Home { token: token.clone(), on_open: open, on_play: move |(k, id)| open_title(k, id, true) }
+                    Home {
+                        token: token.clone(),
+                        active_category: home_category,
+                        on_open: open,
+                        on_open_title: move |(k, id)| open_title(k, id, false),
+                        on_play: move |(k, id)| open_title(k, id, true),
+                        on_open_shelf: open_shelf,
+                    }
                 },
                 View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, on_open: open } },
-                View::Tab(Tab::Mine) => rsx! { Mine { token: token.clone(), on_open: open } },
+                View::Tab(Tab::Mine) => rsx! {
+                    Mine {
+                        token: token.clone(),
+                        filters: my_filters,
+                        on_filters: move |f: MyFilters| {
+                            telegram::haptic(telegram::Haptic::Select);
+                            my_filters.set(f);
+                            platform::storage_set(MY_FILTERS_KEY, &f.encode());
+                        },
+                        on_open: open,
+                    }
+                },
                 View::Tab(Tab::Profile) => rsx! {
                     Profile {
                         token: token.clone(),
@@ -451,16 +590,19 @@ fn Main(
                         autoplay: play,
                         on_open: open,
                         on_person: open_person,
-                        // Closing a player that was started from Home goes back to Home.
-                        on_exit: move |_| {
-                            if let Some(prev) = trail.with_mut(|t| t.pop()) {
-                                view.set(prev);
-                                telegram::pop_history();
-                            }
-                        },
                     }
                 },
                 View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, on_open: open } },
+                View::Shelf { id, title, subtitle } => rsx! {
+                    Shelf {
+                        key: "shelf-{id}",
+                        token: token.clone(),
+                        id,
+                        title,
+                        subtitle,
+                        on_open: open,
+                    }
+                },
             }
         }
     }
@@ -495,38 +637,353 @@ fn Person(token: String, id: i64, on_open: EventHandler<TitleSummary>) -> Elemen
     }
 }
 
+const HOME_LAZY_BATCH: usize = 4;
+const MAX_ROW_AUTO_PAGES: u32 = 4;
+
 #[component]
-fn Home(token: String, on_open: EventHandler<TitleSummary>, on_play: EventHandler<(MediaKind, i64)>) -> Element {
-    let t2 = token.clone();
-    let mut data = use_resource(move || {
-        let t = token.clone();
-        async move {
-            let feed = api::home(&t).await?;
-            let cont = api::continue_watching(&t).await?;
-            Ok::<_, api::Failure>((feed, cont))
+fn Home(
+    token: String,
+    active_category: Signal<String>,
+    on_open: EventHandler<TitleSummary>,
+    on_open_title: EventHandler<(MediaKind, i64)>,
+    on_play: EventHandler<(MediaKind, i64)>,
+    on_open_shelf: EventHandler<(String, String, Option<String>)>,
+) -> Element {
+    let token_cont = token.clone();
+    let mut cont_res = use_resource(move || {
+        let t = token_cont.clone();
+        async move { api::continue_watching(&t).await }
+    });
+    let token_feed = token.clone();
+    let mut feed_res = use_resource(move || {
+        let t = token_feed.clone();
+        async move { api::home(&t).await }
+    });
+
+    let mut feed_state = use_signal(|| None::<HomeFeed>);
+    let mut loading_shelves = use_signal(Vec::<String>::new);
+    let mut loading_row_pages = use_signal(Vec::<String>::new);
+    let mut loading_more_rows = use_signal(|| false);
+
+    use_effect(move || {
+        if let Some(Ok(f)) = &*feed_res.read() {
+            feed_state.set(Some(f.clone()));
+            loading_shelves.set(Vec::new());
+            loading_row_pages.set(Vec::new());
+            loading_more_rows.set(false);
         }
     });
-    let state = data.read().clone();
-    match state {
-        None => loading(),
-        Some(Err(e)) => error_text(&e.message),
-        Some(Ok((feed, cont))) => rsx! {
-            HomeView {
-                feed,
-                continue_items: cont,
-                on_open,
-                // Plays at once from where the user stopped, without the title page in between.
-                on_play: move |c: kino_core::ContinueItem| on_play.call((c.last.kind, c.last.tmdb_id)),
-                on_drop: move |c: kino_core::ContinueItem| {
-                    let t = t2.clone();
-                    spawn(async move {
-                        if api::set_status(&t, c.last.kind, c.last.tmdb_id, Some(TitleStatus::Dropped)).await.is_ok() {
-                            data.restart();
-                        }
-                    });
-                },
+
+    let load_batch = {
+        let token = token.clone();
+        move |limit: usize, cat: String| {
+            let batch_ids: Vec<String> = {
+                let Some(feed) = feed_state.peek().as_ref().cloned() else {
+                    return;
+                };
+                let busy = loading_shelves.peek();
+                feed.rows
+                    .iter()
+                    .filter(|r| !r.loaded && (cat == "for_you" || r.categories.iter().any(|c| c == &cat)))
+                    .map(|r| r.id.clone())
+                    .filter(|id| !busy.contains(id))
+                    .take(limit)
+                    .collect()
+            };
+            if batch_ids.is_empty() {
+                return;
             }
-        },
+            loading_shelves.with_mut(|v| {
+                for id in &batch_ids {
+                    if !v.contains(id) {
+                        v.push(id.clone());
+                    }
+                }
+            });
+            loading_more_rows.set(true);
+            let t = token.clone();
+            spawn(async move {
+                let res = api::home_shelves(&t, &batch_ids).await;
+                if let Ok(loaded) = res {
+                    feed_state.with_mut(|maybe| {
+                        let Some(feed) = maybe.as_mut() else { return };
+                        for id in &batch_ids {
+                            if let Some(pos) = feed.rows.iter().position(|r| &r.id == id) {
+                                if let Some(fresh) = loaded.iter().find(|r| &r.id == id) {
+                                    feed.rows[pos] = fresh.clone();
+                                } else {
+                                    feed.rows[pos].loaded = true;
+                                    feed.rows[pos].has_more = false;
+                                }
+                            }
+                        }
+                        feed.rows.retain(|r| !r.loaded || !r.items.is_empty());
+                    });
+                }
+                loading_shelves.with_mut(|v| v.retain(|id| !batch_ids.contains(id)));
+                loading_more_rows.set(false);
+            });
+        }
+    };
+
+    // If restored category isn't "for_you", load its hidden shelves right after feed arrives.
+    {
+        let mut load_batch = load_batch.clone();
+        use_effect(move || {
+            let cat = active_category();
+            if feed_state().is_some() && cat != "for_you" {
+                load_batch(6, cat);
+            }
+        });
+    }
+
+    // Auto-load next deferred shelf batch when scrolling near the bottom sentinel.
+    {
+        let mut load_batch = load_batch.clone();
+        use_hook(move || {
+            spawn(async move {
+                let mut bridge = dioxus::document::eval(
+                    "if (window.__kinoHomeStop) { try { window.__kinoHomeStop(); } catch (e) {} }
+                     var obs = null, timer = null, lastSent = 0, observedEl = null;
+                     var check = function() {
+                       var el = document.getElementById('home-lazy-sentinel');
+                       if (!el) return;
+                       var r = el.getBoundingClientRect();
+                       if (r.top <= window.innerHeight + 350) {
+                         var now = Date.now();
+                         if (now - lastSent > 350) {
+                           lastSent = now;
+                           dioxus.send(true);
+                         }
+                       }
+                     };
+                     if (typeof IntersectionObserver !== 'undefined') {
+                       obs = new IntersectionObserver(function(entries) {
+                         if (entries.some(function(e) { return e.isIntersecting; })) check();
+                       }, { rootMargin: '350px 0px' });
+                     }
+                     timer = setInterval(function() {
+                       if (!document.getElementById('home-active-marker')) {
+                         window.__kinoHomeStop();
+                         return;
+                       }
+                       var el = document.getElementById('home-lazy-sentinel');
+                       if (el !== observedEl) {
+                         if (obs && observedEl) obs.unobserve(observedEl);
+                         observedEl = el;
+                         if (obs && el) obs.observe(el);
+                       }
+                       check();
+                     }, 450);
+                     window.addEventListener('scroll', check, { passive: true });
+                     window.__kinoHomeStop = function() {
+                       if (obs) obs.disconnect();
+                       if (timer) clearInterval(timer);
+                       window.removeEventListener('scroll', check);
+                     };",
+                );
+                while let Ok(true) = bridge.recv::<bool>().await {
+                    if !*loading_more_rows.peek() {
+                        load_batch(HOME_LAZY_BATCH, active_category.peek().clone());
+                    }
+                }
+            });
+        });
+    }
+
+    let load_more_items = {
+        let token = token.clone();
+        move |shelf_id: String| {
+            let next_page = {
+                let Some(feed) = feed_state.peek().as_ref().cloned() else {
+                    return;
+                };
+                let Some(row) = feed.rows.iter().find(|r| r.id == shelf_id) else {
+                    return;
+                };
+                if !row.loaded || !row.has_more || row.page >= MAX_ROW_AUTO_PAGES {
+                    return;
+                }
+                if loading_row_pages.peek().contains(&shelf_id) {
+                    return;
+                }
+                row.page + 1
+            };
+            loading_row_pages.with_mut(|v| v.push(shelf_id.clone()));
+            let t = token.clone();
+            let sid = shelf_id.clone();
+            spawn(async move {
+                if let Ok(page) = api::shelf_page(&t, &sid, next_page).await {
+                    feed_state.with_mut(|maybe| {
+                        let Some(feed) = maybe.as_mut() else { return };
+                        let Some(row) = feed.rows.iter_mut().find(|r| r.id == sid) else {
+                            return;
+                        };
+                        for item in page.items {
+                            if !row
+                                .items
+                                .iter()
+                                .any(|e| e.kind == item.kind && e.tmdb_id == item.tmdb_id)
+                            {
+                                row.items.push(item);
+                            }
+                        }
+                        row.page = page.page;
+                        row.has_more = page.has_more;
+                    });
+                }
+                loading_row_pages.with_mut(|v| v.retain(|id| id != &sid));
+            });
+        }
+    };
+
+    let cont_items = match &*cont_res.read() {
+        Some(Ok(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    let feed_err = match &*feed_res.read() {
+        Some(Err(e)) => Some(e.message.clone()),
+        _ => None,
+    };
+    let cont_err = match &*cont_res.read() {
+        Some(Err(e)) => Some(e.message.clone()),
+        _ => None,
+    };
+    let feed_for_view = match (feed_state(), &feed_err) {
+        (Some(f), _) => Some(f),
+        (None, Some(_)) if cont_items.is_empty() => return error_text(feed_err.as_deref().unwrap_or_default()),
+        (None, Some(_)) => Some(HomeFeed {
+            rows: Vec::new(),
+            categories: Vec::new(),
+            demo: false,
+        }),
+        (None, None) => None,
+    };
+    let t_drop = token.clone();
+    let mut lb_cat = load_batch.clone();
+    let mut lb_more = load_batch;
+    rsx! {
+        div { id: "home-active-marker", style: "display:none" }
+        HomeView {
+            feed: feed_for_view,
+            continue_items: cont_items,
+            active_category: active_category(),
+            loading_shelves: loading_shelves(),
+            loading_row_pages: loading_row_pages(),
+            loading_more_rows: loading_more_rows(),
+            on_open,
+            on_open_title,
+            // Plays at once from where the user stopped, without the title page in between.
+            on_play: move |c: kino_core::ContinueItem| on_play.call((c.last.kind, c.last.tmdb_id)),
+            on_drop: move |c: kino_core::ContinueItem| {
+                let t = t_drop.clone();
+                spawn(async move {
+                    if api::set_status(&t, c.last.kind, c.last.tmdb_id, Some(TitleStatus::Dropped))
+                        .await
+                        .is_ok()
+                    {
+                        cont_res.restart();
+                        feed_res.restart();
+                    }
+                });
+            },
+            on_category: move |cat: String| {
+                telegram::haptic(telegram::Haptic::Select);
+                active_category.set(cat.clone());
+                lb_cat(6, cat);
+            },
+            on_load_more_items: load_more_items,
+            on_open_shelf,
+            on_load_more_rows: move |_| {
+                if !*loading_more_rows.peek() {
+                    lb_more(HOME_LAZY_BATCH, active_category.peek().clone());
+                }
+            },
+        }
+        if let Some(err) = feed_err {
+            {error_text(&err)}
+        }
+        if let Some(err) = cont_err {
+            {error_text(&err)}
+        }
+    }
+}
+
+#[component]
+fn Shelf(
+    token: String,
+    id: String,
+    title: String,
+    subtitle: Option<String>,
+    on_open: EventHandler<TitleSummary>,
+) -> Element {
+    let mut items = use_signal(Vec::<TitleSummary>::new);
+    let mut page = use_signal(|| 0u32);
+    let mut has_more = use_signal(|| true);
+    let mut loading = use_signal(|| true);
+    let mut err = use_signal(|| None::<String>);
+    let mut shelf_title = use_signal(|| title);
+    let mut shelf_sub = use_signal(|| subtitle);
+
+    let mut fetch_page = {
+        let token = token.clone();
+        let id = id.clone();
+        move |target_page: u32| {
+            loading.set(true);
+            err.set(None);
+            let t = token.clone();
+            let sid = id.clone();
+            spawn(async move {
+                match api::shelf_page(&t, &sid, target_page).await {
+                    Ok(res) => {
+                        if !res.title.is_empty() {
+                            shelf_title.set(res.title);
+                        }
+                        if res.subtitle.is_some() {
+                            shelf_sub.set(res.subtitle);
+                        }
+                        items.with_mut(|list| {
+                            for item in res.items {
+                                if !list.iter().any(|e| e.kind == item.kind && e.tmdb_id == item.tmdb_id) {
+                                    list.push(item);
+                                }
+                            }
+                        });
+                        page.set(res.page);
+                        has_more.set(res.has_more);
+                    }
+                    Err(e) => err.set(Some(e.message)),
+                }
+                loading.set(false);
+            });
+        }
+    };
+
+    {
+        let mut fp = fetch_page.clone();
+        use_hook(move || fp(1));
+    }
+
+    if let Some(message) = err() {
+        if items().is_empty() {
+            return error_text(&message);
+        }
+    }
+
+    rsx! {
+        ShelfView {
+            title: shelf_title(),
+            subtitle: shelf_sub(),
+            items: items(),
+            has_more: has_more(),
+            loading: loading(),
+            on_open,
+            on_load_more: move |_| {
+                if !*loading.peek() && *has_more.peek() {
+                    fetch_page(*page.peek() + 1);
+                }
+            },
+        }
     }
 }
 
@@ -557,8 +1014,12 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
 }
 
 #[component]
-fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
-    let mut filter = use_signal(|| None::<TitleStatus>);
+fn Mine(
+    token: String,
+    filters: Signal<MyFilters>,
+    on_filters: EventHandler<MyFilters>,
+    on_open: EventHandler<TitleSummary>,
+) -> Element {
     let items = use_resource(move || {
         let t = token.clone();
         async move { api::my(&t).await }
@@ -568,7 +1029,7 @@ fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
         None => loading(),
         Some(Err(e)) => error_text(&e.message),
         Some(Ok(items)) => rsx! {
-            MyView { items, filter: filter(), on_filter: move |f| filter.set(f), on_open }
+            MyView { items, filters: filters(), on_filters, on_open }
         },
     }
 }
@@ -631,6 +1092,7 @@ fn Profile(
                     }
                 });
             },
+            on_refresh: move |_| data.restart(),
             on_open,
             on_logout,
         }
@@ -653,7 +1115,6 @@ fn Title(
     autoplay: bool,
     on_open: EventHandler<TitleSummary>,
     on_person: EventHandler<i64>,
-    on_exit: EventHandler<()>,
 ) -> Element {
     let t1 = token.clone();
     let mut data = use_resource(move || {
@@ -704,6 +1165,7 @@ fn Title(
     // nothing, the list is shown without them (once the releases have loaded).
     let mut defaults_pending = use_signal(|| false);
     let mut defaults_relaxed = use_signal(|| false);
+    let mut prefs_applied = use_signal(|| false);
     let t_prefs = token.clone();
     let user_prefs = use_resource(move || {
         let t = t_prefs.clone();
@@ -713,7 +1175,6 @@ fn Title(
     let mut panel = use_signal(|| None::<PickerPanel>);
     let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
     let mut auto = use_signal(|| autoplay);
-    let mut exit_on_close = use_signal(|| autoplay);
     let mut overlay_pushed = use_signal(|| false);
     let mut notice_pushed = use_signal(|| false);
     let t0 = token.clone();
@@ -728,9 +1189,22 @@ fn Title(
         }
     });
 
-    // Once the releases are in: when the default filters leave nothing, drop them
-    // (the season of the episode stays) and say so.
+    // Once the releases (and user prefs) are in: relax secondary filters if they
+    // leave nothing, while always preserving the user's chosen audio language.
     use_effect(move || {
+        if picker.read().is_none() {
+            return;
+        }
+        if !*prefs_applied.peek() {
+            if let Some(Some(p)) = user_prefs.read().clone() {
+                prefs_applied.set(true);
+                let updated = filter.peek().clone().or(ReleaseFilter::from_prefs(&p));
+                filter.set(updated);
+                sort.set(ReleaseSort::from_key(p.sort.as_deref()));
+                defaults_pending.set(true);
+                defaults_relaxed.set(false);
+            }
+        }
         let Some(Ok(list)) = releases.read().clone().flatten() else {
             return;
         };
@@ -742,9 +1216,36 @@ fn Title(
         if list.releases.is_empty() || list.releases.iter().any(|r| f.matches(r)) {
             return;
         }
-        let season_only = match (kind, picker.peek().as_ref()) {
-            (MediaKind::Tv, Some(t)) => ReleaseFilter::default().for_season(t.season),
-            _ => ReleaseFilter::default(),
+        let season = (kind == MediaKind::Tv)
+            .then(|| picker.peek().as_ref().map(|t| t.season))
+            .flatten();
+        if f.language.is_some() {
+            let lang_season = ReleaseFilter {
+                language: f.language.clone(),
+                season,
+                ..ReleaseFilter::default()
+            };
+            if list.releases.iter().any(|r| lang_season.matches(r)) {
+                filter.set(lang_season);
+                defaults_relaxed.set(true);
+                return;
+            }
+            let just_lang = ReleaseFilter {
+                language: f.language.clone(),
+                ..ReleaseFilter::default()
+            };
+            if season.is_some() && list.releases.iter().any(|r| just_lang.matches(r)) {
+                filter.set(just_lang);
+                defaults_relaxed.set(true);
+                return;
+            }
+            // Keep the chosen language active even when 0 releases match it.
+            filter.set(lang_season);
+            return;
+        }
+        let season_only = ReleaseFilter {
+            season,
+            ..ReleaseFilter::default()
         };
         let relaxed = if list.releases.iter().any(|r| season_only.matches(r)) {
             season_only
@@ -778,7 +1279,7 @@ fn Title(
         .filter_map(|p| p.release.as_ref().map(|r| r.infohash.clone()))
         .collect();
 
-    let loaded_prefs = user_prefs.read().clone().flatten().unwrap_or_default();
+    let loaded_prefs_opt = user_prefs.read().clone().flatten();
     let open_picker = {
         let latest = latest.clone();
         let choice_for = choice_for.clone();
@@ -790,18 +1291,19 @@ fn Title(
                 (None, Some(prev)) => ReleaseFilter::like(prev),
                 _ => ReleaseFilter::default(),
             };
-            let f = base.or(ReleaseFilter::from_prefs(&loaded_prefs));
+            prefs_applied.set(loaded_prefs_opt.is_some());
+            let prefs_now = loaded_prefs_opt.clone().unwrap_or_default();
+            let f = base.or(ReleaseFilter::from_prefs(&prefs_now));
             let f = if kind == MediaKind::Tv {
                 f.for_season(t.season)
             } else {
                 f
             };
             filter.set(f);
-            sort.set(ReleaseSort::from_key(loaded_prefs.sort.as_deref()));
+            sort.set(ReleaseSort::from_key(prefs_now.sort.as_deref()));
             defaults_pending.set(true);
             defaults_relaxed.set(false);
             panel.set(None);
-            exit_on_close.set(false);
             if picker.peek().is_none() && !*overlay_pushed.peek() {
                 overlay_pushed.set(true);
                 telegram::push_history(None);
@@ -830,14 +1332,13 @@ fn Title(
             telegram::haptic(telegram::Haptic::Tap);
             match choice_for(season_key(&t)) {
                 Some(c) => {
-                    if !*exit_on_close.peek() && !*overlay_pushed.peek() {
+                    if !*overlay_pushed.peek() {
                         overlay_pushed.set(true);
                         telegram::push_history(None);
                     }
                     playing.set(Some((t, c)));
                 }
                 None => {
-                    exit_on_close.set(false);
                     open_picker(t);
                 }
             }
@@ -948,7 +1449,7 @@ fn Title(
                                     title: "Закрыть",
                                     "aria-label": "Закрыть",
                                     onclick: move |_| close_picker.call(()),
-                                    "✕"
+                                    Icon { svg: icons::CLOSE, class: "ic sm" }
                                 }
                             }
                             p { class: "muted", "Ищем раздачи на трекерах…" }
@@ -965,11 +1466,11 @@ fn Title(
                                     title: "Закрыть",
                                     "aria-label": "Закрыть",
                                     onclick: move |_| close_picker.call(()),
-                                    "✕"
+                                    Icon { svg: icons::CLOSE, class: "ic sm" }
                                 }
                             }
                             p { class: "error", "{e.message}" }
-                            button { class: "btn ghost", onclick: move |_| close_picker.call(()), "Закрыть" }
+                            button { class: "btn glass", onclick: move |_| close_picker.call(()), "Закрыть" }
                         }
                     }
                 },
@@ -982,7 +1483,10 @@ fn Title(
                 sort: sort(),
                 panel: panel(),
                 mock: !list.configured,
-                note: defaults_relaxed().then(|| "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned()),
+                note: defaults_relaxed().then(|| match filter().language {
+                    Some(l) => format!("По строгим фильтрам ничего не нашлось — показаны все доступные в озвучке «{l}»."),
+                    None => "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned(),
+                }),
                 on_filter: move |f| filter.set(f),
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),
@@ -1056,16 +1560,11 @@ fn Title(
                 },
                 on_close: move |_| {
                     playing.set(None);
-                    if exit_on_close() {
-                        exit_on_close.set(false);
-                        on_exit.call(());
-                    } else {
-                        if *overlay_pushed.peek() {
-                            overlay_pushed.set(false);
-                            telegram::pop_history();
-                        }
-                        data.restart();
+                    if *overlay_pushed.peek() {
+                        overlay_pushed.set(false);
+                        telegram::pop_history();
                     }
+                    data.restart();
                 },
                 on_need_release: {
                     let mut open_picker = open_picker.clone();

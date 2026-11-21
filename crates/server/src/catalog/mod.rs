@@ -2,12 +2,16 @@
 //! server falls back to a small built-in demo catalog so the UI can be tried.
 
 mod demo;
+pub mod personalize;
 mod tmdb;
 
 use async_trait::async_trait;
-use kino_core::{HomeFeed, MediaKind, PersonDetails, SearchResults, Season, TitleDetails, TitleExtras};
+use kino_core::{
+    CatalogRow, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, ShelfPage, TitleDetails, TitleExtras,
+};
 
 pub use demo::DemoCatalog;
+pub use personalize::UserTaste;
 pub use tmdb::TmdbCatalog;
 
 #[derive(Debug, thiserror::Error)]
@@ -34,10 +38,67 @@ pub fn from_settings(
     })
 }
 
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RandomMovieFilter {
+    /// TMDB genre ID, if selected.
+    pub genre_id: Option<i32>,
+    /// Genre name in Russian lowercase (for `DemoCatalog`).
+    pub genre_name: Option<String>,
+    /// Approximate target runtime in minutes.
+    pub target_runtime_min: Option<i32>,
+    /// Minimum TMDB rating (`0.0..=10.0`).
+    pub min_rating: Option<f32>,
+    /// Allowed deviation in percent (`0..=100`) applied to runtime and rating bounds.
+    pub deviation_pct: u8,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffectiveRandomBounds {
+    pub genre_id: Option<i32>,
+    pub runtime_range: Option<(i32, i32)>,
+    pub min_rating: Option<f32>,
+}
+
+impl RandomMovieFilter {
+    pub fn effective_bounds(&self) -> EffectiveRandomBounds {
+        let pct = self.deviation_pct.min(100) as f32 / 100.0;
+        let runtime_range = self.target_runtime_min.filter(|&m| m > 0).map(|target| {
+            let delta = if self.deviation_pct == 0 {
+                5
+            } else {
+                ((target as f32 * pct).round() as i32).max(5)
+            };
+            ((target - delta).max(15), target + delta)
+        });
+        let min_rating = self.min_rating.filter(|&r| r > 0.0).map(|min_r| {
+            let adjusted = (min_r * (1.0 - pct)).clamp(0.0, 10.0);
+            (adjusted * 10.0).round() / 10.0
+        });
+        EffectiveRandomBounds {
+            genre_id: self.genre_id,
+            runtime_range,
+            min_rating,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RandomMoviePick {
+    pub details: TitleDetails,
+    /// True when no movie matched the exact/deviated filters and bounds had to be relaxed.
+    pub relaxed: bool,
+}
+
 #[async_trait]
 pub trait Catalog: Send + Sync {
-    async fn home(&self) -> Result<HomeFeed, CatalogError>;
+    async fn home(&self) -> Result<HomeFeed, CatalogError> {
+        self.home_for(&UserTaste::default()).await
+    }
+    async fn home_for(&self, taste: &UserTaste) -> Result<HomeFeed, CatalogError>;
+    async fn home_shelves(&self, ids: &[String], taste: &UserTaste) -> Result<Vec<CatalogRow>, CatalogError>;
+    async fn shelf_page(&self, id: &str, page: u32, taste: &UserTaste) -> Result<ShelfPage, CatalogError>;
     async fn search(&self, query: &str) -> Result<SearchResults, CatalogError>;
+    async fn random_movie(&self, filter: &RandomMovieFilter) -> Result<RandomMoviePick, CatalogError>;
     async fn details(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleDetails, CatalogError>;
     /// Cast, recommendations and similar titles.
     async fn extras(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleExtras, CatalogError>;
@@ -189,5 +250,25 @@ mod tests {
         assert_eq!(anchor_word_query("Зеленая линия").as_deref(), Some("линия"));
         assert_eq!(anchor_word_query("линия"), None);
         assert_eq!(anchor_word_query("Все везде"), None);
+    }
+
+    #[test]
+    fn random_filter_applies_deviation_to_runtime_and_rating() {
+        let f = RandomMovieFilter {
+            genre_id: Some(878),
+            genre_name: Some("фантастика".into()),
+            target_runtime_min: Some(120),
+            min_rating: Some(7.5),
+            deviation_pct: 20,
+        };
+        let b = f.effective_bounds();
+        assert_eq!(b.genre_id, Some(878));
+        assert_eq!(b.runtime_range, Some((96, 144)));
+        assert_eq!(b.min_rating, Some(6.0));
+
+        let strict = RandomMovieFilter { deviation_pct: 0, ..f };
+        let sb = strict.effective_bounds();
+        assert_eq!(sb.runtime_range, Some((115, 125)));
+        assert_eq!(sb.min_rating, Some(7.5));
     }
 }

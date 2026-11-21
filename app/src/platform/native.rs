@@ -24,8 +24,7 @@ pub async fn init() {
     super::android::style_bars(false);
 }
 
-/// Remembers a server address chosen by the user; takes effect after restart of the app.
-#[allow(dead_code)]
+/// Remembers a server address chosen by the user.
 pub fn save_server(base: &str) {
     storage_set(SERVER_KEY, base.trim().trim_end_matches('/'));
 }

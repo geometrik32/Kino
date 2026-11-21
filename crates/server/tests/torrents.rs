@@ -500,7 +500,7 @@ async fn transcodes_with_ffmpeg(pool: PgPool) {
     assert_eq!(info.audio.len(), 1);
     assert_eq!(info.audio[0].label(), "LostFilm · Русский");
     assert_eq!(info.subtitles.len(), 1);
-    assert_eq!(info.subtitle_track, Some(0), "picked by the preferred language");
+    assert_eq!(info.subtitle_track, None, "subtitles are never auto-enabled from prefs");
 
     let (code, headers, bytes) = raw(&app, Method::GET, &info.transcoded_url(Some(0), 1.0), None, &[]).await;
     assert_eq!(code, StatusCode::OK);

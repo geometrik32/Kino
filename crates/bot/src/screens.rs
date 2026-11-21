@@ -3,6 +3,7 @@
 //! goes through [`esc`].
 
 use kino_core::{clock, episode_code, ContinueItem, MediaKind, TitleDetails, TitleStatus, TitleSummary};
+use kino_server::catalog::{RandomMovieFilter, RandomMoviePick};
 use teloxide::{
     types::{ButtonRequest, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, WebAppInfo},
     utils::html::escape as esc,
@@ -27,16 +28,21 @@ pub const CMD_CALLBACK: &str = "cmd:";
 /// Callback data to open a movie card from the remaining search results: `card:<kind>:<tmdb_id>`.
 pub const CARD_CALLBACK: &str = "card:";
 
+/// Callback data for the random movie recommender: `rnd:<op>:<state>`.
+pub const RANDOM_CALLBACK: &str = "rnd:";
+
 pub const BTN_OPEN_APP: &str = "🎬 Открыть кинопоказ";
+pub const BTN_RANDOM: &str = "🎲 Случайный фильм";
 pub const BTN_SEARCH: &str = "🔍 Поиск";
 pub const BTN_CONTINUE: &str = "▶ Продолжить";
 pub const BTN_MY: &str = "📚 Мои списки";
 pub const BTN_LOGIN: &str = "🌐 Вход на сайт";
 pub const BTN_HELP: &str = "❓ Помощь";
-pub const BTN_INVITE: &str = "🎟 Приглашение";
+pub const BTN_INVITE: &str = "🎟 Пригласить";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BotAction {
+    Random,
     Search,
     Continue,
     My,
@@ -48,6 +54,7 @@ pub enum BotAction {
 impl BotAction {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Random => "random",
             Self::Search => "search",
             Self::Continue => "continue",
             Self::My => "my",
@@ -59,6 +66,7 @@ impl BotAction {
 
     pub fn parse_button(text: &str) -> Option<Self> {
         match text.trim() {
+            BTN_RANDOM => Some(Self::Random),
             BTN_SEARCH => Some(Self::Search),
             BTN_CONTINUE => Some(Self::Continue),
             BTN_MY => Some(Self::My),
@@ -71,6 +79,7 @@ impl BotAction {
 
     pub fn parse_callback(suffix: &str) -> Option<Self> {
         match suffix {
+            "random" => Some(Self::Random),
             "search" => Some(Self::Search),
             "continue" => Some(Self::Continue),
             "my" => Some(Self::My),
@@ -85,6 +94,164 @@ impl BotAction {
 pub fn parse_card_callback(suffix: &str) -> Option<(MediaKind, i64)> {
     let (kind, id) = suffix.split_once(':')?;
     Some((MediaKind::parse(kind)?, id.parse().ok()?))
+}
+
+const RANDOM_GENRES: &[(i32, &str)] = &[
+    (28, "Боевик"),
+    (35, "Комедия"),
+    (18, "Драма"),
+    (878, "Фантастика"),
+    (53, "Триллер"),
+    (27, "Ужасы"),
+    (9648, "Детектив"),
+    (10749, "Мелодрама"),
+    (12, "Приключения"),
+    (16, "Мультфильм"),
+    (80, "Криминал"),
+    (14, "Фэнтези"),
+];
+
+const RANDOM_RUNTIMES: &[(Option<i32>, &str)] = &[
+    (None, "Любое"),
+    (Some(80), "~80 мин"),
+    (Some(105), "~105 мин"),
+    (Some(135), "~135 мин"),
+    (Some(170), "~170 мин"),
+];
+
+const RANDOM_RATINGS: &[(Option<f32>, &str)] = &[
+    (None, "Любой"),
+    (Some(6.0), "6.0+"),
+    (Some(7.0), "7.0+"),
+    (Some(7.5), "7.5+"),
+    (Some(8.0), "8.0+"),
+];
+
+const RANDOM_DEVIATIONS: &[(u8, &str)] = &[
+    (0, "0% (строго)"),
+    (10, "±10%"),
+    (20, "±20%"),
+    (35, "±35%"),
+    (50, "±50%"),
+];
+
+/// Stateless filter configuration encoded into Telegram `callback_data`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RandomState {
+    pub genre: usize,
+    pub runtime: usize,
+    pub rating: usize,
+    pub deviation: usize,
+}
+
+impl Default for RandomState {
+    fn default() -> Self {
+        Self {
+            genre: 0,
+            runtime: 0,
+            rating: 0,
+            deviation: 2, // ±20%
+        }
+    }
+}
+
+impl RandomState {
+    pub fn encode(self) -> String {
+        format!("{}:{}:{}:{}", self.genre, self.runtime, self.rating, self.deviation)
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let mut parts = s.split(':');
+        let genre: usize = parts.next()?.parse().ok()?;
+        let runtime: usize = parts.next()?.parse().ok()?;
+        let rating: usize = parts.next()?.parse().ok()?;
+        let deviation: usize = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        if genre > RANDOM_GENRES.len()
+            || runtime >= RANDOM_RUNTIMES.len()
+            || rating >= RANDOM_RATINGS.len()
+            || deviation >= RANDOM_DEVIATIONS.len()
+        {
+            return None;
+        }
+        Some(Self {
+            genre,
+            runtime,
+            rating,
+            deviation,
+        })
+    }
+
+    pub fn genre_label(self) -> &'static str {
+        if self.genre == 0 {
+            "Любой"
+        } else {
+            RANDOM_GENRES[self.genre - 1].1
+        }
+    }
+
+    pub fn runtime_label(self) -> &'static str {
+        RANDOM_RUNTIMES[self.runtime].1
+    }
+
+    pub fn rating_label(self) -> &'static str {
+        RANDOM_RATINGS[self.rating].1
+    }
+
+    pub fn deviation_label(self) -> &'static str {
+        RANDOM_DEVIATIONS[self.deviation].1
+    }
+
+    pub fn to_filter(self) -> RandomMovieFilter {
+        let (genre_id, genre_name) = if self.genre == 0 {
+            (None, None)
+        } else {
+            let (id, name) = RANDOM_GENRES[self.genre - 1];
+            (Some(id), Some(name.to_lowercase()))
+        };
+        RandomMovieFilter {
+            genre_id,
+            genre_name,
+            target_runtime_min: RANDOM_RUNTIMES[self.runtime].0,
+            min_rating: RANDOM_RATINGS[self.rating].0,
+            deviation_pct: RANDOM_DEVIATIONS[self.deviation].0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RandomSubmenu {
+    Genre,
+    Runtime,
+    Rating,
+    Deviation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RandomCallback {
+    Any,
+    Go(RandomState),
+    Menu(RandomState),
+    Submenu(RandomSubmenu, RandomState),
+}
+
+pub fn parse_random_callback(suffix: &str) -> Option<RandomCallback> {
+    if suffix == "any" {
+        return Some(RandomCallback::Any);
+    }
+    let (op, rest) = suffix.split_once(':')?;
+    let state = RandomState::decode(rest)?;
+    match op {
+        "go" => Some(RandomCallback::Go(state)),
+        "menu" => Some(RandomCallback::Menu(state)),
+        "mg" => Some(RandomCallback::Submenu(RandomSubmenu::Genre, state)),
+        "mt" => Some(RandomCallback::Submenu(RandomSubmenu::Runtime, state)),
+        "mr" => Some(RandomCallback::Submenu(RandomSubmenu::Rating, state)),
+        "md" => Some(RandomCallback::Submenu(RandomSubmenu::Deviation, state)),
+        _ => None,
+    }
 }
 
 /// The app opened on a title: `<site>/?open=tv_1396`.
@@ -166,19 +333,17 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 pub fn main_reply_keyboard(app_url: &Url, is_admin: bool) -> KeyboardMarkup {
     let mut rows = vec![
         vec![KeyboardButton::new(BTN_OPEN_APP).request(ButtonRequest::WebApp(WebAppInfo { url: app_url.clone() }))],
-        vec![KeyboardButton::new(BTN_SEARCH), KeyboardButton::new(BTN_CONTINUE)],
-        vec![KeyboardButton::new(BTN_MY), KeyboardButton::new(BTN_LOGIN)],
+        vec![KeyboardButton::new(BTN_RANDOM), KeyboardButton::new(BTN_SEARCH)],
+        vec![KeyboardButton::new(BTN_CONTINUE), KeyboardButton::new(BTN_MY)],
+        vec![KeyboardButton::new(BTN_LOGIN), KeyboardButton::new(BTN_HELP)],
     ];
-    let last_row = if is_admin {
-        vec![KeyboardButton::new(BTN_HELP), KeyboardButton::new(BTN_INVITE)]
-    } else {
-        vec![KeyboardButton::new(BTN_HELP)]
-    };
-    rows.push(last_row);
+    if is_admin {
+        rows.push(vec![KeyboardButton::new(BTN_INVITE)]);
+    }
     KeyboardMarkup::new(rows)
         .resize_keyboard()
         .persistent()
-        .input_field_placeholder("Введите название фильма или сериала…")
+        .input_field_placeholder("Введите название фильма или выберите кнопку…")
 }
 
 fn command_inline_rows(base: &Url, is_admin: bool) -> Vec<Vec<InlineKeyboardButton>> {
@@ -187,21 +352,24 @@ fn command_inline_rows(base: &Url, is_admin: bool) -> Vec<Vec<InlineKeyboardButt
     };
     let mut rows = vec![
         vec![open_app(base, BTN_OPEN_APP)],
-        vec![
-            cmd(BTN_SEARCH, BotAction::Search),
-            cmd(BTN_CONTINUE, BotAction::Continue),
-        ],
-        vec![cmd(BTN_MY, BotAction::My), cmd(BTN_LOGIN, BotAction::Login)],
+        vec![cmd(BTN_RANDOM, BotAction::Random), cmd(BTN_SEARCH, BotAction::Search)],
+        vec![cmd(BTN_CONTINUE, BotAction::Continue), cmd(BTN_MY, BotAction::My)],
     ];
-    if is_admin {
-        rows.push(vec![cmd(BTN_INVITE, BotAction::Invite)]);
-    }
+    let last = if is_admin {
+        vec![cmd(BTN_LOGIN, BotAction::Login), cmd(BTN_INVITE, BotAction::Invite)]
+    } else {
+        vec![cmd(BTN_LOGIN, BotAction::Login)]
+    };
+    rows.push(last);
     rows
 }
 
 pub fn start_welcome_text() -> &'static str {
-    "Привет! Здесь можно найти фильм или сериал и смотреть его с того места, где остановились.\n\n\
-     Просто напишите название фильма в чат или выберите действие на кнопках ниже."
+    "<b>Орловский кинопоказ</b>\n\
+     Ваш личный кинотеатр с единой историей и прогрессом на всех устройствах.\n\n\
+     • Напишите название фильма в чат — пришлю карточки с постером и описанием\n\
+     • Нажмите <b>🎲 Случайный фильм</b> — подберу кино под настроение и длительность\n\
+     • Выберите нужное действие на кнопках ниже"
 }
 
 pub fn start_inline(app_url: &Url, is_admin: bool) -> Screen {
@@ -210,26 +378,29 @@ pub fn start_inline(app_url: &Url, is_admin: bool) -> Screen {
 
 /// Shown in an empty chat with the bot, above the "Начать" button (Telegram allows 512 characters).
 pub const BOT_DESCRIPTION: &str = "Орловский кинопоказ: ваш личный кинотеатр.\n\n\
-    Ищите фильмы и сериалы, смотрите в Telegram, на сайте и в приложении и продолжайте с того же места на любом устройстве.\n\n\
+    Ищите фильмы и сериалы, подбирайте случайное кино по жанру и времени, смотрите в Telegram, на сайте и в приложении с того же места.\n\n\
     Нажмите «Начать».";
 
 /// Shown on the bot's profile and when it is shared (Telegram allows 120 characters).
 pub const BOT_SHORT_DESCRIPTION: &str =
-    "Личный кинотеатр: поиск, просмотр и продолжение с того же места на любом устройстве.";
+    "Личный кинотеатр: поиск, подбор случайного фильма и просмотр с любого устройства.";
 
 pub fn help(base: &Url, is_admin: bool) -> Screen {
     let mut text = String::from(
-        "<b>Орловский кинопоказ</b>\n\
-         Ищите фильмы и сериалы и смотрите дальше с того места, где остановились, на любом устройстве.\n\n\
-         /search <i>название</i> — найти фильм или сериал. Можно просто написать название без команды\n\
-         /continue — продолжить просмотр\n\
-         /my — мои списки: смотрю, хочу посмотреть, просмотрено, брошено\n\
-         /login — войти на сайт в браузере\n\
-         /help — эта подсказка\n\
-         /start — открыть кинотеатр и обновить кнопки",
+        "<b>Орловский кинопоказ — что умеет бот</b>\n\n\
+         <b>Поиск и подбор</b>\n\
+         • /search <i>название</i> — поиск фильма или сериала (можно просто написать название в чат)\n\
+         • /random — случайный фильм (без рамок или по жанру, длительности, рейтингу и допуску)\n\n\
+         <b>Просмотр и списки</b>\n\
+         • /continue — продолжить с места остановки\n\
+         • /my — списки: смотрю, хочу посмотреть, просмотрено, брошено\n\n\
+         <b>Доступ</b>\n\
+         • /login — быстрый вход на сайт в браузере\n\
+         • /start — открыть кинопоказ и показать кнопки команд\n\
+         • /help — эта подсказка",
     );
     if is_admin {
-        text.push_str("\n/invite — создать приглашение (только админ)");
+        text.push_str("\n• /invite — создать одноразовое приглашение (админ)");
     }
     Screen::new(text, command_inline_rows(base, is_admin))
 }
@@ -243,14 +414,24 @@ pub fn search_prompt() -> String {
 pub fn search_empty(query: &str) -> Screen {
     Screen::new(
         format!(
-            "По запросу «{}» ничего не нашлось. Попробуйте другое название.",
+            "По запросу «{}» ничего не нашлось. Попробуйте другое название или подберите случайный фильм.",
             esc(query)
         ),
-        vec![],
+        vec![vec![InlineKeyboardButton::callback(
+            BTN_RANDOM,
+            format!("{RANDOM_CALLBACK}any"),
+        )]],
     )
 }
 
-fn format_card(base: &Url, t: &TitleSummary, genres: &[String], runtime_min: Option<i32>) -> Screen {
+fn format_card(
+    base: &Url,
+    t: &TitleSummary,
+    genres: &[String],
+    runtime_min: Option<i32>,
+    note: Option<&str>,
+    extra_rows: Vec<Vec<InlineKeyboardButton>>,
+) -> Screen {
     let header = name_with_year(t);
     let mut text = format!("<b>{}</b>", esc(&header));
     let mut plain_len = header.chars().count();
@@ -278,28 +459,226 @@ fn format_card(base: &Url, t: &TitleSummary, genres: &[String], runtime_min: Opt
         plain_len += 1 + joined.chars().count();
     }
 
+    let note_clean = note.map(str::trim).filter(|n| !n.is_empty());
+    let note_reserve = note_clean.map(|n| 2 + n.chars().count()).unwrap_or(0);
+
     if let Some(overview) = t.overview.as_deref().map(str::trim).filter(|o| !o.is_empty()) {
-        let budget = CAPTION_MAX_CHARS.saturating_sub(plain_len + 2);
+        let budget = CAPTION_MAX_CHARS.saturating_sub(plain_len + note_reserve + 2);
         if budget >= 20 {
             let short = truncate_chars(overview, budget);
             text.push_str(&format!("\n\n{}", esc(&short)));
         }
     }
 
-    Screen::new(
-        text,
-        vec![vec![open_title(BTN_OPEN_APP.into(), base, t.kind, t.tmdb_id)]],
-    )
+    if let Some(note_text) = note_clean {
+        text.push_str(&format!("\n\n<i>{}</i>", esc(note_text)));
+    }
+
+    let mut rows = vec![vec![open_title(BTN_OPEN_APP.into(), base, t.kind, t.tmdb_id)]];
+    rows.extend(extra_rows);
+    Screen::new(text, rows)
 }
 
 /// Movie or series card shown for search results (photo caption + open button).
 pub fn title_card(base: &Url, t: &TitleSummary) -> Screen {
-    format_card(base, t, &[], None)
+    format_card(base, t, &[], None, None, Vec::new())
 }
 
 /// Movie or series card enriched with details (genres and runtime).
 pub fn title_details_card(base: &Url, d: &TitleDetails) -> Screen {
-    format_card(base, &d.summary, &d.genres, d.runtime_min)
+    format_card(base, &d.summary, &d.genres, d.runtime_min, None, Vec::new())
+}
+
+pub fn random_menu(state: RandomState) -> Screen {
+    let bounds = state.to_filter().effective_bounds();
+    let runtime_desc = match bounds.runtime_range {
+        Some((lo, hi)) => format!("{} ({lo}–{hi} мин)", state.runtime_label()),
+        None => "любая".to_owned(),
+    };
+    let rating_desc = match (RANDOM_RATINGS[state.rating].0, bounds.min_rating) {
+        (Some(target), Some(eff)) if (target - eff).abs() >= 0.05 => {
+            format!("от {target:.1} (с допуском: от {eff:.1})")
+        }
+        (Some(target), _) => format!("от {target:.1}"),
+        _ => "любой".to_owned(),
+    };
+    let text = format!(
+        "<b>🎲 Подбор случайного фильма</b>\n\
+         Задайте желаемые рамки или сразу выберите случайный фильм.\n\n\
+         • <b>Жанр:</b> {}\n\
+         • <b>Длительность:</b> {runtime_desc}\n\
+         • <b>Рейтинг:</b> {rating_desc}\n\
+         • <b>Отклонение:</b> {}",
+        state.genre_label().to_lowercase(),
+        state.deviation_label(),
+    );
+    let enc = state.encode();
+    let mut rows = vec![
+        vec![InlineKeyboardButton::callback(
+            "🎲 Подобрать по фильтрам",
+            format!("{RANDOM_CALLBACK}go:{enc}"),
+        )],
+        vec![InlineKeyboardButton::callback(
+            "⚡ Полностью случайный",
+            format!("{RANDOM_CALLBACK}any"),
+        )],
+        vec![
+            InlineKeyboardButton::callback(
+                format!("🎭 Жанр: {}", state.genre_label()),
+                format!("{RANDOM_CALLBACK}mg:{enc}"),
+            ),
+            InlineKeyboardButton::callback(
+                format!("⏱ Время: {}", state.runtime_label()),
+                format!("{RANDOM_CALLBACK}mt:{enc}"),
+            ),
+        ],
+        vec![
+            InlineKeyboardButton::callback(
+                format!("⭐ Рейтинг: {}", state.rating_label()),
+                format!("{RANDOM_CALLBACK}mr:{enc}"),
+            ),
+            InlineKeyboardButton::callback(
+                format!("📊 Допуск: {}", state.deviation_label()),
+                format!("{RANDOM_CALLBACK}md:{enc}"),
+            ),
+        ],
+    ];
+    if state != RandomState::default() {
+        rows.push(vec![InlineKeyboardButton::callback(
+            "↺ Сбросить фильтры",
+            format!("{RANDOM_CALLBACK}menu:{}", RandomState::default().encode()),
+        )]);
+    }
+    Screen::new(text, rows)
+}
+
+pub fn random_submenu(sub: RandomSubmenu, state: RandomState) -> Screen {
+    let back = vec![InlineKeyboardButton::callback(
+        "← К фильтрам",
+        format!("{RANDOM_CALLBACK}menu:{}", state.encode()),
+    )];
+    let mark = |selected: bool, label: &str| {
+        if selected {
+            format!("✓ {label}")
+        } else {
+            label.to_owned()
+        }
+    };
+
+    match sub {
+        RandomSubmenu::Genre => {
+            let mut rows = vec![vec![InlineKeyboardButton::callback(
+                mark(state.genre == 0, "Любой жанр"),
+                format!("{RANDOM_CALLBACK}menu:{}", RandomState { genre: 0, ..state }.encode()),
+            )]];
+            let genre_buttons: Vec<_> = RANDOM_GENRES
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, name))| {
+                    let g = idx + 1;
+                    let next = RandomState { genre: g, ..state }.encode();
+                    InlineKeyboardButton::callback(
+                        mark(state.genre == g, name),
+                        format!("{RANDOM_CALLBACK}menu:{next}"),
+                    )
+                })
+                .collect();
+            rows.extend(genre_buttons.chunks(3).map(<[_]>::to_vec));
+            rows.push(back);
+            Screen::new("<b>🎭 Выберите жанр</b>".to_owned(), rows)
+        }
+        RandomSubmenu::Runtime => {
+            let buttons: Vec<_> = RANDOM_RUNTIMES
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, label))| {
+                    let next = RandomState { runtime: idx, ..state }.encode();
+                    InlineKeyboardButton::callback(
+                        mark(state.runtime == idx, label),
+                        format!("{RANDOM_CALLBACK}menu:{next}"),
+                    )
+                })
+                .collect();
+            let mut rows: Vec<_> = buttons.chunks(2).map(<[_]>::to_vec).collect();
+            rows.push(back);
+            Screen::new(
+                "<b>⏱ Примерная длительность</b>\nИтоговый диапазон зависит от процента отклонения.".to_owned(),
+                rows,
+            )
+        }
+        RandomSubmenu::Rating => {
+            let buttons: Vec<_> = RANDOM_RATINGS
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, label))| {
+                    let next = RandomState { rating: idx, ..state }.encode();
+                    InlineKeyboardButton::callback(
+                        mark(state.rating == idx, label),
+                        format!("{RANDOM_CALLBACK}menu:{next}"),
+                    )
+                })
+                .collect();
+            let mut rows: Vec<_> = buttons.chunks(2).map(<[_]>::to_vec).collect();
+            rows.push(back);
+            Screen::new(
+                "<b>⭐ Минимальный рейтинг</b>\nПри выбранном отклонении порог может смягчаться.".to_owned(),
+                rows,
+            )
+        }
+        RandomSubmenu::Deviation => {
+            let buttons: Vec<_> = RANDOM_DEVIATIONS
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, label))| {
+                    let next = RandomState {
+                        deviation: idx,
+                        ..state
+                    }
+                    .encode();
+                    InlineKeyboardButton::callback(
+                        mark(state.deviation == idx, label),
+                        format!("{RANDOM_CALLBACK}menu:{next}"),
+                    )
+                })
+                .collect();
+            let mut rows: Vec<_> = buttons.chunks(2).map(<[_]>::to_vec).collect();
+            rows.push(back);
+            Screen::new(
+                "<b>📊 Процент отклонения от настроек</b>\nРасширяет допуск по длительности и снижает порог рейтинга на заданный процент.".to_owned(),
+                rows,
+            )
+        }
+    }
+}
+
+pub fn random_movie_card(base: &Url, pick: &RandomMoviePick, state: Option<RandomState>) -> Screen {
+    let note = pick
+        .relaxed
+        .then_some("Точных совпадений по заданным рамкам не нашлось, поэтому фильтр был расширен.");
+    let extra_rows = match state {
+        Some(st) => {
+            let enc = st.encode();
+            vec![vec![
+                InlineKeyboardButton::callback("🎲 Другой фильм", format!("{RANDOM_CALLBACK}go:{enc}")),
+                InlineKeyboardButton::callback("⚙ Фильтры", format!("{RANDOM_CALLBACK}menu:{enc}")),
+            ]]
+        }
+        None => vec![vec![
+            InlineKeyboardButton::callback("🎲 Ещё случайный", format!("{RANDOM_CALLBACK}any")),
+            InlineKeyboardButton::callback(
+                "⚙ По фильтрам",
+                format!("{RANDOM_CALLBACK}menu:{}", RandomState::default().encode()),
+            ),
+        ]],
+    };
+    format_card(
+        base,
+        &pick.details.summary,
+        &pick.details.genres,
+        pick.details.runtime_min,
+        note,
+        extra_rows,
+    )
 }
 
 /// Compact list of additional search hits beyond [`SEARCH_CARD_LIMIT`], each opening its full card.
@@ -511,10 +890,10 @@ mod tests {
     }
 
     #[test]
-    fn search_with_nothing_found_says_so_without_buttons() {
+    fn search_with_nothing_found_offers_random_movie() {
         let s = search_empty("ыыы");
         assert!(s.text.contains("ничего не нашлось"));
-        assert!(s.keyboard.inline_keyboard.is_empty());
+        assert_eq!(s.keyboard.inline_keyboard[0][0].text, BTN_RANDOM);
     }
 
     #[test]
@@ -545,6 +924,7 @@ mod tests {
         let kb = main_reply_keyboard(&base(), false);
         let texts: Vec<_> = kb.keyboard.iter().flatten().map(|b| b.text.as_str()).collect();
         assert!(texts.contains(&BTN_OPEN_APP));
+        assert!(texts.contains(&BTN_RANDOM));
         assert!(texts.contains(&BTN_SEARCH));
         assert!(texts.contains(&BTN_CONTINUE));
         assert!(texts.contains(&BTN_MY));
@@ -556,6 +936,7 @@ mod tests {
         let admin_texts: Vec<_> = admin_kb.keyboard.iter().flatten().map(|b| b.text.as_str()).collect();
         assert!(admin_texts.contains(&BTN_INVITE));
 
+        assert_eq!(BotAction::parse_button(BTN_RANDOM), Some(BotAction::Random));
         assert_eq!(BotAction::parse_button(BTN_SEARCH), Some(BotAction::Search));
         assert_eq!(BotAction::parse_button(BTN_CONTINUE), Some(BotAction::Continue));
         assert_eq!(BotAction::parse_button(BTN_MY), Some(BotAction::My));
@@ -563,6 +944,63 @@ mod tests {
         assert_eq!(BotAction::parse_button(BTN_HELP), Some(BotAction::Help));
         assert_eq!(BotAction::parse_button(BTN_INVITE), Some(BotAction::Invite));
         assert_eq!(BotAction::parse_button("Зеленая линия"), None);
+    }
+
+    #[test]
+    fn random_state_round_trip_and_callback_sizes_fit_telegram_limit() {
+        let st = RandomState {
+            genre: 4,
+            runtime: 2,
+            rating: 3,
+            deviation: 2,
+        };
+        let encoded = st.encode();
+        assert_eq!(RandomState::decode(&encoded), Some(st));
+        assert_eq!(RandomState::decode("99:0:0:0"), None);
+        assert_eq!(
+            parse_random_callback(&format!("go:{encoded}")),
+            Some(RandomCallback::Go(st))
+        );
+        assert_eq!(parse_random_callback("any"), Some(RandomCallback::Any));
+
+        for screen in [
+            random_menu(st),
+            random_submenu(RandomSubmenu::Genre, st),
+            random_submenu(RandomSubmenu::Runtime, st),
+            random_submenu(RandomSubmenu::Rating, st),
+            random_submenu(RandomSubmenu::Deviation, st),
+        ] {
+            for btn in screen.keyboard.inline_keyboard.iter().flatten() {
+                if let InlineKeyboardButtonKind::CallbackData(d) = &btn.kind {
+                    assert!(d.len() <= 64, "callback_data too long: {d}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn random_movie_card_has_rerun_and_filter_buttons() {
+        let mut t = summary(MediaKind::Movie, 603, "Матрица", Some(1999));
+        t.overview = Some("Хакер Нео узнаёт правду.".into());
+        let pick = RandomMoviePick {
+            details: TitleDetails {
+                summary: t,
+                genres: vec!["фантастика".into()],
+                runtime_min: Some(136),
+                tagline: None,
+                seasons: vec![],
+                imdb_id: None,
+                last_episode: None,
+            },
+            relaxed: true,
+        };
+        let st = RandomState::default();
+        let s = random_movie_card(&base(), &pick, Some(st));
+        assert!(s.text.contains("136 мин"));
+        assert!(s.text.contains("фильтр был расширен"));
+        assert_eq!(s.keyboard.inline_keyboard.len(), 2);
+        assert_eq!(s.keyboard.inline_keyboard[1][0].text, "🎲 Другой фильм");
+        assert_eq!(s.keyboard.inline_keyboard[1][1].text, "⚙ Фильтры");
     }
 
     fn progress(kind: MediaKind, season: i32, episode: i32, pos: f64, finished: bool) -> Progress {
@@ -672,6 +1110,7 @@ mod tests {
             .flatten()
             .map(|b| b.text.as_str())
             .collect();
+        assert!(user_buttons.contains(&BTN_RANDOM));
         assert!(user_buttons.contains(&BTN_SEARCH));
         assert!(user_buttons.contains(&BTN_CONTINUE));
         assert!(user_buttons.contains(&BTN_MY));

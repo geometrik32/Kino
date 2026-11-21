@@ -34,9 +34,11 @@ pub struct Jackett {
     api_key: String,
 }
 
-/// Torznab categories: movies (2000) and TV (5000), with their sub-categories.
-pub const MOVIE_CATS: &str = "2000,2010,2020,2030,2040,2045,2050,2060,2070,2080";
-pub const TV_CATS: &str = "5000,5010,5020,5030,5040,5045,5050,5060,5070,5080";
+/// Torznab categories: movies (2000) and TV (5000) with sub-categories, plus
+/// `8000`/`8010` (`Other`) because Russian indexers in Jackett (RuTor,
+/// MegaPeer, torrent.by) return search results under `Other`.
+pub const MOVIE_CATS: &str = "2000,2010,2020,2030,2040,2045,2050,2060,2070,2080,8000,8010";
+pub const TV_CATS: &str = "5000,5010,5020,5030,5040,5045,5050,5060,5070,5080,8000,8010";
 
 impl Jackett {
     pub fn new(http: reqwest::Client, base: &str, api_key: &str) -> Self {

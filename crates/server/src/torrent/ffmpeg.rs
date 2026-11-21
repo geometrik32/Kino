@@ -197,6 +197,7 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
             "-b:a",
             "192k",
             "-sn",
+            "-dn",
             "-f",
             "mp4",
             "-movflags",
@@ -212,10 +213,27 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
 /// `start`, times count from that second, to match a re-encoded stream.
 pub fn subtitle_args(input: &str, index: i32, start: u64) -> Vec<String> {
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error"].map(String::from).to_vec();
+    if is_http(input) {
+        a.extend(["-rw_timeout".into(), "30000000".into()]);
+    }
     if start > 0 {
         a.extend(["-ss".into(), start.to_string()]);
     }
-    a.extend(["-i", input, "-map", &format!("0:s:{index}"), "-f", "webvtt", "pipe:1"].map(String::from));
+    a.extend(
+        [
+            "-i",
+            input,
+            "-map",
+            &format!("0:s:{index}"),
+            "-vn",
+            "-an",
+            "-dn",
+            "-f",
+            "webvtt",
+            "pipe:1",
+        ]
+        .map(String::from),
+    );
     a
 }
 
@@ -259,9 +277,12 @@ mod tests {
         assert!(a.contains("-ss 600 -i http://ts/stream"));
         assert!(a.contains("-map 0:a:1?"));
         assert!(a.contains("h264_qsv"));
+        assert!(a.contains("-dn"));
         let a = transcode_args("f.mkv", 0, 0, true, HwAccel::Qsv).join(" ");
         assert!(!a.contains("rw_timeout") && !a.contains("hwaccel") && !a.contains("-ss") && a.contains("-c:v copy"));
         assert_eq!(subtitle_args("f.mkv", 2, 0)[6], "0:s:2");
-        assert!(subtitle_args("f.mkv", 0, 90).join(" ").contains("-ss 90 -i f.mkv"));
+        let s = subtitle_args("http://ts/stream", 0, 90).join(" ");
+        assert!(s.contains("-rw_timeout 30000000") && s.contains("-ss 90 -i http://ts/stream"));
+        assert!(s.contains("-vn -an -dn"));
     }
 }

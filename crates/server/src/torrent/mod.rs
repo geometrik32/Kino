@@ -11,10 +11,11 @@ pub mod token;
 pub mod torrserver;
 pub mod torznab;
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::LazyLock};
 
 pub use kino_core::is_infohash;
 use kino_core::{estimate_bitrate_kbps, MediaKind, ReleaseOption, TitleDetails};
+use regex::Regex;
 use sha1::{Digest, Sha1};
 use sqlx::PgPool;
 
@@ -107,9 +108,28 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     }
 }
 
-/// Whether a release name is about this title: it has one of the names and,
-/// for films, a year no more than one off.
+static NON_VIDEO_KIND: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(аудиокнига|audiobook|саундтрек|soundtrack|ost)\b").unwrap());
+static NON_VIDEO_EXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(mp3|мр3|flac|alac|ape|wav|m4a|m4b|fb2|epub|mobi|djvu)\b").unwrap());
+static VIDEO_HINT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)\b(web-?dl|web-?rip|bd-?rip|bd-?remux|blu-?ray|bluray|dvd-?rip|hd-?rip|hd-?tv|tv-?rip|sat-?rip|1080[pi]?|720[pi]?|2160[pi]?|1440[pi]?|4k|uhd|hevc|[hx]\.?26[45]|avc|av1|mkv|mp4|avi|сезон)\b|\bs\d{1,2}e\d{1,3}\b",
+    )
+    .unwrap()
+});
+
+fn is_non_video(name: &str) -> bool {
+    NON_VIDEO_KIND.is_match(name) || (NON_VIDEO_EXT.is_match(name) && !VIDEO_HINT.is_match(name))
+}
+
+/// Whether a release name is about this title: it has one of the names,
+/// looks like video (filtering out OSTs/audiobooks from category `Other`) and,
+/// for films, has a year no more than one off.
 pub fn is_about(name: &str, details: &TitleDetails) -> bool {
+    if is_non_video(name) {
+        return false;
+    }
     let n = normalize(name);
     let s = &details.summary;
     let names = [Some(&s.title), s.original_title.as_ref()];
@@ -310,4 +330,65 @@ pub fn http_client() -> reqwest::Client {
         .user_agent("kino")
         .build()
         .expect("http client")
+}
+
+#[cfg(test)]
+mod tests {
+    use kino_core::TitleSummary;
+
+    use super::*;
+
+    fn details(kind: MediaKind, title: &str, original: &str, year: Option<i32>) -> TitleDetails {
+        TitleDetails {
+            summary: TitleSummary {
+                kind,
+                tmdb_id: 1,
+                title: title.into(),
+                original_title: Some(original.into()),
+                year,
+                poster_path: None,
+                backdrop_path: None,
+                rating: None,
+                overview: None,
+            },
+            genres: vec![],
+            runtime_min: None,
+            tagline: None,
+            seasons: vec![],
+            imdb_id: None,
+            last_episode: None,
+        }
+    }
+
+    #[test]
+    fn filters_non_video_from_other_category() {
+        let movie = details(MediaKind::Movie, "Зелёная миля", "The Green Mile", Some(1999));
+        assert!(is_about("Зеленая миля / The Green Mile (1999) BDRip 1080p", &movie));
+        assert!(is_about("Зеленая миля / The Green Mile (1999) DVDRip XviD MP3", &movie));
+        assert!(!is_about(
+            "OST - Зеленая миля / The Green Mile Soundtrack [Thomas Newman] (1999) MP3",
+            &movie
+        ));
+        assert!(!is_about("Зелёная миля (1999) Аудиокнига MP3", &movie));
+
+        let tv = details(
+            MediaKind::Tv,
+            "Декстер: Воскрешение",
+            "Dexter: Resurrection",
+            Some(2025),
+        );
+        assert!(is_about(
+            "Декстер: Воскрешение / Dexter: Resurrection [S02E01-04 of 10] (2026) WEBRip от Kerob | L2",
+            &tv
+        ));
+        assert!(!is_about("Dexter: Resurrection Official Soundtrack FLAC", &tv));
+    }
+
+    #[test]
+    fn categories_include_other_for_russian_trackers() {
+        assert!(MOVIE_CATS.split(',').any(|c| c == "8000"));
+        assert!(MOVIE_CATS.split(',').any(|c| c == "8010"));
+        assert!(TV_CATS.split(',').any(|c| c == "8000"));
+        assert!(TV_CATS.split(',').any(|c| c == "8010"));
+    }
 }

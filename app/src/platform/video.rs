@@ -48,6 +48,12 @@ mod imp {
             self.0.set_default_playback_rate(rate);
             self.0.set_playback_rate(rate);
         }
+        pub fn set_volume(&self, vol: f64) {
+            self.0.set_volume(vol.clamp(0.0, 1.0));
+        }
+        pub fn set_muted(&self, muted: bool) {
+            self.0.set_muted(muted);
+        }
     }
 
     /// Starts mirroring (nothing to do in a browser).
@@ -117,6 +123,17 @@ mod imp {
         pub fn set_rate(&self, rate: f64) {
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
+            ));
+        }
+        pub fn set_volume(&self, vol: f64) {
+            let vol = vol.clamp(0.0, 1.0);
+            run(format!(
+                "var v=document.getElementById('{VIDEO_ID}'); if(v) v.volume={vol};"
+            ));
+        }
+        pub fn set_muted(&self, muted: bool) {
+            run(format!(
+                "var v=document.getElementById('{VIDEO_ID}'); if(v) v.muted={muted};"
             ));
         }
     }

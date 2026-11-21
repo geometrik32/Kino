@@ -3,11 +3,11 @@
 use std::sync::LazyLock;
 
 use kino_core::{
-    ApiError, AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
-    MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayRequest, PreloadItem, PreloadRequest, Progress,
-    ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season, StatusUpdate,
-    StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest,
-    WidgetAuthRequest,
+    ApiError, AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest,
+    LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayRequest, PreloadItem, PreloadRequest,
+    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season,
+    ShelfPage, StatusUpdate, StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate,
+    UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -114,6 +114,17 @@ pub async fn continue_watching(token: &str) -> Result<Vec<ContinueItem>, Failure
 
 pub async fn home(token: &str) -> Result<HomeFeed, Failure> {
     get("/api/catalog/home", token).await
+}
+
+pub async fn home_shelves(token: &str, ids: &[String]) -> Result<Vec<CatalogRow>, Failure> {
+    let joined = ids.join(",");
+    let encoded = urlencoding::encode(&joined);
+    get(&format!("/api/catalog/home/shelves?ids={encoded}"), token).await
+}
+
+pub async fn shelf_page(token: &str, id: &str, page: u32) -> Result<ShelfPage, Failure> {
+    let encoded = urlencoding::encode(id);
+    get(&format!("/api/catalog/shelf/{encoded}?page={page}"), token).await
 }
 
 pub async fn search(token: &str, q: &str) -> Result<SearchResults, Failure> {

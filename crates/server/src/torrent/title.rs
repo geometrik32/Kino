@@ -63,9 +63,13 @@ struct Regexes {
     avc: Regex,
     av1: Regex,
     dub: Regex,
+    dub_cyr: Regex,
     mvo: Regex,
     dvo: Regex,
     avo: Regex,
+    rus: Regex,
+    orig: Regex,
+    sub_lang: Regex,
     sub: Regex,
     ukr_only: Regex,
     mbps: Regex,
@@ -87,10 +91,16 @@ impl Regexes {
             hevc: re(r"(?i)\b(hevc|[hx]\.?265)\b"),
             avc: re(r"(?i)\b(avc|[hx]\.?264)\b"),
             av1: re(r"(?i)\bav1\b"),
-            dub: re(r"(?i)\b(dub|d|дубляж|дублированный|д|дб)\b"),
+            dub: re(r"(?i)\b(dub|dubbed|дубляж|дублированный|дб)\b"),
+            dub_cyr: re(r"(?i)(?:^|[\s|,/\[\(])[дd](?:$|[\s|,\]\)])"),
             mvo: re(r"(?i)\b(mvo|многоголосый|пм|лм)\b"),
             dvo: re(r"(?i)\b(dvo|двухголосый|пд|лд)\b"),
             avo: re(r"(?i)\b(avo|авторский|ао|ап)\b"),
+            rus: re(r"(?i)\b(rus|russian|рус|русск(?:ий|ая|ое))\b"),
+            orig: re(r"(?i)\b(orig|original|оригинал)\b"),
+            sub_lang: re(
+                r"(?i)\b(?:sub|subs|subtitles?|субтитры?|ст)[\s.:]*(?:\([^)]*\)|\[[^\]]*\]|(?:rus|russian|рус|eng)\b)|\b(?:rus|russian|рус)[\s.:]+(?:sub|subs|subtitles?|суб)\b",
+            ),
             sub: re(r"(?i)\b(sub|subs|субтитры|ст)\b"),
             ukr_only: re(r"(?i)\b(ukr|укр)\b"),
             mbps: re(r"(?i)(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:mbps|mbit/s|mbit|мбит/с|мбит/сек|мбит)"),
@@ -139,6 +149,8 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         None
     };
 
+    let has_cyr = has_cyrillic(name);
+    let audio_text = re.sub_lang.replace_all(name, " ");
     let studio = STUDIOS.iter().find(|(k, _)| lower.contains(k)).map(|(_, v)| *v);
     let voice = match studio {
         Some(s) => s.to_string(),
@@ -146,12 +158,20 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         None if re.mvo.is_match(name) => "Многоголосый".into(),
         None if re.dvo.is_match(name) => "Двухголосый".into(),
         None if re.avo.is_match(name) => "Авторский".into(),
-        None if has_cyrillic(name) => "Русский".into(),
+        None if has_cyr && re.dub_cyr.is_match(name) => "Дубляж".into(),
+        None if re.rus.is_match(&audio_text) => "Русский".into(),
+        None if re.orig.is_match(&audio_text) => "Оригинал".into(),
+        None if has_cyr => "Русский".into(),
         None => "Оригинал".into(),
     };
     let language = if voice == "Оригинал" {
         "Английский"
-    } else if re.ukr_only.is_match(name) && studio.is_none() && !lower.contains("rus") && !lower.contains("рус") {
+    } else if re.ukr_only.is_match(name)
+        && studio.is_none()
+        && !re.rus.is_match(&audio_text)
+        && !lower.contains("rus")
+        && !lower.contains("рус")
+    {
         "Украинский"
     } else {
         "Русский"
@@ -239,6 +259,24 @@ mod tests {
         assert_eq!(p.season, None);
         assert_eq!(p.quality, "720p");
         assert_eq!(p.codec.as_deref(), Some("H.264"));
+        assert_eq!(p.voice, "Оригинал");
+        assert_eq!(p.language, "Английский");
+
+        // Standalone Latin D in English release names must not match Russian dub.
+        let p = parse_title("Avatar Aang The Last Airbender 2026 2160p AMZN WEB DL DD 5 1 Atmos H 265 E N D");
+        assert_eq!(p.voice, "Оригинал");
+        assert_eq!(p.language, "Английский");
+
+        let p = parse_title("Властелин колец: Кольца власти [S02] (2024) WEB-DL 1080p | D | RHS");
+        assert_eq!(p.language, "Русский");
+
+        let p = parse_title("The.Green.Mile.1999.1080p.BluRay.RUS.ENG.x264");
+        assert_eq!(p.language, "Русский");
+
+        let p = parse_title("The.Green.Mile.1999.1080p.BluRay.ENG.Sub.Rus");
+        assert_eq!(p.language, "Английский");
+
+        let p = parse_title("Зелёная миля / The Green Mile (1999) BDRip 1080p [Original, Sub Rus]");
         assert_eq!(p.voice, "Оригинал");
         assert_eq!(p.language, "Английский");
 

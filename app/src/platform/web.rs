@@ -16,6 +16,9 @@ pub async fn init() {
     super::set_server_base(&origin);
 }
 
+/// Web always talks to its own origin.
+pub fn save_server(_base: &str) {}
+
 pub async fn storage_get(key: &str) -> Option<String> {
     storage()?.get_item(key).ok()?
 }

@@ -10,15 +10,15 @@ use axum::{
 };
 use chrono::Utc;
 use kino_core::{
-    AuthResponse, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me,
-    MediaKind, PersonDetails, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice,
-    ReleaseChoiceUpdate, Role, SearchResults, Season, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus,
-    TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest, LoginLinkStatus,
+    MarkWatched, Me, MediaKind, PersonDetails, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
+    ReleaseChoice, ReleaseChoiceUpdate, Role, SearchResults, Season, ShelfPage, StatusUpdate, TitleDetails,
+    TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    catalog::{Catalog, CatalogError},
+    catalog::{personalize, Catalog, CatalogError},
     config::Config,
     db::{self, LoginOutcome, Pool},
     error::AppError,
@@ -67,6 +67,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/invites", post(create_invite))
         .route("/catalog/home", get(catalog_home))
+        .route("/catalog/home/shelves", get(catalog_home_shelves))
+        .route("/catalog/shelf/{id}", get(catalog_shelf))
         .route("/catalog/search", get(catalog_search))
         .route("/catalog/{kind}/{tmdb_id}", get(catalog_details))
         .route("/catalog/{kind}/{tmdb_id}/extras", get(catalog_extras))
@@ -601,8 +603,57 @@ impl From<CatalogError> for AppError {
     }
 }
 
-async fn catalog_home(State(state): State<AppState>, _user: CurrentUser) -> Result<Json<HomeFeed>, AppError> {
-    Ok(Json(state.catalog.home().await?))
+async fn catalog_home(State(state): State<AppState>, user: CurrentUser) -> Result<Json<HomeFeed>, AppError> {
+    let signals = userdata::taste_signals(&state.pool, user.0).await?;
+    let taste = personalize::build_taste(&*state.catalog, &signals).await;
+    Ok(Json(state.catalog.home_for(&taste).await?))
+}
+
+#[derive(Deserialize)]
+struct ShelvesQuery {
+    #[serde(default)]
+    ids: String,
+}
+
+async fn catalog_home_shelves(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    axum::extract::Query(q): axum::extract::Query<ShelvesQuery>,
+) -> Result<Json<Vec<CatalogRow>>, AppError> {
+    let ids: Vec<String> = q
+        .ids
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && s.len() <= 64)
+        .take(12)
+        .map(str::to_owned)
+        .collect();
+    if ids.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let signals = userdata::taste_signals(&state.pool, user.0).await?;
+    let taste = personalize::exclusions_only(&signals);
+    Ok(Json(state.catalog.home_shelves(&ids, &taste).await?))
+}
+
+#[derive(Deserialize)]
+struct ShelfQuery {
+    page: Option<u32>,
+}
+
+async fn catalog_shelf(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<ShelfQuery>,
+) -> Result<Json<ShelfPage>, AppError> {
+    if id.is_empty() || id.len() > 64 {
+        return Err(AppError::bad_request("invalid shelf id"));
+    }
+    let signals = userdata::taste_signals(&state.pool, user.0).await?;
+    let taste = personalize::exclusions_only(&signals);
+    let page = q.page.unwrap_or(1).clamp(1, 20);
+    Ok(Json(state.catalog.shelf_page(&id, page, &taste).await?))
 }
 
 #[derive(Deserialize)]

@@ -622,3 +622,114 @@ async fn telegram_avatar_falls_back_to_init_data_photo_url(pool: PgPool) {
     assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
     assert_eq!(bytes, FAKE_PNG);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn personalized_home_lazy_shelves_and_pagination(pool: PgPool) {
+    let app = test_app(pool);
+    let u = login_ok(&app, ADMIN_TG, None).await;
+    let tok = u.token.as_str();
+
+    // Mark "Матрица" (movie 603) watched + 5 stars, and drop "Тёмный рыцарь" (movie 155).
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/status",
+        Some(tok),
+        Some(json!({ "status": "watched" })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/rating",
+        Some(tok),
+        Some(json!({ "rating": 5 })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/155/status",
+        Some(tok),
+        Some(json!({ "status": "dropped" })),
+    )
+    .await;
+
+    let (status, body) = call(&app, Method::GET, "/api/catalog/home", Some(tok), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let feed: kino_core::HomeFeed = serde_json::from_value(body).unwrap();
+    assert!(!feed.categories.is_empty());
+    assert!(feed.rows.iter().any(|r| r.id == "because:movie:603" && r.loaded));
+    assert!(
+        feed.rows.iter().any(|r| !r.loaded),
+        "should keep trailing shelves deferred"
+    );
+
+    // Excluded titles (watched 603 and dropped 155) must not appear in loaded shelves.
+    for row in feed.rows.iter().filter(|r| r.loaded) {
+        for item in &row.items {
+            assert!(!(item.kind == kino_core::MediaKind::Movie && (item.tmdb_id == 603 || item.tmdb_id == 155)));
+        }
+    }
+
+    // Load deferred shelves in batch.
+    let deferred: Vec<String> = feed.rows.iter().filter(|r| !r.loaded).map(|r| r.id.clone()).collect();
+    let ids = deferred.join(",");
+    let (status, batch_body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/catalog/home/shelves?ids={ids}"),
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let loaded_batch: Vec<kino_core::CatalogRow> = serde_json::from_value(batch_body).unwrap();
+    assert_eq!(loaded_batch.len(), deferred.len());
+    for row in &loaded_batch {
+        assert!(row.loaded);
+        assert!(row
+            .items
+            .iter()
+            .all(|i| !(i.kind == kino_core::MediaKind::Movie && (i.tmdb_id == 603 || i.tmdb_id == 155))));
+    }
+
+    // Shelf pagination (`top_rated` has 12 remaining titles -> 2+ pages).
+    let (status, p1_body) = call(
+        &app,
+        Method::GET,
+        "/api/catalog/shelf/top_rated?page=1",
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let p1: kino_core::ShelfPage = serde_json::from_value(p1_body).unwrap();
+    assert!(p1.has_more);
+
+    let (status, p2_body) = call(
+        &app,
+        Method::GET,
+        "/api/catalog/shelf/top_rated?page=2",
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let p2: kino_core::ShelfPage = serde_json::from_value(p2_body).unwrap();
+    assert!(!p2.items.is_empty());
+    assert!(p2
+        .items
+        .iter()
+        .all(|i| !p1.items.iter().any(|x| x.kind == i.kind && x.tmdb_id == i.tmdb_id)));
+
+    let (status, _) = call(
+        &app,
+        Method::GET,
+        "/api/catalog/shelf/no_such_shelf?page=1",
+        Some(tok),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

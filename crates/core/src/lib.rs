@@ -333,18 +333,65 @@ pub struct TitleExtras {
     pub similar: Vec<TitleSummary>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_page() -> u32 {
+    1
+}
+
+/// A quick category filter chip shown on the home screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeCategory {
+    pub id: String,
+    pub label: String,
+}
+
 /// A named row of posters on the home screen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CatalogRow {
+    /// Stable shelf identifier used for lazy loading and pagination.
+    #[serde(default)]
+    pub id: String,
     pub title: String,
+    /// Optional short explanation shown next to the shelf title.
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    /// Category chip IDs this row belongs to.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// False for deferred rows whose items are fetched on demand.
+    #[serde(default = "default_true")]
+    pub loaded: bool,
+    /// True when more pages exist on `/api/catalog/shelf/{id}`.
+    #[serde(default)]
+    pub has_more: bool,
+    /// 1-based page currently loaded (0 while `loaded == false`).
+    #[serde(default = "default_page")]
+    pub page: u32,
     pub items: Vec<TitleSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct HomeFeed {
     pub rows: Vec<CatalogRow>,
+    #[serde(default)]
+    pub categories: Vec<HomeCategory>,
     /// True when the server runs on built-in demo data instead of TMDB.
     pub demo: bool,
+}
+
+/// One page of titles for a shelf (`GET /api/catalog/shelf/{id}?page=N`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ShelfPage {
+    pub id: String,
+    pub title: String,
+    #[serde(default)]
+    pub subtitle: Option<String>,
+    pub page: u32,
+    pub has_more: bool,
+    pub items: Vec<TitleSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

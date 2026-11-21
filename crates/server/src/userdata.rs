@@ -163,6 +163,57 @@ pub async fn list_states(
     rows.iter().map(state_from_row).collect()
 }
 
+/// Aggregated per-title interaction signal used for home feed personalization.
+#[derive(Debug, Clone)]
+pub struct UserTitleSignal {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub status: Option<TitleStatus>,
+    pub rating: Option<i16>,
+    pub finished: bool,
+}
+
+/// Recent titles the user watched, rated or saved, newest interaction first.
+pub async fn taste_signals(pool: &PgPool, user_id: i64) -> Result<Vec<UserTitleSignal>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT media_kind, tmdb_id,
+                MAX(status) AS status,
+                MAX(rating) AS rating,
+                BOOL_OR(finished) AS finished,
+                MAX(updated_at) AS last_at
+         FROM (
+             SELECT media_kind, tmdb_id, status, rating, FALSE AS finished, updated_at
+             FROM title_state
+             WHERE user_id = $1
+             UNION ALL
+             SELECT media_kind, tmdb_id, NULL::text AS status, NULL::smallint AS rating, finished, updated_at
+             FROM watch_progress
+             WHERE user_id = $1
+         ) s
+         GROUP BY media_kind, tmdb_id
+         ORDER BY last_at DESC
+         LIMIT 120",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|row| {
+            let status: Option<String> = row.try_get("status")?;
+            Ok(UserTitleSignal {
+                kind: kind_of(row)?,
+                tmdb_id: row.try_get("tmdb_id")?,
+                status: match status {
+                    Some(s) => Some(TitleStatus::parse(&s).ok_or_else(|| decode_err("status", &s))?),
+                    None => None,
+                },
+                rating: row.try_get("rating")?,
+                finished: row.try_get::<Option<bool>, _>("finished")?.unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
 /// Marks episodes (or a film) watched, or clears them.
 pub async fn mark(pool: &PgPool, user_id: i64, m: &MarkWatched) -> Result<(), sqlx::Error> {
     let targets: Vec<(i32, i32)> = match m.kind {

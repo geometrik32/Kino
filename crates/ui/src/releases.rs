@@ -5,13 +5,15 @@ use dioxus::prelude::*;
 pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
 use kino_core::{format_bitrate, ReleaseChoiceUpdate, UserPrefs};
 
+use crate::icons::{self, seeder_signal, Icon};
+
 /// Video codecs a release can name.
 pub const CODECS: [&str; 3] = ["H.264", "HEVC", "AV1"];
 /// Choices for "at least N seeders" and "at most N GB".
 pub const SEEDER_STEPS: [u32; 4] = [5, 20, 50, 100];
 pub const SIZE_STEPS: [u32; 5] = [5, 10, 20, 40, 80];
 
-/// Seeds below this count make streaming unreliable; offer preloading instead.
+/// Seeds below this count make streaming unreliable; highlight preloading instead.
 pub const LOW_SEEDS: u32 = 5;
 
 /// "28.4 ГБ".
@@ -28,6 +30,14 @@ pub fn human_size(bytes: u64) -> String {
 
 fn quality_rank(q: &str) -> u32 {
     q.trim_end_matches('p').parse().unwrap_or(0)
+}
+
+fn quality_short(q: &str) -> &str {
+    if q == "2160p" {
+        "4K"
+    } else {
+        q
+    }
 }
 
 /// Active filters; `None` means "any".
@@ -190,7 +200,7 @@ impl ReleaseSort {
 
     pub fn label(self) -> &'static str {
         match self {
-            ReleaseSort::Seeders => "По раздающим",
+            ReleaseSort::Seeders => "По сидам",
             ReleaseSort::Size => "По размеру",
             ReleaseSort::Bitrate => "По битрейту",
             ReleaseSort::Name => "По названию",
@@ -255,6 +265,9 @@ pub fn ReleasePicker(
     on_close: EventHandler<()>,
 ) -> Element {
     let total = releases.len();
+    let mut qualities = distinct(&releases, |r| Some(r.quality.clone()));
+    qualities.sort_by_key(|q| std::cmp::Reverse(quality_rank(q)));
+
     let mut shown: Vec<ReleaseOption> = releases.iter().filter(|r| filter.matches(r)).cloned().collect();
     sort_releases(&mut shown, sort, &watched);
     let pinned = chosen
@@ -265,9 +278,9 @@ pub fn ReleasePicker(
     shown.retain(|r| Some(&r.infohash) != chosen.as_ref());
     let n_active = filter.active();
     let filter_label = if n_active > 0 {
-        format!("Фильтр · {n_active}")
+        format!("Фильтры · {n_active}")
     } else {
-        "Фильтр".to_string()
+        "Фильтры".to_string()
     };
     let toggle = move |p: PickerPanel| {
         if panel == Some(p) {
@@ -277,69 +290,128 @@ pub fn ReleasePicker(
         }
     };
     let shown_count = shown.len() + usize::from(pinned.is_some());
+    let f_all = filter.clone();
+    let f_dp = filter.clone();
     rsx! {
         div { class: "sheet-bg", onclick: move |_| on_close.call(()),
             div { class: "sheet", onclick: move |e| e.stop_propagation(),
                 div { class: "sheet-head",
-                    h3 {
-                        "Выбор раздачи"
-                        if mock { span { class: "mock", "примеры" } }
+                    div {
+                        h3 {
+                            "Выбор раздачи"
+                            if mock { span { class: "mock", "примеры" } }
+                        }
+                        div { class: "hint", "{heading}" }
                     }
                     button {
                         class: "sheet-close",
                         title: "Закрыть",
                         "aria-label": "Закрыть",
                         onclick: move |_| on_close.call(()),
-                        "✕"
+                        Icon { svg: icons::CLOSE, class: "ic sm" }
                     }
                 }
-                div { class: "hint", "{heading}" }
                 if let Some(n) = &note { div { class: "hint note", "{n}" } }
-                div { class: "toolbar",
-                    button {
-                        class: if panel == Some(PickerPanel::Filter) || n_active > 0 { "chip active" } else { "chip" },
-                        onclick: move |_| toggle(PickerPanel::Filter),
-                        "⚲ {filter_label}"
+                div { class: "picker-toolbar",
+                    if qualities.len() > 1 {
+                        button {
+                            class: if filter.quality.is_none() { "chip sm active" } else { "chip sm" },
+                            onclick: move |_| on_filter.call(ReleaseFilter { quality: None, ..f_all.clone() }),
+                            "Все"
+                        }
+                        for q in qualities.iter().take(4).cloned() {
+                            {
+                                let active = filter.quality.as_deref() == Some(q.as_str());
+                                let f_q = filter.clone();
+                                let q_val = q.clone();
+                                rsx! {
+                                    button {
+                                        key: "q-{q}",
+                                        class: if active { "chip sm active" } else { "chip sm" },
+                                        onclick: move |_| {
+                                            let next = if active { None } else { Some(q_val.clone()) };
+                                            on_filter.call(ReleaseFilter { quality: next, ..f_q.clone() });
+                                        },
+                                        "{quality_short(&q)}"
+                                    }
+                                }
+                            }
+                        }
                     }
                     button {
-                        class: if panel == Some(PickerPanel::Sort) { "chip active" } else { "chip" },
+                        class: if filter.direct_play == Some(true) { "chip sm accent" } else { "chip sm" },
+                        onclick: move |_| {
+                            let next = if f_dp.direct_play == Some(true) { None } else { Some(true) };
+                            on_filter.call(ReleaseFilter { direct_play: next, ..f_dp.clone() });
+                        },
+                        Icon { svg: icons::BOLT, class: "ic xs" }
+                        "Играет сразу"
+                    }
+                    button {
+                        class: if panel == Some(PickerPanel::Filter) || n_active > 0 { "chip sm active" } else { "chip sm" },
+                        onclick: move |_| toggle(PickerPanel::Filter),
+                        Icon { svg: icons::FILTER, class: "ic xs" }
+                        "{filter_label}"
+                    }
+                    button {
+                        class: if panel == Some(PickerPanel::Sort) { "chip sm active" } else { "chip sm" },
                         onclick: move |_| toggle(PickerPanel::Sort),
-                        "⇅ {sort.label()}"
+                        Icon { svg: icons::SORT, class: "ic xs" }
+                        "{sort.label()}"
                     }
                     span { class: "count", "{shown_count} из {total}" }
                 }
                 match panel {
                     Some(PickerPanel::Filter) => rsx! { FilterPanel { releases: releases.clone(), filter: filter.clone(), on_filter } },
                     Some(PickerPanel::Sort) => rsx! {
-                        div { class: "panel",
+                        div { class: "filter-drawer sort-drawer",
                             for s in ReleaseSort::ALL {
                                 button {
                                     class: if s == sort { "opt on" } else { "opt" },
                                     onclick: move |_| { on_sort.call(s); on_panel.call(None); },
-                                    "{s.label()}"
-                                    if s == sort { span { "✓" } }
+                                    span { "{s.label()}" }
+                                    if s == sort { Icon { svg: icons::CHECK, class: "ic sm" } }
                                 }
                             }
                         }
                     },
                     None => rsx! {},
                 }
-                if let Some(r) = pinned {
-                    ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, on_pick, on_preload }
-                }
-                for r in shown {
-                    ReleaseRow {
-                        key: "{r.infohash}",
-                        watched: watched.contains(&r.infohash),
-                        release: r,
-                        chosen: false,
-                        on_pick,
-                        on_preload,
+                div { class: "rel-list",
+                    if let Some(r) = pinned {
+                        ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, on_pick, on_preload }
                     }
-                }
-                if shown_count == 0 {
-                    p { class: "muted", "Под фильтр ничего не подходит. ",
-                        button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтр" }
+                    for r in shown {
+                        ReleaseRow {
+                            key: "{r.infohash}",
+                            watched: watched.contains(&r.infohash),
+                            release: r,
+                            chosen: false,
+                            on_pick,
+                            on_preload,
+                        }
+                    }
+                    if shown_count == 0 {
+                        if let Some(lang) = filter.language.clone() {
+                            {
+                                let f_nolang = ReleaseFilter { language: None, ..filter.clone() };
+                                rsx! {
+                                    p { class: "muted rel-empty",
+                                        "В озвучке «{lang}» подходящих раздач не найдено (всего: {total}). "
+                                        button { class: "link", onclick: move |_| on_filter.call(f_nolang.clone()), "Показать на всех языках" }
+                                        if n_active > 1 {
+                                            " · "
+                                            button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтры" }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            p { class: "muted rel-empty",
+                                "Под фильтр ничего не подходит. "
+                                button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтры" }
+                            }
+                        }
                     }
                 }
             }
@@ -356,50 +428,96 @@ fn FilterPanel(releases: Vec<ReleaseOption>, filter: ReleaseFilter, on_filter: E
     let seasons = distinct(&releases, |r| r.season);
     let trackers = distinct(&releases, |r| Some(r.tracker.clone()));
     let years = distinct(&releases, |r| r.year);
+    let codecs = distinct(&releases, |r| r.codec.clone());
     let set = move |f: ReleaseFilter| on_filter.call(f);
     let f = filter.clone();
+    let flag_label = |v: Option<bool>, pos: &'static str, neg: &'static str| -> &'static str {
+        if v == Some(false) {
+            neg
+        } else {
+            pos
+        }
+    };
+    let toggle_flag = |v: Option<bool>| -> Option<bool> {
+        if v.is_some() {
+            None
+        } else {
+            Some(true)
+        }
+    };
     rsx! {
-        div { class: "panel",
+        div { class: "filter-drawer",
             if filter.active() > 0 {
-                button { class: "link reset", onclick: move |_| set(ReleaseFilter::default()), "Сбросить фильтр" }
+                div { class: "filter-reset-row",
+                    button { class: "link", onclick: move |_| set(ReleaseFilter::default()), "Сбросить все фильтры" }
+                }
             }
-            FilterRow { name: "Качество", any: "Любое",
-                options: qualities.clone(), selected: f.quality.clone(),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { quality: v, ..f.clone() }) } }
-            YesNoRow { name: "HDR", value: f.hdr,
-                on_select: { let f = f.clone(); move |v| set(ReleaseFilter { hdr: v, ..f.clone() }) } }
-            YesNoRow { name: "Dolby Vision", value: f.dolby_vision,
-                on_select: { let f = f.clone(); move |v| set(ReleaseFilter { dolby_vision: v, ..f.clone() }) } }
-            YesNoRow { name: "Субтитры", value: f.subtitles,
-                on_select: { let f = f.clone(); move |v| set(ReleaseFilter { subtitles: v, ..f.clone() }) } }
-            FilterRow { name: "Перевод", any: "Любой",
-                options: voices, selected: f.voice.clone(),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { voice: v, ..f.clone() }) } }
-            FilterRow { name: "Язык", any: "Любой",
-                options: languages, selected: f.language.clone(),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { language: v, ..f.clone() }) } }
-            if !seasons.is_empty() {
+            if qualities.len() > 1 || f.quality.is_some() {
+                FilterRow { name: "Качество", any: "Любое",
+                    options: qualities, selected: f.quality.clone(),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { quality: v, ..f.clone() }) } }
+            }
+            div { class: "f-row",
+                div { class: "f-lbl", "Параметры" }
+                div { class: "f-opts",
+                    button {
+                        class: if f.hdr.is_some() { "chip sm active" } else { "chip sm" },
+                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { hdr: toggle_flag(f.hdr), ..f.clone() }) },
+                        "{flag_label(f.hdr, \"HDR\", \"Без HDR\")}"
+                    }
+                    button {
+                        class: if f.dolby_vision.is_some() { "chip sm active" } else { "chip sm" },
+                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { dolby_vision: toggle_flag(f.dolby_vision), ..f.clone() }) },
+                        "{flag_label(f.dolby_vision, \"Dolby Vision\", \"Без DV\")}"
+                    }
+                    button {
+                        class: if f.subtitles.is_some() { "chip sm active" } else { "chip sm" },
+                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { subtitles: toggle_flag(f.subtitles), ..f.clone() }) },
+                        "{flag_label(f.subtitles, \"Субтитры\", \"Без субтитров\")}"
+                    }
+                    button {
+                        class: if f.direct_play.is_some() { "chip sm active" } else { "chip sm" },
+                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { direct_play: toggle_flag(f.direct_play), ..f.clone() }) },
+                        "{flag_label(f.direct_play, \"Без перекодирования\", \"С перекодированием\")}"
+                    }
+                }
+            }
+            if voices.len() > 1 || f.voice.is_some() {
+                FilterRow { name: "Перевод", any: "Любой",
+                    options: voices, selected: f.voice.clone(),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { voice: v, ..f.clone() }) } }
+            }
+            if languages.len() > 1 || f.language.is_some() {
+                FilterRow { name: "Язык", any: "Любой",
+                    options: languages, selected: f.language.clone(),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { language: v, ..f.clone() }) } }
+            }
+            if seasons.len() > 1 || f.season.is_some() {
                 FilterRow { name: "Сезон", any: "Любой",
                     options: seasons.iter().map(|s| s.to_string()).collect::<Vec<_>>(), selected: f.season.map(|s| s.to_string()),
                     on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { season: v.and_then(|s| s.parse().ok()), ..f.clone() }) } }
             }
-            FilterRow { name: "Кодек", any: "Любой",
-                options: CODECS.map(String::from).to_vec(), selected: f.codec.clone(),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { codec: v, ..f.clone() }) } }
-            YesNoRow { name: "Играет без перекодирования", value: f.direct_play,
-                on_select: { let f = f.clone(); move |v| set(ReleaseFilter { direct_play: v, ..f.clone() }) } }
-            FilterRow { name: "Раздающих", any: "Любое число",
+            if codecs.len() > 1 || f.codec.is_some() {
+                FilterRow { name: "Кодек", any: "Любой",
+                    options: CODECS.map(String::from).to_vec(), selected: f.codec.clone(),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { codec: v, ..f.clone() }) } }
+            }
+            FilterRow { name: "Раздающих", any: "Любое",
                 options: SEEDER_STEPS.map(|n| format!("от {n}")).to_vec(), selected: f.min_seeders.map(|n| format!("от {n}")),
                 on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { min_seeders: v.and_then(|s| s.trim_start_matches("от ").parse().ok()), ..f.clone() }) } }
             FilterRow { name: "Размер", any: "Любой",
                 options: SIZE_STEPS.map(|n| format!("до {n} ГБ")).to_vec(), selected: f.max_size_gb.map(|n| format!("до {n} ГБ")),
                 on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { max_size_gb: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" ГБ").parse().ok()), ..f.clone() }) } }
-            FilterRow { name: "Трекер", any: "Любой",
-                options: trackers, selected: f.tracker.clone(),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { tracker: v, ..f.clone() }) } }
-            FilterRow { name: "Год", any: "Любой",
-                options: years.iter().map(|y| y.to_string()).collect::<Vec<_>>(), selected: f.year.map(|y| y.to_string()),
-                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { year: v.and_then(|y| y.parse().ok()), ..f.clone() }) } }
+            if trackers.len() > 1 || f.tracker.is_some() {
+                FilterRow { name: "Трекер", any: "Любой",
+                    options: trackers, selected: f.tracker.clone(),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { tracker: v, ..f.clone() }) } }
+            }
+            if years.len() > 1 || f.year.is_some() {
+                FilterRow { name: "Год", any: "Любой",
+                    options: years.iter().map(|y| y.to_string()).collect::<Vec<_>>(), selected: f.year.map(|y| y.to_string()),
+                    on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { year: v.and_then(|y| y.parse().ok()), ..f.clone() }) } }
+            }
         }
     }
 }
@@ -414,9 +532,9 @@ fn FilterRow(
     on_select: EventHandler<Option<String>>,
 ) -> Element {
     rsx! {
-        div { class: "frow",
-            div { class: "fname", "{name}" }
-            div { class: "fopts",
+        div { class: "f-row",
+            div { class: "f-lbl", "{name}" }
+            div { class: "f-opts",
                 button { class: if selected.is_none() { "chip sm active" } else { "chip sm" }, onclick: move |_| on_select.call(None), "{any}" }
                 for o in options {
                     button {
@@ -424,20 +542,6 @@ fn FilterRow(
                         onclick: { let v = o.clone(); move |_| on_select.call(Some(v.clone())) },
                         "{o}"
                     }
-                }
-            }
-        }
-    }
-}
-
-#[component]
-fn YesNoRow(name: &'static str, value: Option<bool>, on_select: EventHandler<Option<bool>>) -> Element {
-    rsx! {
-        div { class: "frow",
-            div { class: "fname", "{name}" }
-            div { class: "fopts",
-                for (label, v) in [("Не важно", None), ("Есть", Some(true)), ("Нет", Some(false))] {
-                    button { class: if value == v { "chip sm active" } else { "chip sm" }, onclick: move |_| on_select.call(v), "{label}" }
                 }
             }
         }
@@ -453,37 +557,71 @@ fn ReleaseRow(
     on_preload: EventHandler<ReleaseOption>,
 ) -> Element {
     let low = release.seeders < LOW_SEEDS;
+    let is_uhd = quality_rank(&release.quality) >= 2160;
+    let q_sub = match (release.dolby_vision, release.hdr, release.codec.as_deref()) {
+        (true, true, _) => "DV · HDR",
+        (true, false, _) => "DV",
+        (false, true, _) => "HDR",
+        (false, false, Some(c)) => c,
+        _ => "",
+    };
     let (a, b) = (release.clone(), release.clone());
     let added = ru_short_date(&release.added);
     rsx! {
-        div { class: if chosen { "rel last" } else { "rel" },
-            div {
-                div { class: "rt", "{release.title}" }
-                div { class: "tags",
-                    span { class: "tag q", "{release.quality}" }
-                    if release.hdr { span { class: "tag q", "HDR" } }
-                    if release.dolby_vision { span { class: "tag q", "Dolby Vision" } }
-                    span { class: "tag", "{release.voice}" }
-                    if release.subtitles { span { class: "tag", "субтитры" } }
-                    span { class: "tag", "{release.tracker}" }
+        div {
+            class: if chosen { "rel-card picked" } else { "rel-card" },
+            role: "button",
+            tabindex: "0",
+            onclick: move |_| on_pick.call(a.clone()),
+            div { class: if is_uhd { "q-box uhd" } else { "q-box" },
+                b { "{quality_short(&release.quality)}" }
+                if !q_sub.is_empty() { small { "{q_sub}" } }
+            }
+            div { class: "rel-main",
+                div { class: "rel-voice",
+                    strong { "{release.voice}" }
+                    if chosen {
+                        span { class: "tag acc", "Ваша раздача" }
+                    } else if watched {
+                        span { class: "tag ok", "Смотрели" }
+                    }
                     if release.direct_play {
-                        span { class: "tag ok", "играет сразу" }
+                        span { class: "tag ok",
+                            Icon { svg: icons::BOLT, class: "ic xs" }
+                            "Играет сразу"
+                        }
                     } else if release.codec.is_some() || release.hdr {
                         // Known to need the server's help; unknown codecs are not guessed.
-                        span { class: "tag warn", "перекодируется" }
+                        span { class: "tag warn", "Перекодируется" }
                     }
-                    if chosen {
-                        span { class: "tag ok", "ваша раздача" }
-                    } else if watched {
-                        span { class: "tag ok", "смотрели" }
+                    if release.subtitles {
+                        span { class: "tag", "Субтитры" }
                     }
+                    span { class: "tag", "{release.tracker}" }
+                }
+                div { class: "rel-raw", title: "{release.title} · {added}", "{release.title}" }
+            }
+            div { class: "pre-slot",
+                button {
+                    class: if low { "pre-btn recommend" } else { "pre-btn" },
+                    title: if low {
+                        "Мало сидов — лучше скачать заранее на сервер"
+                    } else {
+                        "Скачать заранее на сервер"
+                    },
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        on_preload.call(b.clone());
+                    },
+                    Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                    "Заранее"
                 }
             }
-            div { class: "side",
-                div { "{human_size(release.size_bytes)}" }
+            div { class: "rel-metrics",
+                div { class: "sz", "{human_size(release.size_bytes)}" }
                 if let Some(kbps) = release.bitrate_kbps {
                     div {
-                        class: "bitrate",
+                        class: "br",
                         title: if release.bitrate_approx {
                             "Приблизительно: размер раздачи, делённый на длительность. Включает звук."
                         } else {
@@ -493,15 +631,11 @@ fn ReleaseRow(
                         "{format_bitrate(kbps)}"
                     }
                 }
-                div { class: if low { "seeds low" } else { "seeds" }, "▲ {release.seeders}" }
-                div { "{added}" }
-            }
-            div { class: "act",
-                button { class: "btn primary", onclick: move |_| on_pick.call(a.clone()),
-                    if chosen { "▶ Смотреть" } else { "▶ Выбрать и смотреть" }
-                }
-                if low {
-                    button { class: "btn ghost", onclick: move |_| on_preload.call(b.clone()), "⇣ Скачать заранее" }
+                div {
+                    class: if low { "sd low" } else { "sd ok" },
+                    title: "Раздающих: {release.seeders} · добавлено {added}",
+                    span { class: "sig-wrap", "aria-hidden": "true", dangerous_inner_html: seeder_signal(release.seeders) }
+                    span { "{release.seeders}" }
                 }
             }
         }

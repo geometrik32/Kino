@@ -17,9 +17,9 @@ use kino_core::{
 };
 use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
-    mock_releases, HomeView, LoginView, MyView, PersonView, PickerPanel, PlayerEpisode, PlayerMenu, PlayerState,
-    PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, Shell, Tab, Theme,
-    TitleExtrasView, TitleView, FAVICON_URI, STYLE,
+    icons, mock_releases, HomeView, Icon, LoginView, MyFilters, MyView, PersonView, PickerPanel, PlayerEpisode,
+    PlayerMenu, PlayerState, PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
+    SearchView, Shell, Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
@@ -101,16 +101,39 @@ fn Page(props: PageProps) -> Element {
         Screen::Login => {
             return rsx! {
                 LoginView { invite: Some("demo".to_string()),
-                    button { class: "btn primary", "Войти через Telegram" }
+                    input { class: "input-field", placeholder: "Код приглашения (если есть)" }
+                    button { class: "btn primary",
+                        Icon { svg: icons::TG, class: "ic sm" }
+                        "Войти через Telegram"
+                    }
                 }
             }
         }
         Screen::Home(feed, cont) => {
-            rsx! { HomeView { feed, continue_items: cont, on_open: |_| {}, on_play: |_| {}, on_drop: |_| {} } }
+            rsx! {
+                HomeView {
+                    feed: Some(feed),
+                    continue_items: cont,
+                    on_open: |_| {},
+                    on_open_title: |_| {},
+                    on_play: |_| {},
+                    on_drop: |_| {},
+                    on_category: |_| {},
+                    on_open_shelf: |_| {},
+                    on_load_more_rows: |_| {},
+                }
+            }
         }
         Screen::Search(_, r) => rsx! { SearchView { results: Some(r), on_open: |_| {} } },
         Screen::Person(person) => rsx! { PersonView { person, on_open: |_| {} } },
-        Screen::Mine(items, filter) => rsx! { MyView { items, filter, on_filter: |_| {}, on_open: |_| {} } },
+        Screen::Mine(items, filter) => rsx! {
+            MyView {
+                items,
+                filters: MyFilters { status: filter, ..MyFilters::default() },
+                on_filters: |_| {},
+                on_open: |_| {},
+            }
+        },
         Screen::Profile(history, preloads, prefs) => rsx! {
             ProfileView {
                 name: "Даниил",
@@ -124,6 +147,7 @@ fn Page(props: PageProps) -> Element {
                 on_theme: |_| {},
                 on_prefs: |_| {},
                 on_delete_preload: |_| {},
+                on_refresh: |_| {},
                 on_open: |_| {},
                 on_logout: |_| {},
             }
@@ -177,7 +201,7 @@ fn Page(props: PageProps) -> Element {
         },
     };
     rsx! {
-        Shell { tab, query, user_initial: "Д", on_tab: |_| {}, on_query: |_| {}, {body} }
+        Shell { tab, query, user_initial: "Д", dl_percent: Some(42), on_tab: |_| {}, on_query: |_| {}, {body} }
     }
 }
 
@@ -498,6 +522,9 @@ async fn main() -> anyhow::Result<()> {
         preloaded: false,
         controls: true,
         rate: 1.0,
+        volume: 0.78,
+        muted: false,
+        show_volume: true,
         season: 2,
         episode: 6,
         episodes: [

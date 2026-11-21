@@ -51,7 +51,9 @@
 | GET | `/api/watchlist` | «Хочу посмотреть» |
 | PUT/DELETE | `/api/watchlist/{movie\|tv}/{tmdb_id}` | Добавить / убрать |
 | POST | `/api/invites` | Создать приглашение (админ) |
-| GET | `/api/catalog/home` | Подборки для главной |
+| GET | `/api/catalog/home` | Подборки для главной (персональные + отложенные) |
+| GET | `/api/catalog/home/shelves?ids=` | Догрузка скрытых/отложенных подборок главной |
+| GET | `/api/catalog/shelf/{id}?page=` | Страница конкретной подборки (для автоподгрузки и «Все») |
 | GET | `/api/catalog/search?q=` | Поиск фильмов и сериалов |
 | GET | `/api/catalog/{movie\|tv}/{tmdb_id}` | Карточка тайтла |
 | GET | `/api/catalog/{movie\|tv}/{tmdb_id}/extras` | Актёры, «Рекомендации» и «Похожие» (TMDB) |
