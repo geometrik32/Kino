@@ -209,7 +209,7 @@ impl ImageDiskCache {
             }
             return;
         }
-        if seq % 64 == 0 && !self.pruning.swap(true, Ordering::AcqRel) {
+        if seq.is_multiple_of(64) && !self.pruning.swap(true, Ordering::AcqRel) {
             let dir = self.dir.clone();
             let max_bytes = self.max_bytes;
             let flag = Arc::clone(&self.pruning);

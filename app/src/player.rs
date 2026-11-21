@@ -1683,7 +1683,7 @@ pub fn Player(
                         }
                     }
                     if desired_paused() {
-                        let paused_state = sync_state.peek().as_ref().map_or(true, |st| st.paused);
+                        let paused_state = sync_state.peek().as_ref().is_none_or(|st| st.paused);
                         ui.with_mut(|s| s.paused = paused_state);
                         return;
                     }
@@ -1910,7 +1910,10 @@ pub fn Player(
     let mut toggle_scale = {
         let key = title_scale_key.clone();
         move || {
-            let current = saved_scale().unwrap_or_else(|| active_scale());
+            let current = match saved_scale() {
+                Some(s) => s,
+                None => active_scale(),
+            };
             let next = current.toggle();
             user_touched_scale.set(true);
             saved_scale.set(Some(next));
@@ -2161,7 +2164,10 @@ pub fn Player(
         st.season = season;
         st.episode = episode;
         st.rate = rate();
-        st.scale = saved_scale().unwrap_or_else(|| active_scale());
+        st.scale = match saved_scale() {
+            Some(s) => s,
+            None => active_scale(),
+        };
         st.volume = volume();
         st.muted = muted();
         st.show_volume = !finger;

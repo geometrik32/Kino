@@ -27,7 +27,7 @@ fn ensure_back_bridge() {
     if !BACK_BRIDGE_STARTED.swap(true, Ordering::AcqRel) {
         dioxus::core::spawn_forever(async {
             let mut bridge = dioxus::document::eval("window.__kinoNativeBack = function() { dioxus.send(1); };");
-            while let Ok(_) = bridge.recv::<i32>().await {
+            while bridge.recv::<i32>().await.is_ok() {
                 let top = BACK_STACK.with(|s| s.borrow_mut().pop());
                 if let Some((id, mut cb)) = top {
                     let has_more = BACK_STACK.with(|s| !s.borrow().is_empty());
