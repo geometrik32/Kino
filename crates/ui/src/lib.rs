@@ -141,12 +141,23 @@ pub fn Shell(
     query: String,
     user_initial: String,
     #[props(default)] avatar_url: Option<String>,
+    #[props(default)] on_back: Option<EventHandler<()>>,
     on_tab: EventHandler<Tab>,
     on_query: EventHandler<String>,
     children: Element,
 ) -> Element {
     rsx! {
         header { class: "topbar",
+            if let Some(back) = on_back {
+                button {
+                    class: "back-btn",
+                    title: "Назад",
+                    "aria-label": "Назад",
+                    onclick: move |_| back.call(()),
+                    "←"
+                    span { class: "back-label", "Назад" }
+                }
+            }
             button { class: "logo", onclick: move |_| on_tab.call(Tab::Home),
                 RingMark {}
                 "Орловский"

@@ -312,6 +312,10 @@ fn Main(
 ) -> Element {
     // A link to a title (from a bot message) opens it, with Home behind it.
     let link = use_hook(telegram::open_target);
+    use_hook(|| {
+        let initial_url = link.map(|(k, id)| format!("/?open={}_{id}", k.as_str()));
+        telegram::init_history(link.is_some(), initial_url.as_deref());
+    });
     let mut view = use_signal(|| match link {
         Some((kind, id)) => View::Title(kind, id, false),
         None => View::Tab(Tab::Home),
@@ -337,6 +341,8 @@ fn Main(
             })
         });
         view.set(View::Title(kind, id, play));
+        let url = format!("/?open={}_{id}", kind.as_str());
+        telegram::push_history(Some(&url));
     };
     let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id, false);
     let open_person = move |id: i64| {
@@ -348,32 +354,75 @@ fn Main(
             })
         });
         view.set(View::Person(id));
+        telegram::push_history(Some("/"));
     };
-    rsx! {
-        if !trail().is_empty() {
-            native::BackButton {
-                on_back: move |_| {
-                    telegram::haptic(telegram::Haptic::Tap);
-                    if let Some(prev) = trail.with_mut(|t| t.pop()) {
-                        view.set(prev);
-                    }
-                },
+    let go_back = move |_: ()| {
+        telegram::haptic(telegram::Haptic::Tap);
+        if let Some(prev) = trail.with_mut(|t| t.pop()) {
+            if matches!(prev, View::Tab(Tab::Home)) && trail.peek().is_empty() {
+                query.set(String::new());
             }
+            view.set(prev);
+            telegram::pop_history();
+        }
+    };
+    let can_back = !trail().is_empty();
+    rsx! {
+        if can_back {
+            native::BackButton { on_back: go_back }
         }
         Shell {
             tab,
             query: query(),
             user_initial: initial,
             avatar_url: avatar_url.clone(),
+            on_back: can_back.then(|| Callback::new(go_back)),
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
-                trail.set(Vec::new());
                 query.set(String::new());
-                view.set(View::Tab(t));
+                if view() == View::Tab(t) && (t != Tab::Home || trail.peek().is_empty()) {
+                    return;
+                }
+                if t == Tab::Home || telegram::is_telegram() {
+                    trail.set(Vec::new());
+                    view.set(View::Tab(t));
+                    if !telegram::is_telegram() {
+                        telegram::reset_history();
+                    }
+                } else {
+                    let prev = match view() {
+                        View::Title(k, i, _) => View::Title(k, i, false),
+                        v => v,
+                    };
+                    trail.with_mut(|tr| tr.push(prev));
+                    view.set(View::Tab(t));
+                    telegram::push_history(Some("/"));
+                }
             },
             on_query: move |q: String| {
-                trail.set(Vec::new());
-                view.set(View::Tab(if q.trim().is_empty() { Tab::Home } else { Tab::Search }));
+                let empty = q.trim().is_empty();
+                if empty {
+                    if matches!(view(), View::Tab(Tab::Search)) {
+                        if let Some(prev) = trail.with_mut(|tr| tr.pop()) {
+                            view.set(prev);
+                            telegram::pop_history();
+                        } else {
+                            view.set(View::Tab(Tab::Home));
+                        }
+                    }
+                } else if !matches!(view(), View::Tab(Tab::Search)) {
+                    if !telegram::is_telegram() {
+                        let prev = match view() {
+                            View::Title(k, i, _) => View::Title(k, i, false),
+                            v => v,
+                        };
+                        trail.with_mut(|tr| tr.push(prev));
+                        telegram::push_history(Some("/"));
+                    } else {
+                        trail.set(Vec::new());
+                    }
+                    view.set(View::Tab(Tab::Search));
+                }
                 query.set(q);
             },
             match view() {
@@ -406,6 +455,7 @@ fn Main(
                         on_exit: move |_| {
                             if let Some(prev) = trail.with_mut(|t| t.pop()) {
                                 view.set(prev);
+                                telegram::pop_history();
                             }
                         },
                     }
@@ -663,6 +713,9 @@ fn Title(
     let mut panel = use_signal(|| None::<PickerPanel>);
     let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
     let mut auto = use_signal(|| autoplay);
+    let mut exit_on_close = use_signal(|| autoplay);
+    let mut overlay_pushed = use_signal(|| false);
+    let mut notice_pushed = use_signal(|| false);
     let t0 = token.clone();
     // Releases for the open picker, loaded from the indexer (or demo data).
     let releases = use_resource(move || {
@@ -748,17 +801,45 @@ fn Title(
             defaults_pending.set(true);
             defaults_relaxed.set(false);
             panel.set(None);
+            exit_on_close.set(false);
+            if picker.peek().is_none() && !*overlay_pushed.peek() {
+                overlay_pushed.set(true);
+                telegram::push_history(None);
+            }
             picker.set(Some(t));
         }
     };
+    let close_picker = Callback::new(move |_: ()| {
+        picker.set(None);
+        if *overlay_pushed.peek() {
+            overlay_pushed.set(false);
+            telegram::pop_history();
+        }
+    });
+    let close_notice = Callback::new(move |_: ()| {
+        notice.set(None);
+        if *notice_pushed.peek() {
+            notice_pushed.set(false);
+            telegram::pop_history();
+        }
+    });
     let on_play = Callback::new({
         let choice_for = choice_for.clone();
         let mut open_picker = open_picker.clone();
         move |t: PlayTarget| {
             telegram::haptic(telegram::Haptic::Tap);
             match choice_for(season_key(&t)) {
-                Some(c) => playing.set(Some((t, c))),
-                None => open_picker(t),
+                Some(c) => {
+                    if !*exit_on_close.peek() && !*overlay_pushed.peek() {
+                        overlay_pushed.set(true);
+                        telegram::push_history(None);
+                    }
+                    playing.set(Some((t, c)));
+                }
+                None => {
+                    exit_on_close.set(false);
+                    open_picker(t);
+                }
             }
         }
     });
@@ -785,10 +866,10 @@ fn Title(
             native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
         }
         if picker().is_some() {
-            native::BackButton { on_back: move |_| picker.set(None) }
+            native::BackButton { on_back: move |_| close_picker.call(()) }
         }
         if notice().is_some() {
-            native::BackButton { on_back: move |_| notice.set(None) }
+            native::BackButton { on_back: move |_| close_notice.call(()) }
         }
         if auto() {
             AutoPlay {
@@ -858,19 +939,37 @@ fn Title(
         if let (Some(heading), Some(target)) = (heading, picker()) {
             match releases.read().clone().flatten() {
                 None => rsx! {
-                    div { class: "sheet-bg", onclick: move |_| picker.set(None),
+                    div { class: "sheet-bg", onclick: move |_| close_picker.call(()),
                         div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                            h3 { "{heading}" }
+                            div { class: "sheet-head",
+                                h3 { "{heading}" }
+                                button {
+                                    class: "sheet-close",
+                                    title: "Закрыть",
+                                    "aria-label": "Закрыть",
+                                    onclick: move |_| close_picker.call(()),
+                                    "✕"
+                                }
+                            }
                             p { class: "muted", "Ищем раздачи на трекерах…" }
                         }
                     }
                 },
                 Some(Err(e)) => rsx! {
-                    div { class: "sheet-bg", onclick: move |_| picker.set(None),
+                    div { class: "sheet-bg", onclick: move |_| close_picker.call(()),
                         div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                            h3 { "{heading}" }
+                            div { class: "sheet-head",
+                                h3 { "{heading}" }
+                                button {
+                                    class: "sheet-close",
+                                    title: "Закрыть",
+                                    "aria-label": "Закрыть",
+                                    onclick: move |_| close_picker.call(()),
+                                    "✕"
+                                }
+                            }
                             p { class: "error", "{e.message}" }
-                            button { class: "btn ghost", onclick: move |_| picker.set(None), "Закрыть" }
+                            button { class: "btn ghost", onclick: move |_| close_picker.call(()), "Закрыть" }
                         }
                     }
                 },
@@ -905,7 +1004,7 @@ fn Title(
                     let t4 = token.clone();
                     let pre_season = picker_season.unwrap_or(0);
                     move |r: ReleaseOption| {
-                        picker.set(None);
+                        close_picker.call(());
                         let req = PreloadRequest {
                             kind,
                             tmdb_id: id,
@@ -917,22 +1016,27 @@ fn Title(
                         let name = summary.title.clone();
                         telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
-                            notice.set(Some(match api::add_preload(&t, &req).await {
+                            let msg = match api::add_preload(&t, &req).await {
                                 Ok(_) => format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки»."),
                                 Err(e) => format!("Не удалось поставить в загрузку: {}", e.message),
-                            }));
+                            };
+                            if !*notice_pushed.peek() {
+                                notice_pushed.set(true);
+                                telegram::push_history(None);
+                            }
+                            notice.set(Some(msg));
                         });
                     }
                 },
-                on_close: move |_| picker.set(None),
+                on_close: move |_| close_picker.call(()),
             } },
             }
         }
         if let Some(text) = notice() {
-            div { class: "sheet-bg", onclick: move |_| notice.set(None),
+            div { class: "sheet-bg", onclick: move |_| close_notice.call(()),
                 div { class: "sheet", onclick: move |e| e.stop_propagation(),
                     p { "{text}" }
-                    button { class: "btn ghost", onclick: move |_| notice.set(None), "Хорошо" }
+                    button { class: "btn ghost", onclick: move |_| close_notice.call(()), "Хорошо" }
                 }
             }
         }
@@ -952,9 +1056,14 @@ fn Title(
                 },
                 on_close: move |_| {
                     playing.set(None);
-                    if autoplay {
+                    if exit_on_close() {
+                        exit_on_close.set(false);
                         on_exit.call(());
                     } else {
+                        if *overlay_pushed.peek() {
+                            overlay_pushed.set(false);
+                            telegram::pop_history();
+                        }
                         data.restart();
                     }
                 },

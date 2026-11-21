@@ -14,6 +14,10 @@ pub fn push_back(_handler: impl FnMut() + 'static) -> u64 {
     0
 }
 pub fn pop_back(_id: u64) {}
+pub fn init_history(_has_initial_trail: bool, _initial_url: Option<&str>) {}
+pub fn push_history(_url: Option<&str>) {}
+pub fn pop_history() {}
+pub fn reset_history() {}
 pub fn show_main_button(_text: &str, _on_click: impl FnMut() + 'static) {}
 pub fn hide_main_button() {}
 

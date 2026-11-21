@@ -90,6 +90,12 @@ pub(crate) fn matches_normalized_query(title: &str, original: Option<&str>, norm
     contains_all(&norm_title) || norm_orig.as_deref().is_some_and(contains_all)
 }
 
+fn push_unique(variants: &mut Vec<String>, trimmed: &str, candidate: String) {
+    if candidate != trimmed && !variants.contains(&candidate) {
+        variants.push(candidate);
+    }
+}
+
 /// Candidate queries to work around strict `е` / `ё` matching in TMDB search.
 pub(crate) fn yo_query_variants(query: &str) -> Vec<String> {
     let trimmed = query.trim();
@@ -97,11 +103,6 @@ pub(crate) fn yo_query_variants(query: &str) -> Vec<String> {
         return Vec::new();
     }
     let mut variants = Vec::new();
-    let mut push_unique = |candidate: String| {
-        if candidate != trimmed && !variants.contains(&candidate) {
-            variants.push(candidate);
-        }
-    };
 
     if trimmed.contains(['ё', 'Ё']) {
         let folded: String = trimmed
@@ -112,7 +113,7 @@ pub(crate) fn yo_query_variants(query: &str) -> Vec<String> {
                 other => other,
             })
             .collect();
-        push_unique(folded);
+        push_unique(&mut variants, trimmed, folded);
     }
 
     for (byte_idx, ch) in trimmed.char_indices() {
@@ -125,8 +126,8 @@ pub(crate) fn yo_query_variants(query: &str) -> Vec<String> {
         candidate.push_str(&trimmed[..byte_idx]);
         candidate.push(replacement);
         candidate.push_str(&trimmed[byte_idx + ch.len_utf8()..]);
-        push_unique(candidate);
-        if variants.len() >= MAX_YO_POSITIONS + 1 {
+        push_unique(&mut variants, trimmed, candidate);
+        if variants.len() > MAX_YO_POSITIONS {
             break;
         }
     }

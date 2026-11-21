@@ -176,6 +176,111 @@ thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
     static BACK_WIRED: Cell<bool> = const { Cell::new(false) };
     static MAIN: RefCell<Option<Closure<dyn FnMut()>>> = const { RefCell::new(None) };
+    static HISTORY_WIRED: Cell<bool> = const { Cell::new(false) };
+    static HISTORY_DEPTH: Cell<i32> = const { Cell::new(0) };
+    static SKIP_POP: Cell<i32> = const { Cell::new(0) };
+    static IN_POPSTATE: Cell<bool> = const { Cell::new(false) };
+}
+
+struct PopGuard;
+
+impl Drop for PopGuard {
+    fn drop(&mut self) {
+        IN_POPSTATE.with(|p| p.set(false));
+    }
+}
+
+/// Hooks `window.history` (`popstate`) to the app's back stack in regular browsers.
+/// Inside Telegram Mini App, Telegram's native `BackButton` owns navigation.
+pub fn init_history(has_initial_trail: bool, initial_url: Option<&str>) {
+    if is_telegram() || HISTORY_WIRED.with(|w| w.replace(true)) {
+        return;
+    }
+    let Some(w) = web_sys::window() else { return };
+    if let Ok(h) = w.history() {
+        if has_initial_trail {
+            let _ = h.replace_state_with_url(&JsValue::from_f64(0.0), "", Some("/"));
+            let _ = h.push_state_with_url(&JsValue::from_f64(1.0), "", initial_url);
+            HISTORY_DEPTH.with(|d| d.set(1));
+        } else {
+            let _ = h.replace_state_with_url(&JsValue::from_f64(0.0), "", None);
+            HISTORY_DEPTH.with(|d| d.set(0));
+        }
+    }
+    let on_pop = Closure::<dyn FnMut(web_sys::PopStateEvent)>::new(move |ev: web_sys::PopStateEvent| {
+        let target = ev.state().as_f64().unwrap_or(0.0) as i32;
+        let skip = SKIP_POP.with(|s| s.get());
+        if skip > 0 {
+            SKIP_POP.with(|s| s.set(skip - 1));
+            HISTORY_DEPTH.with(|d| d.set(target));
+            return;
+        }
+        let cur = HISTORY_DEPTH.with(|d| d.get());
+        if target < cur {
+            HISTORY_DEPTH.with(|d| d.set(target));
+            let top = BACKS.with(|b| b.borrow().last().map(|(_, h)| h.clone()));
+            if let Some(h) = top {
+                IN_POPSTATE.with(|p| p.set(true));
+                let _guard = PopGuard;
+                (h.borrow_mut())();
+            }
+        } else if target > cur {
+            if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+                SKIP_POP.with(|s| s.set(s.get() + 1));
+                let _ = h.back();
+            }
+        }
+    });
+    let _ = w.add_event_listener_with_callback("popstate", on_pop.as_ref().unchecked_ref());
+    on_pop.forget();
+}
+
+/// Records a forward navigation step in browser history.
+pub fn push_history(url: Option<&str>) {
+    if is_telegram() {
+        return;
+    }
+    let Some(h) = web_sys::window().and_then(|w| w.history().ok()) else {
+        return;
+    };
+    let next = HISTORY_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let _ = h.push_state_with_url(&JsValue::from_f64(f64::from(next)), "", url);
+}
+
+/// Steps browser history back by one entry after a UI Back button click.
+pub fn pop_history() {
+    if is_telegram() || IN_POPSTATE.with(|p| p.get()) {
+        return;
+    }
+    let cur = HISTORY_DEPTH.with(|d| d.get());
+    if cur <= 0 {
+        return;
+    }
+    if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+        HISTORY_DEPTH.with(|d| d.set(cur - 1));
+        SKIP_POP.with(|s| s.set(s.get() + 1));
+        let _ = h.back();
+    }
+}
+
+/// Returns browser history to the root (`Home`) entry.
+pub fn reset_history() {
+    if is_telegram() || IN_POPSTATE.with(|p| p.get()) {
+        return;
+    }
+    let cur = HISTORY_DEPTH.with(|d| d.get());
+    if cur <= 0 {
+        return;
+    }
+    if let Some(h) = web_sys::window().and_then(|w| w.history().ok()) {
+        HISTORY_DEPTH.with(|d| d.set(0));
+        SKIP_POP.with(|s| s.set(s.get() + 1));
+        let _ = h.go_with_delta(-cur);
+    }
 }
 
 /// Takes over the native Back button until [`pop_back`]. Returns the id to give back.

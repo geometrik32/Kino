@@ -280,9 +280,18 @@ pub fn ReleasePicker(
     rsx! {
         div { class: "sheet-bg", onclick: move |_| on_close.call(()),
             div { class: "sheet", onclick: move |e| e.stop_propagation(),
-                h3 {
-                    "Выбор раздачи"
-                    if mock { span { class: "mock", "примеры" } }
+                div { class: "sheet-head",
+                    h3 {
+                        "Выбор раздачи"
+                        if mock { span { class: "mock", "примеры" } }
+                    }
+                    button {
+                        class: "sheet-close",
+                        title: "Закрыть",
+                        "aria-label": "Закрыть",
+                        onclick: move |_| on_close.call(()),
+                        "✕"
+                    }
                 }
                 div { class: "hint", "{heading}" }
                 if let Some(n) = &note { div { class: "hint note", "{n}" } }
