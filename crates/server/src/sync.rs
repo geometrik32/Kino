@@ -204,7 +204,7 @@ impl Room {
     }
 
     fn broadcast(&self, state: &SyncState) {
-        let msg = SyncServerMsg::State(state.clone());
+        let msg = SyncServerMsg::State(Box::new(state.clone()));
         for m in &self.members {
             if let Some(tx) = &m.tx {
                 let _ = tx.send(msg.clone());
@@ -979,7 +979,7 @@ async fn handle_socket(state: AppState, claims: SyncTicketClaims, socket: WebSoc
     };
 
     let (mut ws_tx, mut ws_rx) = socket.split();
-    if let Ok(json) = serde_json::to_string(&SyncServerMsg::State(initial)) {
+    if let Ok(json) = serde_json::to_string(&SyncServerMsg::State(Box::new(initial))) {
         if ws_tx.send(Message::Text(json.into())).await.is_err() {
             state
                 .sync
@@ -1125,7 +1125,7 @@ mod tests {
             assert_eq!(m, decoded);
         }
 
-        let server_msg = SyncServerMsg::State(SyncState {
+        let server_msg = SyncServerMsg::State(Box::new(SyncState {
             revision: 7,
             kind: MediaKind::Movie,
             tmdb_id: 603,
@@ -1148,7 +1148,7 @@ mod tests {
                 ready: true,
                 buffering: false,
             }],
-        });
+        }));
         let json = serde_json::to_string(&server_msg).expect("serialize server msg");
         let decoded: SyncServerMsg = serde_json::from_str(&json).expect("deserialize server msg");
         assert_eq!(server_msg, decoded);

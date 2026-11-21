@@ -633,6 +633,7 @@ pub fn Player(
                                                 });
                                             }
                                             SyncServerMsg::State(st) => {
+                                                let st = *st;
                                                 ui.with_mut(|s| {
                                                     s.sync_members = st.members.clone();
                                                     s.sync_waiting_for = st.waiting_for.clone();

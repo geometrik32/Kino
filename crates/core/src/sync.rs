@@ -179,7 +179,7 @@ pub enum SyncClientMsg {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncServerMsg {
-    State(SyncState),
+    State(Box<SyncState>),
     Pong { client_ms: i64, server_ms: i64 },
     Error { message: String },
 }
