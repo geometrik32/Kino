@@ -10,59 +10,65 @@
     </linearGradient>
     <mask id="ring-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="160" height="160">
       <rect width="160" height="160" fill="#000"/>
-      <circle cx="80" cy="80" r="58" fill="none" stroke="#fff" stroke-width="16.5"/>
+      <circle cx="80" cy="80" r="57.25" fill="none" stroke="#fff" stroke-width="21.5"/>
       <g fill="#000">
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(0 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(15 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(30 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(45 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(60 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(75 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(90 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(105 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(120 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(135 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(150 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(165 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(180 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(195 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(210 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(225 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(240 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(255 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(270 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(285 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(300 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(315 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(330 80 80)"/>
-        <rect x="76.6" y="18.8" width="6.8" height="4.6" rx="1.4" transform="rotate(345 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(0.00 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(8.18 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(16.36 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(24.55 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(32.73 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(40.91 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(49.09 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(57.27 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(65.45 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(73.64 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(81.82 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(90.00 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(98.18 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(106.36 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(114.55 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(122.73 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(130.91 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(139.09 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(147.27 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(155.45 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(163.64 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(171.82 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(180.00 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(188.18 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(196.36 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(204.55 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(212.73 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(220.91 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(229.09 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(237.27 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(245.45 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(253.64 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(261.82 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(270.00 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(278.18 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(286.36 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(294.55 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(302.73 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(310.91 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(319.09 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(327.27 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(335.45 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(343.64 80 80)"/>
+        <rect x="78.1" y="16.1" width="3.8" height="4.8" rx="1.1" transform="rotate(351.82 80 80)"/>
       </g>
     </mask>
     <mask id="eagle-mask" maskUnits="userSpaceOnUse" x="0" y="0" width="160" height="160">
       <rect width="160" height="160" fill="#000"/>
-      <path fill="#fff" d="
-        M 42 103
-        C 45 81, 55 68, 67 60
-        C 60 58.5, 55 55.5, 52 51.5
-        C 61 53.2, 69 51.5, 79 51.5
-        C 95 51.5, 110 58, 115 73.5
-        C 110.5 68, 103.5 66.5, 96.5 68
-        C 90 69.5, 86.5 74, 86.5 81
-        C 86.5 93.5, 94 103, 107.5 107
-        C 96.5 117.5, 74 123, 54 116.5
-        C 46.5 114, 41.5 109, 42 103
-        Z
-      "/>
-      <path fill="#000" d="M 84.5 59.5 C 89 57.4, 95 58, 98.5 61 C 94 62.2, 88.5 61.8, 84.5 59.5 Z"/>
-      <path fill="none" stroke="#000" stroke-width="3.2" stroke-linecap="round" d="
-        M 80.5 77.5 C 74 91, 77 107, 87.5 117
-      "/>
+      <path fill="#fff" d="M 81.3 52.3 C 85.2 52.0, 87.0 52.2, 89.9 52.5 C 92.8 52.8, 93.0 53.2, 94.5 53.8 C 95.9 54.3, 95.5 54.1, 96.7 55.0 C 97.9 55.9, 98.8 56.9, 99.7 57.8 C 100.6 58.7, 100.3 58.4, 100.7 59.3 C 101.1 60.2, 100.4 61.2, 101.5 62.0 C 102.7 62.7, 104.3 62.3, 106.0 62.8 C 107.6 63.2, 107.7 63.3, 109.0 64.0 C 110.2 64.7, 110.7 64.9, 111.7 66.0 C 112.8 67.2, 113.2 67.7, 113.7 69.3 C 114.3 70.9, 114.3 72.0, 114.3 73.4 C 114.3 74.8, 114.2 74.6, 113.7 75.7 C 113.3 76.8, 112.2 78.3, 112.2 78.3 C 112.2 78.3, 111.7 77.0, 111.2 76.3 C 110.7 75.6, 110.9 75.6, 110.0 75.0 C 109.0 74.5, 109.0 74.0, 106.9 73.8 C 104.8 73.5, 103.1 73.5, 100.6 73.8 C 98.1 74.0, 97.6 74.3, 95.5 75.0 C 93.4 75.7, 92.7 76.1, 91.0 77.0 C 89.4 77.9, 90.0 77.4, 88.0 79.0 C 86.1 80.7, 84.3 82.1, 82.3 84.5 C 80.3 87.0, 80.0 88.3, 79.0 90.3 C 78.0 92.3, 78.2 92.2, 77.8 93.8 C 77.3 95.5, 77.1 95.1, 77.0 97.8 C 76.9 100.6, 76.9 103.3, 77.3 106.2 C 77.6 109.0, 77.5 108.2, 78.5 110.7 C 79.5 113.2, 80.7 115.4, 81.8 117.5 C 82.9 119.5, 81.8 118.1, 83.5 120.0 C 85.2 121.8, 89.5 125.9, 89.5 125.9 C 89.5 125.9, 87.4 126.6, 84.4 126.8 C 81.4 126.9, 79.3 127.0, 75.8 126.8 C 72.4 126.5, 71.8 126.3, 68.6 125.5 C 65.4 124.7, 64.2 124.2, 61.3 123.0 C 58.4 121.8, 58.5 122.0, 55.5 120.0 C 52.6 118.0, 50.5 116.4, 47.8 114.0 C 45.1 111.6, 45.1 111.3, 43.3 109.0 C 41.4 106.6, 41.1 106.3, 39.5 103.5 C 38.0 100.6, 37.0 98.0, 36.3 96.0 C 35.5 93.9, 36.4 94.9, 36.3 94.3 C 36.1 93.8, 35.8 94.3, 35.5 93.5 C 35.2 92.6, 33.4 93.8, 35.0 90.6 C 36.6 87.4, 40.4 82.5, 43.0 78.8 C 45.7 75.1, 44.6 76.3, 47.0 73.8 C 49.4 71.3, 50.9 69.7, 53.8 67.3 C 56.7 64.8, 58.3 64.0, 60.3 62.8 C 62.3 61.5, 62.7 61.7, 62.7 61.7 C 62.7 61.7, 63.4 61.5, 62.5 61.0 C 61.5 60.5, 59.8 60.4, 58.3 59.5 C 56.8 58.6, 56.5 58.2, 55.5 57.0 C 54.6 55.7, 54.3 54.6, 54.0 53.7 C 53.7 52.7, 54.0 52.5, 54.0 52.5 C 54.0 52.5, 56.8 54.0, 59.3 54.5 C 61.9 55.0, 62.9 55.1, 65.7 55.0 C 68.4 54.9, 70.4 54.5, 71.9 54.3 C 73.4 54.0, 70.5 54.2, 72.6 53.8 C 74.7 53.3, 77.5 52.5, 81.3 52.3 Z"/>
+      <path fill="#fff" d="M 91.6 80.0 C 91.6 80.0, 92.0 80.5, 92.0 80.5 C 92.0 80.5, 90.9 81.4, 90.0 82.8 C 89.1 84.2, 88.6 84.9, 88.0 86.8 C 87.4 88.8, 87.4 89.9, 87.3 91.8 C 87.1 93.8, 86.9 93.4, 87.5 95.7 C 88.1 97.9, 88.5 99.7, 90.0 102.2 C 91.5 104.7, 92.0 105.2, 94.3 107.0 C 96.6 108.8, 98.7 109.4, 100.6 110.3 C 102.5 111.1, 101.1 110.6, 102.8 110.8 C 104.6 110.9, 106.1 111.0, 108.4 110.8 C 110.7 110.5, 110.9 110.6, 113.2 109.5 C 115.5 108.4, 119.0 105.8, 119.0 105.8 C 119.0 105.8, 116.4 109.8, 114.2 112.2 C 112.0 114.7, 111.3 115.1, 109.0 117.0 C 106.6 118.9, 106.5 119.1, 103.5 120.7 C 100.4 122.4, 97.3 123.9, 94.9 124.5 C 92.5 125.1, 93.8 124.4, 92.5 123.5 C 91.3 122.6, 90.9 122.5, 89.0 120.5 C 87.2 118.5, 85.9 117.1, 84.3 114.5 C 82.7 111.9, 82.6 111.3, 81.8 108.7 C 80.9 106.1, 80.7 105.6, 80.5 102.7 C 80.3 99.7, 80.6 97.6, 81.0 95.1 C 81.4 92.6, 81.1 93.6, 82.3 91.3 C 83.4 89.0, 84.2 87.3, 86.3 84.8 C 88.3 82.3, 91.6 80.0, 91.6 80.0 Z"/>
+      <path fill="#000" d="M 87.7 60.3 C 85.9 60.2, 84.6 60.5, 83.6 60.8 C 82.6 61.0, 83.0 61.5, 83.0 61.5 C 83.0 61.5, 84.8 61.3, 86.2 62.0 C 87.6 62.7, 87.9 64.0, 89.3 64.7 C 90.7 65.4, 91.1 65.5, 92.7 65.3 C 94.2 65.0, 96.2 63.7, 96.2 63.7 C 96.2 63.7, 93.3 61.5, 91.5 60.8 C 89.6 60.0, 89.4 60.3, 87.7 60.3 Z"/>
     </mask>
   </defs>
   <rect width="640" height="640" fill="url(#bg)"/>
-  <g transform="translate(320 320) scale(3.05) translate(-80 -80)">
-    <circle cx="80" cy="80" r="71.5" fill="none" stroke="#38C6BD" stroke-opacity="0.30" stroke-width="1.2"/>
-    <rect x="0" y="0" width="160" height="160" fill="url(#turquoise)" mask="url(#ring-mask)"/>
+  <g transform="translate(320 320) scale(3.15) translate(-80 -80)">
+    <circle cx="80" cy="80" r="70.6" fill="none" stroke="#38C6BD" stroke-opacity="0.34" stroke-width="1.3"/>
     <rect x="0" y="0" width="160" height="160" fill="#F2ECE1" mask="url(#eagle-mask)"/>
+    <rect x="0" y="0" width="160" height="160" fill="url(#turquoise)" mask="url(#ring-mask)"/>
   </g>
 </svg>
