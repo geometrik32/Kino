@@ -257,6 +257,9 @@ pub fn ReleasePicker(
     mock: bool,
     /// A line under the heading, e.g. that the default filters were relaxed.
     note: Option<String>,
+    /// True for native desktop/mobile players that decode MKV/HEVC/AC3/DTS without transcoding.
+    #[props(default)]
+    native_player: bool,
     on_filter: EventHandler<ReleaseFilter>,
     on_sort: EventHandler<ReleaseSort>,
     on_panel: EventHandler<Option<PickerPanel>>,
@@ -338,14 +341,16 @@ pub fn ReleasePicker(
                             }
                         }
                     }
-                    button {
-                        class: if filter.direct_play == Some(true) { "chip sm accent" } else { "chip sm" },
-                        onclick: move |_| {
-                            let next = if f_dp.direct_play == Some(true) { None } else { Some(true) };
-                            on_filter.call(ReleaseFilter { direct_play: next, ..f_dp.clone() });
-                        },
-                        Icon { svg: icons::BOLT, class: "ic xs" }
-                        "Играет сразу"
+                    if !native_player {
+                        button {
+                            class: if filter.direct_play == Some(true) { "chip sm accent" } else { "chip sm" },
+                            onclick: move |_| {
+                                let next = if f_dp.direct_play == Some(true) { None } else { Some(true) };
+                                on_filter.call(ReleaseFilter { direct_play: next, ..f_dp.clone() });
+                            },
+                            Icon { svg: icons::BOLT, class: "ic xs" }
+                            "Играет сразу"
+                        }
                     }
                     button {
                         class: if panel == Some(PickerPanel::Filter) || n_active > 0 { "chip sm active" } else { "chip sm" },
@@ -362,7 +367,7 @@ pub fn ReleasePicker(
                     span { class: "count", "{shown_count} из {total}" }
                 }
                 match panel {
-                    Some(PickerPanel::Filter) => rsx! { FilterPanel { releases: releases.clone(), filter: filter.clone(), on_filter } },
+                    Some(PickerPanel::Filter) => rsx! { FilterPanel { releases: releases.clone(), filter: filter.clone(), native_player, on_filter } },
                     Some(PickerPanel::Sort) => rsx! {
                         div { class: "filter-drawer sort-drawer",
                             for s in ReleaseSort::ALL {
@@ -379,7 +384,7 @@ pub fn ReleasePicker(
                 }
                 div { class: "rel-list",
                     if let Some(r) = pinned {
-                        ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, on_pick, on_preload }
+                        ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, on_pick, on_preload }
                     }
                     for r in shown {
                         ReleaseRow {
@@ -387,6 +392,7 @@ pub fn ReleasePicker(
                             watched: watched.contains(&r.infohash),
                             release: r,
                             chosen: false,
+                            native_player,
                             on_pick,
                             on_preload,
                         }
@@ -420,7 +426,12 @@ pub fn ReleasePicker(
 }
 
 #[component]
-fn FilterPanel(releases: Vec<ReleaseOption>, filter: ReleaseFilter, on_filter: EventHandler<ReleaseFilter>) -> Element {
+fn FilterPanel(
+    releases: Vec<ReleaseOption>,
+    filter: ReleaseFilter,
+    #[props(default)] native_player: bool,
+    on_filter: EventHandler<ReleaseFilter>,
+) -> Element {
     let mut qualities = distinct(&releases, |r| Some(r.quality.clone()));
     qualities.sort_by_key(|q| std::cmp::Reverse(quality_rank(q)));
     let voices = distinct(&releases, |r| Some(r.voice.clone()));
@@ -475,10 +486,12 @@ fn FilterPanel(releases: Vec<ReleaseOption>, filter: ReleaseFilter, on_filter: E
                         onclick: { let f = f.clone(); move |_| set(ReleaseFilter { subtitles: toggle_flag(f.subtitles), ..f.clone() }) },
                         "{flag_label(f.subtitles, \"Субтитры\", \"Без субтитров\")}"
                     }
-                    button {
-                        class: if f.direct_play.is_some() { "chip sm active" } else { "chip sm" },
-                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { direct_play: toggle_flag(f.direct_play), ..f.clone() }) },
-                        "{flag_label(f.direct_play, \"Без перекодирования\", \"С перекодированием\")}"
+                    if !native_player {
+                        button {
+                            class: if f.direct_play.is_some() { "chip sm active" } else { "chip sm" },
+                            onclick: { let f = f.clone(); move |_| set(ReleaseFilter { direct_play: toggle_flag(f.direct_play), ..f.clone() }) },
+                            "{flag_label(f.direct_play, \"Без перекодирования\", \"С перекодированием\")}"
+                        }
                     }
                 }
             }
@@ -553,6 +566,7 @@ fn ReleaseRow(
     release: ReleaseOption,
     chosen: bool,
     watched: bool,
+    #[props(default)] native_player: bool,
     on_pick: EventHandler<ReleaseOption>,
     on_preload: EventHandler<ReleaseOption>,
 ) -> Element {
@@ -585,7 +599,7 @@ fn ReleaseRow(
                     } else if watched {
                         span { class: "tag ok", "Смотрели" }
                     }
-                    if release.direct_play {
+                    if release.direct_play || native_player {
                         span { class: "tag ok",
                             Icon { svg: icons::BOLT, class: "ic xs" }
                             "Играет сразу"

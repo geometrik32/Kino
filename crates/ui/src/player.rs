@@ -77,6 +77,8 @@ pub struct PlayerState {
     pub next: Option<String>,
     /// Re-encoded on the server (shown as a small note).
     pub transcoded: bool,
+    /// Video renders natively behind a transparent WebView (e.g. Android ExoPlayer TextureView).
+    pub native_video: bool,
     /// Played from the server's disk.
     pub preloaded: bool,
     /// The buttons and the seek bar are shown (a tap on the picture toggles them).
@@ -129,6 +131,7 @@ impl Default for PlayerState {
             menu: None,
             next: None,
             transcoded: false,
+            native_video: false,
             preloaded: false,
             controls: false,
             rate: 1.0,
@@ -234,27 +237,38 @@ pub fn PlayerView(
     };
     let next_for_dismiss = s.next.clone();
 
+    let player_cls = match (shown, s.native_video) {
+        (true, true) => "player show native-video",
+        (true, false) => "player show",
+        (false, true) => "player native-video",
+        (false, false) => "player",
+    };
+
     rsx! {
-        div { class: if shown { "player show" } else { "player" },
-            video {
-                id: VIDEO_ID,
-                src: if s.src.is_empty() { None } else { Some(s.src.clone()) },
-                poster: s.poster.clone().unwrap_or_default(),
-                autoplay: s.autoplay,
-                playsinline: true,
-                preload: "auto",
-                ontimeupdate: move |_| on_video.call("time"),
-                onloadedmetadata: move |_| on_video.call("metadata"),
-                oncanplay: move |_| on_video.call("canplay"),
-                onseeked: move |_| on_video.call("seeked"),
-                onwaiting: move |_| on_video.call("waiting"),
-                onplaying: move |_| on_video.call("playing"),
-                onpause: move |_| on_video.call("pause"),
-                onplay: move |_| on_video.call("play"),
-                onended: move |_| on_video.call("ended"),
-                onerror: move |_| on_video.call("error"),
-                if let Some(vtt) = &s.subtitles_src {
-                    track { kind: "subtitles", src: "{vtt}", srclang: "ru", label: "{sub_name}", default: true }
+        div { class: "{player_cls}",
+            if s.native_video {
+                div { id: VIDEO_ID, class: "p-native-slot" }
+            } else {
+                video {
+                    id: VIDEO_ID,
+                    src: if s.src.is_empty() { None } else { Some(s.src.clone()) },
+                    poster: s.poster.clone().unwrap_or_default(),
+                    autoplay: s.autoplay,
+                    playsinline: true,
+                    preload: "auto",
+                    ontimeupdate: move |_| on_video.call("time"),
+                    onloadedmetadata: move |_| on_video.call("metadata"),
+                    oncanplay: move |_| on_video.call("canplay"),
+                    onseeked: move |_| on_video.call("seeked"),
+                    onwaiting: move |_| on_video.call("waiting"),
+                    onplaying: move |_| on_video.call("playing"),
+                    onpause: move |_| on_video.call("pause"),
+                    onplay: move |_| on_video.call("play"),
+                    onended: move |_| on_video.call("ended"),
+                    onerror: move |_| on_video.call("error"),
+                    if let Some(vtt) = &s.subtitles_src {
+                        track { kind: "subtitles", src: "{vtt}", srclang: "ru", label: "{sub_name}", default: true }
+                    }
                 }
             }
             div { class: "p-vignette" }
@@ -647,7 +661,7 @@ pub fn PlayerView(
                                         span { "Выключены" }
                                     }
                                 }
-                                if !s.preloaded && !s.subtitle_tracks.is_empty() {
+                                if !s.preloaded && !s.native_video && !s.subtitle_tracks.is_empty() {
                                     p { class: "muted small p-pop-note",
                                         "Встроенные субтитры отключены при потоке с торрента, чтобы не тормозить загрузку видео."
                                     }
@@ -656,7 +670,7 @@ pub fn PlayerView(
                                     button {
                                         key: "s{t.index}",
                                         class: if s.subtitle_track == Some(t.index) { "p-opt on" } else { "p-opt" },
-                                        disabled: !s.preloaded,
+                                        disabled: !s.preloaded && !s.native_video,
                                         onclick: move |_| on_subtitle.call(Some(t.index)),
                                         span { class: "p-opt-l",
                                             if s.subtitle_track == Some(t.index) {

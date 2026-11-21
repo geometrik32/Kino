@@ -519,6 +519,7 @@ async fn main() -> anyhow::Result<()> {
         menu: None,
         next: Some("S02E07".into()),
         transcoded: true,
+        native_video: false,
         preloaded: false,
         controls: true,
         rate: 1.0,

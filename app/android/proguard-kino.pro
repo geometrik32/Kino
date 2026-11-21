@@ -1,0 +1,3 @@
+-keep class dev.dioxus.main.MainActivity { *; }
+-keep class androidx.media3.** { *; }
+-keep class org.jellyfin.media3.** { *; }

@@ -496,11 +496,27 @@ async fn transcodes_with_ffmpeg(pool: PgPool) {
     assert_eq!(code, StatusCode::OK, "{body}");
     let info: PlayInfo = serde_json::from_value(body).unwrap();
     assert!(!info.direct, "MPEG-4 + AC3 in MKV needs re-encoding");
+    assert!(!info.native);
     assert!((info.duration.unwrap() - 3.0).abs() < 0.2);
     assert_eq!(info.audio.len(), 1);
     assert_eq!(info.audio[0].label(), "LostFilm · Русский");
     assert_eq!(info.subtitles.len(), 1);
     assert_eq!(info.subtitle_track, None, "subtitles are never auto-enabled from prefs");
+
+    // A native client (Android ExoPlayer / Desktop libmpv) gets direct playback for the same MKV+AC3 file.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/play",
+        Some(&t),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "episode": 1, "release": key, "native": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let native_info: PlayInfo = serde_json::from_value(body).unwrap();
+    assert!(native_info.direct);
+    assert!(native_info.native);
+    assert!(native_info.plays_directly(Some(0)));
 
     let (code, headers, bytes) = raw(&app, Method::GET, &info.transcoded_url(Some(0), 1.0), None, &[]).await;
     assert_eq!(code, StatusCode::OK);

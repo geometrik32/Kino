@@ -60,10 +60,13 @@ fn waiting_label(st: &SyncState) -> String {
     }
 }
 
-/// Aborts the `<video>` element's open network fetch immediately.
+/// Aborts the `<video>` element's open network fetch and stops any active native player immediately.
 fn stop_video_element() {
+    platform::video::native_close();
     let _ = dioxus::document::eval(
-        "var v = document.getElementById('kino-video'); if (v) { v.pause(); v.removeAttribute('src'); v.load(); }",
+        "document.documentElement.classList.remove('native-video'); \
+         var v = document.getElementById('kino-video'); \
+         if (v && typeof v.pause === 'function') { v.pause(); v.removeAttribute('src'); v.load(); }",
     );
 }
 
@@ -104,6 +107,16 @@ struct SyncGuard;
 impl Drop for SyncGuard {
     fn drop(&mut self) {
         sync::stop(None);
+    }
+}
+
+/// Stops the Android ExoPlayer surface if `Player` is unmounted directly.
+struct NativePlayerGuard;
+
+impl Drop for NativePlayerGuard {
+    fn drop(&mut self) {
+        platform::video::native_close();
+        let _ = dioxus::document::eval("document.documentElement.classList.remove('native-video');");
     }
 }
 
@@ -248,6 +261,7 @@ pub fn Player(
     };
 
     use_hook(|| std::rc::Rc::new(SyncGuard));
+    use_hook(|| std::rc::Rc::new(NativePlayerGuard));
 
     // The episodes of the season being watched, with the ones already seen.
     let season_list = {
@@ -302,14 +316,15 @@ pub fn Player(
     let mut load_source = move |at: f64| {
         let Some(i) = info() else { return };
         let audio = ui.peek().audio_track;
-        let transcode = force_transcode() || !i.plays_directly(audio);
+        let native = platform::video::supports_native() && !force_transcode();
+        let transcode = !native && (force_transcode() || !i.plays_directly(audio));
         let (src, off) = if transcode {
             last_reload_ms.set(platform::now_ms());
             pending_seek.set(None);
             seeking_target.set(None);
             (i.transcoded_url(audio, at), at.floor())
         } else {
-            pending_seek.set((at > 0.0).then_some(at));
+            pending_seek.set((!native && at > 0.0).then_some(at));
             seeking_target.set(None);
             (i.stream.clone(), 0.0)
         };
@@ -324,6 +339,18 @@ pub fn Player(
                     duration_sec: ui.peek().duration,
                     file_index: fi,
                 });
+            }
+            return;
+        }
+        if native && ui.peek().native_video && ui.peek().src == src {
+            platform::video::native_set_audio(audio);
+            if (ui.peek().position - at).abs() > 1.5 {
+                if let Some(v) = video() {
+                    awaiting_ready.set(true);
+                    seeking_target.set(Some(at));
+                    v.set_current_time(at);
+                    ui.with_mut(|s| s.position = at);
+                }
             }
             return;
         }
@@ -346,15 +373,28 @@ pub fn Player(
         sync::set_stream_offset(off);
         stall_secs.set(0);
         played.set(false);
+        let sub_track = if i.preloaded || native {
+            ui.peek().subtitle_track
+        } else {
+            None
+        };
+        if native {
+            platform::video::native_open(&src, at, f64::from(rate()), audio, sub_track, !hold);
+            let _ = dioxus::document::eval("document.documentElement.classList.add('native-video');");
+        } else {
+            platform::video::native_close();
+            let _ = dioxus::document::eval("document.documentElement.classList.remove('native-video');");
+        }
         ui.with_mut(|s| {
             s.autoplay = !hold;
             s.src = src;
+            s.native_video = native;
             s.transcoded = transcode;
             s.position = at;
             s.waiting = true;
             s.status = Some(status.into());
             s.progress = None;
-            s.subtitles_src = if i.preloaded {
+            s.subtitles_src = if !native && i.preloaded {
                 s.subtitle_track.map(|t| i.subtitle_url(t, off))
             } else {
                 None
@@ -493,6 +533,7 @@ pub fn Player(
                     season: if kind == MediaKind::Tv { season } else { 0 },
                     episode: if kind == MediaKind::Tv { episode } else { 0 },
                     release: rel.infohash.clone(),
+                    native: platform::video::supports_native(),
                 };
                 let res = api::play(&t, &req).await;
                 if play_gen() != my_gen || closing() {
@@ -513,7 +554,11 @@ pub fn Player(
                             s.audio = i.audio.clone();
                             s.subtitle_tracks = i.subtitles.clone();
                             s.audio_track = synced_audio;
-                            s.subtitle_track = if i.preloaded { i.subtitle_track } else { None };
+                            s.subtitle_track = if i.preloaded || i.native {
+                                i.subtitle_track
+                            } else {
+                                None
+                            };
                             s.next = i.next.map(|(s, e)| episode_code(s, e));
                             s.preloaded = i.preloaded;
                         });
@@ -1187,7 +1232,7 @@ pub fn Player(
                 }
                 "seeked" => {
                     if let Some(tgt) = seeking_target() {
-                        if (v.current_time() - tgt).abs() < 8.0 {
+                        if ui.peek().native_video || (v.current_time() - tgt).abs() < 8.0 {
                             seeking_target.set(None);
                         }
                     }
@@ -1354,6 +1399,8 @@ pub fn Player(
             }
         }
     };
+    let on_video = use_callback(on_video);
+    platform::video::use_native_events(on_video);
 
     let close = Callback::new({
         let mut save = save.clone();
@@ -1654,12 +1701,19 @@ pub fn Player(
             on_subtitle: {
                 let save_tracks = save_tracks.clone();
                 move |t: Option<i32>| {
+                    let native = ui.peek().native_video;
+                    if native {
+                        platform::video::native_set_subtitle(t);
+                    }
                     let off = offset();
-                    let url = info
-                        .peek()
-                        .as_ref()
-                        .filter(|i| i.preloaded)
-                        .and_then(|i| t.map(|t| i.subtitle_url(t, off)));
+                    let url = (!native)
+                        .then(|| {
+                            info.peek()
+                                .as_ref()
+                                .filter(|i| i.preloaded)
+                                .and_then(|i| t.map(|t| i.subtitle_url(t, off)))
+                        })
+                        .flatten();
                     ui.with_mut(|s| {
                         s.subtitle_track = t;
                         s.subtitles_src = url;

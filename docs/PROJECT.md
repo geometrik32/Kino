@@ -57,7 +57,7 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 - Запоминание выбранной раздачи для фильма или конкретного сезона сериала (`release_choice`).
 - Теги совместимости в списке раздач:
   - `играет сразу` — если в названии `H.264`, без `HDR` и не `2160p`;
-  - `перекодируется` — если указан `HEVC`/`AV1` или `HDR`.
+  - `перекодируется` — если указан `HEVC`/`AV1` или `HDR` (для нативного плеера Android при `native_player = true` фильтры `Играет сразу`/`Без перекодирования` и тег `перекодируется` скрываются, т.к. поток воспроизводится напрямую).
 
 ### 3.4. Воспроизведение, дорожки и стриминг (`crates/server/src/play.rs`, `ffmpeg.rs`, `app/src/player.rs`, `crates/ui/src/player.rs`)
 - Выбор нужного файла внутри раздачи (`files.rs`), в том числе в многосерийных паках и сезонах.
@@ -67,10 +67,13 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 - Анализ файла через `ffprobe`: длительность, контейнер, видеокодек, список аудиодорожек и текстовых субтитров.
 - Извлечение текстовых субтитров в WebVTT (`GET /api/stream/{token}/sub/{n}.vtt`) работает для предзагруженных на диск сервера релизов (`preloaded`); для живого стрима через TorrServer встроенные субтитры отключены с подсказкой в плеере, чтобы чтение всего MKV до конца файла не блокировало `<video>` и не перегружало кеш TorrServer.
 - **Текущая логика перекодирования / прямой отдачи:**
-  - Прямая отдача (с HTTP `Range`) используется, только если `probe.browser_ok()` истинно (`mov,mp4` + видео `h264`/`vp9`/`av1` + звук по умолчанию `aac`/`mp3`/`opus`/`vorbis`) **и** выбрана аудиодорожка по умолчанию.
-  - Во всех остальных случаях (`.mkv`, `HEVC`, `AC3`/`DTS`, выбор другой аудиодорожки или ошибка `<video>` с откатом в `force_transcode`) сервер запускает `ffmpeg` на лету (ограничение — не более `MAX_TRANSCODES = 4` одновременных потоков с ожиданием слота до 10 с), отдавая фрагментированный MP4:
+  - Прямая отдача (с HTTP `Range`) используется, если клиент передал `PlayRequest.native = true` (нативное Android-приложение), либо если `probe.browser_ok()` истинно (`mov,mp4` + видео `h264`/`vp9`/`av1` + звук по умолчанию `aac`/`mp3`/`opus`/`vorbis`) **и** выбрана аудиодорожка по умолчанию.
+  - Во всех остальных случаях браузера/Mini App (`.mkv`, `HEVC`, `AC3`/`DTS`, выбор другой аудиодорожки или ошибка декодера с откатом в `force_transcode`) сервер запускает `ffmpeg` на лету (ограничение — не более `MAX_TRANSCODES = 4` одновременных потоков с ожиданием слота до 10 с), отдавая фрагментированный MP4:
     - при видео `H.264` используется `-c:v copy` (перекодируется только аудио в `AAC` stereo 192k);
     - при других видеокодеках видео перекодируется в `H.264` (`libx264`, либо аппаратно `h264_qsv` / `h264_vaapi` при `TRANSCODE_HWACCEL`).
+- **Нативный плеер Android (`app/android/MainActivity.kt`, `app/android/proguard-kino.pro`, `app/src/platform/android.rs`, `app/src/platform/video.rs`, `app/Dioxus.toml`):**
+  - Под WebView (на прозрачном фоне при `.player.native-video` / `html.native-video`) размещён `AndroidX Media3 ExoPlayer` (`1.9.0`) + программный аудиодекодер `org.jellyfin.media3:media3-ffmpeg-decoder` (`1.9.0+1`) в режиме `EXTENSION_RENDERER_MODE_ON`: аппаратное декодирование видео (`MediaCodec` для H.264/HEVC/AV1/HDR) и декодирование `AC3`/`EAC3`/`DTS`/`TrueHD`/FLAC через FFmpeg, вывод через `TextureView` + `SubtitleView`.
+  - Управление, меню аудиодорожек и встроенных субтитров, прогресс каждые 10 с, скорость, перемотка, удержание экрана (`keepScreenOn`), переход к следующей серии и Watch Together-синхронизация сохраняются поверх единого UI `PlayerView`; смена аудиодорожки/субтитров происходит внутри `ExoPlayer` без перезапуска потока и без `ffmpeg` на сервере (при ошибке декодера предусмотрен откат на серверное `ffmpeg`-перекодирование в `<video>`).
 - Плеер в клиенте (`app/src/player.rs`, `app/src/sync.rs`, `crates/server/src/sync.rs`): сохранение позиции каждые 10 секунд с именем устройства, переход к следующей серии, скорость воспроизведения, двойной тап ±10 с, выбор дорожек/субтитров (запоминается для тайтла), полноэкранный режим (`navigationUI: 'hide'`, повтор по тапу, `WindowInsetsController` и чёрные бары Telegram в плеере), поворот в ландшафт на Android, тихий fallback при запрете автовоспроизведения со звуком (кнопка «Включить звук» с размутом по тапу) и **живая синхронизация просмотра между устройствами одного аккаунта** (`POST /api/sync/join`, `POST /api/sync/leave`, `GET /api/sync/ws`: воспроизведение/пауза, таймкод с калибровкой часов и автокоррекцией рассинхрона, скорость, перемотка, смена серии/раздачи/дорожки, взаимное ожидание буферизации, защита `watch_progress` от устаревших перезаписей и REC-индикатор со списком устройств при 2+ активных подключениях).
 
 ### 3.5. Профиль, история и Telegram-бот
@@ -80,7 +83,7 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 ### 3.6. База данных и деплой
 - PostgreSQL (миграции `crates/server/migrations/0001..0007`): таблицы `users`, `invites`, `watch_progress`, `watchlist`, `release_choice`, `title_state`, `watch_history`, `user_prefs`, `preload`, `torrent_source`, `login_link`.
 - Docker / TrueNAS стек (`deploy/compose.yaml`, `Dockerfile`): `kino-db`, `kino-server` (с пробросом `/dev/dri` для VA-API/QSV), `kino-bot`, `torrserver`, `jackett`, `qbittorrent` за Traefik.
-- CI (`.github/workflows/ci.yml`): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo clippy -p kino-app --target wasm32-unknown-unknown --locked -- -D warnings`, сборка Docker-образа.
+- CI (`.github/workflows/ci.yml`, `.github/workflows/android.yml`): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo clippy -p kino-app --target wasm32-unknown-unknown --locked -- -D warnings`, сборка Docker-образа; отдельный workflow `.github/workflows/android.yml` для сборки `arm64` APK (`dx bundle --package kino-app --platform android --target aarch64-linux-android --release --package-types apk`).
 
 ---
 
@@ -89,5 +92,5 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 | Платформа | Клиент | Требования к воспроизведению | Текущий статус |
 |---|---|---|---|
 | **Web / Telegram Mini App** | `kino-app` (`web`) | Браузерный `<video>`, серверная адаптация через `ffmpeg` для несовместимых форматов. | Работает. |
-| **Desktop (Windows / macOS / Linux)** | `kino-app` (`desktop`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `AV1`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с переключением аудиодорожек и субтитров. | **Не реализовано** (сейчас играет через WebView `<video>`, см. `ISSUE-001` в `docs/ISSUES.md`). |
-| **Android** | `kino-app` (`mobile`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с сохранением внутриприложенческого UX (прогресс, дорожки, следующая серия). | **Не реализовано** (сейчас играет через системный WebView `<video>`, см. `ISSUE-001` в `docs/ISSUES.md`). |
+| **Desktop (Windows / macOS / Linux)** | `kino-app` (`desktop`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `AV1`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с переключением аудиодорожек и субтитров. | **Отложено по решению владельца** (сейчас приоритет на Android; общий серверный протокол `PlayRequest.native` готов, см. `ISSUE-001` в `docs/ISSUES.md`). |
+| **Android** | `kino-app` (`mobile`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с сохранением внутриприложенческого UX (прогресс, дорожки, следующая серия). | **Реализовано в коде (`ExoPlayer` + `Jellyfin FFmpeg`)**; ожидает сборки APK в GitHub Actions и проверки на реальном Android-устройстве (см. `ISSUE-001`). |

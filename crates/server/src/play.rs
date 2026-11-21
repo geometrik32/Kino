@@ -268,11 +268,13 @@ async fn play(
         }
     };
     // Without ffprobe nothing is known; let the browser try mp4/webm files directly.
-    let direct = if probe.container.is_empty() {
-        file.path.to_ascii_lowercase().ends_with(".mp4")
-    } else {
-        probe.browser_ok()
-    };
+    // Native clients (Android/Desktop) decode MKV/HEVC/AC3/DTS directly on the client.
+    let direct = req.native
+        || if probe.container.is_empty() {
+            file.path.to_ascii_lowercase().ends_with(".mp4")
+        } else {
+            probe.browser_ok()
+        };
 
     let claims = StreamClaims {
         uid: user.0,
@@ -295,8 +297,9 @@ async fn play(
     let prefs = userdata::get_prefs(&state.pool, user.0).await?;
     let (audio_track, subtitle_track) =
         choose_tracks(&probe, st.audio_track.as_deref(), st.subtitle_track.as_deref(), &prefs);
-    // Extracting embedded subtitles scans to EOF and blocks `<video default>` on live torrent streams.
-    let subtitle_track = if preloaded { subtitle_track } else { None };
+    // Extracting embedded WebVTT subtitles scans to EOF and blocks `<video default>` on live torrent streams;
+    // native players read subtitles inline from the stream.
+    let subtitle_track = if preloaded || req.native { subtitle_track } else { None };
     let next = match episode {
         Some(e) => next_episode(&state.catalog.details(MediaKind::Tv, req.tmdb_id).await?, e),
         None => None,
@@ -316,6 +319,7 @@ async fn play(
         start_at,
         next,
         preloaded,
+        native: req.native,
     }))
 }
 

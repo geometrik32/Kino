@@ -865,6 +865,11 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 }
 .player video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
 .player video::cue { background: rgba(0,0,0,.62); font-size: 1.1em; }
+.player.native-video { background: transparent; }
+.p-native-slot { position: absolute; inset: 0; width: 100%; height: 100%; }
+html.native-video, html.native-video body { background: transparent !important; visibility: hidden !important; }
+html.native-video .player.native-video,
+html.native-video .player.native-video * { visibility: visible; }
 .p-vignette {
   position: absolute; inset: 0; pointer-events: none; transition: opacity .25s;
   background: linear-gradient(180deg, rgba(6,10,16,.76) 0%, transparent 26%, transparent 66%, rgba(6,10,16,.86) 100%);

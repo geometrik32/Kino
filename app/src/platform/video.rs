@@ -94,17 +94,45 @@ mod imp {
         }
     }
 
+    pub fn supports_native() -> bool {
+        false
+    }
+    pub fn native_open(
+        _url: &str,
+        _start_sec: f64,
+        _rate: f64,
+        _audio: Option<i32>,
+        _subtitle: Option<i32>,
+        _autoplay: bool,
+    ) {
+    }
+    pub fn native_set_audio(_audio: Option<i32>) {}
+    pub fn native_set_subtitle(_subtitle: Option<i32>) {}
+    pub fn native_close() {}
+
     /// Starts mirroring (nothing to do in a browser).
     pub fn use_bridge() {}
+
+    /// Native player polling loop (not used in browser).
+    pub fn use_native_events(_on_video: dioxus::prelude::Callback<&'static str>) {}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
 
     use dioxus::{document::eval, prelude::*};
 
     use super::{PlayOutcome, VIDEO_ID};
+
+    #[cfg(target_os = "android")]
+    use std::{
+        sync::atomic::AtomicU64,
+        time::{Duration, Instant},
+    };
 
     #[derive(Clone, Copy)]
     struct Snapshot {
@@ -121,10 +149,125 @@ mod imp {
         ready_state: 0,
     });
 
+    static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+    #[cfg(target_os = "android")]
+    static NATIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(target_os = "android")]
+    #[derive(Clone, Copy, Default)]
+    struct PollState {
+        seq: u64,
+        seek_seq: u64,
+        metadata_sent: bool,
+        ready_sent: bool,
+        played_sent: bool,
+        waiting: bool,
+        paused: bool,
+        ended_sent: bool,
+        error_sent: bool,
+        last_time_sec: f64,
+        ignore_paused_until: Option<Instant>,
+        ignore_seek_until: Option<Instant>,
+    }
+
+    #[cfg(target_os = "android")]
+    static POLL_STATE: Mutex<PollState> = Mutex::new(PollState {
+        seq: 0,
+        seek_seq: 0,
+        metadata_sent: false,
+        ready_sent: false,
+        played_sent: false,
+        waiting: false,
+        paused: true,
+        ended_sent: false,
+        error_sent: false,
+        last_time_sec: -1.0,
+        ignore_paused_until: None,
+        ignore_seek_until: None,
+    });
+
     pub struct Video;
 
     pub fn video() -> Option<Video> {
         Some(Video)
+    }
+
+    pub fn supports_native() -> bool {
+        cfg!(target_os = "android")
+    }
+
+    pub fn is_native_active() -> bool {
+        NATIVE_ACTIVE.load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "android")]
+    pub fn native_open(
+        url: &str,
+        start_sec: f64,
+        rate: f64,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+        autoplay: bool,
+    ) {
+        let start = start_sec.max(0.0);
+        *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
+            time: start,
+            duration: f64::NAN,
+            paused: !autoplay,
+            ready_state: 0,
+        };
+        let seq = super::super::android::native_open(url, start, rate as f32, audio, subtitle, autoplay);
+        NATIVE_SEQ.store(seq, Ordering::Relaxed);
+        *POLL_STATE.lock().expect("poll state") = PollState {
+            seq,
+            paused: !autoplay,
+            last_time_sec: -1.0,
+            ..PollState::default()
+        };
+        NATIVE_ACTIVE.store(true, Ordering::Relaxed);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    pub fn native_open(
+        _url: &str,
+        _start_sec: f64,
+        _rate: f64,
+        _audio: Option<i32>,
+        _subtitle: Option<i32>,
+        _autoplay: bool,
+    ) {
+    }
+
+    pub fn native_set_audio(audio: Option<i32>) {
+        #[cfg(target_os = "android")]
+        if is_native_active() {
+            super::super::android::native_select_audio(audio);
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = audio;
+    }
+
+    pub fn native_set_subtitle(subtitle: Option<i32>) {
+        #[cfg(target_os = "android")]
+        if is_native_active() {
+            super::super::android::native_select_subtitle(subtitle);
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = subtitle;
+    }
+
+    pub fn native_close() {
+        let was_active = NATIVE_ACTIVE.swap(false, Ordering::Relaxed);
+        #[cfg(target_os = "android")]
+        {
+            NATIVE_SEQ.store(0, Ordering::Relaxed);
+            if was_active {
+                super::super::android::native_close();
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        let _ = was_active;
     }
 
     fn snapshot() -> Snapshot {
@@ -150,12 +293,32 @@ mod imp {
         }
         pub fn set_current_time(&self, t: f64) {
             SNAPSHOT.lock().expect("video snapshot").time = t;
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                {
+                    let mut st = POLL_STATE.lock().expect("poll state");
+                    st.ignore_seek_until = Some(Instant::now() + Duration::from_millis(500));
+                }
+                super::super::android::native_seek(t);
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) v.currentTime={t};"
             ));
         }
         pub fn play_checked(&self, on_done: impl FnOnce(PlayOutcome) + 'static) {
             SNAPSHOT.lock().expect("video snapshot").paused = false;
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                {
+                    let mut st = POLL_STATE.lock().expect("poll state");
+                    st.paused = false;
+                    st.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
+                }
+                super::super::android::native_play();
+                on_done(PlayOutcome::Ok);
+                return;
+            }
             spawn(async move {
                 let res = eval(&format!(
                     "var v=document.getElementById('{VIDEO_ID}'); if(!v) return 'none'; \
@@ -178,21 +341,46 @@ mod imp {
         }
         pub fn pause(&self) {
             SNAPSHOT.lock().expect("video snapshot").paused = true;
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                {
+                    let mut st = POLL_STATE.lock().expect("poll state");
+                    st.paused = true;
+                    st.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
+                }
+                super::super::android::native_pause();
+                return;
+            }
             run(format!("var v=document.getElementById('{VIDEO_ID}'); if(v) v.pause();"));
         }
         /// Playback speed (1.0 is normal).
         pub fn set_rate(&self, rate: f64) {
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                super::super::android::native_set_rate(rate as f32);
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
             ));
         }
         pub fn set_volume(&self, vol: f64) {
             let vol = vol.clamp(0.0, 1.0);
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                super::super::android::native_set_volume(vol as f32);
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) v.volume={vol};"
             ));
         }
         pub fn set_muted(&self, muted: bool) {
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                super::super::android::native_set_muted(muted);
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) v.muted={muted};"
             ));
@@ -206,20 +394,163 @@ mod imp {
                 let mut bridge = eval(&format!(
                     "setInterval(function () {{ \
                        var v = document.getElementById('{VIDEO_ID}'); \
-                       if (v) dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState]); \
+                       if (v && typeof v.play === 'function') dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState]); \
                      }}, 250);"
                 ));
                 while let Ok((time, duration, paused, ready_state)) = bridge.recv::<(f64, f64, bool, u16)>().await {
-                    *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
-                        time,
-                        duration: if duration < 0.0 { f64::NAN } else { duration },
-                        paused,
-                        ready_state,
-                    };
+                    if !is_native_active() {
+                        *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
+                            time,
+                            duration: if duration < 0.0 { f64::NAN } else { duration },
+                            paused,
+                            ready_state,
+                        };
+                    }
                 }
             });
         });
     }
+
+    #[cfg(target_os = "android")]
+    fn poll_native_once() -> Vec<&'static str> {
+        let mut events = Vec::new();
+        if !is_native_active() {
+            return events;
+        }
+        let expected_seq = NATIVE_SEQ.load(Ordering::Relaxed);
+        if expected_seq == 0 {
+            return events;
+        }
+        let Some(snap) = super::super::android::poll_native_player() else {
+            return events;
+        };
+        if snap.open_seq != expected_seq {
+            return events;
+        }
+
+        let now = Instant::now();
+        let mut st = POLL_STATE.lock().expect("poll state");
+        if st.seq != expected_seq {
+            return events;
+        }
+
+        let mut cur = SNAPSHOT.lock().expect("video snapshot");
+        cur.duration = snap.duration_sec;
+        cur.ready_state = if snap.ready && !snap.buffering { 4 } else { 1 };
+
+        let seeked = snap.seek_seq != st.seek_seq;
+        if seeked {
+            st.seek_seq = snap.seek_seq;
+            st.ignore_seek_until = None;
+        }
+        let seek_guarded = st.ignore_seek_until.is_some_and(|u| now < u);
+        if !seek_guarded {
+            st.ignore_seek_until = None;
+            cur.time = snap.position_sec;
+        }
+
+        let pause_guarded = match st.ignore_paused_until {
+            Some(until) if now < until => {
+                if snap.paused == st.paused {
+                    st.ignore_paused_until = None;
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => {
+                st.ignore_paused_until = None;
+                false
+            }
+        };
+
+        if pause_guarded {
+            cur.paused = st.paused;
+        } else {
+            cur.paused = snap.paused;
+        }
+
+        if snap.error {
+            if !st.error_sent {
+                st.error_sent = true;
+                events.push("error");
+            }
+            return events;
+        }
+
+        if seeked {
+            events.push("seeked");
+        }
+
+        if (snap.ready || snap.duration_sec.is_finite()) && !st.metadata_sent {
+            st.metadata_sent = true;
+            events.push("metadata");
+        }
+
+        if snap.ready && !st.ready_sent {
+            st.ready_sent = true;
+            st.waiting = false;
+            events.push("canplay");
+        }
+
+        if st.ready_sent && snap.buffering && !st.waiting && !snap.ended {
+            st.waiting = true;
+            events.push("waiting");
+        }
+
+        if snap.ready && !snap.buffering && !snap.ended {
+            if !snap.paused && (!st.played_sent || st.waiting) {
+                st.played_sent = true;
+                st.waiting = false;
+                events.push("playing");
+            } else if snap.paused && st.waiting {
+                st.waiting = false;
+                events.push("canplay");
+            }
+        }
+
+        if !pause_guarded && snap.paused != st.paused && !snap.ended {
+            st.paused = snap.paused;
+            events.push(if snap.paused { "pause" } else { "play" });
+        }
+
+        if st.ready_sent && !seek_guarded && (snap.position_sec - st.last_time_sec).abs() >= 0.15 && !snap.ended {
+            st.last_time_sec = snap.position_sec;
+            events.push("time");
+        }
+
+        if snap.ended && !st.ended_sent {
+            st.ended_sent = true;
+            cur.paused = true;
+            events.push("ended");
+        }
+
+        events
+    }
+
+    /// Polls Android's native ExoPlayer state and forwards transitions to `on_video`.
+    pub fn use_native_events(on_video: Callback<&'static str>) {
+        #[cfg(target_os = "android")]
+        use_hook(|| {
+            spawn(async move {
+                loop {
+                    let ms = if is_native_active() { 200 } else { 400 };
+                    super::super::sleep(ms).await;
+                    if !is_native_active() {
+                        continue;
+                    }
+                    for ev in poll_native_once() {
+                        on_video.call(ev);
+                    }
+                }
+            });
+        });
+        #[cfg(not(target_os = "android"))]
+        let _ = on_video;
+    }
 }
 
-pub use imp::{use_bridge, video};
+pub use imp::{
+    native_close, native_open, native_set_audio, native_set_subtitle, supports_native, use_bridge, use_native_events,
+    video,
+};

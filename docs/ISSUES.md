@@ -12,9 +12,9 @@
 
 ## ISSUE-001: Нативное воспроизведение сложных кодеков и контейнеров (Desktop + Android)
 
-- **Статус:** `Открыто` (отложено по решению владельца: сначала дорабатывается веб-версия; также в текущей локальной среде отсутствуют нативные SDK и линкер, см. `ISSUE-002`)
-- **Приоритет:** Высокий (P1, этап после полировки веба)
-- **Затронутые платформы:** Windows / macOS / Linux (`kino-app --features desktop`) и Android (`kino-app --features mobile`), а также серверное API (`kino-core`, `kino-server`).
+- **Статус:** `В работе` (часть **Android** + протокол `PlayRequest.native` и UI реализованы в коде; локально пройдены `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --locked`, ожидает прогона `cargo check/clippy --features mobile`, сборки `.apk` через `.github/workflows/android.yml` и проверки на устройстве; часть **Desktop / Windows** временно отложена по решению владельца)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Windows / macOS / Linux (`kino-app --features desktop` — отложено) и Android (`kino-app --features mobile`), а также серверное API (`kino-core`, `kino-server`).
 
 ### Суть проблемы
 Сейчас нативные приложения для компьютера (`desktop`) и телефона (`mobile`) используют системный WebView и HTML-элемент `<video>` ([app/src/platform/video.rs](../app/src/platform/video.rs)). Одновременно сервер в `POST /api/play` ([crates/server/src/play.rs](../crates/server/src/play.rs)) жёстко решает совместимость через `probe.browser_ok()` (`mov,mp4` + `h264|vp9|av1` + `aac|mp3|opus|vorbis`), а `PlayInfo::plays_directly()` ([crates/core/src/release.rs](../crates/core/src/release.rs)) отправляет на перекодирование при любом переключении аудиодорожки.
@@ -36,11 +36,25 @@
 4. **Запасной механизм (fallback):**
    - Если на конкретном устройстве нативный декодер всё же не смог открыть файл, сохранять безопасный откат на серверный `ffmpeg`-поток (`force_transcode`).
 
+### Что реализовано (этап Android + общий протокол)
+1. **Протокол и сервер ([crates/core/src/release.rs](../crates/core/src/release.rs), [crates/server/src/play.rs](../crates/server/src/play.rs), [crates/server/tests/torrents.rs](../crates/server/tests/torrents.rs)):**
+   - В `PlayRequest` и `PlayInfo` добавлен флаг `native: bool` (`PlayInfo::plays_directly` всегда `true` при `native`);
+   - В `POST /api/play` при `req.native == true` отдаётся `direct = true` и сохраняется `subtitle_track` даже для потоковых торрент-раздач без предзагрузки; добавлена проверка `native: true` в интеграционный тест `transcodes_with_ffmpeg`.
+2. **UI списка раздач и слот плеера ([crates/ui/src/releases.rs](../crates/ui/src/releases.rs), [crates/ui/src/player.rs](../crates/ui/src/player.rs), [crates/ui/src/style.css](../crates/ui/src/style.css), [crates/preview/src/main.rs](../crates/preview/src/main.rs), [app/src/main.rs](../app/src/main.rs)):**
+   - В `ReleasePicker` передаётся `native_player = cfg!(feature = "mobile")` и сбрасывается дефолтный фильтр `direct_play`: скрываются фильтры «Играет сразу» / «Без перекодирования» и бейдж «перекодируется»;
+   - В `PlayerState` / `PlayerView` добавлен `native_video: bool`: вместо `<video>` рендерится прозрачный слот `<div id="kino-video" class="p-native-slot">`, меню субтитров доступно без предзагрузки, а при `html.native-video` фон и элементы страницы позади `.player.native-video` скрываются, чтобы просвечивал нативный видеослой.
+3. **Android ExoPlayer + Jellyfin FFmpeg и CI ([app/Dioxus.toml](../app/Dioxus.toml), [app/android/MainActivity.kt](../app/android/MainActivity.kt), [app/android/proguard-kino.pro](../app/android/proguard-kino.pro), [app/src/platform/android.rs](../app/src/platform/android.rs), [app/src/platform/video.rs](../app/src/platform/video.rs), [app/src/player.rs](../app/src/player.rs), [.github/workflows/android.yml](../.github/workflows/android.yml)):**
+   - Подключены `androidx.media3:media3-exoplayer:1.9.0`, `androidx.media3:media3-ui:1.9.0`, `org.jellyfin.media3:media3-ffmpeg-decoder:1.9.0+1`, `compile_sdk`/`target_sdk = 35`, `uses_cleartext_traffic = true`, `large_heap = true`, ProGuard-правила для JNI и Media3;
+   - В `MainActivity.kt` поверх `WryActivity` за `WebView` размещён контейнер с `AspectRatioFrameLayout`, `TextureView` и `SubtitleView`, реализованы `ExoPlayer` (`EXTENSION_RENDERER_MODE_ON`), выбор дорожек, `keepScreenOn` на время воспроизведения, защита от гонок `openSeq`/`seekSeq` и экспорт снимка состояния через JNI;
+   - В `video.rs` и `player.rs` нативный `ExoPlayer` подключён ко всем существующим сценариям плеера (перемотка, пауза/воспроизведение, скорость, громкость, живое переключение аудио и субтитров без перезапуска потока, прогресс каждые 10 с, следующая серия, синхронизация устройств, `NativePlayerGuard` при размонтировании и откат на серверное перекодирование в `force_transcode` при ошибке декодера);
+   - Создан workflow `.github/workflows/android.yml` для сборки и публикации `orel-kino-arm64.apk`.
+
 ### Критерии приёмки
-- [ ] На Windows (и других Desktop ОС) релиз с `HEVC` + `.mkv` + `AC3` + несколькими аудиодорожками запускается напрямую через `GET /api/stream/{token}` без запуска `ffmpeg` на сервере; переключение аудиодорожек и субтитров происходит внутри клиента.
-- [ ] На Android тот же релиз запускается напрямую через нативный плеер без запуска `ffmpeg` на сервере; работает перемотка, сохранение прогресса в `/api/progress` и переход к следующей серии.
+- [ ] На Android релиз с `HEVC` + `.mkv` + `AC3`/`DTS` + несколькими аудиодорожками и субтитрами запускается напрямую через `GET /api/stream/{token}` без запуска `ffmpeg` на сервере; переключение дорожек, перемотка, сохранение прогресса и переход к следующей серии работают на реальном устройстве.
+- [ ] Пройдены CI-проверки `cargo clippy -p kino-app --no-default-features --features mobile --target aarch64-linux-android` и сборка `.apk` в `.github/workflows/android.yml`, а также полный workspace CI `.github/workflows/ci.yml` (включая серверный тест `transcodes_with_ffmpeg`).
 - [ ] Веб-версия и Telegram Mini App продолжают автоматически использовать `ffmpeg`-транскодирование для несовместимых форматов.
-- [ ] UI корректно отображает статус прямого воспроизведения для нативного клиента.
+- [x] UI скрывает тег «перекодируется» и фильтры перекодирования для нативного Android-клиента (проверено в коде/check, ждёт живой проверки на устройстве).
+- [ ] (Отложено) На Windows/Desktop реализовано и проверено нативное воспроизведение без серверного `ffmpeg`.
 
 ---
 

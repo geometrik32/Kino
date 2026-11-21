@@ -1199,7 +1199,10 @@ fn Title(
         if !*prefs_applied.peek() {
             if let Some(Some(p)) = user_prefs.read().clone() {
                 prefs_applied.set(true);
-                let updated = filter.peek().clone().or(ReleaseFilter::from_prefs(&p));
+                let mut updated = filter.peek().clone().or(ReleaseFilter::from_prefs(&p));
+                if cfg!(feature = "mobile") {
+                    updated.direct_play = None;
+                }
                 filter.set(updated);
                 sort.set(ReleaseSort::from_key(p.sort.as_deref()));
                 defaults_pending.set(true);
@@ -1295,7 +1298,10 @@ fn Title(
             };
             prefs_applied.set(loaded_prefs_opt.is_some());
             let prefs_now = loaded_prefs_opt.clone().unwrap_or_default();
-            let f = base.or(ReleaseFilter::from_prefs(&prefs_now));
+            let mut f = base.or(ReleaseFilter::from_prefs(&prefs_now));
+            if cfg!(feature = "mobile") {
+                f.direct_play = None;
+            }
             let f = if kind == MediaKind::Tv {
                 f.for_season(t.season)
             } else {
@@ -1486,6 +1492,7 @@ fn Title(
                 filter: filter(),
                 sort: sort(),
                 panel: panel(),
+                native_player: cfg!(feature = "mobile"),
                 mock: !list.configured,
                 note: defaults_relaxed().then(|| match filter().language {
                     Some(l) => format!("По строгим фильтрам ничего не нашлось — показаны все доступные в озвучке «{l}»."),

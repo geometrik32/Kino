@@ -349,6 +349,9 @@ pub struct PlayRequest {
     pub episode: i32,
     /// [`ReleaseOption::infohash`] of the chosen release.
     pub release: String,
+    /// Client uses a native player (ExoPlayer / libmpv) that decodes MKV/HEVC/AC3/DTS directly.
+    #[serde(default)]
+    pub native: bool,
 }
 
 /// An audio or subtitle track of the video file.
@@ -429,11 +432,17 @@ pub struct PlayInfo {
     pub next: Option<(i32, i32)>,
     /// Played from the server's disk (downloaded in advance).
     pub preloaded: bool,
+    /// Client requested native direct playback (MKV/HEVC/AC3/DTS without server transcoding).
+    #[serde(default)]
+    pub native: bool,
 }
 
 impl PlayInfo {
-    /// Whether the browser can play the file as it is with this audio track.
+    /// Whether the client can play the file as it is with this audio track.
     pub fn plays_directly(&self, audio: Option<i32>) -> bool {
+        if self.native {
+            return true;
+        }
         let default_audio = match audio {
             None => true,
             Some(a) => {
@@ -497,6 +506,7 @@ mod tests {
             start_at: 0,
             next: None,
             preloaded: false,
+            native: false,
         };
         assert!(info.plays_directly(Some(0)));
         assert!(!info.plays_directly(Some(1)), "another dub needs re-encoding");
@@ -505,6 +515,8 @@ mod tests {
         assert_eq!(info.subtitle_url(2, 0.0), "/api/stream/T/sub/2.vtt");
         info.direct = false;
         assert!(!info.plays_directly(None));
+        info.native = true;
+        assert!(info.plays_directly(Some(1)), "native players switch tracks directly");
         assert!(is_release_key(&format!("u{}", "0".repeat(39))));
         assert!(!is_release_key("x"));
     }
