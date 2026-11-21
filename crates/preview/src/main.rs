@@ -546,6 +546,7 @@ async fn main() -> anyhow::Result<()> {
         .collect(),
         flash: None,
         autoplay: true,
+        auto_muted: false,
         sync_members: Vec::new(),
         sync_waiting_for: Vec::new(),
         sync_client_id: String::new(),

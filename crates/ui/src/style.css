@@ -934,7 +934,7 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 .p-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3; display: grid; justify-items: center; gap: 10px; text-align: center; max-width: 84%; }
 .p-center p { margin: 0; color: rgba(242,236,225,.88); }
 .p-big {
-  width: 78px; height: 78px; border-radius: 50%; padding-left: 4px;
+  width: 78px; height: 78px; border-radius: 50%;
   background: rgba(14,22,33,.66); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
   border: 1.5px solid rgba(255,255,255,.26); color: #F2ECE1;
   display: grid; place-items: center; box-shadow: 0 10px 30px rgba(0,0,0,.5);
@@ -1050,6 +1050,12 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 .p-next-sub { font-size: 11.5px; color: var(--muted); }
 .p-next-title { font-weight: 700; font-size: 14px; margin-top: 1px; }
 .p-next-close { width: 32px !important; height: 32px !important; }
+.p-unmute-btn {
+  position: absolute; left: 50%; bottom: calc(24px + var(--sab)); transform: translateX(-50%); z-index: 5;
+  background: rgba(14,22,33,.82); border-color: rgba(56,198,189,.45); box-shadow: 0 10px 28px rgba(0,0,0,.5);
+  transition: bottom .25s, background .15s, border-color .15s;
+}
+.player.show .p-unmute-btn { bottom: calc(134px + var(--sab)); }
 
 /* =========================================================================
    Mobile (≤ 720px) — 38px Brand, 4-Tab Telegram Photo Bar, Equal-Width Title Controls
@@ -1183,6 +1189,7 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
   .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
   .p-opt { padding: 8px 10px; font-size: 13.5px; }
   .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(104px + var(--sab)); }
+  .player.show .p-unmute-btn { bottom: calc(104px + var(--sab)); }
 }
 
 /* Telegram Mini App auto-landscape fallback while OS viewport stays portrait */
@@ -1216,4 +1223,5 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
   html.tg.tg-player-rot .player .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
   html.tg.tg-player-rot .player .p-opt { padding: 8px 10px; font-size: 13.5px; }
   html.tg.tg-player-rot .player .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(96px + var(--sab)); }
+  html.tg.tg-player-rot .player.show .p-unmute-btn { bottom: calc(96px + var(--sab)); }
 }

@@ -7,9 +7,17 @@
 
 use kino_ui::VIDEO_ID;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlayOutcome {
+    Ok,
+    NotAllowed,
+    Aborted,
+    Error,
+}
+
 #[cfg(target_arch = "wasm32")]
 mod imp {
-    use super::VIDEO_ID;
+    use super::{PlayOutcome, VIDEO_ID};
     use wasm_bindgen::JsCast;
 
     pub struct Video(web_sys::HtmlVideoElement);
@@ -40,16 +48,35 @@ mod imp {
         pub fn set_current_time(&self, t: f64) {
             self.0.set_current_time(t);
         }
-        pub fn play(&self) {
-            thread_local! {
-                static IGNORE_ERR: wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)> =
-                    wasm_bindgen::closure::Closure::new(|_| {});
-            }
-            if let Ok(p) = self.0.play() {
-                IGNORE_ERR.with(|cb| {
-                    let _ = p.catch(cb);
-                });
-            }
+        pub fn play_checked(&self, on_done: impl FnOnce(PlayOutcome) + 'static) {
+            let Ok(promise) = self.0.play() else {
+                on_done(PlayOutcome::Error);
+                return;
+            };
+            let done = std::rc::Rc::new(std::cell::RefCell::new(Some(on_done)));
+            let done_err = done.clone();
+            let on_ok = wasm_bindgen::closure::Closure::once(move |_: wasm_bindgen::JsValue| {
+                if let Some(cb) = done.borrow_mut().take() {
+                    cb(PlayOutcome::Ok);
+                }
+            });
+            let on_err = wasm_bindgen::closure::Closure::once(move |err: wasm_bindgen::JsValue| {
+                let name = js_sys::Reflect::get(&err, &"name".into())
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
+                let outcome = match name.as_str() {
+                    "NotAllowedError" => PlayOutcome::NotAllowed,
+                    "AbortError" => PlayOutcome::Aborted,
+                    _ => PlayOutcome::Error,
+                };
+                if let Some(cb) = done_err.borrow_mut().take() {
+                    cb(outcome);
+                }
+            });
+            let _ = promise.then2(&on_ok, &on_err);
+            on_ok.forget();
+            on_err.forget();
         }
         pub fn pause(&self) {
             let _ = self.0.pause();
@@ -77,7 +104,7 @@ mod imp {
 
     use dioxus::{document::eval, prelude::*};
 
-    use super::VIDEO_ID;
+    use super::{PlayOutcome, VIDEO_ID};
 
     #[derive(Clone, Copy)]
     struct Snapshot {
@@ -127,11 +154,27 @@ mod imp {
                 "var v=document.getElementById('{VIDEO_ID}'); if(v) v.currentTime={t};"
             ));
         }
-        pub fn play(&self) {
+        pub fn play_checked(&self, on_done: impl FnOnce(PlayOutcome) + 'static) {
             SNAPSHOT.lock().expect("video snapshot").paused = false;
-            run(format!(
-                "var v=document.getElementById('{VIDEO_ID}'); if(v){{var p=v.play(); if(p&&p.catch)p.catch(function(){{}});}}"
-            ));
+            spawn(async move {
+                let res = eval(&format!(
+                    "var v=document.getElementById('{VIDEO_ID}'); if(!v) return 'none'; \
+                     return await v.play().then(function(){{return 'ok';}}, function(e){{return (e&&e.name)||'err';}});"
+                ))
+                .join::<String>()
+                .await
+                .unwrap_or_else(|_| "err".into());
+                let outcome = match res.as_str() {
+                    "ok" => PlayOutcome::Ok,
+                    "NotAllowedError" => PlayOutcome::NotAllowed,
+                    "AbortError" => PlayOutcome::Aborted,
+                    _ => PlayOutcome::Error,
+                };
+                if outcome != PlayOutcome::Ok {
+                    SNAPSHOT.lock().expect("video snapshot").paused = true;
+                }
+                on_done(outcome);
+            });
         }
         pub fn pause(&self) {
             SNAPSHOT.lock().expect("video snapshot").paused = true;

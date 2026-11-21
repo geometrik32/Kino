@@ -15,6 +15,8 @@ pub struct TorznabItem {
     pub tracker: String,
     /// `YYYY-MM-DD`.
     pub added: String,
+    /// Standard/custom Torznab category IDs returned by the indexer.
+    pub categories: Vec<u32>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -84,6 +86,13 @@ pub fn parse_feed(xml: &str) -> Result<Vec<TorznabItem>, TorznabError> {
         .filter(|n| n.has_tag_name("item"))
         .map(|item| {
             let mut it = TorznabItem::default();
+            let mut add_cat = |raw: &str| {
+                if let Ok(cat) = raw.parse::<u32>() {
+                    if !it.categories.contains(&cat) {
+                        it.categories.push(cat);
+                    }
+                }
+            };
             for c in item.children().filter(|c| c.is_element()) {
                 let text = c.text().unwrap_or("").trim();
                 match c.tag_name().name() {
@@ -96,6 +105,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<TorznabItem>, TorznabError> {
                             .map(|d| d.format("%Y-%m-%d").to_string())
                             .unwrap_or_default()
                     }
+                    "category" => add_cat(text),
                     "attr" => {
                         let value = c.attribute("value").unwrap_or("");
                         match c.attribute("name") {
@@ -105,6 +115,7 @@ pub fn parse_feed(xml: &str) -> Result<Vec<TorznabItem>, TorznabError> {
                                 it.infohash = Some(value.to_lowercase())
                             }
                             Some("magneturl") if !value.is_empty() => it.magnet = Some(value.to_owned()),
+                            Some("category") => add_cat(value),
                             _ => {}
                         }
                     }
@@ -161,5 +172,22 @@ mod tests {
     fn error_answer() {
         let e = parse_feed(r#"<?xml version="1.0"?><error code="100" description="Invalid API Key"/>"#).unwrap_err();
         assert!(e.to_string().contains("Invalid API Key"));
+    }
+
+    #[test]
+    fn parses_categories() {
+        let xml = r#"<?xml version="1.0"?>
+        <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+          <item>
+            <title>Test (1997)</title>
+            <link>https://example.com/1.torrent</link>
+            <category>8000</category>
+            <torznab:attr name="category" value="8000" />
+            <torznab:attr name="category" value="100003" />
+          </item>
+        </channel></rss>"#;
+        let items = parse_feed(xml).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].categories, vec![8000, 100003]);
     }
 }

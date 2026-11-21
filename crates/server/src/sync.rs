@@ -551,7 +551,11 @@ impl SyncHub {
             }
             SyncClientMsg::Play { position_sec } => {
                 room.last_device = device;
-                room.anchor_pos = sanitize_pos(position_sec, room.duration_sec);
+                room.anchor_pos = if room.paused || room.members.len() <= 1 {
+                    sanitize_pos(position_sec, room.duration_sec)
+                } else {
+                    room.current_pos(now_ms)
+                };
                 room.anchor_at_ms = now_ms;
                 room.paused = false;
                 room.members[member_idx].ready = true;

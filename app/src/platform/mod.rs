@@ -78,16 +78,46 @@ pub fn apply_theme(theme: kino_ui::Theme) {
     android::style_bars(theme == kino_ui::Theme::Light);
 }
 
+/// Toggles DOM fullscreen (hiding Android navigation/status bars when supported)
+/// and falls back to Telegram fullscreen if DOM fullscreen is unavailable.
+pub fn toggle_fullscreen() {
+    let js = "try { \
+        var root = document.documentElement; \
+        var tg = window.Telegram && window.Telegram.WebApp; \
+        if (document.fullscreenElement) { \
+          window.__kinoFsUserExit = true; \
+          if (document.exitFullscreen) document.exitFullscreen().catch(function(){}); \
+          if (tg && tg.isFullscreen && tg.exitFullscreen) tg.exitFullscreen(); \
+        } else if (root.requestFullscreen && document.fullscreenEnabled !== false) { \
+          window.__kinoFsUserExit = false; \
+          var go = function () { if (window.matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+          try { root.requestFullscreen({ navigationUI: 'hide' }).then(go, function () { try { root.requestFullscreen().then(go, go); } catch (e) { go(); } }); } \
+          catch (e) { try { root.requestFullscreen().then(go, go); } catch (e2) { go(); } } \
+          if (tg && !tg.isFullscreen && tg.isVersionAtLeast && tg.isVersionAtLeast('8.0') && tg.requestFullscreen) tg.requestFullscreen(); \
+        } else if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast('8.0')) { \
+          if (tg.isFullscreen && tg.exitFullscreen) tg.exitFullscreen(); \
+          else if (tg.requestFullscreen) tg.requestFullscreen(); \
+        } \
+      } catch (e) {}";
+    let _ = dioxus::document::eval(js);
+}
+
 /// The player takes the screen: hides the underlying page scrollbar everywhere,
-/// and on a phone turns to landscape (with CSS rotation fallback inside Telegram
-/// Mini App when the container refuses OS orientation lock); `false` restores everything.
+/// and on a phone hides system bars / turns to landscape (with CSS rotation fallback
+/// inside Telegram Mini App when the container refuses OS orientation lock); `false` restores everything.
 pub fn player_mode(on: bool) {
     let root_js = if on {
-        "document.documentElement.classList.add('kino-playing');"
+        "document.documentElement.classList.add('kino-playing'); window.__kinoFsUserExit = false;"
     } else {
-        "document.documentElement.classList.remove('kino-playing'); document.documentElement.classList.remove('tg-player-rot');"
+        "document.documentElement.classList.remove('kino-playing'); document.documentElement.classList.remove('tg-player-rot'); window.__kinoFsUserExit = false;"
     };
     let _ = dioxus::document::eval(root_js);
+
+    if on {
+        crate::telegram::paint_player_bars();
+    } else {
+        crate::telegram::paint_bars();
+    }
 
     #[cfg(target_os = "android")]
     android::player_mode(on);
@@ -97,24 +127,43 @@ pub fn player_mode(on: bool) {
         // the *current* orientation (portrait). Always keep it unlocked in the player
         // and use `tg-player-rot` CSS landscape fallback when Telegram stays portrait.
         let js = if on {
-            "try { if (window.matchMedia('(pointer: coarse)').matches) { \
-               var root = document.documentElement; \
-               var tg = window.Telegram && window.Telegram.WebApp; \
-               var inTg = !!(tg && tg.initData); \
-               var go = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
-               if (inTg) { \
-                 if (tg.unlockOrientation) { tg.unlockOrientation(); } \
-                 root.classList.add('tg-player-rot'); \
-                 go(); \
-               } else { \
-                 var el = root; \
-                 if (el.requestFullscreen && !document.fullscreenElement) { el.requestFullscreen().then(go, go); } else { go(); } \
-               } } } catch (e) {}"
+            "try { \
+               if (window.__kinoFsRetry) { document.removeEventListener('pointerup', window.__kinoFsRetry, true); window.__kinoFsRetry = null; } \
+               if (window.matchMedia('(pointer: coarse)').matches) { \
+                 var root = document.documentElement; \
+                 var tg = window.Telegram && window.Telegram.WebApp; \
+                 var inTg = !!(tg && tg.initData); \
+                 if (inTg) { \
+                   if (tg.unlockOrientation) { tg.unlockOrientation(); } \
+                   root.classList.add('tg-player-rot'); \
+                 } \
+                 var enterFs = function () { \
+                   var lock = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+                   if (root.requestFullscreen && !document.fullscreenElement) { \
+                     try { root.requestFullscreen({ navigationUI: 'hide' }).then(lock, function () { try { root.requestFullscreen().then(lock, lock); } catch (e) { lock(); } }); } \
+                     catch (e) { try { root.requestFullscreen().then(lock, lock); } catch (e2) { lock(); } } \
+                   } else { lock(); } \
+                 }; \
+                 enterFs(); \
+                 window.__kinoFsRetry = function (ev) { \
+                   if (!document.documentElement.classList.contains('kino-playing')) return; \
+                   if (window.__kinoFsUserExit) return; \
+                   if (ev && ev.target && ev.target.closest && ev.target.closest('.p-fs-btn')) return; \
+                   if (inTg && tg && !tg.isFullscreen && tg.isVersionAtLeast && tg.isVersionAtLeast('8.0') && tg.requestFullscreen) { tg.requestFullscreen(); } \
+                   if (!document.fullscreenElement) { enterFs(); } \
+                   else if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } \
+                 }; \
+                 document.addEventListener('pointerup', window.__kinoFsRetry, true); \
+               } \
+             } catch (e) {}"
         } else {
-            "try { if (screen.orientation && screen.orientation.unlock) { screen.orientation.unlock(); } \
+            "try { \
+               if (window.__kinoFsRetry) { document.removeEventListener('pointerup', window.__kinoFsRetry, true); window.__kinoFsRetry = null; } \
+               if (screen.orientation && screen.orientation.unlock) { screen.orientation.unlock(); } \
                var tg = window.Telegram && window.Telegram.WebApp; \
                if (tg && tg.unlockOrientation) { tg.unlockOrientation(); } \
-               if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen(); } } catch (e) {}"
+               if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen().catch(function () {}); } \
+             } catch (e) {}"
         };
         let _ = dioxus::document::eval(js);
     }

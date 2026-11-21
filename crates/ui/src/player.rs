@@ -96,6 +96,8 @@ pub struct PlayerState {
     pub flash: Option<(bool, i32)>,
     /// Auto-start `<video>` when loaded (false while joining a paused/waiting sync room).
     pub autoplay: bool,
+    /// True when browser autoplay policy forced muted playback until the first user tap.
+    pub auto_muted: bool,
     /// Devices currently connected to the live playback sync room.
     pub sync_members: Vec<SyncMemberInfo>,
     /// Device names currently holding the buffering barrier.
@@ -138,6 +140,7 @@ impl Default for PlayerState {
             episodes: Vec::new(),
             flash: None,
             autoplay: true,
+            auto_muted: false,
             sync_members: Vec::new(),
             sync_waiting_for: Vec::new(),
             sync_client_id: String::new(),
@@ -200,6 +203,7 @@ pub fn PlayerView(
     on_video: EventHandler<&'static str>,
     #[props(default)] on_volume: Option<EventHandler<f32>>,
     #[props(default)] on_mute: Option<EventHandler<()>>,
+    #[props(default)] on_unmute: Option<EventHandler<()>>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
@@ -401,6 +405,21 @@ pub fn PlayerView(
                     }
                 }
 
+                if s.auto_muted && !s.paused && s.error.is_none() {
+                    button {
+                        class: "p-glass-btn p-unmute-btn",
+                        title: "Нажмите, чтобы включить звук",
+                        "aria-label": "Включить звук",
+                        onclick: move |_| {
+                            if let Some(cb) = on_unmute {
+                                cb.call(());
+                            }
+                        },
+                        Icon { svg: icons::VOL_MUTE, class: "ic sm" }
+                        "Включить звук"
+                    }
+                }
+
                 if let Some(next) = s.next.as_deref().filter(|_| show_next) {
                     div { class: "p-next-card",
                         div { class: "p-next-info",
@@ -564,7 +583,7 @@ pub fn PlayerView(
                             "{speed_label(rate)}"
                         }
                         button {
-                            class: "p-glass-btn icon",
+                            class: "p-glass-btn icon p-fs-btn",
                             title: "Во весь экран",
                             "aria-label": "Во весь экран",
                             onclick: move |_| on_fullscreen.call(()),

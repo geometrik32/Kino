@@ -78,17 +78,6 @@ pub fn random_id() -> String {
     format!("w-{ts:x}-{a:x}-{b:x}")
 }
 
-/// Full screen on or off.
-pub fn toggle_fullscreen() {
-    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-        if doc.fullscreen_element().is_some() {
-            doc.exit_fullscreen();
-        } else if let Some(el) = doc.document_element() {
-            let _ = el.request_fullscreen();
-        }
-    }
-}
-
 /// Opens a link outside the app.
 pub fn open_external(url: &str) {
     if let Some(w) = web_sys::window() {

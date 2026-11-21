@@ -14,7 +14,7 @@ use super::{
         because_shelf_page, because_shelf_row, categories_for, deferred_stub, filter_excluded, parse_because_id,
         rank_shelves, ShelfMeta, UserTaste, INITIAL_HOME_ROWS,
     },
-    Catalog, CatalogError, RandomMovieFilter, RandomMoviePick,
+    split_query_year, Catalog, CatalogError, RandomMovieFilter, RandomMoviePick,
 };
 
 struct DemoTitle {
@@ -320,11 +320,33 @@ impl Catalog for DemoCatalog {
 
     async fn search(&self, query: &str) -> Result<SearchResults, CatalogError> {
         let norm_q = normalize_search_text(query);
-        let items = TITLES
+        let mut items: Vec<_> = TITLES
             .iter()
             .filter(|t| matches_normalized_query(t.title, Some(t.original), &norm_q))
             .map(summary)
             .collect();
+        if items.is_empty() {
+            if let Some((title_q, year)) = split_query_year(query) {
+                let title_norm = normalize_search_text(title_q);
+                let matched: Vec<_> = TITLES
+                    .iter()
+                    .filter(|t| matches_normalized_query(t.title, Some(t.original), &title_norm))
+                    .collect();
+                items = matched
+                    .iter()
+                    .copied()
+                    .filter(|t| t.year == year)
+                    .map(summary)
+                    .collect();
+                if items.is_empty() {
+                    items = matched
+                        .into_iter()
+                        .filter(|t| (t.year - year).abs() <= 1)
+                        .map(summary)
+                        .collect();
+                }
+            }
+        }
         Ok(SearchResults {
             query: query.to_owned(),
             items,
@@ -490,6 +512,11 @@ mod tests {
         let res_yo = DemoCatalog.search("Тёмный").await.unwrap();
         assert_eq!(res_yo.items.len(), 1);
         assert_eq!(res_yo.items[0].tmdb_id, 155);
+
+        let res_year = DemoCatalog.search("Матрица 1999").await.unwrap();
+        assert_eq!(res_year.items.len(), 1);
+        assert_eq!(res_year.items[0].tmdb_id, 603);
+        assert!(DemoCatalog.search("Матрица 2020").await.unwrap().items.is_empty());
     }
 
     #[tokio::test]

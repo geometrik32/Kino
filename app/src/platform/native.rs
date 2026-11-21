@@ -85,14 +85,6 @@ pub fn random_id() -> String {
     format!("n-{ts:x}-{seq:x}")
 }
 
-/// Full screen on or off.
-pub fn toggle_fullscreen() {
-    let _ = eval(
-        "if (document.fullscreenElement) { document.exitFullscreen(); } \
-         else { document.documentElement.requestFullscreen(); }",
-    );
-}
-
 /// Opens a link in the system browser (or the Telegram app).
 pub fn open_external(url: &str) {
     if let Err(e) = open_url(url) {

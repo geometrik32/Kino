@@ -1,7 +1,11 @@
 //! Android-only glue (JNI).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use dioxus::mobile::wry::prelude::dispatch;
 use jni::{objects::JValue, JNIEnv};
+
+static PLAYER_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Opens a link with the system: `https://t.me/...` goes to the Telegram app when it is installed.
 pub fn open_url(url: &str) -> Result<(), String> {
@@ -71,13 +75,16 @@ pub fn style_bars(light: bool) {
         let decor = env
             .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
             .l()?;
-        env.call_method(&decor, "setSystemUiVisibility", "(I)V", &[JValue::Int(flags)])?;
+        if !PLAYER_ACTIVE.load(Ordering::Relaxed) {
+            env.call_method(&decor, "setSystemUiVisibility", "(I)V", &[JValue::Int(flags)])?;
+        }
         Ok(())
     });
 }
 
 /// Landscape and hidden system bars while a film plays; back to normal afterwards.
 pub fn player_mode(on: bool) {
+    PLAYER_ACTIVE.store(on, Ordering::Relaxed);
     on_activity("player mode", move |env, activity| {
         // SCREEN_ORIENTATION_SENSOR_LANDSCAPE = 6, SCREEN_ORIENTATION_UNSPECIFIED = -1.
         let orientation = if on { 6 } else { -1 };
@@ -85,6 +92,32 @@ pub fn player_mode(on: bool) {
         let window = env
             .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
             .l()?;
+        let sdk = env
+            .get_static_field("android/os/Build$VERSION", "SDK_INT", "I")
+            .and_then(|v| v.i())
+            .unwrap_or(0);
+        if sdk >= 28 {
+            if let Ok(attrs) = env
+                .call_method(
+                    &window,
+                    "getAttributes",
+                    "()Landroid/view/WindowManager$LayoutParams;",
+                    &[],
+                )
+                .and_then(|v| v.l())
+            {
+                // LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES = 1, DEFAULT = 0.
+                let cutout = if on { 1 } else { 0 };
+                let _ = env.set_field(&attrs, "layoutInDisplayCutoutMode", "I", JValue::Int(cutout));
+                let _ = env.call_method(
+                    &window,
+                    "setAttributes",
+                    "(Landroid/view/WindowManager$LayoutParams;)V",
+                    &[(&attrs).into()],
+                );
+            }
+            let _ = env.exception_clear();
+        }
         let decor = env
             .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
             .l()?;
@@ -95,6 +128,43 @@ pub fn player_mode(on: bool) {
             0
         };
         env.call_method(&decor, "setSystemUiVisibility", "(I)V", &[JValue::Int(flags)])?;
+        if sdk >= 30 {
+            let _ = env.call_method(
+                &window,
+                "setDecorFitsSystemWindows",
+                "(Z)V",
+                &[JValue::Bool(u8::from(!on))],
+            );
+            if let Ok(ctrl) = env
+                .call_method(
+                    &window,
+                    "getInsetsController",
+                    "()Landroid/view/WindowInsetsController;",
+                    &[],
+                )
+                .and_then(|v| v.l())
+            {
+                if !ctrl.is_null() {
+                    let status = env
+                        .call_static_method("android/view/WindowInsets$Type", "statusBars", "()I", &[])
+                        .and_then(|v| v.i())
+                        .unwrap_or(1);
+                    let nav = env
+                        .call_static_method("android/view/WindowInsets$Type", "navigationBars", "()I", &[])
+                        .and_then(|v| v.i())
+                        .unwrap_or(2);
+                    let types = status | nav;
+                    if on {
+                        // BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE = 2.
+                        let _ = env.call_method(&ctrl, "setSystemBarsBehavior", "(I)V", &[JValue::Int(2)]);
+                        let _ = env.call_method(&ctrl, "hide", "(I)V", &[JValue::Int(types)]);
+                    } else {
+                        let _ = env.call_method(&ctrl, "show", "(I)V", &[JValue::Int(types)]);
+                    }
+                }
+            }
+            let _ = env.exception_clear();
+        }
         Ok(())
     });
 }

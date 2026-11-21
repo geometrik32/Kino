@@ -9,7 +9,11 @@ use kino_core::{
 };
 use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView};
 
-use crate::{api, native, platform, platform::video::video, sync, telegram};
+use crate::{
+    api, native, platform,
+    platform::video::{video, PlayOutcome},
+    sync, telegram,
+};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -164,6 +168,84 @@ pub fn Player(
     let mut ws_gen = use_signal(|| 0u32);
     let mut closing = use_signal(|| false);
     let mut sync_init_done = use_signal(|| false);
+    let mut auto_muted = use_signal(|| false);
+    let mut last_prog_pause_ms = use_signal(|| 0_i64);
+
+    let mut pause_video = move || {
+        last_prog_pause_ms.set(platform::now_ms());
+        if let Some(v) = video() {
+            v.pause();
+        }
+    };
+
+    let mut unmute_auto = move || {
+        if !auto_muted() {
+            return;
+        }
+        auto_muted.set(false);
+        if let Some(v) = video() {
+            v.set_muted(muted());
+        }
+        ui.with_mut(|s| s.auto_muted = false);
+    };
+
+    let mut attempt_play = move |expected_gen: u32, from_user: bool| {
+        let Some(v) = video() else { return };
+        if from_user && auto_muted() {
+            auto_muted.set(false);
+            v.set_muted(muted());
+            ui.with_mut(|s| s.auto_muted = false);
+        }
+        v.play_checked(move |outcome| {
+            if closing() || play_gen() != expected_gen || desired_paused() {
+                return;
+            }
+            match outcome {
+                PlayOutcome::Ok | PlayOutcome::Aborted | PlayOutcome::Error => {}
+                PlayOutcome::NotAllowed => {
+                    let Some(vid) = video() else { return };
+                    if !muted() && !auto_muted() {
+                        auto_muted.set(true);
+                        vid.set_muted(true);
+                        ui.with_mut(|s| s.auto_muted = true);
+                        vid.play_checked(move |muted_outcome| {
+                            if closing() || play_gen() != expected_gen || desired_paused() {
+                                return;
+                            }
+                            if matches!(muted_outcome, PlayOutcome::NotAllowed | PlayOutcome::Error) {
+                                auto_muted.set(false);
+                                if let Some(v2) = video() {
+                                    v2.set_muted(muted());
+                                }
+                                let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
+                                if alone {
+                                    desired_paused.set(true);
+                                }
+                                ui.with_mut(|s| {
+                                    s.auto_muted = false;
+                                    s.paused = true;
+                                    s.waiting = false;
+                                    s.status = None;
+                                    s.progress = None;
+                                });
+                            }
+                        });
+                    } else {
+                        let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
+                        if alone {
+                            desired_paused.set(true);
+                        }
+                        ui.with_mut(|s| {
+                            s.paused = true;
+                            s.waiting = false;
+                            s.status = None;
+                            s.progress = None;
+                        });
+                    }
+                }
+            }
+        });
+    };
 
     use_hook(|| std::rc::Rc::new(SyncGuard));
 
@@ -325,9 +407,7 @@ pub fn Player(
         let hold = paused_by_user || waiting_peer;
         desired_paused.set(hold);
         if hold {
-            if let Some(v) = video() {
-                v.pause();
-            }
+            pause_video();
             let msg = if waiting_peer {
                 st_opt.as_ref().map(waiting_label)
             } else {
@@ -346,34 +426,8 @@ pub fn Player(
                 s.progress = None;
                 s.status = None;
             });
-            if let Some(v) = video() {
-                if v.paused() {
-                    v.play();
-                    if !played() {
-                        let my_gen = play_gen();
-                        spawn(async move {
-                            platform::sleep(300).await;
-                            if closing() || play_gen() != my_gen || played() || desired_paused() {
-                                return;
-                            }
-                            if video().is_some_and(|vid| vid.paused()) {
-                                let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
-                                if alone {
-                                    desired_paused.set(true);
-                                    sync::send(&SyncClientMsg::Pause {
-                                        position_sec: ui.peek().position,
-                                    });
-                                }
-                                ui.with_mut(|s| {
-                                    s.paused = true;
-                                    s.waiting = false;
-                                    s.status = None;
-                                    s.progress = None;
-                                });
-                            }
-                        });
-                    }
-                }
+            if video().is_some_and(|v| v.paused()) {
+                attempt_play(play_gen(), false);
             }
         }
         let s = ui.peek();
@@ -663,11 +717,14 @@ pub fn Player(
                                                     }
                                                 });
 
-                                                if let Some(v) = video() {
+                                                if video().is_some() {
                                                     if hold {
-                                                        v.pause();
-                                                    } else if !awaiting_ready() && info.peek().is_some() && v.paused() {
-                                                        v.play();
+                                                        pause_video();
+                                                    } else if !awaiting_ready()
+                                                        && info.peek().is_some()
+                                                        && video().is_some_and(|v| v.paused())
+                                                    {
+                                                        attempt_play(play_gen(), false);
                                                     }
                                                 }
 
@@ -732,6 +789,7 @@ pub fn Player(
                                                         st.event,
                                                         SyncEventKind::Seek
                                                             | SyncEventKind::Resumed
+                                                            | SyncEventKind::Play
                                                             | SyncEventKind::Pause
                                                     );
                                                     if is_align {
@@ -1024,18 +1082,28 @@ pub fn Player(
         move || {
             let Some(v) = video() else { return };
             let cur_pos = ui.peek().position;
-            let is_paused_now = desired_paused() || v.paused();
+            let st_opt = sync_state.peek().clone();
+            let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
+            let is_paused_now = ui.peek().paused || (!waiting_peer && (desired_paused() || v.paused()));
             if is_paused_now {
                 desired_paused.set(false);
-                sync::send(&SyncClientMsg::Play { position_sec: cur_pos });
-                let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                if st_opt.as_ref().is_none_or(|st| st.paused || st.waiting) {
+                    sync::send(&SyncClientMsg::Play { position_sec: cur_pos });
+                }
                 if !waiting_peer {
-                    v.play();
+                    if let Some(st) = st_opt.as_ref().filter(|st| !st.paused && !st.waiting) {
+                        let expected = clock.peek().expected_position(st, platform::now_ms());
+                        if (cur_pos - expected).abs() > 1.5 && !ui.peek().transcoded {
+                            v.set_current_time(expected);
+                            ui.with_mut(|s| s.position = expected);
+                        }
+                    }
                     ui.with_mut(|s| s.paused = false);
+                    attempt_play(play_gen(), true);
                 }
             } else {
                 desired_paused.set(true);
-                v.pause();
+                pause_video();
                 ui.with_mut(|s| s.paused = true);
                 sync::send(&SyncClientMsg::Pause { position_sec: cur_pos });
                 save(false);
@@ -1106,9 +1174,9 @@ pub fn Player(
                         v.set_rate(f64::from(rate()));
                     }
                     v.set_volume(f64::from(volume()));
-                    v.set_muted(muted());
+                    v.set_muted(muted() || auto_muted());
                     if desired_paused() {
-                        v.pause();
+                        pause_video();
                     }
                     if pending_seek.peek().is_none()
                         && seeking_target.peek().is_none()
@@ -1119,7 +1187,7 @@ pub fn Player(
                 }
                 "seeked" => {
                     if let Some(tgt) = seeking_target() {
-                        if (v.current_time() - tgt).abs() < 3.0 {
+                        if (v.current_time() - tgt).abs() < 8.0 {
                             seeking_target.set(None);
                         }
                     }
@@ -1192,7 +1260,7 @@ pub fn Player(
                     if desired_paused() {
                         let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
                         if waiting_peer {
-                            v.pause();
+                            pause_video();
                             return;
                         }
                         if sync_state.peek().as_ref().is_some_and(|st| st.paused) {
@@ -1206,7 +1274,8 @@ pub fn Player(
                     ui.with_mut(|s| s.paused = false);
                 }
                 "pause" => {
-                    if closing() || awaiting_ready() {
+                    if closing() || awaiting_ready() || seeking_target.peek().is_some() || pending_seek.peek().is_some()
+                    {
                         return;
                     }
                     let pos = offset() + v.current_time();
@@ -1217,6 +1286,9 @@ pub fn Player(
                     }
                     if desired_paused() {
                         ui.with_mut(|s| s.paused = sync_state.peek().as_ref().is_some_and(|st| st.paused));
+                        return;
+                    }
+                    if !v.paused() || platform::now_ms() - last_prog_pause_ms() < 600 {
                         return;
                     }
                     // External pause trigger (e.g. MediaSession / headphone disconnect).
@@ -1297,9 +1369,7 @@ pub fn Player(
             if !sync_connected() {
                 save(false);
             }
-            if let Some(v) = video() {
-                v.pause();
-            }
+            pause_video();
             ui.with_mut(|s| {
                 s.src.clear();
                 s.subtitles_src = None;
@@ -1374,6 +1444,10 @@ pub fn Player(
         }
     };
     let mut toggle_mute = move || {
+        if auto_muted() {
+            unmute_auto();
+            return;
+        }
         let next = !muted();
         muted.set(next);
         if !next && volume() <= 0.001 {
@@ -1387,9 +1461,6 @@ pub fn Player(
         }
     };
     let toggle_fullscreen = move || {
-        if telegram::set_fullscreen(!telegram::is_fullscreen()) {
-            return;
-        }
         platform::toggle_fullscreen();
     };
 
@@ -1505,6 +1576,13 @@ pub fn Player(
             on_tap: {
                 let mut toggle_play = toggle_play.clone();
                 move |_| {
+                    if auto_muted() {
+                        unmute_auto();
+                        if finger {
+                            show_controls();
+                        }
+                        return;
+                    }
                     if ui.peek().menu.is_some() {
                         ui.with_mut(|s| s.menu = None);
                     } else if finger {
@@ -1596,6 +1674,7 @@ pub fn Player(
             on_video,
             on_volume: move |v: f32| set_vol(v),
             on_mute: move |_| toggle_mute(),
+            on_unmute: move |_| unmute_auto(),
         }
     }
 }

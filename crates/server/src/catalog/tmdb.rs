@@ -25,7 +25,7 @@ use super::{
         because_shelf_page, because_shelf_row, categories_for, deferred_stub, filter_excluded, parse_because_id,
         rank_shelves, ShelfMeta, UserTaste, INITIAL_HOME_ROWS,
     },
-    year_of, yo_query_variants, Catalog, CatalogError, RandomMovieFilter, RandomMoviePick,
+    split_query_year, year_of, yo_query_variants, Catalog, CatalogError, RandomMovieFilter, RandomMoviePick,
 };
 
 const API: &str = "https://api.themoviedb.org/3";
@@ -158,6 +158,94 @@ impl TmdbCatalog {
             .get("/search/multi", &[("query", query), ("include_adult", "false")])
             .await?;
         Ok(page.results.into_iter().filter_map(|r| r.into_summary(None)).collect())
+    }
+
+    async fn search_typed_with_year(&self, query: &str, year: i32) -> Vec<TitleSummary> {
+        let y = year.to_string();
+        let (movies, tv) = tokio::join!(
+            self.get::<Page>(
+                "/search/movie",
+                &[("query", query), ("year", y.as_str()), ("include_adult", "false")],
+            ),
+            self.get::<Page>(
+                "/search/tv",
+                &[
+                    ("query", query),
+                    ("first_air_date_year", y.as_str()),
+                    ("include_adult", "false"),
+                ],
+            ),
+        );
+        let mut out = Vec::new();
+        if let Ok(p) = movies {
+            merge_unique(
+                &mut out,
+                p.results
+                    .into_iter()
+                    .filter_map(|r| r.into_summary(Some(MediaKind::Movie)))
+                    .collect(),
+            );
+        }
+        if let Ok(p) = tv {
+            merge_unique(
+                &mut out,
+                p.results
+                    .into_iter()
+                    .filter_map(|r| r.into_summary(Some(MediaKind::Tv)))
+                    .collect(),
+            );
+        }
+        out
+    }
+
+    async fn search_with_yo_fallback(&self, trimmed: &str, norm_q: &str, items: &mut Vec<TitleSummary>) {
+        let has_match = |list: &[TitleSummary]| {
+            list.iter()
+                .any(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), norm_q))
+        };
+        let variants = yo_query_variants(trimmed);
+        if !variants.is_empty() {
+            let pages = join_all(variants.iter().map(|v| self.search_page(v))).await;
+            for page in pages.into_iter().flatten() {
+                merge_unique(items, page);
+            }
+        }
+        if !has_match(items) {
+            if let Some(anchor) = anchor_word_query(trimmed) {
+                if let Ok(page) = self.search_page(&anchor).await {
+                    let filtered: Vec<_> = page
+                        .into_iter()
+                        .filter(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), norm_q))
+                        .collect();
+                    merge_unique(items, filtered);
+                }
+            }
+        }
+        prioritize_normalized_matches(items, norm_q);
+    }
+
+    async fn search_by_year(&self, title_q: &str, year: i32) -> Vec<TitleSummary> {
+        let mut year_hits = self.search_typed_with_year(title_q, year).await;
+        if year_hits.is_empty() {
+            let variants = yo_query_variants(title_q);
+            if !variants.is_empty() {
+                let pages = join_all(variants.iter().map(|v| self.search_typed_with_year(v, year))).await;
+                for page in pages {
+                    merge_unique(&mut year_hits, page);
+                }
+            }
+        }
+        if year_hits.is_empty() {
+            if let Ok(page) = self.search_page(title_q).await {
+                let near: Vec<_> = page
+                    .into_iter()
+                    .filter(|i| i.year.is_some_and(|y| (y - year).abs() <= 1))
+                    .collect();
+                merge_unique(&mut year_hits, near);
+            }
+        }
+        prioritize_normalized_matches(&mut year_hits, &normalize_search_text(title_q));
+        year_hits
     }
 
     async fn discover_movie_page(
@@ -1053,26 +1141,14 @@ impl Catalog for TmdbCatalog {
                 list.iter()
                     .any(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), &norm_q))
             };
-            if !norm_q.is_empty() && !has_match(&items) {
-                let variants = yo_query_variants(trimmed);
-                if !variants.is_empty() {
-                    let pages = futures_util::future::join_all(variants.iter().map(|v| self.search_page(v))).await;
-                    for page in pages.into_iter().flatten() {
-                        merge_unique(&mut items, page);
-                    }
+            if items.is_empty() {
+                if let Some((title_q, year)) = split_query_year(trimmed) {
+                    items = self.search_by_year(title_q, year).await;
+                } else if !norm_q.is_empty() {
+                    self.search_with_yo_fallback(trimmed, &norm_q, &mut items).await;
                 }
-                if !has_match(&items) {
-                    if let Some(anchor) = anchor_word_query(trimmed) {
-                        if let Ok(page) = self.search_page(&anchor).await {
-                            let filtered: Vec<_> = page
-                                .into_iter()
-                                .filter(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), &norm_q))
-                                .collect();
-                            merge_unique(&mut items, filtered);
-                        }
-                    }
-                }
-                prioritize_normalized_matches(&mut items, &norm_q);
+            } else if !norm_q.is_empty() && !has_match(&items) {
+                self.search_with_yo_fallback(trimmed, &norm_q, &mut items).await;
             }
             items
         };

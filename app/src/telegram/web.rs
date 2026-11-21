@@ -166,6 +166,17 @@ pub fn paint_bars() {
     }
 }
 
+/// Colors Telegram's header, background and bottom chrome black while the player is open.
+pub fn paint_player_bars() {
+    if !is_telegram() {
+        return;
+    }
+    let black = JsValue::from_str("#000000");
+    for method in ["setHeaderColor", "setBackgroundColor", "setBottomBarColor"] {
+        call(&[], method, std::slice::from_ref(&black));
+    }
+}
+
 // --- Back button -----------------------------------------------------------
 
 type Handler = Rc<RefCell<dyn FnMut()>>;

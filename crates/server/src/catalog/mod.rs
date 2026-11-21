@@ -212,6 +212,31 @@ pub(crate) fn anchor_word_query(query: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Splits a trailing 4-digit year (`"Одиссей 1997"` or `"Одиссей (1997)"`) from a search query
+/// when there is a non-empty title before it.
+pub(crate) fn split_query_year(query: &str) -> Option<(&str, i32)> {
+    let trimmed = query.trim();
+    let (prefix, year_str) = if let Some(inner) = trimmed.strip_suffix(')') {
+        let (head, y) = inner.rsplit_once('(')?;
+        (head, y.trim())
+    } else if let Some(inner) = trimmed.strip_suffix(']') {
+        let (head, y) = inner.rsplit_once('[')?;
+        (head, y.trim())
+    } else {
+        let idx = trimmed.rfind(char::is_whitespace)?;
+        (&trimmed[..idx], trimmed[idx..].trim())
+    };
+    if year_str.len() != 4 || !year_str.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let year: i32 = year_str.parse().ok()?;
+    if !(1930..=2049).contains(&year) {
+        return None;
+    }
+    let title = prefix.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ',' | '/' | '-' | '–'));
+    title.chars().any(char::is_alphanumeric).then_some((title, year))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,6 +275,16 @@ mod tests {
         assert_eq!(anchor_word_query("Зеленая линия").as_deref(), Some("линия"));
         assert_eq!(anchor_word_query("линия"), None);
         assert_eq!(anchor_word_query("Все везде"), None);
+    }
+
+    #[test]
+    fn splits_trailing_year_from_query() {
+        assert_eq!(split_query_year("Одиссей 1997"), Some(("Одиссей", 1997)));
+        assert_eq!(split_query_year("Одиссея (1997)"), Some(("Одиссея", 1997)));
+        assert_eq!(split_query_year("Дюна, 1984"), Some(("Дюна", 1984)));
+        assert_eq!(split_query_year("1917"), None);
+        assert_eq!(split_query_year("1984"), None);
+        assert_eq!(split_query_year("Фильм 1080"), None);
     }
 
     #[test]

@@ -263,7 +263,7 @@
 
 ## ISSUE-010: Предотвращение конфликтов таймкодов и синхронизация воспроизведения между устройствами
 
-- **Статус:** `Исправлено` (локальные проверки `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --tests --locked`, `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked` пройдены; сборка/тесты `kino-server`, `clippy` и нативные сборки `desktop`/`mobile` не выполнялись локально из-за ограничений окружения по `ISSUE-002`, требуется прогон CI и проверка в живых клиентах)
+- **Статус:** `Исправлено` (локальные проверки и CI-прогон `44920762801` на `0b4dd3e` — `fmt`, `clippy --workspace --all-targets`, `120` тестов workspace, `clippy wasm32` — пройдены; в живой проверке выявлены доработки `ISSUE-012`)
 - **Приоритет:** Высокий (P1)
 - **Затронутые платформы:** Сервер (`kino-core`, `kino-server`) и все клиенты (`kino-ui`, `kino-app` web/desktop/mobile).
 
@@ -294,13 +294,13 @@
 - [x] Реализована живая синхронизация воспроизведения/паузы, таймкода, скорости, перемотки, серии/раздачи/дорожки, взаимного ожидания буферизации и независимого выхода устройств.
 - [x] В интерфейсе плеера добавлена компактная кнопка с цветным кружочком (REC-индикатор) и поповером со списком синхронизированных устройств.
 - [x] Пройдены `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --locked`, `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`.
-- [ ] Пройдены `cargo clippy`, `cargo test --workspace --locked` (в CI с PostgreSQL), а также ручная проверка синхронизации между двумя реальными устройствами (включая `direct` и `ffmpeg` транскодирование).
+- [x] Пройдены `cargo clippy`, `cargo test --workspace --locked` (CI `44920762801`), а регрессии при живой проверке вынесены в `ISSUE-012`.
 
 ---
 
 ## ISSUE-011: Автозапуск плеера при выборе тайтла из «Продолжить просмотр» в Telegram-боте
 
-- **Статус:** `Исправлено` (локальные проверки `kino-app` `wasm32 --tests`, `kino-ui`/`kino-core`/`kino-bot`/`kino-preview` и 18 unit-тестов `kino-bot` пройдены; `fmt`/`clippy` и запуск нативных unit-тестов `kino-app` не выполнялись локально из-за ограничений окружения по `ISSUE-002`, требуется прогон в CI и деплой после согласия владельца)
+- **Статус:** `Исправлено` (CI `44920762801` пройден; доработка тихого автозапуска при блокировке звука браузером вынесена в `ISSUE-012`)
 - **Приоритет:** Высокий (P1)
 - **Затронутые платформы:** Telegram-бот (`kino-bot`), веб/Telegram Mini App (`kino-app`, `kino-ui`).
 
@@ -318,4 +318,72 @@
 - [x] Mini App при открытии по ссылке с `play=1` сразу запускает `Player` на сохранённой раздаче и позиции (или открывает выбор раздачи, если раздача ещё не выбрана).
 - [x] Кнопки из `/search`, `/random`, `/my` и уведомлений о новых сериях по-прежнему открывают страницу тайтла без автозапуска плеера.
 - [x] Пройдены `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`, `cargo check -p kino-ui -p kino-core -p kino-bot -p kino-preview --locked` и `cargo test -p kino-bot --locked` (18 passed).
-- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, нативный запуск `cargo test -p kino-app` (в CI) и проверка на живом боте после деплоя.
+- [x] Пройдены `cargo fmt --all --check`, `cargo clippy`, нативный запуск тестов workspace (`44920762801`), доработки по итогам живой проверки — в `ISSUE-012`.
+
+---
+
+## ISSUE-012: Видимость системного интерфейса Android, автопауза при запуске из бота/синхронизации и смещение иконки Play
+
+- **Статус:** `Исправлено` (локально пройдены `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --tests --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`; сборка `kino-server`, `clippy`, Android JNI `target_os = "android"` и деплой на сервер ждут прогона в CI и проверки на реальном Android)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Клиент (`kino-ui`, `kino-app` Telegram Mini App / Web / Android) и сервер синхронизации (`kino-server`).
+
+### Суть проблем
+По итогам живой проверки на Android/Telegram Mini App зафиксированы 4 проблемы:
+1. Во время просмотра на Android оставался виден системный интерфейс ОС (строка состояния / панель навигации): в Telegram Mini App не запрашивался DOM fullscreen (`navigationUI: 'hide'`), в мобильном браузере `requestFullscreen()` после async-запросов терял user gesture и не повторялся по тапу, нажатие кнопки «Во весь экран» в Telegram выходило из `tg.requestFullscreen()` вместо входа в DOM fullscreen, а в `android.rs` использовался только устаревший `setSystemUiVisibility` без `WindowInsetsController` / cutout mode (и сбрасывался в `style_bars`).
+2. При открытии фильма сразу из Telegram-бота (`/continue`, `?open=...&play=1`) плеер самопроизвольно вставал на паузу: WebView без тапа внутри страницы блокировал автозапуск со звуком (`NotAllowedError`), а таймер `sleep(300)` в `mark_media_ready` интерпретировал это (и любые задержки старта потока >300 мс) как паузу.
+3. При попытке запустить воспроизведение во время синхронизации плеер сразу ставился на паузу из-за: (а) того же 300-мс таймера и `NotAllowedError` на ведомом устройстве, (б) гонки асинхронного DOM-события `pause` от программного `v.pause()` (например, при барьере буферизации), приходившего после снятия `desired_paused` и отправлявшего `SyncClientMsg::Pause` всем участникам, (в) неточного вычисления `is_paused_now` в `toggle_play` при `waiting` и (г) сброса якоря комнаты при запоздалом `Play` от второго устройства.
+4. Треугольник на кнопке Play (`.p-big`, `.p-play-btn`) был заметно смещён вправо из-за двойного сдвига: `padding-left: 4px` на `.p-big` плюс правое смещение самой SVG-геометрии `PLAY` (`x = 7.5..19.6` в `viewBox="0 0 24 24"`).
+
+### Что реализовано
+- [crates/ui/src/icons.rs](../crates/ui/src/icons.rs), [crates/ui/src/style.css](../crates/ui/src/style.css): убрано `padding-left: 4px` у `.p-big`, треугольник `icons::PLAY` сдвинут влево до визуальной симметрии (`x = 6.2..18.33`); добавлена кнопка `.p-unmute-btn` («Включить звук»).
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs), [crates/preview/src/main.rs](../crates/preview/src/main.rs): добавлены `auto_muted`, `on_unmute` и класс `.p-fs-btn` на кнопке полноэкранного режима.
+- [app/src/platform/video.rs](../app/src/platform/video.rs): добавлен `PlayOutcome` и `Video::play_checked` с проверкой результата `Promise` (`Ok`/`NotAllowed`/`Aborted`/`Error`) на `wasm32` и `native`.
+- [app/src/player.rs](../app/src/player.rs), [crates/server/src/sync.rs](../crates/server/src/sync.rs): удалён `sleep(300)`; добавлен `attempt_play` (при `NotAllowedError` переходит на тихий автозапуск `muted = true` с плашкой «Включить звук» и автовключением звука по первому тапу, не отправляя `Pause` другим устройствам в синхронизации); все программные `v.pause()` идут через `pause_video()` с антигонкой `last_prog_pause_ms` в `on_video("pause")`; исправлены `toggle_play`, допуск `seeked` (`< 8.0`) и сохранение якоря на сервере при повторном `Play`.
+- [app/src/platform/mod.rs](../app/src/platform/mod.rs), [web.rs](../app/src/platform/web.rs), [native.rs](../app/src/platform/native.rs), [android.rs](../app/src/platform/android.rs), [telegram/web.rs](../app/src/telegram/web.rs), [telegram/native.rs](../app/src/telegram/native.rs): добавлены DOM fullscreen с `{ navigationUI: 'hide' }` и повтором на первом касании (`kino-playing`), чёрные бары Telegram на время плеера (`paint_player_bars`), исправление `toggle_fullscreen`, а в `android.rs` — `PLAYER_ACTIVE`-защита, `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) и `WindowInsetsController` (`hide` + `BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE`, API 30+).
+
+### Критерии приёмки
+- [x] Треугольник Play в `.p-big` и `.p-play-btn` выровнен по центру без правого смещения.
+- [x] Удалена ложная автопауза `sleep(300)`, реализован fallback на тихий автозапуск с кнопкой включения звука и антигонка программной паузы для синхронизации.
+- [x] Добавлено скрытие системного интерфейса Android для Web/Telegram Mini App (повтор fullscreen по жесту, `navigationUI: 'hide'`, чёрные бары) и нативного Android (`WindowInsetsController` + cutout).
+- [x] Пройдены `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --tests --locked`, `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`.
+- [ ] Пройдены `cargo clippy`, `cargo test --workspace --locked` (в CI), и подтверждено на реальном Android / Telegram Mini App после выкладки.
+
+---
+
+## ISSUE-013: Фильтрация раздач и поиска по году, типу медиа и точному названию тайтла
+
+- **Статус:** `Исправлено` (реализовано в коде; `cargo fmt --check` для затронутых крейтов и `cargo check` для `kino-core`/`kino-ui`/`kino-app` `wasm32` пройдены; сборка/тесты `kino-server` и `clippy` не запускались локально из-за ограничений окружения Windows по `ISSUE-002`, требуется прогон в CI и проверка после деплоя)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Сервер (`kino-server`: `torrent/mod.rs`, `torrent/title.rs`, `torrent/torznab.rs`, `catalog/`), все клиенты (веб, Telegram Mini App, бот, desktop, Android через единый API).
+
+### Суть проблемы
+1. **Не учитывается год для сериалов и мини-сериалов при поиске раздач (`crates/server/src/torrent/mod.rs`):**
+   - В `torrent::search` год добавлялся в запрос к Jackett только для `MediaKind::Movie`, а для `MediaKind::Tv` отправлялся запрос без года. Для односезонного мини-сериала «Одиссей» (1997, `tv/9687`) трекеры возвращали сотни раздач одноимённого фильма Нолана «Одиссея» (2026), а также сериалов 1992, 2013, 2024 годов.
+   - В `torrent::is_about` проверка года (`(want - have).abs() <= 1`) выполнялась только для `MediaKind::Movie`, а для `MediaKind::Tv` всегда возвращала `true`.
+2. **Подстрочное сравнение названия (`n.contains(&t)`) без учёта структуры заголовка пропускает чужие фильмы, эпизоды и несовпадающие переводы:**
+   - При открытии сериала «Сверхъестественное» (2005–2020, `tv/1622`) в список раздач попадали фильмы-однофамильцы и фильмы с другим оригинальным названием: «Сверхъестественное. Разлом времени / Taklee Genesis x Worlds Collide (2024)», «Сверхъестественное. Знаки (2022)», «Сверхъестественное. Прибытие (2022)», «Сверхъестественное / Первый свет / First Light (2018)», «Сверхъестественное / Заблудившиеся / Stray (2019)».
+   - Для «Одиссей» (1997) также попадали «Доктор Одиссей (2024)», серии других сериалов с названием эпизода «The Odyssey» (`Arrow.S01E14.The.Odyssey`, `Krapopolis S02E06 ... The Odyssey`), советский фильм 1978 года и аудиокниги.
+3. **Разбор года в названии раздачи (`crates/server/src/torrent/title.rs`):**
+   - `parse_title` брал первый 4-значный год в строке, что ломалось на фильмах с числом-годом в названии (`2001: Космическая одиссея (1968)`, `Чудо-женщина: 1984 (2020)`, `Бегущий по лезвию 2049 (2017)`) и не учитывал диапазоны лет сериалов (`2005-2020`).
+4. **Поиск в каталоге с указанием года (`crates/server/src/catalog/`):**
+   - Запрос вида «Одиссей 1997» или «Дюна 1984» в `/search/multi` TMDB и в демо-каталоге возвращал пустой результат вместо фильтрации по году.
+
+### Что реализовано
+- [crates/server/src/torrent/torznab.rs](../crates/server/src/torrent/torznab.rs): добавлено чтение стандартных и пользовательских категорий Torznab (`<category>`, `<torznab:attr name="category">`) в `TorznabItem.categories` + unit-тест `parses_categories`.
+- [crates/server/src/torrent/title.rs](../crates/server/src/torrent/title.rs):
+  - `ParsedTitle` дополнен полями `year_end` (для диапазонов вроде `(2005-2020)`) и `has_series_marker`;
+  - `extract_years` отдаёт приоритет году в скобках `(...)` / `[...]`, иначе берёт диапазон `YYYY-YYYY` или последний год в строке, исключая числа перед `kbps`/`кбит`/`mbps`/`мбит`/`fps`;
+  - добавлены хелперы `episode_split_pos` и `is_known_studio`, а также unit-тест `year_extraction_and_series_markers`.
+- [crates/server/src/torrent/mod.rs](../crates/server/src/torrent/mod.rs):
+  - `search_plan` и `search` добавляют год к запросам Jackett не только для фильмов, но и для односезонных сериалов/мини-сериалов (с резервным поиском без года при пустой выдаче), а для многосезонных сериалов используют резервный поиск с годом при пустой выдаче;
+  - `is_about` (`year_and_kind_ok` + `title_matches`) и `category_ok` проверяют Torznab-категории, сопоставляют год релиза и годы сезонов сериала (с допуском `±1` год и диапазонов лет паков), отсекают сериальные релизы у фильмов и фильмы без маркеров сезона у многосезонных сериалов, ограничивают разбор названия эпизодов частью до `SxxExx`, сравнивают очищенные сегменты заголовка (с нормализацией `ё`/`е`, диакритики, апострофов и римских цифр `II`–`VI`) и отсекают локализованные переименования с противоречащим латинским названием; добавлены unit-тесты на кейсы «Одиссей» (1997) vs «Одиссея» (2026), «Сверхъестественное» (2005–2020) vs «Разлом времени» (2024) / «Первый свет» (2018), «2001: Космическая одиссея» (1968), «Оно» (2017), «Леон» (1994), категории и `search_plan`.
+- [crates/server/src/catalog/mod.rs](../crates/server/src/catalog/mod.rs), [tmdb.rs](../crates/server/src/catalog/tmdb.rs), [demo.rs](../crates/server/src/catalog/demo.rs): добавлен `split_query_year` и резервный поиск по году (`search_typed_with_year` в TMDB и фильтр по году в `DemoCatalog`) для запросов вида «Одиссей 1997» / «Дюна (1984)».
+
+### Критерии приёмки
+- [x] Для `MediaKind::Movie` и `MediaKind::Tv` в `torrent::is_about` строго учитываются год релиза/сезонов (с допуском `±1` год, с учётом всех сезонов и диапазонов лет у многосезонных сериалов) и несоответствие типа (сериальные `Sxx`/`Сезон`/`SxxExx` отсеиваются у фильмов; фильмы без маркеров сезона и не из года старта отсеиваются у многосезонных сериалов).
+- [x] Для односезонных сериалов/мини-сериалов запрос в Jackett передаёт год (с резервным запросом без года при пустой выдаче), а для многосезонных — при пустой выдаче по запросу без года.
+- [x] Сопоставление названий в `is_about` сравнивает нормализованные сегменты заголовка раздачи (до `SxxExx` для эпизодов, до тегов/года/качества), отсекает противоречащее латинское `original_title` и учитывает Torznab-категории.
+- [x] `parse_title` корректно определяет год релиза (скобки в приоритете, затем последний год вне битрейта) и диапазон лет.
+- [x] Поиск в каталоге (`TmdbCatalog::search`, `DemoCatalog::search`) поддерживает запросы с годом в конце («Название 1997»).
+- [ ] Пройдены `cargo clippy --workspace --all-targets --locked -- -D warnings` и `cargo test --workspace --locked` в CI (с PostgreSQL), а также проверка в живом приложении после деплоя.

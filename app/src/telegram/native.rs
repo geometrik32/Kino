@@ -10,6 +10,7 @@ pub fn is_telegram() -> bool {
 }
 pub fn init() {}
 pub fn paint_bars() {}
+pub fn paint_player_bars() {}
 pub fn push_back(_handler: impl FnMut() + 'static) -> u64 {
     0
 }

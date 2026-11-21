@@ -18,10 +18,14 @@ pub struct ParsedTitle {
     /// Single season; `None` for films and multi-season packs.
     pub season: Option<i32>,
     pub year: Option<i32>,
+    /// Upper bound of a year span such as `(2005-2020)` when stated.
+    pub year_end: Option<i32>,
     /// Bitrate in kbit/s when the name states it, e.g. "25.4 Mbps".
     pub bitrate_kbps: Option<u32>,
     /// One episode of a series, not a whole season.
     pub single_episode: bool,
+    /// True when the name mentions seasons or episodes (`S01`, `S01-S05`, `Сезон`, `S01E01`).
+    pub has_series_marker: bool,
 }
 
 /// Studios recognised by name, in the spelling shown to the user.
@@ -56,7 +60,9 @@ static RE: LazyLock<Regexes> = LazyLock::new(Regexes::new);
 struct Regexes {
     quality: Regex,
     season: Regex,
+    brackets: Regex,
     year: Regex,
+    year_range: Regex,
     dv: Regex,
     hdr: Regex,
     hevc: Regex,
@@ -75,6 +81,9 @@ struct Regexes {
     mbps: Regex,
     kbps: Regex,
     episode: Regex,
+    x_episode: Regex,
+    sxx_exx: Regex,
+    complete_series: Regex,
 }
 
 impl Regexes {
@@ -85,7 +94,9 @@ impl Regexes {
             season: re(
                 r"(?i)(?:сезон[ыа]?[:\s]*(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?)|(?:\b(\d{1,2})(?:\s*[-–]\s*(\d{1,2}))?\s*сезон)|(?:\bs(\d{1,2})(?:\s*[-–]\s*s?(\d{1,2}))?(?:e\d|\b))|(?:season\s*(\d{1,2}))",
             ),
+            brackets: re(r"[\(\[]([^\)\]]+)[\)\]]"),
             year: re(r"\b(19[3-9]\d|20[0-4]\d)\b"),
+            year_range: re(r"\b(19[3-9]\d|20[0-4]\d)\s*[-–]\s*(19[3-9]\d|20[0-4]\d)\b"),
             dv: re(r"(?i)dolby\s*vision|\bdovi\b|\bdv\b"),
             hdr: re(r"(?i)\bhdr(10\+?|10plus)?\b"),
             hevc: re(r"(?i)\b(hevc|[hx]\.?265)\b"),
@@ -108,6 +119,11 @@ impl Regexes {
             episode: re(
                 r"(?i)(?:\bs\d{1,2}e\d{1,3}(\s*[-–]\s*e?\d{1,3})?)|(?:\bсери[яи][:\s]*\d{1,3}(\s*[-–]\s*\d{1,3})?)",
             ),
+            x_episode: re(r"(?i)\b(?:[1-9]|[12]\d)x\d{2,3}\b"),
+            sxx_exx: re(
+                r"(?i)(?:\bs\d{1,2}(?:\s*[-–]\s*s?\d{1,2})?\s*[._-]?\s*e\d{1,3}\b|\b(?:[1-9]|[12]\d)x\d{2,3}\b)",
+            ),
+            complete_series: re(r"(?i)\bcomplete\s+series\b|\bсезоны\b|\bвсе\s+сезоны\b"),
         }
     }
 }
@@ -177,6 +193,12 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         "Русский"
     };
 
+    let (year, year_end) = extract_years(name, re);
+    let has_series_marker = re.season.is_match(name)
+        || re.episode.is_match(name)
+        || re.x_episode.is_match(name)
+        || re.complete_series.is_match(name);
+
     ParsedTitle {
         quality,
         hdr: re.hdr.is_match(name) || re.dv.is_match(name),
@@ -186,13 +208,74 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         language: language.into(),
         subtitles: re.sub.is_match(name),
         season: season.flatten(),
-        year: re.year.captures(name).and_then(|c| c[1].parse().ok()),
+        year,
+        year_end,
         bitrate_kbps: bitrate_in(name),
         single_episode: re
             .episode
             .captures(name)
             .is_some_and(|c| c.get(1).is_none() && c.get(2).is_none()),
+        has_series_marker,
     }
+}
+
+fn is_rate_unit(rest: &str) -> bool {
+    let lower = rest.trim_start().to_lowercase();
+    ["kbps", "kbit", "кбит", "mbps", "mbit", "мбит", "fps"]
+        .iter()
+        .any(|u| lower.starts_with(u))
+}
+
+fn years_in_slice(s: &str, re: &Regexes) -> Vec<i32> {
+    re.year
+        .find_iter(s)
+        .filter(|m| !is_rate_unit(&s[m.end()..]))
+        .filter_map(|m| m.as_str().parse::<i32>().ok())
+        .collect()
+}
+
+fn year_range_in(s: &str, re: &Regexes) -> Option<(i32, i32)> {
+    re.year_range.captures(s).and_then(|c| {
+        let a = c[1].parse::<i32>().ok()?;
+        let b = c[2].parse::<i32>().ok()?;
+        (a < b).then_some((a, b))
+    })
+}
+
+/// Extracts the release year (and optional upper year for series spans such as `(2005-2020)`).
+/// Bracketed years take precedence so title numbers like `2001` in `2001: A Space Odyssey (1968)`
+/// are not mistaken for the release year.
+fn extract_years(name: &str, re: &Regexes) -> (Option<i32>, Option<i32>) {
+    for cap in re.brackets.captures_iter(name) {
+        let inner = &cap[1];
+        if let Some((a, b)) = year_range_in(inner, re) {
+            return (Some(a), Some(b));
+        }
+        let ys = years_in_slice(inner, re);
+        if let Some(&first) = ys.first() {
+            let end = ys.get(1).copied().filter(|&b| b > first);
+            return (Some(first), end);
+        }
+    }
+    if let Some((a, b)) = year_range_in(name, re) {
+        return (Some(a), Some(b));
+    }
+    let ys = years_in_slice(name, re);
+    (ys.last().copied(), None)
+}
+
+/// Byte offset of an episode code (`S01E14`, `1x05`) when present, so title matching
+/// checks only the show name before it and ignores episode titles after it.
+pub(crate) fn episode_split_pos(name: &str) -> Option<usize> {
+    RE.sxx_exx.find(name).map(|m| m.start())
+}
+
+pub(crate) fn is_known_studio(norm_words: &str) -> bool {
+    STUDIOS.iter().any(|(k, _)| *k == norm_words)
+        || matches!(
+            norm_words,
+            "kerob" | "rhs" | "dreamrecords" | "sunshinestudio" | "new team" | "gears media" | "generalfilm"
+        )
 }
 
 /// A bitrate written in the name, as kbit/s. Values outside what a video can
@@ -208,7 +291,7 @@ fn bitrate_in(name: &str) -> Option<u32> {
     (300.0..=400_000.0).contains(&kbps).then_some(kbps.round() as u32)
 }
 
-fn has_cyrillic(s: &str) -> bool {
+pub(crate) fn has_cyrillic(s: &str) -> bool {
     s.chars().any(|c| matches!(c, 'а'..='я' | 'А'..='Я' | 'ё' | 'Ё'))
 }
 
@@ -311,5 +394,30 @@ mod tests {
     #[test]
     fn names() {
         assert_eq!(normalize("Ёлки: Part Two!"), "елкиparttwo");
+    }
+
+    #[test]
+    fn year_extraction_and_series_markers() {
+        let p = parse_title("2001: Космическая одиссея / 2001: A Space Odyssey (1968) BDRip 1080p");
+        assert_eq!((p.year, p.year_end, p.has_series_marker), (Some(1968), None, false));
+
+        let p = parse_title("Blade.Runner.2049.2017.1080p.BluRay");
+        assert_eq!((p.year, p.year_end, p.has_series_marker), (Some(2017), None, false));
+
+        let p = parse_title("Чудо-женщина: 1984 / Wonder Woman 1984 (2020) WEB-DL 1080p");
+        assert_eq!(p.year, Some(2020));
+
+        let p = parse_title("Сверхъестественное / Supernatural [S01-15] (2005-2020) BDRip-HEVC 1080p");
+        assert_eq!(
+            (p.year, p.year_end, p.season, p.has_series_marker),
+            (Some(2005), Some(2020), None, true)
+        );
+
+        let p = parse_title("Фильм 1999 2000 kbps");
+        assert_eq!((p.year, p.bitrate_kbps), (Some(1999), Some(2000)));
+
+        let p =
+            parse_title("Сверхъестественное. Разлом времени / Taklee Genesis x Worlds Collide (2024) WEB-DL 1080p | D");
+        assert_eq!((p.year, p.season, p.has_series_marker), (Some(2024), None, false));
     }
 }
