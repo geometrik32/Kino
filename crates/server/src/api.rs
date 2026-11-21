@@ -33,6 +33,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub catalog: Arc<dyn Catalog>,
     pub media: Arc<crate::play::Media>,
+    pub telegram: reqwest::Client,
 }
 
 pub fn router() -> Router<AppState> {
@@ -72,6 +73,7 @@ pub fn router() -> Router<AppState> {
         .route("/person/{id}", get(person))
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
+        .route("/avatar/{token}", get(crate::avatar::serve))
         .merge(crate::play::routes())
 }
 
@@ -102,7 +104,8 @@ async fn finish_login(
     invite: Option<String>,
 ) -> Result<Json<AuthResponse>, AppError> {
     match db::login(&state.pool, &tg, invite.as_deref(), &state.config.admin_telegram_ids).await? {
-        LoginOutcome::LoggedIn(me) => {
+        LoginOutcome::LoggedIn(mut me) => {
+            crate::avatar::attach_to_me(state, &mut me, tg.photo_url.is_some()).await;
             let expires_at = Utc::now() + state.config.session_ttl;
             let token = session::issue(&state.config.session_secret, me.id, expires_at);
             Ok(Json(AuthResponse { token, expires_at, me }))
@@ -181,7 +184,9 @@ async fn load_me(state: &AppState, user: &CurrentUser) -> Result<Me, AppError> {
 }
 
 async fn me(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Me>, AppError> {
-    Ok(Json(load_me(&state, &user).await?))
+    let mut me = load_me(&state, &user).await?;
+    crate::avatar::attach_to_me(&state, &mut me, false).await;
+    Ok(Json(me))
 }
 
 async fn continue_watching(

@@ -16,7 +16,10 @@ use kino_core::{
 };
 use serde::{de::DeserializeOwned, Deserialize};
 
-use super::{year_of, Catalog, CatalogError};
+use super::{
+    anchor_word_query, matches_normalized_query, normalize_search_text, year_of, yo_query_variants, Catalog,
+    CatalogError,
+};
 
 const API: &str = "https://api.themoviedb.org/3";
 const IMAGES: &str = "https://image.tmdb.org/t/p";
@@ -96,6 +99,28 @@ impl TmdbCatalog {
         let page: Page = self.get(path, &[]).await?;
         Ok(page.results.into_iter().filter_map(|r| r.into_summary(kind)).collect())
     }
+
+    async fn search_page(&self, query: &str) -> Result<Vec<TitleSummary>, CatalogError> {
+        let page: Page = self
+            .get("/search/multi", &[("query", query), ("include_adult", "false")])
+            .await?;
+        Ok(page.results.into_iter().filter_map(|r| r.into_summary(None)).collect())
+    }
+}
+
+fn merge_unique(dst: &mut Vec<TitleSummary>, src: Vec<TitleSummary>) {
+    for item in src {
+        if !dst
+            .iter()
+            .any(|existing| existing.kind == item.kind && existing.tmdb_id == item.tmdb_id)
+        {
+            dst.push(item);
+        }
+    }
+}
+
+fn prioritize_normalized_matches(items: &mut [TitleSummary], norm_query: &str) {
+    items.sort_by_key(|item| !matches_normalized_query(&item.title, item.original_title.as_deref(), norm_query));
 }
 
 /// Stores an answer, first dropping what has expired and, when the cache is
@@ -401,13 +426,38 @@ impl Catalog for TmdbCatalog {
     }
 
     async fn search(&self, query: &str) -> Result<SearchResults, CatalogError> {
-        let items = if query.trim().is_empty() {
+        let trimmed = query.trim();
+        let items = if trimmed.is_empty() {
             Vec::new()
         } else {
-            let page: Page = self
-                .get("/search/multi", &[("query", query.trim()), ("include_adult", "false")])
-                .await?;
-            page.results.into_iter().filter_map(|r| r.into_summary(None)).collect()
+            let mut items = self.search_page(trimmed).await?;
+            let norm_q = normalize_search_text(trimmed);
+            let has_match = |list: &[TitleSummary]| {
+                list.iter()
+                    .any(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), &norm_q))
+            };
+            if !norm_q.is_empty() && !has_match(&items) {
+                let variants = yo_query_variants(trimmed);
+                if !variants.is_empty() {
+                    let pages = futures_util::future::join_all(variants.iter().map(|v| self.search_page(v))).await;
+                    for page in pages.into_iter().flatten() {
+                        merge_unique(&mut items, page);
+                    }
+                }
+                if !has_match(&items) {
+                    if let Some(anchor) = anchor_word_query(trimmed) {
+                        if let Ok(page) = self.search_page(&anchor).await {
+                            let filtered: Vec<_> = page
+                                .into_iter()
+                                .filter(|i| matches_normalized_query(&i.title, i.original_title.as_deref(), &norm_q))
+                                .collect();
+                            merge_unique(&mut items, filtered);
+                        }
+                    }
+                }
+                prioritize_normalized_matches(&mut items, &norm_q);
+            }
+            items
         };
         Ok(SearchResults {
             query: query.to_owned(),
@@ -641,5 +691,32 @@ mod tests {
         assert!(!is_image_file("a.jpg?x=1"));
         assert!(!is_image_file(".jpg"));
         assert!(!is_image_file("evil.com/x.jpg"));
+    }
+
+    #[test]
+    fn merges_unique_and_prioritizes_normalized_matches() {
+        let item = |kind, id, title: &str| TitleSummary {
+            kind,
+            tmdb_id: id,
+            title: title.into(),
+            original_title: None,
+            year: None,
+            poster_path: None,
+            backdrop_path: None,
+            rating: None,
+            overview: None,
+        };
+        let mut list = vec![item(MediaKind::Movie, 1, "Другой фильм")];
+        merge_unique(
+            &mut list,
+            vec![
+                item(MediaKind::Movie, 1, "Дубликат"),
+                item(MediaKind::Movie, 2, "Зелёная линия"),
+            ],
+        );
+        prioritize_normalized_matches(&mut list, &normalize_search_text("зеленая линия"));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].tmdb_id, 2);
+        assert_eq!(list[0].title, "Зелёная линия");
     }
 }

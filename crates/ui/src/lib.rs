@@ -114,12 +114,33 @@ fn percent(p: &Progress) -> f64 {
 // Layout
 // ---------------------------------------------------------------------------
 
+/// Shows the user's Telegram photo when available and falls back to their initial on missing or failed loads.
+#[component]
+pub(crate) fn AvatarContent(initial: String, url: Option<String>, alt: String) -> Element {
+    let mut failed_for = use_signal(|| None::<String>);
+    let active_url = url.filter(|u| !u.is_empty() && failed_for().as_deref() != Some(u.as_str()));
+    match active_url {
+        Some(raw) => {
+            let src = kino_core::asset_url(&raw);
+            rsx! {
+                img {
+                    src: "{src}",
+                    alt: "{alt}",
+                    onerror: move |_| failed_for.set(Some(raw.clone())),
+                }
+            }
+        }
+        None => rsx! { "{initial}" },
+    }
+}
+
 /// Top bar on wide screens, bottom tab bar on phones.
 #[component]
 pub fn Shell(
     tab: Option<Tab>,
     query: String,
     user_initial: String,
+    #[props(default)] avatar_url: Option<String>,
     on_tab: EventHandler<Tab>,
     on_query: EventHandler<String>,
     children: Element,
@@ -153,7 +174,7 @@ pub fn Shell(
                 class: if tab == Some(Tab::Profile) { "avatar active" } else { "avatar" },
                 title: "Профиль",
                 onclick: move |_| on_tab.call(Tab::Profile),
-                "{user_initial}"
+                AvatarContent { initial: user_initial, url: avatar_url, alt: "Профиль".to_owned() }
             }
         }
         main { class: "content", {children} }

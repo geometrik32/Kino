@@ -148,7 +148,7 @@ pub fn PlayerView(
     let sub_name = track_name(&s.subtitle_tracks, s.subtitle_track, "Выкл");
     let remaining = (dur - pos).max(0.0);
     let shown = s.controls || s.paused || s.menu.is_some();
-    let busy = s.waiting || s.status.is_some();
+    let busy = s.error.is_none() && (s.waiting || s.status.is_some());
     let rate = if s.rate > 0.0 { s.rate } else { 1.0 };
     rsx! {
         div { class: if shown { "player show" } else { "player" },
@@ -201,7 +201,7 @@ pub fn PlayerView(
                     }
                 }
             }
-            if s.waiting || s.status.is_some() {
+            if busy {
                 div { class: "p-center",
                     if let Some(pr) = &s.progress {
                         ConnectProgress { progress: pr.clone() }
@@ -210,7 +210,7 @@ pub fn PlayerView(
                         if let Some(st) = &s.status { p { "{st}" } }
                     }
                 }
-            } else if shown && s.menu.is_none() && !busy {
+            } else if shown && s.menu.is_none() && s.error.is_none() {
                 button {
                     class: "p-center p-big",
                     onclick: move |_| on_toggle.call(()),

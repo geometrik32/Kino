@@ -92,6 +92,8 @@ pub fn Player(
     // Bumped on every touch so that a stale timer does not hide the controls.
     let mut interaction = use_signal(|| 0u32);
     let mut flash_gen = use_signal(|| 0u32);
+    let mut play_gen = use_signal(|| 0u32);
+    let mut stall_secs = use_signal(|| 0u32);
     let mut rate = use_signal(|| 1.0_f32);
     // The episodes of the season being watched, with the ones already seen.
     let season_list = {
@@ -154,6 +156,7 @@ pub fn Player(
             (i.stream.clone(), 0.0)
         };
         offset.set(off);
+        stall_secs.set(0);
         ui.with_mut(|s| {
             s.src = src;
             s.transcoded = transcode;
@@ -206,11 +209,12 @@ pub fn Player(
             async move {
                 loop {
                     platform::sleep(1_000).await;
-                    let busy = {
+                    let (busy, preloaded) = {
                         let s = ui.peek();
-                        s.error.is_none() && (s.status.is_some() || s.waiting)
+                        (s.error.is_none() && (s.status.is_some() || s.waiting), s.preloaded)
                     };
-                    if !busy {
+                    if !busy || preloaded {
+                        stall_secs.set(0);
                         if ui.peek().progress.is_some() {
                             ui.with_mut(|s| s.progress = None);
                         }
@@ -219,11 +223,32 @@ pub fn Player(
                     let key = release.peek().infohash.clone();
                     if let Ok(p) = api::play_progress(&token, &key).await {
                         // The answer may arrive after playback began.
-                        let (connecting, waiting) = {
+                        let (connecting, waiting, has_err) = {
                             let s = ui.peek();
-                            (s.status.is_some(), s.waiting)
+                            (s.status.is_some(), s.waiting, s.error.is_some())
                         };
-                        if connecting || waiting {
+                        if !has_err && (connecting || waiting) {
+                            // Fail cleanly instead of spinning forever when no data is arriving after `/api/play`.
+                            if !connecting && waiting && p.loaded_bytes == 0 && p.speed_bps == 0 {
+                                let secs = stall_secs() + 1;
+                                stall_secs.set(secs);
+                                let limit = if p.phase == StreamPhase::Connecting && p.peers == 0 {
+                                    45
+                                } else {
+                                    60
+                                };
+                                if secs >= limit {
+                                    ui.with_mut(|s| {
+                                        s.src.clear();
+                                        s.waiting = false;
+                                        s.progress = None;
+                                        s.error = Some("Нет раздающих или поток не отвечает. Попробуйте другую раздачу или «Скачать заранее».".into());
+                                    });
+                                    continue;
+                                }
+                            } else {
+                                stall_secs.set(0);
+                            }
                             // Stalling in the middle of a film is not "starting": plain spinner.
                             let shown = (connecting || p.phase != StreamPhase::Ready).then_some(p);
                             ui.with_mut(|s| s.progress = shown);
@@ -241,6 +266,9 @@ pub fn Player(
             let (season, episode) = target();
             let rel = release();
             let t = token.clone();
+            let my_gen = play_gen() + 1;
+            play_gen.set(my_gen);
+            stall_secs.set(0);
             info.set(None);
             force_transcode.set(false);
             ui.with_mut(|s| {
@@ -249,10 +277,30 @@ pub fn Player(
                 s.menu = None;
                 s.position = 0.0;
                 s.duration = None;
+                s.waiting = false;
                 s.release = release_label(&rel);
                 s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
                 s.status = Some("Подключаемся к раздаче…".into());
                 s.progress = None;
+            });
+            spawn(async move {
+                platform::sleep(95_000).await;
+                if play_gen() != my_gen {
+                    return;
+                }
+                let still_connecting = {
+                    let s = ui.peek();
+                    s.error.is_none() && s.status.is_some()
+                };
+                if still_connecting {
+                    ui.with_mut(|s| {
+                        s.status = None;
+                        s.waiting = false;
+                        s.progress = None;
+                        s.error =
+                            Some("Сервер не ответил вовремя. Попробуйте другую раздачу или «Скачать заранее».".into());
+                    });
+                }
             });
             spawn(async move {
                 let req = PlayRequest {
@@ -262,7 +310,11 @@ pub fn Player(
                     episode: if kind == MediaKind::Tv { episode } else { 0 },
                     release: rel.infohash.clone(),
                 };
-                match api::play(&t, &req).await {
+                let res = api::play(&t, &req).await;
+                if play_gen() != my_gen {
+                    return;
+                }
+                match res {
                     Ok(i) => {
                         ui.with_mut(|s| {
                             s.status = None;
@@ -281,6 +333,7 @@ pub fn Player(
                     }
                     Err(e) => ui.with_mut(|s| {
                         s.status = None;
+                        s.progress = None;
                         s.error = Some(e.message);
                     }),
                 }
@@ -358,10 +411,13 @@ pub fn Player(
                     }
                 }
                 "waiting" => ui.with_mut(|s| s.waiting = true),
-                "playing" | "play" => ui.with_mut(|s| {
-                    s.waiting = false;
-                    s.paused = false;
-                }),
+                "playing" | "play" => {
+                    stall_secs.set(0);
+                    ui.with_mut(|s| {
+                        s.waiting = false;
+                        s.paused = false;
+                    });
+                }
                 "pause" => {
                     ui.with_mut(|s| s.paused = true);
                     save(false);

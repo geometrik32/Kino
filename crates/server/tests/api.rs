@@ -500,3 +500,125 @@ async fn bot_login_link_signs_the_browser_in_once(pool: PgPool) {
     let (_, again) = call(&app, Method::GET, &format!("/api/auth/link/{code}"), None, None).await;
     assert_eq!(again["status"], "expired");
 }
+
+async fn start_mock_telegram(router: axum::Router) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    format!("http://{addr}")
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn telegram_avatar_fetched_via_bot_api_and_served(pool: PgPool) {
+    use axum::{http::header, routing::get, Json};
+    const FAKE_JPEG: &[u8] = b"\xFF\xD8\xFF\xE0fake-telegram-avatar-jpeg";
+
+    let mock_tg = axum::Router::new()
+        .route(
+            &format!("/bot{BOT_TOKEN}/getUserProfilePhotos"),
+            get(|| async {
+                Json(json!({
+                    "ok": true,
+                    "result": {
+                        "total_count": 1,
+                        "photos": [[
+                            { "file_id": "small", "width": 160 },
+                            { "file_id": "medium", "width": 320 }
+                        ]]
+                    }
+                }))
+            }),
+        )
+        .route(
+            &format!("/bot{BOT_TOKEN}/getFile"),
+            get(
+                |axum::extract::Query(q): axum::extract::Query<BTreeMap<String, String>>| async move {
+                    assert_eq!(q.get("file_id").map(String::as_str), Some("medium"));
+                    Json(json!({ "ok": true, "result": { "file_path": "photos/ava.jpg" } }))
+                },
+            ),
+        )
+        .route(
+            &format!("/file/bot{BOT_TOKEN}/photos/ava.jpg"),
+            get(|| async { ([(header::CONTENT_TYPE, "image/jpeg")], FAKE_JPEG) }),
+        );
+
+    let mock_url = start_mock_telegram(mock_tg).await;
+    let mut state = test_state(pool);
+    let mut cfg = (*state.config).clone();
+    cfg.telegram_api_url = Some(mock_url);
+    state.config = std::sync::Arc::new(cfg);
+    let app = kino_server::app(state);
+
+    let auth = login_ok(&app, ADMIN_TG, None).await;
+    let avatar_url = auth.me.avatar_url.expect("avatar_url should be populated");
+    assert!(avatar_url.starts_with("/api/avatar/"), "{avatar_url}");
+
+    // Subsequent /api/me keeps returning the same cached avatar URL.
+    let (status, me_json) = call(&app, Method::GET, "/api/me", Some(&auth.token), None).await;
+    assert_eq!(status, StatusCode::OK);
+    let me: Me = serde_json::from_value(me_json).unwrap();
+    assert_eq!(me.avatar_url.as_deref(), Some(avatar_url.as_str()));
+
+    // Serving the avatar URL returns the JPEG bytes and strong security/cache headers.
+    let (status, headers, body) = raw(&app, Method::GET, &avatar_url, None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/jpeg");
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert_eq!(headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+    assert_eq!(body, FAKE_JPEG);
+
+    // Forged avatar token is rejected.
+    let (status, _, _) = raw(&app, Method::GET, "/api/avatar/forged.token", None, &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn telegram_avatar_falls_back_to_init_data_photo_url(pool: PgPool) {
+    use axum::{http::header, routing::get, Json};
+    const FAKE_PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake-png";
+
+    let mock_tg = axum::Router::new()
+        .route(
+            &format!("/bot{BOT_TOKEN}/getUserProfilePhotos"),
+            get(|| async { Json(json!({ "ok": true, "result": { "total_count": 0, "photos": [] } })) }),
+        )
+        .route(
+            "/userpic/320/ava.png",
+            get(|| async { ([(header::CONTENT_TYPE, "image/png")], FAKE_PNG) }),
+        );
+
+    let mock_url = start_mock_telegram(mock_tg).await;
+    let mut state = test_state(pool);
+    let mut cfg = (*state.config).clone();
+    cfg.telegram_api_url = Some(mock_url.clone());
+    state.config = std::sync::Arc::new(cfg);
+    let app = kino_server::app(state);
+
+    let photo_url = format!("{mock_url}/userpic/320/ava.png");
+    let user = json!({ "id": ADMIN_TG, "first_name": "Даня", "photo_url": photo_url }).to_string();
+    let now = chrono::Utc::now().timestamp().to_string();
+    let init_data = telegram_auth::sign_webapp(&[("auth_date", &now), ("user", &user)], BOT_TOKEN);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/auth/webapp",
+        None,
+        Some(json!({ "init_data": init_data })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let auth: kino_core::AuthResponse = serde_json::from_value(body).unwrap();
+    let avatar_url = auth.me.avatar_url.expect("fallback photo_url should be cached");
+
+    let (status, headers, bytes) = raw(&app, Method::GET, &avatar_url, None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CONTENT_TYPE).unwrap(), "image/png");
+    assert_eq!(bytes, FAKE_PNG);
+}

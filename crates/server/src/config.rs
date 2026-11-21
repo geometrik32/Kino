@@ -25,6 +25,8 @@ pub struct Config {
     pub tmdb_api_key: Option<String>,
     /// Proxy for Telegram Bot API calls only, e.g. `socks5h://xray:1080`.
     pub telegram_proxy: Option<String>,
+    /// Base URL for Telegram Bot API (`https://api.telegram.org` by default; `None` disables outbound calls in tests).
+    pub telegram_api_url: Option<String>,
     /// Proxy for TMDB (API and images) only.
     pub tmdb_proxy: Option<String>,
     /// Language for titles and descriptions, e.g. `ru-RU`.
@@ -145,6 +147,12 @@ impl Config {
                 .to_owned(),
             tmdb_api_key: env_value("TMDB_API_KEY"),
             telegram_proxy: env_value("TELEGRAM_PROXY"),
+            telegram_api_url: Some(
+                env_value("TELEGRAM_API_URL")
+                    .unwrap_or_else(|| "https://api.telegram.org".into())
+                    .trim_end_matches('/')
+                    .to_owned(),
+            ),
             tmdb_proxy: env_value("TMDB_PROXY"),
             tmdb_language: var_or("TMDB_LANGUAGE", "ru-RU"),
             static_dir: std::env::var("STATIC_DIR").ok().map(PathBuf::from),

@@ -250,6 +250,19 @@ async fn play(
     let probe = match ffmpeg::probe(&media.ffprobe, &input).await {
         Ok(p) => p,
         Err(e) => {
+            if !preloaded {
+                if let Some(ts) = &media.torrserver {
+                    let stalled = match ts.progress(&hash).await {
+                        Ok(p) => p.peers == 0 && p.loaded_bytes == 0 && p.speed_bps == 0,
+                        Err(_) => true,
+                    };
+                    if stalled {
+                        return Err(unavailable(
+                            "Нет раздающих: не удалось начать загрузку. Попробуйте другую раздачу или «Скачать заранее».",
+                        ));
+                    }
+                }
+            }
             tracing::warn!(error = %e, "ffprobe failed, playing the file as it is");
             Probe::default()
         }
@@ -326,7 +339,13 @@ async fn play_progress(
     let Some(hash) = hash else {
         return Ok(Json(StreamProgress::default()));
     };
-    Ok(Json(ts.progress(&hash).await.unwrap_or_default()))
+    match ts.progress(&hash).await {
+        Ok(p) => Ok(Json(p)),
+        Err(e) => {
+            tracing::warn!(hash, error = %e, "TorrServer progress failed");
+            Ok(Json(StreamProgress::default()))
+        }
+    }
 }
 
 fn no_file() -> AppError {
@@ -474,11 +493,19 @@ async fn stream(
             .stdout
             .take()
             .ok_or_else(|| unavailable("Перекодирование недоступно"))?;
+        let mut reader = tokio_util::io::ReaderStream::new(out);
+        let first = tokio::time::timeout(std::time::Duration::from_secs(45), reader.next())
+            .await
+            .map_err(|_| unavailable("Поток не отвечает. Попробуйте другую раздачу или «Скачать заранее»."))?
+            .ok_or_else(|| unavailable("Не удалось запустить видео"))?
+            .map_err(|_| unavailable("Не удалось запустить видео"))?;
         // The child lives as long as the response body; dropping it stops ffmpeg.
-        let body = tokio_util::io::ReaderStream::new(out).map(move |chunk| {
-            let _keep = (&child, &permit);
-            chunk
-        });
+        let body = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
+            .chain(reader)
+            .map(move |chunk| {
+                let _keep = (&child, &permit);
+                chunk
+            });
         return Ok((
             [(header::CONTENT_TYPE, "video/mp4"), (header::CACHE_CONTROL, "no-store")],
             Body::from_stream(body),
@@ -531,10 +558,16 @@ async fn proxy(ts: &TorrServer, url: &str, headers: &HeaderMap) -> Result<Respon
     if let Some(range) = headers.get(header::RANGE) {
         r = r.header(header::RANGE, range.as_bytes());
     }
-    let upstream = r.send().await.map_err(|e| {
-        tracing::warn!(error = %e, "TorrServer stream failed");
-        unavailable("Потоковый сервер не отвечает")
-    })?;
+    let upstream = tokio::time::timeout(std::time::Duration::from_secs(45), r.send())
+        .await
+        .map_err(|_| {
+            tracing::warn!("TorrServer stream timed out");
+            unavailable("Потоковый сервер не отвечает")
+        })?
+        .map_err(|e| {
+            tracing::warn!(error = %e, "TorrServer stream failed");
+            unavailable("Потоковый сервер не отвечает")
+        })?;
     let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp = Response::builder().status(status);
     for name in [

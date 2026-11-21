@@ -2,6 +2,7 @@
 //! plus static hosting of the Dioxus web app.
 
 pub mod api;
+pub mod avatar;
 pub mod catalog;
 pub mod config;
 pub mod db;

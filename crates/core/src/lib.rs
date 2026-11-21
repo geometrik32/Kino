@@ -191,6 +191,9 @@ pub struct Me {
     pub first_name: Option<String>,
     pub username: Option<String>,
     pub role: Role,
+    /// Relative path (such as `/api/avatar/...`) or URL of the user's Telegram photo.
+    #[serde(default)]
+    pub avatar_url: Option<String>,
 }
 
 /// Successful login: a bearer token for `Authorization: Bearer <token>`.
@@ -380,9 +383,13 @@ pub fn set_asset_base(base: impl Into<String>) {
     let _ = ASSET_BASE.set(base.into().trim_end_matches('/').to_owned());
 }
 
-/// `path` (starting with `/`) as a URL the current client can load.
+/// `path` (starting with `/`) as a URL the current client can load; full URLs pass through unchanged.
 pub fn asset_url(path: &str) -> String {
-    format!("{}{}", ASSET_BASE.get().map(String::as_str).unwrap_or(""), path)
+    if path.starts_with('/') {
+        format!("{}{}", ASSET_BASE.get().map(String::as_str).unwrap_or(""), path)
+    } else {
+        path.to_owned()
+    }
 }
 
 /// URL of a TMDB image through the server's image proxy (TMDB's CDN is not

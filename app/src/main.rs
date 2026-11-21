@@ -54,8 +54,14 @@ fn main() {
 #[derive(Clone, PartialEq)]
 enum Session {
     Checking,
-    LoggedOut { error: Option<String> },
-    LoggedIn { token: String, name: String },
+    LoggedOut {
+        error: Option<String>,
+    },
+    LoggedIn {
+        token: String,
+        name: String,
+        avatar_url: Option<String>,
+    },
 }
 
 /// Tries every way to be logged in: Mini App data, Login Widget redirect, saved token.
@@ -90,6 +96,7 @@ async fn establish() -> Session {
             return Session::LoggedIn {
                 token: auth.token,
                 name: auth.me.first_name.unwrap_or_default(),
+                avatar_url: auth.me.avatar_url,
             };
         }
         Some(Err(f)) if f.code == "not_invited" => return Session::LoggedOut { error: Some(f.message) },
@@ -107,6 +114,7 @@ async fn establish() -> Session {
                 return Session::LoggedIn {
                     token,
                     name: me.first_name.unwrap_or_default(),
+                    avatar_url: me.avatar_url,
                 }
             }
             Err(f) if f.code == "unauthorized" => api::forget_token(),
@@ -158,10 +166,11 @@ fn App() -> Element {
         match session() {
             Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
             Session::LoggedOut { error } => rsx! { Login { error, on_login: move |s| session.set(s) } },
-            Session::LoggedIn { token, name } => rsx! {
+            Session::LoggedIn { token, name, avatar_url } => rsx! {
                 Main {
                     token,
                     name,
+                    avatar_url,
                     theme: theme(),
                     on_theme,
                     on_logout: move |_| {
@@ -214,6 +223,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                         on_login.call(Session::LoggedIn {
                             token: auth.token,
                             name: auth.me.first_name.unwrap_or_default(),
+                            avatar_url: auth.me.avatar_url,
                         });
                         return;
                     }
@@ -295,6 +305,7 @@ enum View {
 fn Main(
     token: String,
     name: String,
+    avatar_url: Option<String>,
     theme: Theme,
     on_theme: EventHandler<Theme>,
     on_logout: EventHandler<()>,
@@ -353,6 +364,7 @@ fn Main(
             tab,
             query: query(),
             user_initial: initial,
+            avatar_url: avatar_url.clone(),
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
                 trail.set(Vec::new());
@@ -374,6 +386,7 @@ fn Main(
                     Profile {
                         token: token.clone(),
                         name: name.clone(),
+                        avatar_url: avatar_url.clone(),
                         theme,
                         on_theme,
                         on_open: move |(k, id)| open_title(k, id, false),
@@ -514,6 +527,7 @@ fn Mine(token: String, on_open: EventHandler<TitleSummary>) -> Element {
 fn Profile(
     token: String,
     name: String,
+    avatar_url: Option<String>,
     theme: Theme,
     on_theme: EventHandler<Theme>,
     on_open: EventHandler<(MediaKind, i64)>,
@@ -541,6 +555,7 @@ fn Profile(
     rsx! {
         ProfileView {
             name,
+            avatar_url,
             history,
             preloads,
             prefs: prefs_now().unwrap_or(prefs),

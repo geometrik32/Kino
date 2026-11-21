@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use kino_core::{MediaKind, TitleStatus};
+use kino_core::{ImageSize, MediaKind, TitleStatus};
 use kino_server::{
     catalog::{self, Catalog},
     config::{env_value, parse_ids},
@@ -16,8 +16,8 @@ use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use teloxide::{
     prelude::*,
     types::{
-        BotCommand, BotCommandScope, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, MenuButton,
-        ParseMode, Recipient, WebAppInfo,
+        BotCommand, BotCommandScope, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
+        MenuButton, ParseMode, Recipient, WebAppInfo,
     },
     utils::command::BotCommands,
 };
@@ -25,7 +25,7 @@ use tracing_subscriber::EnvFilter;
 use url::Url;
 
 mod screens;
-use screens::Screen;
+use screens::{BotAction, Screen};
 
 /// `/start` payload prefix for invites: `t.me/<bot>?start=inv_<code>`.
 const INVITE_PREFIX: &str = "inv_";
@@ -77,10 +77,6 @@ fn app_url(base: &Url, start_payload: &str) -> Url {
     url
 }
 
-fn open_button(url: Url) -> InlineKeyboardMarkup {
-    InlineKeyboardMarkup::new([[InlineKeyboardButton::web_app("Открыть кинопоказ", WebAppInfo { url })]])
-}
-
 async fn is_admin(state: &BotState, telegram_id: i64) -> anyhow::Result<bool> {
     if state.admin_ids.contains(&telegram_id) {
         return Ok(true);
@@ -116,6 +112,28 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
     let data = q.data.clone().unwrap_or_default();
     if let Some(which) = data.strip_prefix(screens::MY_CALLBACK) {
         return my_callback(&bot, q, which, &state).await;
+    }
+    if let Some(suffix) = data.strip_prefix(screens::CMD_CALLBACK) {
+        bot.answer_callback_query(q.id.clone()).await?;
+        if let Some(action) = BotAction::parse_callback(suffix) {
+            let (chat, is_private) = match q.regular_message() {
+                Some(m) => (m.chat.id, m.chat.is_private()),
+                None => (ChatId(q.from.id.0 as i64), true),
+            };
+            return run_action(&bot, chat, is_private, Some(&q.from), action, &state).await;
+        }
+        return Ok(());
+    }
+    if let Some(suffix) = data.strip_prefix(screens::CARD_CALLBACK) {
+        bot.answer_callback_query(q.id.clone()).await?;
+        let Some((kind, tmdb_id)) = screens::parse_card_callback(suffix) else {
+            return Ok(());
+        };
+        let chat = q
+            .regular_message()
+            .map(|m| m.chat.id)
+            .unwrap_or_else(|| ChatId(q.from.id.0 as i64));
+        return send_title_card(&bot, chat, kind, tmdb_id, &state).await;
     }
     let Some(token) = data.strip_prefix(LOGIN_CALLBACK) else {
         bot.answer_callback_query(q.id).await?;
@@ -162,6 +180,76 @@ async fn say(bot: &Bot, chat: ChatId, text: &str) -> ResponseResult<()> {
 
 /// How long to wait for the catalog before showing a title without its name.
 const CATALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+const POSTER_WAIT: std::time::Duration = std::time::Duration::from_secs(4);
+
+async fn fetch_poster(catalog: &dyn Catalog, poster_path: Option<&str>) -> Option<(Vec<u8>, String)> {
+    let file = poster_path?.trim_start_matches('/');
+    if file.is_empty() {
+        return None;
+    }
+    tokio::time::timeout(POSTER_WAIT, catalog.image(ImageSize::Poster.tmdb(), file))
+        .await
+        .ok()?
+        .ok()
+}
+
+async fn send_card(
+    bot: &Bot,
+    chat: ChatId,
+    screen: Screen,
+    poster_path: Option<&str>,
+    poster: Option<Vec<u8>>,
+) -> ResponseResult<()> {
+    if let Some(bytes) = poster.filter(|b| !b.is_empty()) {
+        let filename = poster_path
+            .and_then(|p| p.rsplit('/').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("poster.jpg")
+            .to_owned();
+        let file = InputFile::memory(bytes).file_name(filename);
+        let mut req = bot
+            .send_photo(chat, file)
+            .caption(screen.text.clone())
+            .parse_mode(ParseMode::Html);
+        if !screen.keyboard.inline_keyboard.is_empty() {
+            req = req.reply_markup(screen.keyboard.clone());
+        }
+        match req.await {
+            Ok(_) => return Ok(()),
+            Err(e) => tracing::warn!(error = %e, "sending poster card failed, falling back to text"),
+        }
+    }
+    send_screen(bot, chat, screen).await
+}
+
+async fn send_title_card(
+    bot: &Bot,
+    chat: ChatId,
+    kind: MediaKind,
+    tmdb_id: i64,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let _ = bot.send_chat_action(chat, ChatAction::Typing).await;
+    match tokio::time::timeout(CATALOG_WAIT, state.catalog.details(kind, tmdb_id)).await {
+        Ok(Ok(details)) => {
+            let poster = fetch_poster(state.catalog.as_ref(), details.summary.poster_path.as_deref())
+                .await
+                .map(|(b, _)| b);
+            let card = screens::title_details_card(&state.public_url, &details);
+            send_card(bot, chat, card, details.summary.poster_path.as_deref(), poster).await
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "loading title details failed");
+            say(
+                bot,
+                chat,
+                "Не удалось загрузить карточку фильма, попробуйте чуть позже.",
+            )
+            .await
+        }
+        Err(_) => say(bot, chat, "Каталог отвечает слишком долго, попробуйте чуть позже.").await,
+    }
+}
 
 async fn title_name(state: &BotState, kind: MediaKind, tmdb_id: i64) -> Option<String> {
     tokio::time::timeout(CATALOG_WAIT, state.catalog.details(kind, tmdb_id))
@@ -190,12 +278,36 @@ async fn search(bot: &Bot, msg: &Message, query: &str, state: &BotState) -> Resp
     let found = tokio::time::timeout(CATALOG_WAIT, state.catalog.search(query)).await;
     match found {
         Ok(Ok(results)) => {
-            send_screen(
-                bot,
-                msg.chat.id,
-                screens::search_results(&state.public_url, query, &results.items),
-            )
-            .await
+            if results.items.is_empty() {
+                return send_screen(bot, msg.chat.id, screens::search_empty(query)).await;
+            }
+            let shown = &results.items[..results.items.len().min(screens::LIST_LIMIT)];
+            let cards_len = shown.len().min(screens::SEARCH_CARD_LIMIT);
+            let (cards, rest) = shown.split_at(cards_len);
+
+            let mut posters: Vec<Option<Vec<u8>>> = vec![None; cards.len()];
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, item) in cards.iter().enumerate() {
+                if let Some(path) = item.poster_path.clone() {
+                    let catalog = state.catalog.clone();
+                    set.spawn(async move {
+                        let bytes = fetch_poster(catalog.as_ref(), Some(&path)).await.map(|(b, _)| b);
+                        (idx, bytes)
+                    });
+                }
+            }
+            while let Some(Ok((idx, bytes))) = set.join_next().await {
+                posters[idx] = bytes;
+            }
+
+            for (item, poster) in cards.iter().zip(posters) {
+                let card = screens::title_card(&state.public_url, item);
+                send_card(bot, msg.chat.id, card, item.poster_path.as_deref(), poster).await?;
+            }
+            if !rest.is_empty() {
+                send_screen(bot, msg.chat.id, screens::more_search_results(query, cards.len(), rest)).await?;
+            }
+            Ok(())
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, "search failed");
@@ -205,24 +317,29 @@ async fn search(bot: &Bot, msg: &Message, query: &str, state: &BotState) -> Resp
     }
 }
 
-async fn continue_watching(bot: &Bot, msg: &Message, state: &BotState) -> ResponseResult<()> {
-    let Some(from) = msg.from.as_ref() else { return Ok(()) };
+async fn continue_watching(
+    bot: &Bot,
+    chat: ChatId,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let Some(from) = from else { return Ok(()) };
     let user = match db::user_by_telegram(&state.pool, from.id.0 as i64).await {
         Ok(Some(user)) => user,
-        Ok(None) => return send_screen(bot, msg.chat.id, screens::not_registered(&state.public_url)).await,
-        Err(e) => return db_failed(bot, msg.chat.id, e).await,
+        Ok(None) => return send_screen(bot, chat, screens::not_registered(&state.public_url)).await,
+        Err(e) => return db_failed(bot, chat, e).await,
     };
     let items = match db::continue_watching(&state.pool, user.id, screens::LIST_LIMIT as i64).await {
         Ok(items) => items,
-        Err(e) => return db_failed(bot, msg.chat.id, e).await,
+        Err(e) => return db_failed(bot, chat, e).await,
     };
-    bot.send_chat_action(msg.chat.id, ChatAction::Typing).await?;
+    bot.send_chat_action(chat, ChatAction::Typing).await?;
     let mut rows = Vec::new();
     for item in items {
         let title = title_name(state, item.last.kind, item.last.tmdb_id).await;
         rows.push(screens::ContinueRow { item, title });
     }
-    send_screen(bot, msg.chat.id, screens::continue_list(&state.public_url, &rows)).await
+    send_screen(bot, chat, screens::continue_list(&state.public_url, &rows)).await
 }
 
 async fn db_failed(bot: &Bot, chat: ChatId, e: sqlx::Error) -> ResponseResult<()> {
@@ -252,15 +369,15 @@ async fn my_list(state: &BotState, user_id: i64, status: TitleStatus) -> Result<
     Ok(screens::my_list(&state.public_url, status, &titles, all.len()))
 }
 
-async fn my(bot: &Bot, msg: &Message, state: &BotState) -> ResponseResult<()> {
-    let Some(from) = msg.from.as_ref() else { return Ok(()) };
+async fn my(bot: &Bot, chat: ChatId, from: Option<&teloxide::types::User>, state: &BotState) -> ResponseResult<()> {
+    let Some(from) = from else { return Ok(()) };
     match db::user_by_telegram(&state.pool, from.id.0 as i64).await {
         Ok(Some(user)) => match my_menu(state, user.id).await {
-            Ok(screen) => send_screen(bot, msg.chat.id, screen).await,
-            Err(e) => db_failed(bot, msg.chat.id, e).await,
+            Ok(screen) => send_screen(bot, chat, screen).await,
+            Err(e) => db_failed(bot, chat, e).await,
         },
-        Ok(None) => send_screen(bot, msg.chat.id, screens::not_registered(&state.public_url)).await,
-        Err(e) => db_failed(bot, msg.chat.id, e).await,
+        Ok(None) => send_screen(bot, chat, screens::not_registered(&state.public_url)).await,
+        Err(e) => db_failed(bot, chat, e).await,
     }
 }
 
@@ -297,26 +414,27 @@ async fn my_callback(bot: &Bot, q: CallbackQuery, which: &str, state: &BotState)
 }
 
 /// `/login`: a one-time link that signs the browser in as this Telegram account.
-async fn site_login(bot: &Bot, msg: &Message, state: &BotState) -> ResponseResult<()> {
-    let Some(from) = msg.from.as_ref() else { return Ok(()) };
-    if !msg.chat.is_private() {
-        return say(
-            bot,
-            msg.chat.id,
-            "Ссылку для входа я пришлю только в личных сообщениях.",
-        )
-        .await;
+async fn site_login(
+    bot: &Bot,
+    chat: ChatId,
+    is_private: bool,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let Some(from) = from else { return Ok(()) };
+    if !is_private {
+        return say(bot, chat, "Ссылку для входа я пришлю только в личных сообщениях.").await;
     }
     let tg = tg_user(from);
     // A newcomer would be turned away by the site anyway; say why here.
     let known = match db::user_by_telegram(&state.pool, tg.id).await {
         Ok(user) => user.is_some() || state.admin_ids.contains(&tg.id),
-        Err(e) => return db_failed(bot, msg.chat.id, e).await,
+        Err(e) => return db_failed(bot, chat, e).await,
     };
     if !known {
         return say(
             bot,
-            msg.chat.id,
+            chat,
             "Вход только по приглашению. Попросите у администратора ссылку-приглашение и откройте её.",
         )
         .await;
@@ -328,66 +446,118 @@ async fn site_login(bot: &Bot, msg: &Message, state: &BotState) -> ResponseResul
     }
     .await;
     match made {
-        Ok(code) => send_screen(bot, msg.chat.id, screens::login_link(&state.public_url, &code)).await,
-        Err(e) => db_failed(bot, msg.chat.id, e).await,
+        Ok(code) => send_screen(bot, chat, screens::login_link(&state.public_url, &code)).await,
+        Err(e) => db_failed(bot, chat, e).await,
+    }
+}
+
+async fn send_help(
+    bot: &Bot,
+    chat: ChatId,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let admin = match from {
+        Some(u) => is_admin(state, u.id.0 as i64).await.unwrap_or(false),
+        None => false,
+    };
+    send_screen(bot, chat, screens::help(&state.public_url, admin)).await
+}
+
+async fn create_invite(
+    bot: &Bot,
+    chat: ChatId,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let Some(user) = from else { return Ok(()) };
+    let telegram_id = user.id.0 as i64;
+    let reply = match is_admin(state, telegram_id).await {
+        Ok(true) => match db::create_invite(&state.pool, None).await {
+            Ok(code) => format!(
+                "Одноразовое приглашение:\nhttps://t.me/{}?start={INVITE_PREFIX}{code}",
+                state.bot_username
+            ),
+            Err(e) => {
+                tracing::error!(error = %e, "creating invite failed");
+                "Не получилось создать приглашение, попробуйте позже.".to_owned()
+            }
+        },
+        Ok(false) => "Приглашения создаёт только администратор.".to_owned(),
+        Err(e) => {
+            tracing::error!(error = %e, "admin check failed");
+            "Что-то пошло не так, попробуйте позже.".to_owned()
+        }
+    };
+    bot.send_message(chat, reply).await?;
+    Ok(())
+}
+
+async fn run_action(
+    bot: &Bot,
+    chat: ChatId,
+    is_private: bool,
+    from: Option<&teloxide::types::User>,
+    action: BotAction,
+    state: &BotState,
+) -> ResponseResult<()> {
+    match action {
+        BotAction::Search => say(bot, chat, &screens::search_prompt()).await,
+        BotAction::Continue => continue_watching(bot, chat, from, state).await,
+        BotAction::My => my(bot, chat, from, state).await,
+        BotAction::Login => site_login(bot, chat, is_private, from, state).await,
+        BotAction::Help => send_help(bot, chat, from, state).await,
+        BotAction::Invite => create_invite(bot, chat, from, state).await,
     }
 }
 
 /// Typing a title without a command searches for it, in private chats only.
 async fn handle_text(bot: Bot, msg: Message, state: Arc<BotState>) -> ResponseResult<()> {
     if let Some(text) = msg.text() {
+        if let Some(action) = BotAction::parse_button(text) {
+            return run_action(
+                &bot,
+                msg.chat.id,
+                msg.chat.is_private(),
+                msg.from.as_ref(),
+                action,
+                &state,
+            )
+            .await;
+        }
         search(&bot, &msg, text, &state).await?;
     }
     Ok(())
 }
 
 async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> ResponseResult<()> {
+    let from = msg.from.as_ref();
+    let is_private = msg.chat.is_private();
     match cmd {
         Command::Start(payload) if payload.trim().starts_with(db::LOGIN_PREFIX) => {
             let token = payload.trim()[db::LOGIN_PREFIX.len()..].to_owned();
             ask_login(&bot, &msg, &token, &state).await?;
         }
         Command::Start(payload) => {
-            bot.send_message(
-                msg.chat.id,
-                "Привет! Здесь можно найти фильм или сериал и смотреть его с того места, где остановились.",
-            )
-            .reply_markup(open_button(app_url(&state.public_url, &payload)))
-            .await?;
-        }
-        Command::Help => {
-            let admin = match msg.from.as_ref() {
+            let admin = match from {
                 Some(u) => is_admin(&state, u.id.0 as i64).await.unwrap_or(false),
                 None => false,
             };
-            send_screen(&bot, msg.chat.id, screens::help(&state.public_url, admin)).await?;
+            let url = app_url(&state.public_url, &payload);
+            if is_private {
+                bot.send_message(msg.chat.id, screens::start_welcome_text())
+                    .reply_markup(screens::main_reply_keyboard(&url, admin))
+                    .await?;
+            } else {
+                send_screen(&bot, msg.chat.id, screens::start_inline(&url, admin)).await?;
+            }
         }
+        Command::Help => run_action(&bot, msg.chat.id, is_private, from, BotAction::Help, &state).await?,
         Command::Search(query) => search(&bot, &msg, &query, &state).await?,
-        Command::Continue => continue_watching(&bot, &msg, &state).await?,
-        Command::My => my(&bot, &msg, &state).await?,
-        Command::Login => site_login(&bot, &msg, &state).await?,
-        Command::Invite => {
-            let Some(user) = msg.from.as_ref() else { return Ok(()) };
-            let telegram_id = user.id.0 as i64;
-            let reply = match is_admin(&state, telegram_id).await {
-                Ok(true) => match db::create_invite(&state.pool, None).await {
-                    Ok(code) => format!(
-                        "Одноразовое приглашение:\nhttps://t.me/{}?start={INVITE_PREFIX}{code}",
-                        state.bot_username
-                    ),
-                    Err(e) => {
-                        tracing::error!(error = %e, "creating invite failed");
-                        "Не получилось создать приглашение, попробуйте позже.".to_owned()
-                    }
-                },
-                Ok(false) => "Приглашения создаёт только администратор.".to_owned(),
-                Err(e) => {
-                    tracing::error!(error = %e, "admin check failed");
-                    "Что-то пошло не так, попробуйте позже.".to_owned()
-                }
-            };
-            bot.send_message(msg.chat.id, reply).await?;
-        }
+        Command::Continue => run_action(&bot, msg.chat.id, is_private, from, BotAction::Continue, &state).await?,
+        Command::My => run_action(&bot, msg.chat.id, is_private, from, BotAction::My, &state).await?,
+        Command::Login => run_action(&bot, msg.chat.id, is_private, from, BotAction::Login, &state).await?,
+        Command::Invite => run_action(&bot, msg.chat.id, is_private, from, BotAction::Invite, &state).await?,
     }
     Ok(())
 }

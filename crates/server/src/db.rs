@@ -24,6 +24,7 @@ fn me_from_row(row: &sqlx::postgres::PgRow) -> Result<Me, sqlx::Error> {
         first_name: row.try_get("first_name")?,
         username: row.try_get("username")?,
         role: if role == "admin" { Role::Admin } else { Role::User },
+        avatar_url: None,
     })
 }
 
@@ -46,6 +47,76 @@ pub async fn user_by_telegram(pool: &PgPool, telegram_id: i64) -> Result<Option<
     row.as_ref().map(me_from_row).transpose()
 }
 
+pub struct AvatarMeta {
+    pub telegram_id: i64,
+    pub photo_url: Option<String>,
+    pub avatar_hash: Option<String>,
+    pub avatar_checked_at: Option<DateTime<Utc>>,
+}
+
+pub async fn avatar_meta(pool: &PgPool, user_id: i64) -> Result<Option<AvatarMeta>, sqlx::Error> {
+    let row = sqlx::query("SELECT telegram_id, photo_url, avatar_hash, avatar_checked_at FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|r| {
+        Ok(AvatarMeta {
+            telegram_id: r.try_get("telegram_id")?,
+            photo_url: r.try_get("photo_url")?,
+            avatar_hash: r.try_get("avatar_hash")?,
+            avatar_checked_at: r.try_get("avatar_checked_at")?,
+        })
+    })
+    .transpose()
+}
+
+pub async fn save_avatar(pool: &PgPool, user_id: i64, data: &[u8], mime: &str, hash: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET avatar_data = $2, avatar_mime = $3, avatar_hash = $4, avatar_checked_at = now()
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .bind(data)
+    .bind(mime)
+    .bind(hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn clear_avatar(pool: &PgPool, user_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE users SET avatar_data = NULL, avatar_mime = NULL, avatar_hash = NULL, avatar_checked_at = now()
+         WHERE id = $1",
+    )
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn avatar_bytes(
+    pool: &PgPool,
+    user_id: i64,
+) -> Result<Option<(Vec<u8>, String, Option<String>)>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT avatar_data, avatar_mime, avatar_hash
+         FROM users
+         WHERE id = $1 AND avatar_data IS NOT NULL AND avatar_mime IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    row.map(|r| {
+        Ok((
+            r.try_get("avatar_data")?,
+            r.try_get("avatar_mime")?,
+            r.try_get("avatar_hash")?,
+        ))
+    })
+    .transpose()
+}
+
 #[derive(Debug, PartialEq)]
 pub enum LoginOutcome {
     LoggedIn(Me),
@@ -63,7 +134,8 @@ pub async fn login(
 ) -> Result<LoginOutcome, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let existing = sqlx::query(&format!(
-        "UPDATE users SET username = $2, first_name = $3, last_name = $4, photo_url = $5, last_seen_at = now()
+        "UPDATE users SET username = $2, first_name = $3, last_name = $4,
+                photo_url = COALESCE(NULLIF($5, ''), photo_url), last_seen_at = now()
          WHERE telegram_id = $1 RETURNING {ME_COLUMNS}"
     ))
     .bind(tg.id)
@@ -99,7 +171,7 @@ pub async fn login(
 
     let row = sqlx::query(&format!(
         "INSERT INTO users (telegram_id, username, first_name, last_name, photo_url, role)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING {ME_COLUMNS}"
+         VALUES ($1, $2, $3, $4, NULLIF($5, ''), $6) RETURNING {ME_COLUMNS}"
     ))
     .bind(tg.id)
     .bind(&tg.username)

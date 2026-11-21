@@ -32,11 +32,18 @@ async fn main() -> anyhow::Result<()> {
         config.tmdb_proxy.as_deref(),
     )?;
     let media = Arc::new(kino_server::play::Media::new(&config.torrents));
+    let telegram =
+        kino_server::config::http_client(config.telegram_proxy.as_deref(), std::time::Duration::from_secs(15))
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "TELEGRAM_PROXY is wrong, talking to Telegram directly");
+                reqwest::Client::new()
+            });
     let state = AppState {
         media,
         pool,
         config: Arc::new(config),
         catalog,
+        telegram,
     };
     kino_server::jobs::spawn(state.clone(), state.config.notify_every);
     axum::serve(listener, app(state))

@@ -13,11 +13,20 @@ pub struct TorrServer {
     auth: Option<(String, String)>,
 }
 
+/// Deserializes `null` (common for Go `nil` slices in TorrServer JSON) as `T::default()`.
+fn null_as_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct Status {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     hash: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     file_stats: Vec<FileStat>,
 }
 
@@ -25,19 +34,19 @@ struct Status {
 #[derive(Debug, Default, Deserialize)]
 struct Stats {
     /// 0 added, 1 getting the file list, 2 preloading, 3 working, 4 closed, 5 in the database.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     stat: i32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     active_peers: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     connected_seeders: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     download_speed: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     preloaded_bytes: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     preload_size: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     file_stats: Vec<FileStat>,
 }
 
@@ -65,7 +74,9 @@ impl Stats {
 #[derive(Debug, Deserialize)]
 struct FileStat {
     id: i32,
+    #[serde(default, deserialize_with = "null_as_default")]
     path: String,
+    #[serde(default, deserialize_with = "null_as_default")]
     length: u64,
 }
 
@@ -88,15 +99,34 @@ impl TorrServer {
     /// Adds the torrent (from its `.torrent` when we have it) and waits until
     /// TorrServer knows the file list, which needs the metadata from peers.
     pub async fn add(&self, src: &Source) -> Result<Vec<FileEntry>, reqwest::Error> {
+        // Re-uploading a torrent that is already active in RAM can wedge TorrServer.
+        if let Some(hash) = src.infohash.as_deref().filter(|h| !h.is_empty()) {
+            if let Ok(resp) = self
+                .req(self.http.post(format!("{}/torrents", self.base)))
+                .json(&json!({ "action": "get", "hash": hash }))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(s) = resp.json::<Stats>().await {
+                        if matches!(s.stat, 1..=3) && !s.file_stats.is_empty() {
+                            return Ok(entries(s.file_stats));
+                        }
+                    }
+                }
+            }
+        }
         let status: Status = match &src.torrent {
             Some(bytes) => {
                 let part = reqwest::multipart::Part::bytes(bytes.clone()).file_name("release.torrent");
+                // Omit `save`: TorrServer's `/torrent/upload` treats any non-empty value (even "false") as true.
                 let form = reqwest::multipart::Form::new()
                     .part("file", part)
-                    .text("title", src.title.clone())
-                    .text("save", "false");
+                    .text("title", src.title.clone());
                 self.req(self.http.post(format!("{}/torrent/upload", self.base)))
                     .multipart(form)
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await?
                     .error_for_status()?
@@ -110,6 +140,7 @@ impl TorrServer {
                     .unwrap_or_else(|| format!("magnet:?xt=urn:btih:{}", src.key));
                 self.req(self.http.post(format!("{}/torrents", self.base)))
                     .json(&json!({ "action": "add", "link": link, "title": src.title, "save_to_db": false }))
+                    .timeout(std::time::Duration::from_secs(30))
                     .send()
                     .await?
                     .error_for_status()?
@@ -130,6 +161,7 @@ impl TorrServer {
             let s: Status = self
                 .req(self.http.post(format!("{}/torrents", self.base)))
                 .json(&json!({ "action": "get", "hash": hash }))
+                .timeout(std::time::Duration::from_secs(5))
                 .send()
                 .await?
                 .error_for_status()?
@@ -236,5 +268,12 @@ mod tests {
             stats(json!({ "hash": "x", "title": "y" })).phase,
             StreamPhase::Connecting
         );
+        // Go nil slices arrive as explicit JSON null and must not fail decoding.
+        assert_eq!(
+            stats(json!({ "stat": 1, "file_stats": null, "active_peers": null })).phase,
+            StreamPhase::Connecting
+        );
+        let st: Status = serde_json::from_value(json!({ "hash": "abc", "file_stats": null })).unwrap();
+        assert!(st.file_stats.is_empty());
     }
 }

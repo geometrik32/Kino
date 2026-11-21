@@ -112,6 +112,7 @@ impl Theme {
 #[component]
 pub fn ProfileView(
     name: String,
+    #[props(default)] avatar_url: Option<String>,
     history: Vec<HistoryEntry>,
     preloads: Vec<PreloadItem>,
     prefs: UserPrefs,
@@ -128,9 +129,16 @@ pub fn ProfileView(
 ) -> Element {
     let tz = FixedOffset::east_opt(utc_offset_min * 60).unwrap_or(FixedOffset::east_opt(0).expect("UTC"));
     let p = prefs.clone();
+    let initial = name
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".into());
     rsx! {
         section { class: "section profile-head",
-            div { class: "avatar big", "{name.chars().next().unwrap_or('?')}" }
+            div { class: "avatar big",
+                crate::AvatarContent { initial, url: avatar_url, alt: name.clone() }
+            }
             div {
                 h2 { "{name}" }
                 button { class: "link", onclick: move |_| on_logout.call(()), "Выйти" }

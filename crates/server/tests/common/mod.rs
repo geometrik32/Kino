@@ -35,6 +35,7 @@ pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfi
         public_url: "https://kino.example.com".into(),
         tmdb_api_key: None,
         telegram_proxy: None,
+        telegram_api_url: None,
         tmdb_proxy: None,
         tmdb_language: "ru-RU".into(),
         static_dir: None,
@@ -47,6 +48,7 @@ pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfi
         media: Arc::new(kino_server::play::Media::new(&config.torrents)),
         config: Arc::new(config),
         catalog: Arc::new(DemoCatalog),
+        telegram: reqwest::Client::new(),
     }
 }
 

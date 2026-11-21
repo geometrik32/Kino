@@ -7,7 +7,7 @@ use kino_core::{
     TitleDetails, TitleExtras, TitleSummary,
 };
 
-use super::{Catalog, CatalogError};
+use super::{matches_normalized_query, normalize_search_text, Catalog, CatalogError};
 
 struct DemoTitle {
     kind: MediaKind,
@@ -123,12 +123,10 @@ impl Catalog for DemoCatalog {
     }
 
     async fn search(&self, query: &str) -> Result<SearchResults, CatalogError> {
-        let q = query.trim().to_lowercase();
+        let norm_q = normalize_search_text(query);
         let items = TITLES
             .iter()
-            .filter(|t| {
-                !q.is_empty() && (t.title.to_lowercase().contains(&q) || t.original.to_lowercase().contains(&q))
-            })
+            .filter(|t| matches_normalized_query(t.title, Some(t.original), &norm_q))
             .map(summary)
             .collect();
         Ok(SearchResults {
@@ -237,5 +235,21 @@ impl Catalog for DemoCatalog {
 
     async fn image(&self, _size: &str, _file: &str) -> Result<(Vec<u8>, String), CatalogError> {
         Err(CatalogError::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn search_matches_e_and_yo_equivalently() {
+        let res = DemoCatalog.search("темный рыцарь").await.unwrap();
+        assert_eq!(res.items.len(), 1);
+        assert_eq!(res.items[0].title, "Тёмный рыцарь");
+
+        let res_yo = DemoCatalog.search("Тёмный").await.unwrap();
+        assert_eq!(res_yo.items.len(), 1);
+        assert_eq!(res_yo.items[0].tmdb_id, 155);
     }
 }

@@ -103,22 +103,20 @@ pub fn parse_probe(json: &[u8]) -> Result<Probe, serde_json::Error> {
     Ok(p)
 }
 
+fn is_http(input: &str) -> bool {
+    input.starts_with("http://") || input.starts_with("https://")
+}
+
 /// Runs ffprobe on a file or URL.
 pub async fn probe(ffprobe: &str, input: &str) -> anyhow::Result<Probe> {
+    let mut args = vec!["-v", "quiet", "-print_format", "json", "-show_streams", "-show_format"];
+    if is_http(input) {
+        args.extend(["-rw_timeout", "30000000"]);
+    }
+    args.push(input);
     let out = tokio::time::timeout(
-        std::time::Duration::from_secs(60),
-        Command::new(ffprobe)
-            .args([
-                "-v",
-                "quiet",
-                "-print_format",
-                "json",
-                "-show_streams",
-                "-show_format",
-                input,
-            ])
-            .kill_on_drop(true)
-            .output(),
+        std::time::Duration::from_secs(45),
+        Command::new(ffprobe).args(args).kill_on_drop(true).output(),
     )
     .await??;
     anyhow::ensure!(out.status.success(), "ffprobe failed");
@@ -147,6 +145,9 @@ impl HwAccel {
 /// ffmpeg arguments for a browser-friendly fragmented MP4 to stdout.
 pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw: HwAccel) -> Vec<String> {
     let mut a: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+    if is_http(input) {
+        a.extend(["-rw_timeout".into(), "30000000".into()]);
+    }
     if !copy_video {
         match hw {
             HwAccel::Qsv => a.extend(["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"].map(String::from)),
@@ -253,12 +254,13 @@ mod tests {
     #[test]
     fn args() {
         let a = transcode_args("http://ts/stream", 600, 1, false, HwAccel::Qsv).join(" ");
+        assert!(a.contains("-rw_timeout 30000000"));
         assert!(a.contains("-hwaccel qsv"));
         assert!(a.contains("-ss 600 -i http://ts/stream"));
         assert!(a.contains("-map 0:a:1?"));
         assert!(a.contains("h264_qsv"));
         let a = transcode_args("f.mkv", 0, 0, true, HwAccel::Qsv).join(" ");
-        assert!(!a.contains("hwaccel") && !a.contains("-ss") && a.contains("-c:v copy"));
+        assert!(!a.contains("rw_timeout") && !a.contains("hwaccel") && !a.contains("-ss") && a.contains("-c:v copy"));
         assert_eq!(subtitle_args("f.mkv", 2, 0)[6], "0:s:2");
         assert!(subtitle_args("f.mkv", 0, 90).join(" ").contains("-ss 90 -i f.mkv"));
     }
