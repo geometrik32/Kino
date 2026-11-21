@@ -1214,6 +1214,7 @@ mod tests {
             None,
             t,
         );
+        while rx_a.try_recv().is_ok() {}
 
         // Advance 10 seconds -> Device A is at 130.0s.
         t += 10_000;
