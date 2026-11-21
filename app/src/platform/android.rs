@@ -41,7 +41,8 @@ pub fn open_url(url: &str) -> Result<(), String> {
 }
 
 /// The page's own colour (`--bg`), so the system bars do not show up as grey stripes.
-const BAR_COLOR: i32 = 0xFF0D0F14_u32 as i32;
+const DARK_BAR_COLOR: i32 = 0xFF0E1621_u32 as i32;
+const LIGHT_BAR_COLOR: i32 = 0xFFF7F2E8_u32 as i32;
 
 /// Runs `f` on the Android UI thread with the activity; failures are only logged.
 fn on_activity(
@@ -56,14 +57,21 @@ fn on_activity(
     });
 }
 
-/// Dark status and navigation bars, like the app itself.
-pub fn style_bars() {
-    on_activity("style bars", |env, activity| {
+/// Dark or light status and navigation bars, matching the active theme.
+pub fn style_bars(light: bool) {
+    let color = if light { LIGHT_BAR_COLOR } else { DARK_BAR_COLOR };
+    // SYSTEM_UI_FLAG_LIGHT_STATUS_BAR (0x2000) | SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR (0x10).
+    let flags: i32 = if light { 0x2000 | 0x10 } else { 0 };
+    on_activity("style bars", move |env, activity| {
         let window = env
             .call_method(activity, "getWindow", "()Landroid/view/Window;", &[])?
             .l()?;
-        env.call_method(&window, "setStatusBarColor", "(I)V", &[JValue::Int(BAR_COLOR)])?;
-        env.call_method(&window, "setNavigationBarColor", "(I)V", &[JValue::Int(BAR_COLOR)])?;
+        env.call_method(&window, "setStatusBarColor", "(I)V", &[JValue::Int(color)])?;
+        env.call_method(&window, "setNavigationBarColor", "(I)V", &[JValue::Int(color)])?;
+        let decor = env
+            .call_method(&window, "getDecorView", "()Landroid/view/View;", &[])?
+            .l()?;
+        env.call_method(&decor, "setSystemUiVisibility", "(I)V", &[JValue::Int(flags)])?;
         Ok(())
     });
 }
