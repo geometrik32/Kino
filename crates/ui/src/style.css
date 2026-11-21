@@ -134,6 +134,7 @@ html[data-theme="light"], html.tg[data-theme="light"] {
 html, body { margin: 0; background: var(--bg); color: var(--fg); }
 body { font: 14.5px/1.48 var(--font-sans); -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
 html { -webkit-text-size-adjust: 100%; -webkit-tap-highlight-color: transparent; }
+html:has(.player), html:has(.player) body, html.kino-playing, html.kino-playing body { overflow: hidden !important; }
 a { color: inherit; text-decoration: none; }
 button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; padding: 0; }
 button, a, .poster, .cw-thumb, .rel-card { touch-action: manipulation; }
@@ -913,6 +914,22 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 .p-glass-btn.icon { width: 40px; padding: 0; justify-content: center; }
 .p-glass-btn.active { background: #F2ECE1; color: #0B141B; border-color: transparent; }
 .p-glass-btn .short { display: none; }
+.p-sync-btn { position: relative; }
+.p-sync-dot {
+  width: 11px; height: 11px; border-radius: 50%; display: block;
+  background: #EF4444;
+  box-shadow: 0 0 0 3px rgba(239, 68, 68, .22), 0 0 10px rgba(239, 68, 68, .65);
+  animation: p-rec-pulse 2.2s ease-in-out infinite;
+}
+.p-sync-btn.wait .p-sync-dot {
+  background: #F59E0B;
+  box-shadow: 0 0 0 3px rgba(245, 158, 11, .26), 0 0 10px rgba(245, 158, 11, .7);
+  animation: p-rec-pulse 1.1s ease-in-out infinite;
+}
+@keyframes p-rec-pulse {
+  0%, 100% { transform: scale(1); opacity: 1; }
+  50% { transform: scale(.86); opacity: .76; }
+}
 
 .p-center { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 3; display: grid; justify-items: center; gap: 10px; text-align: center; max-width: 84%; }
 .p-center p { margin: 0; color: rgba(242,236,225,.88); }
@@ -996,6 +1013,17 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 }
 .p-popover h4 { margin: 2px 6px 8px; font-size: 14.5px; }
 .p-popover.speed { width: 276px; }
+.p-popover.sync { bottom: auto; top: calc(68px + var(--sat)); right: calc(24px + var(--sar)); width: 320px; }
+.p-sync-note { margin: 0 6px 8px; }
+.p-sync-list { display: grid; gap: 4px; }
+.p-sync-row { display: flex; align-items: center; gap: 10px; padding: 9px 10px; border-radius: 10px; background: rgba(255,255,255,.04); }
+.p-sync-row.self { background: var(--accent-bg); }
+.p-sync-meta { min-width: 0; flex: 1; }
+.p-sync-name { font-size: 13.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.p-sync-sub { font-size: 11.5px; color: var(--accent-text); margin-top: 1px; }
+.p-sync-badge { font-size: 11.5px; font-weight: 700; color: var(--muted); padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,.08); flex: none; }
+.p-sync-badge.ok { color: var(--ok); background: var(--ok-bg); }
+.p-sync-badge.wait { color: var(--warn); background: var(--warn-bg); }
 .p-speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .p-speed-grid .p-opt { justify-content: center; padding: 10px 6px; font-weight: 700; }
 .p-pop-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 3px; border-radius: 10px; background: rgba(255,255,255,.07); margin-bottom: 8px; }
@@ -1130,13 +1158,14 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
   .p-title-t { font-size: 16.5px; }
   .p-title-s { font-size: 12px; }
   .p-glass-btn { height: 38px; padding: 0 11px; font-size: 12.5px; }
-  .p-glass-btn.icon { width: 38px; height: 38px; }
+  .p-glass-btn.icon, .p-glass-btn.audio-btn { width: 38px; height: 38px; padding: 0; justify-content: center; }
   .p-glass-btn .long { display: none; }
   .p-glass-btn .short { display: inline; }
-  .p-dock { left: calc(12px + var(--sal)); right: calc(12px + var(--sar)); bottom: calc(12px + var(--sab)); padding: 10px 12px; border-radius: 16px; }
+  .p-dock { left: calc(10px + var(--sal)); right: calc(10px + var(--sar)); bottom: calc(12px + var(--sab)); padding: 10px 10px; border-radius: 16px; }
   .p-play-btn { width: 40px; height: 40px; }
-  .p-ctrl-row { gap: 6px; }
+  .p-ctrl-row { gap: 5px; }
   .p-popover { left: 12px; right: 12px; width: auto; bottom: calc(130px + var(--sab)); }
+  .p-popover.sync { top: calc(58px + var(--sat)); bottom: auto; left: 12px; right: 12px; width: auto; }
   .p-next-card { left: 12px; right: 12px; bottom: calc(130px + var(--sab)); justify-content: space-between; }
 }
 
@@ -1147,9 +1176,44 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
   .p-dock { left: calc(16px + var(--sal)); right: calc(16px + var(--sar)); bottom: calc(12px + var(--sab)); padding: 10px 14px; }
   .p-ctrl-row { margin-top: 8px; }
   .p-glass-btn { height: 36px; padding: 0 11px; font-size: 12.5px; }
-  .p-glass-btn.icon { width: 36px; height: 36px; }
+  .p-glass-btn.icon, .p-glass-btn.audio-btn { width: 36px; height: 36px; padding: 0; justify-content: center; }
+  .p-glass-btn.audio-btn .long { display: none; }
   .p-play-btn { width: 40px; height: 40px; }
   .p-popover { left: auto; right: calc(18px + var(--sar)); width: 300px; bottom: calc(104px + var(--sab)); max-height: calc(100vh - 124px); padding: 10px; }
+  .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
   .p-opt { padding: 8px 10px; font-size: 13.5px; }
   .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(104px + var(--sab)); }
+}
+
+/* Telegram Mini App auto-landscape fallback while OS viewport stays portrait */
+@media (orientation: portrait) {
+  html.tg.tg-player-rot .tabbar { display: none !important; }
+  html.tg.tg-player-rot .player {
+    top: 50%; left: 50%; right: auto; bottom: auto;
+    width: var(--tg-viewport-height, 100dvh);
+    height: 100vw;
+    transform: translate(-50%, -50%) rotate(90deg);
+    --rot-sat: max(env(safe-area-inset-right, 0px), var(--tg-safe-area-inset-right, 0px));
+    --rot-sab: max(env(safe-area-inset-left, 0px), var(--tg-safe-area-inset-left, 0px));
+    --rot-sal: calc(var(--tg-safe-area-inset-top, 0px) + var(--tg-content-safe-area-inset-top, 0px));
+    --rot-sar: max(env(safe-area-inset-bottom, 0px), var(--tg-safe-area-inset-bottom, 0px));
+    --sat: var(--rot-sat);
+    --sab: var(--rot-sab);
+    --sal: var(--rot-sal);
+    --sar: var(--rot-sar);
+  }
+  html.tg.tg-player-rot .player .p-top { padding: calc(10px + var(--sat)) calc(18px + var(--sar)) 10px calc(18px + var(--sal)); }
+  html.tg.tg-player-rot .player .p-dock { left: calc(16px + var(--sal)); right: calc(16px + var(--sar)); bottom: calc(12px + var(--sab)); padding: 10px 14px; }
+  html.tg.tg-player-rot .player .p-track input { pointer-events: none; }
+  html.tg.tg-player-rot .player .p-ctrl-row { margin-top: 8px; gap: 6px; }
+  html.tg.tg-player-rot .player .p-glass-btn { height: 36px; padding: 0 11px; font-size: 12.5px; }
+  html.tg.tg-player-rot .player .p-glass-btn.icon,
+  html.tg.tg-player-rot .player .p-glass-btn.audio-btn { width: 36px; height: 36px; padding: 0; justify-content: center; }
+  html.tg.tg-player-rot .player .p-glass-btn .long { display: none; }
+  html.tg.tg-player-rot .player .p-glass-btn .short { display: inline; }
+  html.tg.tg-player-rot .player .p-play-btn { width: 40px; height: 40px; }
+  html.tg.tg-player-rot .player .p-popover { left: auto; right: calc(18px + var(--sar)); width: 300px; bottom: calc(96px + var(--sab)); max-height: calc(100% - 116px); padding: 10px; }
+  html.tg.tg-player-rot .player .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
+  html.tg.tg-player-rot .player .p-opt { padding: 8px 10px; font-size: 13.5px; }
+  html.tg.tg-player-rot .player .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(96px + var(--sab)); }
 }

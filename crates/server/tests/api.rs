@@ -733,3 +733,127 @@ async fn personalized_home_lazy_shelves_and_pagination(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn sync_room_joins_and_protects_timecode(pool: PgPool) {
+    let app = test_app(pool);
+    let u = login_ok(&app, ADMIN_TG, None).await;
+    let tok = u.token.as_str();
+
+    // Seed saved progress at 240s.
+    let (status, _) = call(
+        &app,
+        Method::PUT,
+        "/api/progress",
+        Some(tok),
+        Some(json!({
+            "kind": "movie", "tmdb_id": 603, "position_sec": 240.0, "duration_sec": 8000.0,
+            "release": { "infohash": HASH, "file_index": 0, "title": "Matrix A" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Device 1 joins sync room -> gets saved 240s and joined_existing = false.
+    let (status, body1) = call(
+        &app,
+        Method::POST,
+        "/api/sync/join",
+        Some(tok),
+        Some(json!({
+            "client_id": "dev-1",
+            "device": "ПК",
+            "kind": "movie",
+            "tmdb_id": 603,
+            "season": 0,
+            "episode": 0,
+            "release": { "kind": "movie", "tmdb_id": 603, "season": 0, "infohash": HASH, "title": "Matrix A" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body1}");
+    let j1: kino_core::SyncJoinResponse = serde_json::from_value(body1).unwrap();
+    assert!(!j1.joined_existing);
+    assert!((j1.state.position_sec - 240.0).abs() < 2.0);
+    assert_eq!(j1.state.members.len(), 1);
+
+    // Device 2 opens the same movie -> joins existing room, adopts its release, enters barrier.
+    let other_hash = "f".repeat(40);
+    let (status, body2) = call(
+        &app,
+        Method::POST,
+        "/api/sync/join",
+        Some(tok),
+        Some(json!({
+            "client_id": "dev-2",
+            "device": "Телефон",
+            "kind": "movie",
+            "tmdb_id": 603,
+            "season": 0,
+            "episode": 0,
+            "release": { "kind": "movie", "tmdb_id": 603, "season": 0, "infohash": other_hash, "title": "Matrix B" }
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body2}");
+    let j2: kino_core::SyncJoinResponse = serde_json::from_value(body2).unwrap();
+    assert!(j2.joined_existing);
+    assert!(j2.state.waiting);
+    assert_eq!(j2.state.release.infohash, HASH);
+    assert_eq!(j2.state.members.len(), 2);
+
+    // Stale HTTP progress (e.g. 5.0s while room is around 240s) must NOT overwrite DB progress.
+    let (status, body_stale) = call(
+        &app,
+        Method::PUT,
+        "/api/progress",
+        Some(tok),
+        Some(json!({
+            "kind": "movie", "tmdb_id": 603, "position_sec": 5.0, "duration_sec": 8000.0
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let p_after: Progress = serde_json::from_value(body_stale).unwrap();
+    assert!((p_after.position_sec - 240.0).abs() < 1.0);
+
+    // Leave both devices cleanly (final flush updates DB).
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/sync/leave",
+        Some(tok),
+        Some(json!({
+            "client_id": "dev-2",
+            "kind": "movie",
+            "tmdb_id": 603,
+            "position_sec": 240.0,
+            "duration_sec": 8000.0,
+            "finished": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/sync/leave",
+        Some(tok),
+        Some(json!({
+            "client_id": "dev-1",
+            "kind": "movie",
+            "tmdb_id": 603,
+            "position_sec": 300.0,
+            "duration_sec": 8000.0,
+            "finished": false
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, prog_body) = call(&app, Method::GET, "/api/progress/movie/603", Some(tok), None).await;
+    let saved: Vec<Progress> = serde_json::from_value(prog_body).unwrap();
+    assert_eq!(saved.len(), 1);
+    assert!((saved[0].position_sec - 300.0).abs() < 1.0);
+}

@@ -10,6 +10,8 @@ mod release;
 pub use release::*;
 mod stream;
 pub use stream::*;
+mod sync;
+pub use sync::*;
 
 /// A film or a series, as TMDB distinguishes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

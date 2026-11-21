@@ -278,10 +278,31 @@ fn tg_user(u: &teloxide::types::User) -> TelegramUser {
     }
 }
 
+async fn send_search_prompt(
+    bot: &Bot,
+    chat: ChatId,
+    is_private: bool,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let mut req = bot
+        .send_message(chat, screens::search_prompt())
+        .parse_mode(ParseMode::Html);
+    if is_private {
+        let admin = match from {
+            Some(u) => is_admin(state, u.id.0 as i64).await.unwrap_or(false),
+            None => false,
+        };
+        req = req.reply_markup(screens::main_reply_keyboard(admin));
+    }
+    req.await?;
+    Ok(())
+}
+
 async fn search(bot: &Bot, msg: &Message, query: &str, state: &BotState) -> ResponseResult<()> {
     let query = query.trim();
     if query.is_empty() {
-        return say(bot, msg.chat.id, &screens::search_prompt()).await;
+        return send_search_prompt(bot, msg.chat.id, msg.chat.is_private(), msg.from.as_ref(), state).await;
     }
     bot.send_chat_action(msg.chat.id, ChatAction::Typing).await?;
     let found = tokio::time::timeout(CATALOG_WAIT, state.catalog.search(query)).await;
@@ -575,7 +596,7 @@ async fn run_action(
 ) -> ResponseResult<()> {
     match action {
         BotAction::Random => send_screen(bot, chat, screens::random_menu(screens::RandomState::default())).await,
-        BotAction::Search => say(bot, chat, &screens::search_prompt()).await,
+        BotAction::Search => send_search_prompt(bot, chat, is_private, from, state).await,
         BotAction::Continue => continue_watching(bot, chat, from, state).await,
         BotAction::My => my(bot, chat, from, state).await,
         BotAction::Login => site_login(bot, chat, is_private, from, state).await,
@@ -617,11 +638,20 @@ async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> R
                 None => false,
             };
             let url = app_url(&state.public_url, &payload);
+            let has_invite = url != state.public_url;
             if is_private {
-                bot.send_message(msg.chat.id, screens::start_welcome_text())
-                    .parse_mode(ParseMode::Html)
-                    .reply_markup(screens::main_reply_keyboard(&url, admin))
-                    .await?;
+                if has_invite {
+                    send_screen(&bot, msg.chat.id, screens::invite_welcome(&url)).await?;
+                    bot.send_message(msg.chat.id, "Кнопки команд закреплены ниже 👇")
+                        .disable_notification(true)
+                        .reply_markup(screens::main_reply_keyboard(admin))
+                        .await?;
+                } else {
+                    bot.send_message(msg.chat.id, screens::start_welcome_text())
+                        .parse_mode(ParseMode::Html)
+                        .reply_markup(screens::main_reply_keyboard(admin))
+                        .await?;
+                }
             } else {
                 send_screen(&bot, msg.chat.id, screens::start_inline(&url, admin)).await?;
             }

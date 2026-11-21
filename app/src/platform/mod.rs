@@ -23,6 +23,18 @@ pub fn abs(path: &str) -> String {
     format!("{}{}", server_base(), path)
 }
 
+/// WebSocket URL (`ws://` or `wss://`) of a server path such as `/api/sync/ws?ticket=...`.
+pub fn ws_url(path_and_query: &str) -> String {
+    let full = abs(path_and_query);
+    if let Some(rest) = full.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = full.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        full
+    }
+}
+
 /// Where the server runs: the page's own origin in a browser, a configured address in apps.
 /// Never ends with `/`.
 pub fn server_base() -> String {
@@ -66,21 +78,38 @@ pub fn apply_theme(theme: kino_ui::Theme) {
     android::style_bars(theme == kino_ui::Theme::Light);
 }
 
-/// The player takes the screen: on a phone the picture turns to landscape and the
-/// system bars go away; `false` gives everything back.
+/// The player takes the screen: hides the underlying page scrollbar everywhere,
+/// and on a phone turns to landscape (with CSS rotation fallback inside Telegram
+/// Mini App when the container refuses OS orientation lock); `false` restores everything.
 pub fn player_mode(on: bool) {
+    let root_js = if on {
+        "document.documentElement.classList.add('kino-playing');"
+    } else {
+        "document.documentElement.classList.remove('kino-playing'); document.documentElement.classList.remove('tg-player-rot');"
+    };
+    let _ = dioxus::document::eval(root_js);
+
     #[cfg(target_os = "android")]
     android::player_mode(on);
     #[cfg(not(target_os = "android"))]
     {
-        // A phone's browser (and Telegram) needs full screen before it lets the page rotate.
+        // Never call `tg.lockOrientation()` in portrait: in Bot API 8.0+ it locks
+        // the *current* orientation (portrait). Always keep it unlocked in the player
+        // and use `tg-player-rot` CSS landscape fallback when Telegram stays portrait.
         let js = if on {
             "try { if (window.matchMedia('(pointer: coarse)').matches) { \
-               var el = document.documentElement; \
-               var go = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
-               if (el.requestFullscreen && !document.fullscreenElement) { el.requestFullscreen().then(go, go); } else { go(); } \
+               var root = document.documentElement; \
                var tg = window.Telegram && window.Telegram.WebApp; \
-               if (tg && tg.lockOrientation) { tg.lockOrientation(); } } } catch (e) {}"
+               var inTg = !!(tg && tg.initData); \
+               var go = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+               if (inTg) { \
+                 if (tg.unlockOrientation) { tg.unlockOrientation(); } \
+                 root.classList.add('tg-player-rot'); \
+                 go(); \
+               } else { \
+                 var el = root; \
+                 if (el.requestFullscreen && !document.fullscreenElement) { el.requestFullscreen().then(go, go); } else { go(); } \
+               } } } catch (e) {}"
         } else {
             "try { if (screen.orientation && screen.orientation.unlock) { screen.orientation.unlock(); } \
                var tg = window.Telegram && window.Telegram.WebApp; \

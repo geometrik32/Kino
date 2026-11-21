@@ -1,14 +1,15 @@
 //! Drives the `<video>` of [`PlayerView`]: starts playback on the server,
-//! seeks, switches tracks, saves the position and moves to the next episode.
+//! seeks, switches tracks, saves the position, moves to the next episode and
+//! keeps multiple devices of the same account synchronized in real time.
 
 use dioxus::prelude::*;
 use kino_core::{
     episode_code, MediaKind, PlayInfo, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, StreamPhase,
-    TracksUpdate,
+    SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState, TracksUpdate,
 };
 use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView};
 
-use crate::{api, native, platform, platform::video::video, telegram};
+use crate::{api, native, platform, platform::video::video, sync, telegram};
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,10 +24,20 @@ pub struct PlayStart {
     pub choices: Vec<ReleaseChoiceUpdate>,
     /// Release of this season.
     pub release: ReleaseChoiceUpdate,
+    /// True when the user explicitly tapped a specific episode instead of Resume.
+    pub explicit_episode: bool,
+    /// True when the user explicitly picked a release in `ReleasePicker`.
+    pub explicit_release: bool,
 }
 
 /// How often the position is saved while playing, seconds of video.
 const SAVE_EVERY: f64 = 10.0;
+
+/// How often the player sends a sync heartbeat & checks drift, milliseconds.
+const SYNC_TICK_MS: u32 = 2_000;
+
+/// How long the controls stay on screen while a film plays, milliseconds.
+const CONTROLS_MS: u32 = 3_500;
 
 pub use crate::platform::device_name;
 
@@ -34,6 +45,14 @@ fn release_label(r: &ReleaseChoiceUpdate) -> String {
     match (&r.voice, &r.quality) {
         (Some(v), Some(q)) => format!("{v} · {q}"),
         _ => r.title.clone().unwrap_or_default(),
+    }
+}
+
+fn waiting_label(st: &SyncState) -> String {
+    if st.waiting_for.is_empty() {
+        "Ждём синхронизацию с другим устройством…".into()
+    } else {
+        format!("Ждём синхронизацию: {}…", st.waiting_for.join(", "))
     }
 }
 
@@ -52,9 +71,6 @@ impl Drop for PlayerModeGuard {
         platform::player_mode(false);
     }
 }
-
-/// How long the controls stay on screen while a film plays, milliseconds.
-const CONTROLS_MS: u32 = 3_500;
 
 /// Leaves Telegram's full screen when the player goes away.
 struct FullscreenGuard;
@@ -78,6 +94,15 @@ impl Drop for KeyGuard {
     }
 }
 
+/// Ensures the sync WebSocket closes cleanly if `Player` is unmounted directly.
+struct SyncGuard;
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        sync::stop(None);
+    }
+}
+
 #[component]
 pub fn Player(
     token: String,
@@ -88,6 +113,9 @@ pub fn Player(
 ) -> Element {
     let kind = start.kind;
     let id = start.tmdb_id;
+    let client_id = use_hook(platform::random_id);
+    let device = use_hook(device_name);
+
     let mut target = use_signal(|| (start.season, start.episode));
     let mut release = use_signal(|| start.release.clone());
     let mut info = use_signal(|| None::<PlayInfo>);
@@ -95,15 +123,19 @@ pub fn Player(
         title: start.title.clone(),
         poster: start.poster.clone(),
         status: Some("Подключаемся к раздаче…".into()),
+        sync_client_id: client_id.clone(),
         ..PlayerState::default()
     });
+
     // Start of the current source within the file (re-encoded streams start at `offset`).
     let mut offset = use_signal(|| 0.0_f64);
     // Where to jump once a direct source has its metadata.
     let mut pending_seek = use_signal(|| None::<f64>);
+    // Active direct seek target awaiting `seeked`.
+    let mut seeking_target = use_signal(|| None::<f64>);
     let mut force_transcode = use_signal(|| false);
     let mut last_saved = use_signal(|| 0.0_f64);
-    let device = use_hook(device_name);
+
     platform::video::use_bridge();
     // Finger or mouse: a tap on the picture shows the controls on a phone, pauses on a computer.
     let touch = use_resource(platform::touch_screen);
@@ -117,6 +149,24 @@ pub fn Player(
     let mut rate = use_signal(|| 1.0_f32);
     let mut volume = use_signal(|| 1.0_f32);
     let mut muted = use_signal(|| false);
+
+    // Synchronization state.
+    let mut sync_state = use_signal(|| None::<SyncState>);
+    let mut sync_connected = use_signal(|| false);
+    let mut last_revision = use_signal(|| 0_u64);
+    let mut clock = use_signal(sync::ClockSync::default);
+    let mut desired_paused = use_signal(|| false);
+    let mut awaiting_ready = use_signal(|| true);
+    let mut canplay_seen = use_signal(|| false);
+    let mut last_seek_cmd_ms = use_signal(|| 0_i64);
+    let mut last_reload_ms = use_signal(|| 0_i64);
+    let mut waiting_gen = use_signal(|| 0u32);
+    let mut ws_gen = use_signal(|| 0u32);
+    let mut closing = use_signal(|| false);
+    let mut sync_init_done = use_signal(|| false);
+
+    use_hook(|| std::rc::Rc::new(SyncGuard));
+
     // The episodes of the season being watched, with the ones already seen.
     let season_list = {
         let token = token.clone();
@@ -172,11 +222,33 @@ pub fn Player(
         let audio = ui.peek().audio_track;
         let transcode = force_transcode() || !i.plays_directly(audio);
         let (src, off) = if transcode {
+            last_reload_ms.set(platform::now_ms());
+            pending_seek.set(None);
+            seeking_target.set(None);
             (i.transcoded_url(audio, at), at.floor())
         } else {
             pending_seek.set((at > 0.0).then_some(at));
+            seeking_target.set(None);
             (i.stream.clone(), 0.0)
         };
+        if transcode && ui.peek().src == src {
+            offset.set(off);
+            sync::set_stream_offset(off);
+            ui.with_mut(|s| s.position = at);
+            if !awaiting_ready() {
+                let fi = info.peek().as_ref().map(|x| x.file_index);
+                sync::send(&SyncClientMsg::Ready {
+                    position_sec: at,
+                    duration_sec: ui.peek().duration,
+                    file_index: fi,
+                });
+            }
+            return;
+        }
+        let hold = sync_state.peek().as_ref().is_some_and(|st| st.paused || st.waiting);
+        desired_paused.set(hold);
+        awaiting_ready.set(true);
+        canplay_seen.set(false);
         let status = if transcode {
             if at >= 1.0 {
                 "Готовим видео с нужной минуты…"
@@ -189,9 +261,11 @@ pub fn Player(
             "Запускаем видеопоток…"
         };
         offset.set(off);
+        sync::set_stream_offset(off);
         stall_secs.set(0);
         played.set(false);
         ui.with_mut(|s| {
+            s.autoplay = !hold;
             s.src = src;
             s.transcoded = transcode;
             s.position = at;
@@ -241,6 +315,521 @@ pub fn Player(
         }
     };
 
+    let mut mark_media_ready = move || {
+        awaiting_ready.set(false);
+        stall_secs.set(0);
+        waiting_gen.set(waiting_gen() + 1);
+        let st_opt = sync_state.peek().clone();
+        let paused_by_user = st_opt.as_ref().is_some_and(|st| st.paused);
+        let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
+        let hold = paused_by_user || waiting_peer;
+        desired_paused.set(hold);
+        if hold {
+            if let Some(v) = video() {
+                v.pause();
+            }
+            let msg = if waiting_peer {
+                st_opt.as_ref().map(waiting_label)
+            } else {
+                None
+            };
+            ui.with_mut(|s| {
+                s.paused = paused_by_user;
+                s.waiting = waiting_peer;
+                s.progress = None;
+                s.status = msg;
+            });
+        } else {
+            ui.with_mut(|s| {
+                s.waiting = false;
+                s.paused = false;
+                s.progress = None;
+                s.status = None;
+            });
+            if let Some(v) = video() {
+                if v.paused() {
+                    v.play();
+                    if !played() {
+                        let my_gen = play_gen();
+                        spawn(async move {
+                            platform::sleep(300).await;
+                            if closing() || play_gen() != my_gen || played() || desired_paused() {
+                                return;
+                            }
+                            if video().is_some_and(|vid| vid.paused()) {
+                                let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
+                                if alone {
+                                    desired_paused.set(true);
+                                    sync::send(&SyncClientMsg::Pause {
+                                        position_sec: ui.peek().position,
+                                    });
+                                }
+                                ui.with_mut(|s| {
+                                    s.paused = true;
+                                    s.waiting = false;
+                                    s.status = None;
+                                    s.progress = None;
+                                });
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        let s = ui.peek();
+        let file_index = info.peek().as_ref().map(|i| i.file_index);
+        sync::send(&SyncClientMsg::Ready {
+            position_sec: s.position,
+            duration_sec: s.duration,
+            file_index,
+        });
+    };
+
+    // Fetches `/api/play` for `(season, episode, rel)` and loads the resulting stream.
+    let start_play_fetch = {
+        let token = token.clone();
+        move |season: i32, episode: i32, rel: ReleaseChoiceUpdate, initial_pos: f64, my_gen: u32| {
+            let t = token.clone();
+            spawn(async move {
+                platform::sleep(95_000).await;
+                if play_gen() != my_gen || closing() {
+                    return;
+                }
+                let still_connecting = connecting() && ui.peek().error.is_none();
+                if still_connecting {
+                    connecting.set(false);
+                    ui.with_mut(|s| {
+                        s.status = None;
+                        s.waiting = false;
+                        s.progress = None;
+                        s.error =
+                            Some("Сервер не ответил вовремя. Попробуйте другую раздачу или «Скачать заранее».".into());
+                    });
+                }
+            });
+
+            stall_secs.set(0);
+            connecting.set(true);
+            played.set(false);
+            awaiting_ready.set(true);
+            canplay_seen.set(false);
+            pending_seek.set(None);
+            seeking_target.set(None);
+            info.set(None);
+            force_transcode.set(false);
+            ui.with_mut(|s| {
+                s.src.clear();
+                s.subtitles_src = None;
+                s.error = None;
+                s.menu = None;
+                s.position = initial_pos;
+                s.duration = None;
+                s.waiting = false;
+                s.release = release_label(&rel);
+                s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
+                s.status = Some("Подключаемся к раздаче…".into());
+                s.progress = None;
+            });
+            stop_video_element();
+
+            spawn(async move {
+                let req = PlayRequest {
+                    kind,
+                    tmdb_id: id,
+                    season: if kind == MediaKind::Tv { season } else { 0 },
+                    episode: if kind == MediaKind::Tv { episode } else { 0 },
+                    release: rel.infohash.clone(),
+                };
+                let res = api::play(&t, &req).await;
+                if play_gen() != my_gen || closing() {
+                    return;
+                }
+                connecting.set(false);
+                match res {
+                    Ok(i) => {
+                        let synced_audio = sync_state
+                            .peek()
+                            .as_ref()
+                            .and_then(|st| st.audio_track.as_deref())
+                            .and_then(|lbl| i.audio.iter().find(|a| a.label() == lbl))
+                            .map(|a| a.index)
+                            .or(i.audio_track);
+                        ui.with_mut(|s| {
+                            s.duration = i.duration;
+                            s.audio = i.audio.clone();
+                            s.subtitle_tracks = i.subtitles.clone();
+                            s.audio_track = synced_audio;
+                            s.subtitle_track = if i.preloaded { i.subtitle_track } else { None };
+                            s.next = i.next.map(|(s, e)| episode_code(s, e));
+                            s.preloaded = i.preloaded;
+                        });
+                        let at = sync_state
+                            .peek()
+                            .as_ref()
+                            .map(|st| clock.peek().expected_position(st, platform::now_ms()))
+                            .unwrap_or_else(|| f64::from(i.start_at));
+                        last_saved.set(at);
+                        info.set(Some(i));
+                        load_source(at);
+                    }
+                    Err(e) => {
+                        // Do not keep another peer blocked if this device failed to load the stream.
+                        sync::send(&SyncClientMsg::Ready {
+                            position_sec: 0.0,
+                            duration_sec: None,
+                            file_index: None,
+                        });
+                        ui.with_mut(|s| {
+                            s.status = None;
+                            s.progress = None;
+                            s.error = Some(e.message);
+                        });
+                    }
+                }
+            });
+        }
+    };
+
+    // Asks the server for the stream of the current target (optionally joining sync first).
+    let begin_playback = {
+        let token = token.clone();
+        let client_id = client_id.clone();
+        let device = device.clone();
+        let explicit_ep_initial = start.explicit_episode;
+        let explicit_rel_initial = start.explicit_release;
+        let mut start_play_fetch = start_play_fetch.clone();
+        move |join_sync: bool| {
+            let (season, episode) = *target.peek();
+            let rel = release.peek().clone();
+            let my_gen = play_gen() + 1;
+            play_gen.set(my_gen);
+
+            if !join_sync || sync_init_done() {
+                start_play_fetch(season, episode, rel, 0.0, my_gen);
+                return;
+            }
+
+            stall_secs.set(0);
+            connecting.set(true);
+            played.set(false);
+            awaiting_ready.set(true);
+            canplay_seen.set(false);
+            pending_seek.set(None);
+            seeking_target.set(None);
+            info.set(None);
+            force_transcode.set(false);
+            ui.with_mut(|s| {
+                s.src.clear();
+                s.subtitles_src = None;
+                s.error = None;
+                s.menu = None;
+                s.position = 0.0;
+                s.duration = None;
+                s.waiting = false;
+                s.release = release_label(&rel);
+                s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
+                s.status = Some("Подключаемся к раздаче…".into());
+                s.progress = None;
+            });
+            stop_video_element();
+
+            let t = token.clone();
+            let cid = client_id.clone();
+            let dev = device.clone();
+            let mut start_play_fetch = start_play_fetch.clone();
+            spawn(async move {
+                let mut cur_season = season;
+                let mut cur_episode = episode;
+                let mut cur_rel = rel;
+                let mut initial_pos = 0.0;
+
+                let join_req = SyncJoinRequest {
+                    client_id: cid.clone(),
+                    device: dev.clone(),
+                    kind,
+                    tmdb_id: id,
+                    season: if kind == MediaKind::Tv { cur_season } else { 0 },
+                    episode: if kind == MediaKind::Tv { cur_episode } else { 0 },
+                    release: cur_rel.clone(),
+                    explicit_episode: explicit_ep_initial,
+                    explicit_release: explicit_rel_initial,
+                    reconnect_pos: None,
+                };
+                if let Ok(resp) = api::sync_join(&t, &join_req).await {
+                    if play_gen() != my_gen || closing() {
+                        return;
+                    }
+                    sync_init_done.set(true);
+                    clock.with_mut(|c| c.seed_from_server(resp.state.server_now_ms, platform::now_ms()));
+                    last_revision.set(resp.state.revision);
+                    sync_state.set(Some(resp.state.clone()));
+
+                    if kind == MediaKind::Tv {
+                        cur_season = resp.state.season;
+                        cur_episode = resp.state.episode;
+                        target.set((cur_season, cur_episode));
+                    }
+                    cur_rel = resp.state.release.clone();
+                    release.set(cur_rel.clone());
+                    rate.set(resp.state.rate);
+                    initial_pos = resp.state.position_sec;
+                    let hold = resp.state.paused || resp.state.waiting;
+                    desired_paused.set(hold);
+                    ui.with_mut(|s| {
+                        s.paused = resp.state.paused;
+                        s.autoplay = !hold;
+                        s.release = release_label(&cur_rel);
+                        s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(cur_season, cur_episode));
+                        s.sync_members = resp.state.members.clone();
+                        s.sync_waiting_for = resp.state.waiting_for.clone();
+                    });
+
+                    // Start WebSocket bridge loop with automatic reconnect while Player is open.
+                    let my_ws = ws_gen() + 1;
+                    ws_gen.set(my_ws);
+                    let ws_token = t.clone();
+                    let ws_cid = cid.clone();
+                    let ws_dev = dev.clone();
+                    let initial_ticket = resp.ticket;
+                    let mut ws_start_fetch = start_play_fetch.clone();
+                    spawn(async move {
+                        let mut ticket = initial_ticket;
+                        loop {
+                            if ws_gen() != my_ws || closing() {
+                                break;
+                            }
+                            let mut bridge = sync::start_bridge(&ticket, &ws_token, &ws_cid, kind, id);
+                            while let Ok(raw) = bridge.recv::<String>().await {
+                                if ws_gen() != my_ws || closing() {
+                                    break;
+                                }
+                                let Ok(ev) = serde_json::from_str::<sync::WsBridgeEvent>(&raw) else {
+                                    continue;
+                                };
+                                match ev {
+                                    sync::WsBridgeEvent::Open => {
+                                        sync_connected.set(true);
+                                        sync::send(&SyncClientMsg::Ping {
+                                            client_ms: platform::now_ms(),
+                                        });
+                                        if !awaiting_ready() && info.peek().is_some() {
+                                            let s = ui.peek();
+                                            let fi = info.peek().as_ref().map(|i| i.file_index);
+                                            sync::send(&SyncClientMsg::Ready {
+                                                position_sec: s.position,
+                                                duration_sec: s.duration,
+                                                file_index: fi,
+                                            });
+                                        }
+                                    }
+                                    sync::WsBridgeEvent::Msg { data } => {
+                                        let Some(msg) = sync::parse_server_msg(&data) else {
+                                            continue;
+                                        };
+                                        match msg {
+                                            SyncServerMsg::Pong { client_ms, server_ms } => {
+                                                clock.with_mut(|c| {
+                                                    c.on_pong(client_ms, server_ms, platform::now_ms());
+                                                });
+                                            }
+                                            SyncServerMsg::State(st) => {
+                                                ui.with_mut(|s| {
+                                                    s.sync_members = st.members.clone();
+                                                    s.sync_waiting_for = st.waiting_for.clone();
+                                                    if st.members.len() <= 1 && s.menu == Some(PlayerMenu::Sync) {
+                                                        s.menu = None;
+                                                    }
+                                                });
+                                                if st.revision < last_revision() {
+                                                    continue;
+                                                }
+                                                let is_self = st.updated_by.as_deref() == Some(ws_cid.as_str());
+                                                last_revision.set(st.revision);
+                                                sync_state.set(Some(st.clone()));
+
+                                                let hold = st.paused || st.waiting;
+                                                desired_paused.set(hold);
+                                                ui.with_mut(|s| {
+                                                    s.paused = st.paused;
+                                                    if st.waiting {
+                                                        s.waiting = true;
+                                                        if !connecting() && s.progress.is_none() {
+                                                            s.status = Some(waiting_label(&st));
+                                                        }
+                                                    } else if !awaiting_ready() && !connecting() {
+                                                        s.waiting = false;
+                                                        s.status = None;
+                                                    }
+                                                });
+
+                                                if let Some(v) = video() {
+                                                    if hold {
+                                                        v.pause();
+                                                    } else if !awaiting_ready() && info.peek().is_some() && v.paused() {
+                                                        v.play();
+                                                    }
+                                                }
+
+                                                if is_self {
+                                                    continue;
+                                                }
+
+                                                // Remote episode or release switch: reload stream without tearing down WS.
+                                                let diff_ep =
+                                                    kind == MediaKind::Tv && (st.season, st.episode) != *target.peek();
+                                                let diff_rel = st.release.infohash != release.peek().infohash;
+                                                if diff_ep || diff_rel {
+                                                    target.set((st.season, st.episode));
+                                                    release.set(st.release.clone());
+                                                    rate.set(st.rate);
+                                                    let n_gen = play_gen() + 1;
+                                                    play_gen.set(n_gen);
+                                                    ws_start_fetch(
+                                                        st.season,
+                                                        st.episode,
+                                                        st.release.clone(),
+                                                        st.position_sec,
+                                                        n_gen,
+                                                    );
+                                                    continue;
+                                                }
+
+                                                // Remote audio track switch.
+                                                if st.event == SyncEventKind::Audio {
+                                                    if let Some(i) = info.peek().clone() {
+                                                        let target_idx = st
+                                                            .audio_track
+                                                            .as_deref()
+                                                            .and_then(|lbl| i.audio.iter().find(|a| a.label() == lbl))
+                                                            .map(|a| a.index);
+                                                        if target_idx.is_some() && target_idx != ui.peek().audio_track {
+                                                            let at =
+                                                                clock.peek().expected_position(&st, platform::now_ms());
+                                                            ui.with_mut(|s| s.audio_track = target_idx);
+                                                            load_source(at);
+                                                            continue;
+                                                        }
+                                                    }
+                                                }
+
+                                                // Remote playback rate switch.
+                                                if (rate() - st.rate).abs() > 0.001 {
+                                                    rate.set(st.rate);
+                                                    if let Some(v) = video() {
+                                                        v.set_rate(f64::from(st.rate));
+                                                    }
+                                                }
+
+                                                // Remote position alignment (Seek / Resumed / Pause).
+                                                if info.peek().is_some() && !connecting() {
+                                                    let target_pos =
+                                                        clock.peek().expected_position(&st, platform::now_ms());
+                                                    let local_pos = ui.peek().position;
+                                                    let diff = (local_pos - target_pos).abs();
+                                                    let is_seek = st.event == SyncEventKind::Seek;
+                                                    let is_align = matches!(
+                                                        st.event,
+                                                        SyncEventKind::Seek
+                                                            | SyncEventKind::Resumed
+                                                            | SyncEventKind::Pause
+                                                    );
+                                                    if is_align {
+                                                        if ui.peek().transcoded {
+                                                            let min_diff = if is_seek { 1.0 } else { 2.8 };
+                                                            if diff > min_diff {
+                                                                last_seek_cmd_ms.set(platform::now_ms());
+                                                                load_source(target_pos);
+                                                            } else if is_seek && !awaiting_ready() {
+                                                                let fi = info.peek().as_ref().map(|i| i.file_index);
+                                                                sync::send(&SyncClientMsg::Ready {
+                                                                    position_sec: local_pos,
+                                                                    duration_sec: ui.peek().duration,
+                                                                    file_index: fi,
+                                                                });
+                                                            }
+                                                        } else if diff > 0.45 {
+                                                            if let Some(v) = video() {
+                                                                last_seek_cmd_ms.set(platform::now_ms());
+                                                                awaiting_ready.set(true);
+                                                                canplay_seen.set(false);
+                                                                seeking_target.set(Some(target_pos));
+                                                                v.set_current_time(target_pos);
+                                                                ui.with_mut(|s| s.position = target_pos);
+                                                            }
+                                                        } else if is_seek && !awaiting_ready() {
+                                                            let fi = info.peek().as_ref().map(|i| i.file_index);
+                                                            sync::send(&SyncClientMsg::Ready {
+                                                                position_sec: local_pos,
+                                                                duration_sec: ui.peek().duration,
+                                                                file_index: fi,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            SyncServerMsg::Error { .. } => {}
+                                        }
+                                    }
+                                    sync::WsBridgeEvent::Error | sync::WsBridgeEvent::Closed => {
+                                        sync_connected.set(false);
+                                        break;
+                                    }
+                                }
+                            }
+
+                            // Reconnect cleanly if the player is still open.
+                            sync_connected.set(false);
+                            if ws_gen() != my_ws || closing() {
+                                break;
+                            }
+                            platform::sleep(1_500).await;
+                            if ws_gen() != my_ws || closing() {
+                                break;
+                            }
+                            let (rs, re) = *target.peek();
+                            let rrel = release.peek().clone();
+                            let rejoin_req = SyncJoinRequest {
+                                client_id: ws_cid.clone(),
+                                device: ws_dev.clone(),
+                                kind,
+                                tmdb_id: id,
+                                season: if kind == MediaKind::Tv { rs } else { 0 },
+                                episode: if kind == MediaKind::Tv { re } else { 0 },
+                                release: rrel,
+                                explicit_episode: false,
+                                explicit_release: false,
+                                reconnect_pos: Some(ui.peek().position),
+                            };
+                            match api::sync_join(&ws_token, &rejoin_req).await {
+                                Ok(rejoin) => {
+                                    clock.with_mut(|c| {
+                                        c.seed_from_server(rejoin.state.server_now_ms, platform::now_ms());
+                                    });
+                                    last_revision.set(rejoin.state.revision);
+                                    sync_state.set(Some(rejoin.state.clone()));
+                                    ui.with_mut(|s| {
+                                        s.sync_members = rejoin.state.members.clone();
+                                        s.sync_waiting_for = rejoin.state.waiting_for.clone();
+                                    });
+                                    ticket = rejoin.ticket;
+                                }
+                                Err(_) => {
+                                    platform::sleep(2_000).await;
+                                }
+                            }
+                        }
+                    });
+                }
+
+                start_play_fetch(cur_season, cur_episode, cur_rel, initial_pos, my_gen);
+            });
+        }
+    };
+    use_hook({
+        let mut begin_playback = begin_playback.clone();
+        move || begin_playback(true)
+    });
+
     // While connecting or buffering, shows how far the torrent has got instead of a bare spinner.
     {
         let token = token.clone();
@@ -249,9 +838,19 @@ pub fn Player(
             async move {
                 loop {
                     platform::sleep(1_000).await;
+                    if closing() {
+                        break;
+                    }
                     let (busy, preloaded) = {
                         let s = ui.peek();
-                        (s.error.is_none() && (connecting() || s.waiting), s.preloaded)
+                        let waiting_for_peer = sync_state
+                            .peek()
+                            .as_ref()
+                            .is_some_and(|st| st.waiting && !awaiting_ready() && !connecting());
+                        (
+                            s.error.is_none() && (connecting() || (s.waiting && !waiting_for_peer)),
+                            s.preloaded,
+                        )
                     };
                     if !busy || preloaded {
                         stall_secs.set(0);
@@ -278,6 +877,11 @@ pub fn Player(
                                     60
                                 };
                                 if secs >= limit {
+                                    sync::send(&SyncClientMsg::Ready {
+                                        position_sec: ui.peek().position,
+                                        duration_sec: ui.peek().duration,
+                                        file_index: info.peek().as_ref().map(|i| i.file_index),
+                                    });
                                     ui.with_mut(|s| {
                                         s.src.clear();
                                         s.status = None;
@@ -300,94 +904,74 @@ pub fn Player(
         });
     }
 
-    // Asks the server for the stream of the current target.
-    let begin = {
-        let token = token.clone();
-        move || {
-            let (season, episode) = target();
-            let rel = release();
-            let t = token.clone();
-            let my_gen = play_gen() + 1;
-            play_gen.set(my_gen);
-            stall_secs.set(0);
-            connecting.set(true);
-            played.set(false);
-            info.set(None);
-            force_transcode.set(false);
-            ui.with_mut(|s| {
-                s.src.clear();
-                s.subtitles_src = None;
-                s.error = None;
-                s.menu = None;
-                s.position = 0.0;
-                s.duration = None;
-                s.waiting = false;
-                s.release = release_label(&rel);
-                s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
-                s.status = Some("Подключаемся к раздаче…".into());
-                s.progress = None;
+    // Periodic sync heartbeat + smooth drift correction across devices.
+    use_future(move || async move {
+        loop {
+            platform::sleep(SYNC_TICK_MS).await;
+            if closing() {
+                break;
+            }
+            if !sync_connected() {
+                continue;
+            }
+            let now_ms = platform::now_ms();
+            sync::send(&SyncClientMsg::Ping { client_ms: now_ms });
+            if info.peek().is_none() || connecting() {
+                continue;
+            }
+            let Some(v) = video() else { continue };
+            let local_pos = offset() + v.current_time();
+            let dur = ui.peek().duration;
+            sync::send(&SyncClientMsg::Report {
+                position_sec: local_pos,
+                duration_sec: dur,
+                paused: v.paused(),
+                rate: rate(),
             });
-            stop_video_element();
-            spawn(async move {
-                platform::sleep(95_000).await;
-                if play_gen() != my_gen {
-                    return;
+
+            let Some(st) = sync_state.peek().clone() else {
+                continue;
+            };
+            if st.members.len() <= 1 || st.paused || st.waiting || !played() || awaiting_ready() || ui.peek().waiting {
+                continue;
+            }
+            if now_ms - last_seek_cmd_ms() < 4_000 || now_ms - last_reload_ms() < 8_000 {
+                continue;
+            }
+
+            let expected = clock.peek().expected_position(&st, now_ms);
+            let drift = local_pos - expected;
+            let abs_drift = drift.abs();
+            let target_rate = f64::from(st.rate);
+
+            if !ui.peek().transcoded {
+                if abs_drift > 1.5 {
+                    last_seek_cmd_ms.set(now_ms);
+                    v.set_rate(target_rate);
+                    v.set_current_time(expected);
+                    ui.with_mut(|s| s.position = expected);
+                } else if abs_drift > 0.35 {
+                    let nudge = if drift > 0.0 { 0.95 } else { 1.05 };
+                    v.set_rate((target_rate * nudge).clamp(0.25, 4.0));
+                } else {
+                    v.set_rate(target_rate);
                 }
-                let still_connecting = connecting() && ui.peek().error.is_none();
-                if still_connecting {
-                    connecting.set(false);
-                    ui.with_mut(|s| {
-                        s.status = None;
-                        s.waiting = false;
-                        s.progress = None;
-                        s.error =
-                            Some("Сервер не ответил вовремя. Попробуйте другую раздачу или «Скачать заранее».".into());
-                    });
-                }
-            });
-            spawn(async move {
-                let req = PlayRequest {
-                    kind,
-                    tmdb_id: id,
-                    season: if kind == MediaKind::Tv { season } else { 0 },
-                    episode: if kind == MediaKind::Tv { episode } else { 0 },
-                    release: rel.infohash.clone(),
-                };
-                let res = api::play(&t, &req).await;
-                if play_gen() != my_gen {
-                    return;
-                }
-                connecting.set(false);
-                match res {
-                    Ok(i) => {
-                        ui.with_mut(|s| {
-                            s.duration = i.duration;
-                            s.audio = i.audio.clone();
-                            s.subtitle_tracks = i.subtitles.clone();
-                            s.audio_track = i.audio_track;
-                            s.subtitle_track = if i.preloaded { i.subtitle_track } else { None };
-                            s.next = i.next.map(|(s, e)| episode_code(s, e));
-                            s.preloaded = i.preloaded;
-                        });
-                        let at = f64::from(i.start_at);
-                        last_saved.set(at);
-                        info.set(Some(i));
-                        load_source(at);
-                    }
-                    Err(e) => ui.with_mut(|s| {
-                        s.status = None;
-                        s.progress = None;
-                        s.error = Some(e.message);
-                    }),
-                }
-            });
+            } else if abs_drift > 3.5 {
+                last_seek_cmd_ms.set(now_ms);
+                v.set_rate(target_rate);
+                load_source(expected);
+            } else if abs_drift > 0.6 {
+                let nudge = if drift > 0.0 { 0.94 } else { 1.06 };
+                v.set_rate((target_rate * nudge).clamp(0.25, 4.0));
+            } else {
+                v.set_rate(target_rate);
+            }
         }
-    };
-    use_hook(begin.clone());
+    });
 
     let mut go_next = {
         let mut save = save.clone();
-        let mut begin = begin.clone();
+        let mut begin_playback = begin_playback.clone();
         let choices = start.choices.clone();
         move || {
             let Some((ns, ne)) = info.peek().as_ref().and_then(|i| i.next) else {
@@ -395,9 +979,13 @@ pub fn Player(
             };
             save(true);
             let (season, _) = target();
+            let mut next_rel = None;
             if ns != season {
                 match choices.iter().find(|c| c.season == ns) {
-                    Some(c) => release.set(c.clone()),
+                    Some(c) => {
+                        release.set(c.clone());
+                        next_rel = Some(c.clone());
+                    }
                     None => {
                         on_need_release.call((ns, ne));
                         return;
@@ -405,7 +993,12 @@ pub fn Player(
                 }
             }
             target.set((ns, ne));
-            begin();
+            sync::send(&SyncClientMsg::Episode {
+                season: ns,
+                episode: ne,
+                release: next_rel,
+            });
+            begin_playback(false);
         }
     };
 
@@ -425,10 +1018,62 @@ pub fn Player(
         });
     };
 
+    let mut toggle_play = {
+        let mut save = save.clone();
+        move || {
+            let Some(v) = video() else { return };
+            let cur_pos = ui.peek().position;
+            let is_paused_now = desired_paused() || v.paused();
+            if is_paused_now {
+                desired_paused.set(false);
+                sync::send(&SyncClientMsg::Play { position_sec: cur_pos });
+                let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                if !waiting_peer {
+                    v.play();
+                    ui.with_mut(|s| s.paused = false);
+                }
+            } else {
+                desired_paused.set(true);
+                v.pause();
+                ui.with_mut(|s| s.paused = true);
+                sync::send(&SyncClientMsg::Pause { position_sec: cur_pos });
+                save(false);
+            }
+        }
+    };
+
+    let mut seek_to = move |at: f64| {
+        let s = ui.peek().clone();
+        let at = match s.duration {
+            Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
+            None => at.max(0.0),
+        };
+        last_seek_cmd_ms.set(platform::now_ms());
+        sync::send(&SyncClientMsg::Seek { position_sec: at });
+        if s.transcoded {
+            load_source(at);
+        } else if let Some(v) = video() {
+            if (v.current_time() - at).abs() > 0.25 {
+                awaiting_ready.set(true);
+                canplay_seen.set(false);
+                seeking_target.set(Some(at));
+                v.set_current_time(at);
+                ui.with_mut(|s| s.position = at);
+            } else {
+                seeking_target.set(None);
+                ui.with_mut(|s| s.position = at);
+                if canplay_seen() || v.ready_state() >= 2 {
+                    mark_media_ready();
+                }
+            }
+        }
+    };
+
     let on_video = {
         let mut save = save.clone();
         let mut go_next = go_next.clone();
         let err_token = token.clone();
+        let mut mark_media_ready = mark_media_ready.clone();
         move |ev: &'static str| {
             let Some(v) = video() else { return };
             match ev {
@@ -447,7 +1092,13 @@ pub fn Player(
                 }
                 "metadata" => {
                     if let Some(at) = pending_seek.take() {
-                        v.set_current_time(at);
+                        if (v.current_time() - at).abs() > 0.25 {
+                            canplay_seen.set(false);
+                            seeking_target.set(Some(at));
+                            v.set_current_time(at);
+                        } else {
+                            seeking_target.set(None);
+                        }
                     }
                     // A new source starts at normal speed and full volume.
                     if (rate() - 1.0).abs() > 0.001 {
@@ -455,6 +1106,39 @@ pub fn Player(
                     }
                     v.set_volume(f64::from(volume()));
                     v.set_muted(muted());
+                    if desired_paused() {
+                        v.pause();
+                    }
+                    if pending_seek.peek().is_none()
+                        && seeking_target.peek().is_none()
+                        && (canplay_seen() || v.ready_state() >= 2)
+                    {
+                        mark_media_ready();
+                    }
+                }
+                "seeked" => {
+                    if let Some(tgt) = seeking_target() {
+                        if (v.current_time() - tgt).abs() < 3.0 {
+                            seeking_target.set(None);
+                        }
+                    }
+                    if pending_seek.peek().is_none()
+                        && seeking_target.peek().is_none()
+                        && (canplay_seen() || v.ready_state() >= 2)
+                    {
+                        mark_media_ready();
+                    }
+                }
+                "canplay" => {
+                    canplay_seen.set(true);
+                    if let Some(tgt) = seeking_target() {
+                        if (v.current_time() - tgt).abs() < 1.5 {
+                            seeking_target.set(None);
+                        }
+                    }
+                    if pending_seek.peek().is_none() && seeking_target.peek().is_none() {
+                        mark_media_ready();
+                    }
                 }
                 "waiting" => {
                     let already_played = played();
@@ -471,20 +1155,73 @@ pub fn Player(
                             s.status = Some(msg.into());
                         }
                     });
+                    if !awaiting_ready()
+                        && already_played
+                        && !desired_paused()
+                        && sync_state.peek().as_ref().is_some_and(|st| st.members.len() > 1)
+                    {
+                        let my_wgen = waiting_gen() + 1;
+                        waiting_gen.set(my_wgen);
+                        spawn(async move {
+                            platform::sleep(600).await;
+                            if waiting_gen() == my_wgen
+                                && ui.peek().waiting
+                                && !awaiting_ready()
+                                && !desired_paused()
+                                && !closing()
+                            {
+                                sync::send(&SyncClientMsg::Buffering {
+                                    position_sec: ui.peek().position,
+                                });
+                            }
+                        });
+                    }
                 }
                 "playing" => {
                     played.set(true);
-                    stall_secs.set(0);
-                    ui.with_mut(|s| {
-                        s.waiting = false;
-                        s.paused = false;
-                        s.status = None;
-                        s.progress = None;
-                    });
+                    canplay_seen.set(true);
+                    seeking_target.set(None);
+                    pending_seek.set(None);
+                    mark_media_ready();
                 }
-                "play" => ui.with_mut(|s| s.paused = false),
+                "play" => {
+                    if closing() || awaiting_ready() {
+                        return;
+                    }
+                    if desired_paused() {
+                        let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                        if waiting_peer {
+                            v.pause();
+                            return;
+                        }
+                        if sync_state.peek().as_ref().is_some_and(|st| st.paused) {
+                            // External play trigger (e.g. MediaSession / headphone button).
+                            desired_paused.set(false);
+                            sync::send(&SyncClientMsg::Play {
+                                position_sec: offset() + v.current_time(),
+                            });
+                        }
+                    }
+                    ui.with_mut(|s| s.paused = false);
+                }
                 "pause" => {
+                    if closing() || awaiting_ready() {
+                        return;
+                    }
+                    let pos = offset() + v.current_time();
+                    if let Some(d) = ui.peek().duration {
+                        if d > 0.0 && d - pos < 0.8 {
+                            return;
+                        }
+                    }
+                    if desired_paused() {
+                        ui.with_mut(|s| s.paused = sync_state.peek().as_ref().is_some_and(|st| st.paused));
+                        return;
+                    }
+                    // External pause trigger (e.g. MediaSession / headphone disconnect).
+                    desired_paused.set(true);
                     ui.with_mut(|s| s.paused = true);
+                    sync::send(&SyncClientMsg::Pause { position_sec: pos });
                     save(false);
                 }
                 "ended" => {
@@ -505,6 +1242,11 @@ pub fn Player(
                         let t = err_token.clone();
                         let key = release.peek().infohash.clone();
                         let preloaded = s.preloaded;
+                        sync::send(&SyncClientMsg::Ready {
+                            position_sec: s.position,
+                            duration_sec: s.duration,
+                            file_index: info.peek().as_ref().map(|i| i.file_index),
+                        });
                         ui.with_mut(|s| {
                             s.src.clear();
                             s.subtitles_src = None;
@@ -521,7 +1263,7 @@ pub fn Player(
                                     .await
                                     .is_ok_and(|p| p.peers > 0 || p.loaded_bytes > 0)
                             };
-                            if play_gen() != my_gen {
+                            if play_gen() != my_gen || closing() {
                                 return;
                             }
                             ui.with_mut(|s| {
@@ -542,8 +1284,18 @@ pub fn Player(
 
     let close = Callback::new({
         let mut save = save.clone();
+        let token = token.clone();
+        let client_id = client_id.clone();
         move |_: ()| {
-            save(false);
+            if closing() {
+                return;
+            }
+            closing.set(true);
+            ws_gen.set(ws_gen() + 1);
+            let s = ui.peek().clone();
+            if !sync_connected() {
+                save(false);
+            }
             if let Some(v) = video() {
                 v.pause();
             }
@@ -554,9 +1306,27 @@ pub fn Player(
                 s.status = None;
             });
             stop_video_element();
-            on_close.call(());
+            sync::stop(Some(&SyncClientMsg::Leave {
+                position_sec: s.position,
+                duration_sec: s.duration,
+                finished: false,
+            }));
+            let leave_req = SyncLeaveRequest {
+                client_id: client_id.clone(),
+                kind,
+                tmdb_id: id,
+                position_sec: s.position,
+                duration_sec: s.duration,
+                finished: false,
+            };
+            let t = token.clone();
+            spawn(async move {
+                let _ = api::sync_leave(&t, &leave_req).await;
+                on_close.call(());
+            });
         }
     });
+
     // On a phone in Telegram the film takes the whole screen, and Telegram's Back closes it.
     use_hook(|| {
         if telegram::is_mobile() {
@@ -572,22 +1342,9 @@ pub fn Player(
     use_hook(show_controls);
 
     // Jump by seconds from the current place (double tap, buttons, keyboard).
-    let mut jump = move |by: f64| {
-        let s = ui.peek().clone();
-        let at = s.position + by;
-        let at = match s.duration {
-            Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
-            None => at.max(0.0),
-        };
-        if s.transcoded {
-            load_source(at);
-        } else if let Some(v) = video() {
-            v.set_current_time(at);
-            ui.with_mut(|s| s.position = at);
-        }
-    };
     let mut flash_jump = move |forward: bool| {
-        jump(if forward { 10.0 } else { -10.0 });
+        let cur = ui.peek().position;
+        seek_to(cur + if forward { 10.0 } else { -10.0 });
         let n = flash_gen() + 1;
         flash_gen.set(n);
         ui.with_mut(|s| {
@@ -604,6 +1361,7 @@ pub fn Player(
             }
         });
     };
+
     let mut set_vol = move |v: f32| {
         let clamped = v.clamp(0.0, 1.0);
         volume.set(clamped);
@@ -640,6 +1398,7 @@ pub fn Player(
         let mut set_vol = set_vol;
         let mut toggle_mute = toggle_mute;
         let mut show_controls = show_controls;
+        let mut toggle_play = toggle_play.clone();
         use_hook(move || {
             spawn(async move {
                 let mut bridge = dioxus::document::eval(
@@ -663,13 +1422,7 @@ pub fn Player(
                 while let Ok(cmd) = bridge.recv::<String>().await {
                     match cmd.as_str() {
                         "toggle" => {
-                            if let Some(v) = video() {
-                                if v.paused() {
-                                    v.play()
-                                } else {
-                                    v.pause()
-                                }
-                            }
+                            toggle_play();
                             show_controls();
                         }
                         "back" => {
@@ -711,7 +1464,7 @@ pub fn Player(
     // Plays episode `n` of the current season.
     let mut play_episode = {
         let mut save = save.clone();
-        let mut begin = begin.clone();
+        let mut begin_playback = begin_playback.clone();
         move |n: i32| {
             let (season, current) = target();
             if n == current {
@@ -720,7 +1473,12 @@ pub fn Player(
             }
             save(false);
             target.set((season, n));
-            begin();
+            sync::send(&SyncClientMsg::Episode {
+                season,
+                episode: n,
+                release: None,
+            });
+            begin_playback(false);
         }
     };
 
@@ -743,19 +1501,20 @@ pub fn Player(
         native::BackButton { on_back: move |_| close.call(()) }
         PlayerView {
             state: shown,
-            on_tap: move |_| {
-                if ui.peek().menu.is_some() {
-                    ui.with_mut(|s| s.menu = None);
-                } else if finger {
-                    if ui.peek().controls {
-                        ui.with_mut(|s| s.controls = false);
+            on_tap: {
+                let mut toggle_play = toggle_play.clone();
+                move |_| {
+                    if ui.peek().menu.is_some() {
+                        ui.with_mut(|s| s.menu = None);
+                    } else if finger {
+                        if ui.peek().controls {
+                            ui.with_mut(|s| s.controls = false);
+                        } else {
+                            show_controls();
+                        }
                     } else {
-                        show_controls();
-                    }
-                } else {
-                    // Mouse: a click on the picture pauses or resumes.
-                    if let Some(v) = video() {
-                        if v.paused() { v.play() } else { v.pause() }
+                        // Mouse: a click on the picture pauses or resumes.
+                        toggle_play();
                     }
                 }
             },
@@ -766,34 +1525,18 @@ pub fn Player(
                 if let Some(v) = video() {
                     v.set_rate(f64::from(r));
                 }
+                sync::send(&SyncClientMsg::Rate {
+                    rate: r,
+                    position_sec: ui.peek().position,
+                });
             },
             on_episode: move |n: i32| play_episode(n),
             on_pick_release: move |_| {
                 let (season, episode) = target();
                 on_need_release.call((season, episode));
             },
-            on_toggle: move |_| {
-                if let Some(v) = video() {
-                    if v.paused() {
-                        v.play();
-                    } else {
-                        v.pause();
-                    }
-                }
-            },
-            on_seek: move |at: f64| {
-                let s = ui.peek().clone();
-                let at = match s.duration {
-                    Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
-                    None => at.max(0.0),
-                };
-                if s.transcoded {
-                    load_source(at);
-                } else if let Some(v) = video() {
-                    v.set_current_time(at);
-                    ui.with_mut(|s| s.position = at);
-                }
-            },
+            on_toggle: move |_| toggle_play(),
+            on_seek: move |at: f64| seek_to(at),
             on_menu: move |m: Option<PlayerMenu>| {
                 ui.with_mut(|s| s.menu = m);
                 show_controls();
@@ -811,9 +1554,19 @@ pub fn Player(
                 let save_tracks = save_tracks.clone();
                 move |a: i32| {
                     let at = ui.peek().position;
+                    let label = ui
+                        .peek()
+                        .audio
+                        .iter()
+                        .find(|t| t.index == a)
+                        .map(|t| t.label());
                     ui.with_mut(|s| {
                         s.audio_track = Some(a);
                         s.menu = None;
+                    });
+                    sync::send(&SyncClientMsg::Audio {
+                        audio_track: label,
+                        position_sec: at,
                     });
                     load_source(at);
                     save_tracks();

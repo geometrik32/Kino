@@ -7,6 +7,7 @@ mod api;
 mod native;
 mod platform;
 mod player;
+mod sync;
 mod telegram;
 
 use player::{PlayStart, Player};
@@ -366,11 +367,11 @@ fn Main(
     // A link to a title (from a bot message) opens it, with Home behind it.
     let link = use_hook(telegram::open_target);
     use_hook(|| {
-        let initial_url = link.map(|(k, id)| format!("/?open={}_{id}", k.as_str()));
+        let initial_url = link.map(|t| format!("/?open={}_{}", t.kind.as_str(), t.tmdb_id));
         telegram::init_history(link.is_some(), initial_url.as_deref());
     });
     let mut view = use_signal(|| match link {
-        Some((kind, id)) => View::Title(kind, id, false),
+        Some(t) => View::Title(t.kind, t.tmdb_id, t.autoplay),
         None => View::Tab(Tab::Home),
     });
     // Where "Back" goes from a title page.
@@ -1173,7 +1174,7 @@ fn Title(
     });
     let mut sort = use_signal(ReleaseSort::default);
     let mut panel = use_signal(|| None::<PickerPanel>);
-    let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate)>);
+    let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate, bool, bool)>);
     let mut auto = use_signal(|| autoplay);
     let mut overlay_pushed = use_signal(|| false);
     let mut notice_pushed = use_signal(|| false);
@@ -1273,6 +1274,7 @@ fn Title(
     };
     let latest = choices.first().cloned();
     let (target, play_label) = play_target(&details, &progress);
+    let default_target = target.clone();
     let release_label = choice_for(season_key(&target)).map(|c| choice_label(&c));
     let watched: Vec<String> = progress
         .iter()
@@ -1328,6 +1330,7 @@ fn Title(
     let on_play = Callback::new({
         let choice_for = choice_for.clone();
         let mut open_picker = open_picker.clone();
+        let default_target = default_target.clone();
         move |t: PlayTarget| {
             telegram::haptic(telegram::Haptic::Tap);
             match choice_for(season_key(&t)) {
@@ -1336,7 +1339,8 @@ fn Title(
                         overlay_pushed.set(true);
                         telegram::push_history(None);
                     }
-                    playing.set(Some((t, c)));
+                    let explicit_ep = t.season != default_target.season || t.episode != default_target.episode;
+                    playing.set(Some((t, c, explicit_ep, false)));
                 }
                 None => {
                     open_picker(t);
@@ -1363,7 +1367,7 @@ fn Title(
     let main_target = target.clone();
     rsx! {
         // Inside Telegram: the native big button plays, the native Back closes what is open.
-        if playing().is_none() && picker().is_none() && notice().is_none() {
+        if !auto() && playing().is_none() && picker().is_none() && notice().is_none() {
             native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
         }
         if picker().is_some() {
@@ -1497,7 +1501,9 @@ fn Title(
                         v.insert(0, choice.clone());
                     });
                     picker.set(None);
-                    playing.set(Some((target.clone(), choice.clone())));
+                    let explicit_ep =
+                        target.season != default_target.season || target.episode != default_target.episode;
+                    playing.set(Some((target.clone(), choice.clone(), explicit_ep, true)));
                     let t = t3.clone();
                     spawn(async move {
                         let _ = api::save_release_choice(&t, &choice).await;
@@ -1544,7 +1550,7 @@ fn Title(
                 }
             }
         }
-        if let Some((t, rel)) = playing() {
+        if let Some((t, rel, explicit_episode, explicit_release)) = playing() {
             Player {
                 key: "{t.season}-{t.episode}-{rel.infohash}",
                 token: token.clone(),
@@ -1557,6 +1563,8 @@ fn Title(
                     episode: t.episode,
                     choices: choices.clone(),
                     release: rel,
+                    explicit_episode,
+                    explicit_release,
                 },
                 on_close: move |_| {
                     playing.set(None);

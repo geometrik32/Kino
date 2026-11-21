@@ -10,6 +10,7 @@ pub mod error;
 pub mod jobs;
 pub mod play;
 pub mod session;
+pub mod sync;
 pub mod telegram_auth;
 pub mod torrent;
 pub mod userdata;

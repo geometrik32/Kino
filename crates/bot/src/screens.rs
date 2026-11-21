@@ -5,7 +5,7 @@
 use kino_core::{clock, episode_code, ContinueItem, MediaKind, TitleDetails, TitleStatus, TitleSummary};
 use kino_server::catalog::{RandomMovieFilter, RandomMoviePick};
 use teloxide::{
-    types::{ButtonRequest, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, WebAppInfo},
+    types::{InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, KeyboardMarkup, WebAppInfo},
     utils::html::escape as esc,
 };
 use url::Url;
@@ -262,13 +262,19 @@ pub fn title_url(base: &Url, kind: MediaKind, tmdb_id: i64) -> Url {
     url
 }
 
+/// The app opened on a title and started playing right away: `<site>/?open=tv_1396&play=1`.
+pub fn title_play_url(base: &Url, kind: MediaKind, tmdb_id: i64) -> Url {
+    let mut url = title_url(base, kind, tmdb_id);
+    url.query_pairs_mut().append_pair("play", "1");
+    url
+}
+
+fn open_title_url(label: String, url: Url) -> InlineKeyboardButton {
+    InlineKeyboardButton::web_app(label, WebAppInfo { url })
+}
+
 fn open_title(label: String, base: &Url, kind: MediaKind, tmdb_id: i64) -> InlineKeyboardButton {
-    InlineKeyboardButton::web_app(
-        label,
-        WebAppInfo {
-            url: title_url(base, kind, tmdb_id),
-        },
-    )
+    open_title_url(label, title_url(base, kind, tmdb_id))
 }
 
 pub fn open_app(base: &Url, label: &str) -> InlineKeyboardButton {
@@ -329,10 +335,9 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     format!("{clean}…")
 }
 
-/// Persistent keyboard in private chats showing all available bot commands.
-pub fn main_reply_keyboard(app_url: &Url, is_admin: bool) -> KeyboardMarkup {
+/// Persistent keyboard in private chats showing bot commands without duplicating the left WebApp button.
+pub fn main_reply_keyboard(is_admin: bool) -> KeyboardMarkup {
     let mut rows = vec![
-        vec![KeyboardButton::new(BTN_OPEN_APP).request(ButtonRequest::WebApp(WebAppInfo { url: app_url.clone() }))],
         vec![KeyboardButton::new(BTN_RANDOM), KeyboardButton::new(BTN_SEARCH)],
         vec![KeyboardButton::new(BTN_CONTINUE), KeyboardButton::new(BTN_MY)],
         vec![KeyboardButton::new(BTN_LOGIN), KeyboardButton::new(BTN_HELP)],
@@ -367,9 +372,16 @@ fn command_inline_rows(base: &Url, is_admin: bool) -> Vec<Vec<InlineKeyboardButt
 pub fn start_welcome_text() -> &'static str {
     "<b>Орловский кинопоказ</b>\n\
      Ваш личный кинотеатр с единой историей и прогрессом на всех устройствах.\n\n\
+     • Кнопка <b>«Кино»</b> слева от поля ввода открывает кинотеатр\n\
      • Напишите название фильма в чат — пришлю карточки с постером и описанием\n\
-     • Нажмите <b>🎲 Случайный фильм</b> — подберу кино под настроение и длительность\n\
-     • Выберите нужное действие на кнопках ниже"
+     • Кнопки внизу запускают подбор случайного фильма, поиск, продолжение и списки"
+}
+
+pub fn invite_welcome(app_url: &Url) -> Screen {
+    Screen::new(
+        start_welcome_text().to_owned(),
+        vec![vec![open_app(app_url, "🎬 Открыть по приглашению")]],
+    )
 }
 
 pub fn start_inline(app_url: &Url, is_admin: bool) -> Screen {
@@ -747,11 +759,9 @@ pub fn continue_list(base: &Url, rows: &[ContinueRow]) -> Screen {
     for r in rows.iter().take(LIST_LIMIT) {
         let name = row_title(&r.title, r.item.last.kind);
         text.push_str(&format!("\n• <b>{}</b>, {}", esc(&name), progress_line(&r.item)));
-        buttons.push(vec![open_title(
+        buttons.push(vec![open_title_url(
             format!("▶ {name}"),
-            base,
-            r.item.last.kind,
-            r.item.last.tmdb_id,
+            title_play_url(base, r.item.last.kind, r.item.last.tmdb_id),
         )]);
     }
     Screen::new(text, buttons)
@@ -862,6 +872,10 @@ mod tests {
             title_url(&base(), MediaKind::Tv, 1396).as_str(),
             "https://kino.example.com/?open=tv_1396"
         );
+        assert_eq!(
+            title_play_url(&base(), MediaKind::Tv, 1396).as_str(),
+            "https://kino.example.com/?open=tv_1396&play=1"
+        );
     }
 
     #[test]
@@ -921,9 +935,9 @@ mod tests {
 
     #[test]
     fn reply_keyboard_and_button_parser_cover_all_commands() {
-        let kb = main_reply_keyboard(&base(), false);
+        let kb = main_reply_keyboard(false);
         let texts: Vec<_> = kb.keyboard.iter().flatten().map(|b| b.text.as_str()).collect();
-        assert!(texts.contains(&BTN_OPEN_APP));
+        assert!(!texts.contains(&BTN_OPEN_APP));
         assert!(texts.contains(&BTN_RANDOM));
         assert!(texts.contains(&BTN_SEARCH));
         assert!(texts.contains(&BTN_CONTINUE));
@@ -932,7 +946,7 @@ mod tests {
         assert!(texts.contains(&BTN_HELP));
         assert!(!texts.contains(&BTN_INVITE));
 
-        let admin_kb = main_reply_keyboard(&base(), true);
+        let admin_kb = main_reply_keyboard(true);
         let admin_texts: Vec<_> = admin_kb.keyboard.iter().flatten().map(|b| b.text.as_str()).collect();
         assert!(admin_texts.contains(&BTN_INVITE));
 
@@ -1054,6 +1068,14 @@ mod tests {
         assert!(s.text.contains("<b>Фильм</b>, остановились на 1:02:05 из 50:00"));
         assert_eq!(s.keyboard.inline_keyboard.len(), 3);
         assert_eq!(s.keyboard.inline_keyboard[0][0].text, "▶ Во все тяжкие");
+        assert_eq!(
+            web_app_url(&s.keyboard.inline_keyboard[0][0]),
+            "https://kino.example.com/?open=tv_7&play=1"
+        );
+        assert_eq!(
+            web_app_url(&s.keyboard.inline_keyboard[2][0]),
+            "https://kino.example.com/?open=movie_7&play=1"
+        );
     }
 
     #[test]

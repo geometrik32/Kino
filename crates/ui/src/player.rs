@@ -1,8 +1,11 @@
 //! The video player: a `<video>` with our own cinema floating glass controls,
 //! unified Audio/Subtitles menu, screen lock, live scrub tooltip and desktop volume.
 
+use std::rc::Rc;
+
+use dioxus::html::MountedData;
 use dioxus::prelude::*;
-use kino_core::{clock, MediaTrack, StreamProgress};
+use kino_core::{clock, MediaTrack, StreamProgress, SyncMemberInfo};
 
 use crate::icons::{self, Icon};
 
@@ -16,6 +19,7 @@ pub enum PlayerMenu {
     Subtitles,
     Speed,
     Episodes,
+    Sync,
 }
 
 /// Playback speeds offered in the menu.
@@ -90,6 +94,14 @@ pub struct PlayerState {
     pub episodes: Vec<PlayerEpisode>,
     /// "«10 с» / «10 с»»" feedback after a double tap: forward or back, total seconds.
     pub flash: Option<(bool, i32)>,
+    /// Auto-start `<video>` when loaded (false while joining a paused/waiting sync room).
+    pub autoplay: bool,
+    /// Devices currently connected to the live playback sync room.
+    pub sync_members: Vec<SyncMemberInfo>,
+    /// Device names currently holding the buffering barrier.
+    pub sync_waiting_for: Vec<String>,
+    /// Identifier of this client inside `sync_members`.
+    pub sync_client_id: String,
 }
 
 impl Default for PlayerState {
@@ -125,6 +137,10 @@ impl Default for PlayerState {
             episode: 0,
             episodes: Vec::new(),
             flash: None,
+            autoplay: true,
+            sync_members: Vec::new(),
+            sync_waiting_for: Vec::new(),
+            sync_client_id: String::new(),
         }
     }
 }
@@ -188,6 +204,8 @@ pub fn PlayerView(
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
     let mut scrub = use_signal(|| None::<f64>);
+    let mut track_el = use_signal(|| None::<Rc<MountedData>>);
+    let mut drag_rect = use_signal(|| None::<(f64, f64)>);
     let mut dismissed_next = use_signal(|| None::<String>);
 
     let s = state;
@@ -218,11 +236,13 @@ pub fn PlayerView(
                 id: VIDEO_ID,
                 src: if s.src.is_empty() { None } else { Some(s.src.clone()) },
                 poster: s.poster.clone().unwrap_or_default(),
-                autoplay: true,
+                autoplay: s.autoplay,
                 playsinline: true,
                 preload: "auto",
                 ontimeupdate: move |_| on_video.call("time"),
                 onloadedmetadata: move |_| on_video.call("metadata"),
+                oncanplay: move |_| on_video.call("canplay"),
+                onseeked: move |_| on_video.call("seeked"),
                 onwaiting: move |_| on_video.call("waiting"),
                 onplaying: move |_| on_video.call("playing"),
                 onpause: move |_| on_video.call("pause"),
@@ -318,6 +338,32 @@ pub fn PlayerView(
                             },
                             Icon { svg: icons::LOCK, class: "ic sm" }
                         }
+                        if s.sync_members.len() > 1 {
+                            {
+                                let sync_count = s.sync_members.len();
+                                let sync_wait = !s.sync_waiting_for.is_empty();
+                                let sync_title = if sync_wait {
+                                    format!("Синхронизация ({sync_count} устр.) · ждём: {}", s.sync_waiting_for.join(", "))
+                                } else {
+                                    format!("Синхронизация активна ({sync_count} устр.)")
+                                };
+                                rsx! {
+                                    button {
+                                        class: if s.menu == Some(PlayerMenu::Sync) {
+                                            "p-glass-btn icon p-sync-btn active"
+                                        } else if sync_wait {
+                                            "p-glass-btn icon p-sync-btn wait"
+                                        } else {
+                                            "p-glass-btn icon p-sync-btn"
+                                        },
+                                        title: "{sync_title}",
+                                        "aria-label": "{sync_title}",
+                                        onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Sync) { None } else { Some(PlayerMenu::Sync) }),
+                                        span { class: "p-sync-dot" }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -378,7 +424,42 @@ pub fn PlayerView(
                 div { class: "p-dock",
                     div { class: "p-seek-row",
                         span { class: "p-time", "{clock(display_pos)}" }
-                        div { class: "p-track",
+                        div {
+                            class: "p-track",
+                            onmounted: move |e| track_el.set(Some(e.data())),
+                            onpointerdown: move |e| {
+                                let Some(el) = track_el() else { return };
+                                let cy = e.client_coordinates().y;
+                                spawn(async move {
+                                    if let Ok(rect) = el.get_client_rect().await {
+                                        if rect.height() > rect.width() && rect.height() > 1.0 {
+                                            let top = rect.min_y();
+                                            let h = rect.height();
+                                            drag_rect.set(Some((top, h)));
+                                            let frac = ((cy - top) / h).clamp(0.0, 1.0);
+                                            scrub.set(Some(frac * dur.max(1.0)));
+                                        }
+                                    }
+                                });
+                            },
+                            onpointermove: move |e| {
+                                if let Some((top, h)) = drag_rect() {
+                                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                                    scrub.set(Some(frac * dur.max(1.0)));
+                                }
+                            },
+                            onpointerup: move |e| {
+                                if let Some((top, h)) = drag_rect.take() {
+                                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                                    let v = frac * dur.max(1.0);
+                                    scrub.set(None);
+                                    on_seek.call(v);
+                                }
+                            },
+                            onpointercancel: move |_| {
+                                drag_rect.set(None);
+                                scrub.set(None);
+                            },
                             div { class: "p-fill", style: "width: {pct:.2}%" }
                             if scrub().is_some() {
                                 div { class: "p-tip", style: "left: {pct:.2}%", "{clock(display_pos)}" }
@@ -467,14 +548,14 @@ pub fn PlayerView(
                                 span { class: "long", "Серии" }
                             }
                         }
-                        // Unified Audio + Subtitles button (no separate CC button!).
+                        // Unified Audio + Subtitles button (icon-only on phones so all controls fit cleanly).
                         button {
-                            class: if audio_sub_open { "p-glass-btn active" } else { "p-glass-btn" },
+                            class: if audio_sub_open { "p-glass-btn audio-btn active" } else { "p-glass-btn audio-btn" },
                             title: "Звук и субтитры",
+                            "aria-label": "Звук и субтитры",
                             onclick: move |_| on_menu.call(if audio_sub_open { None } else { Some(PlayerMenu::Audio) }),
                             Icon { svg: icons::AUDIO_CC, class: "ic sm" }
                             span { class: "long", "Звук и субтитры" }
-                            span { class: "short", "Звук" }
                         }
                         button {
                             class: if s.menu == Some(PlayerMenu::Speed) { "p-glass-btn active" } else { "p-glass-btn" },
@@ -496,6 +577,7 @@ pub fn PlayerView(
                     div {
                         class: match menu {
                             PlayerMenu::Speed => "p-popover speed",
+                            PlayerMenu::Sync => "p-popover sync",
                             _ => "p-popover",
                         },
                         if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
@@ -587,6 +669,53 @@ pub fn PlayerView(
                                         class: if (rate - r).abs() < 0.001 { "p-opt on" } else { "p-opt" },
                                         onclick: move |_| on_speed.call(r),
                                         "{speed_label(r)}"
+                                    }
+                                }
+                            }
+                        } else if menu == PlayerMenu::Sync {
+                            h4 { "Синхронизация · {s.sync_members.len()} устр." }
+                            p { class: "muted small p-pop-note p-sync-note",
+                                "Воспроизведение, пауза, скорость и перемотка синхронизируются."
+                            }
+                            div { class: "p-sync-list",
+                                for m in s.sync_members.clone() {
+                                    {
+                                        let is_self = !s.sync_client_id.is_empty() && m.client_id == s.sync_client_id;
+                                        let dev_lower = m.device.to_lowercase();
+                                        let icon_svg = if dev_lower.contains("телефон")
+                                            || dev_lower.contains("android")
+                                            || dev_lower.contains("iphone")
+                                            || dev_lower.contains("telegram")
+                                        {
+                                            icons::PHONE
+                                        } else if dev_lower.contains("тв") || dev_lower.contains("tv") {
+                                            icons::TV
+                                        } else {
+                                            icons::LAPTOP
+                                        };
+                                        let (status_txt, status_cls) = if !m.ready {
+                                            ("Подключается…", "p-sync-badge wait")
+                                        } else if m.buffering {
+                                            ("Буферизация…", "p-sync-badge wait")
+                                        } else if s.paused {
+                                            ("На паузе", "p-sync-badge")
+                                        } else {
+                                            ("Смотрит", "p-sync-badge ok")
+                                        };
+                                        rsx! {
+                                            div {
+                                                key: "{m.client_id}",
+                                                class: if is_self { "p-sync-row self" } else { "p-sync-row" },
+                                                Icon { svg: icon_svg, class: "ic sm muted" }
+                                                div { class: "p-sync-meta",
+                                                    div { class: "p-sync-name", "{m.device}" }
+                                                    if is_self {
+                                                        div { class: "p-sync-sub", "Это устройство" }
+                                                    }
+                                                }
+                                                span { class: "{status_cls}", "{status_txt}" }
+                                            }
+                                        }
                                     }
                                 }
                             }

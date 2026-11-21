@@ -33,6 +33,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub catalog: Arc<dyn Catalog>,
     pub media: Arc<crate::play::Media>,
+    pub sync: Arc<crate::sync::SyncHub>,
     pub telegram: reqwest::Client,
 }
 
@@ -76,6 +77,9 @@ pub fn router() -> Router<AppState> {
         .route("/catalog/tv/{tmdb_id}/season/{number}", get(catalog_season))
         .route("/img/{size}/{file}", get(image))
         .route("/avatar/{token}", get(crate::avatar::serve))
+        .route("/sync/join", post(crate::sync::join))
+        .route("/sync/leave", post(crate::sync::leave))
+        .route("/sync/ws", get(crate::sync::ws))
         .merge(crate::play::routes())
 }
 
@@ -210,7 +214,7 @@ async fn continue_watching(
 
 /// BitTorrent v1 (SHA-1) or v2 (SHA-256) info-hash in hex.
 /// An info-hash (v1 or v2), or the placeholder key of a release found by the indexer.
-fn infohash_ok(h: &str) -> bool {
+pub(crate) fn infohash_ok(h: &str) -> bool {
     (matches!(h.len(), 40 | 64) && h.bytes().all(|b| b.is_ascii_hexdigit())) || kino_core::is_release_key(h)
 }
 
@@ -240,21 +244,39 @@ fn validate(u: &ProgressUpdate) -> Result<(), AppError> {
     Ok(())
 }
 
-async fn save_progress(
-    State(state): State<AppState>,
-    user: CurrentUser,
-    Json(mut u): Json<ProgressUpdate>,
-) -> Result<Json<Progress>, AppError> {
+pub async fn persist_progress(state: &AppState, user_id: i64, mut u: ProgressUpdate) -> Result<Progress, AppError> {
     validate(&u)?;
     if let Some(r) = &mut u.release {
         r.infohash.make_ascii_lowercase();
     }
-    let p = db::save_progress(&state.pool, user.0, &u).await?;
-    userdata::refresh_status(&state.pool, &*state.catalog, user.0, p.kind, p.tmdb_id, true).await?;
+    let p = db::save_progress(&state.pool, user_id, &u).await?;
+    userdata::refresh_status(&state.pool, &*state.catalog, user_id, p.kind, p.tmdb_id, true).await?;
     if p.finished {
-        after_finished(&state, user.0, p.kind, p.tmdb_id, p.season, p.episode).await?;
+        after_finished(state, user_id, p.kind, p.tmdb_id, p.season, p.episode).await?;
     }
-    Ok(Json(p))
+    Ok(p)
+}
+
+async fn save_progress(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(u): Json<ProgressUpdate>,
+) -> Result<Json<Progress>, AppError> {
+    validate(&u)?;
+    if !state.sync.should_accept_http_progress(user.0, &u) {
+        let (season, episode) = match u.kind {
+            MediaKind::Movie => (0, 0),
+            MediaKind::Tv => (u.season, u.episode),
+        };
+        if let Some(existing) = db::title_progress(&state.pool, user.0, u.kind, u.tmdb_id)
+            .await?
+            .into_iter()
+            .find(|p| p.season == season && p.episode == episode)
+        {
+            return Ok(Json(existing));
+        }
+    }
+    Ok(Json(persist_progress(&state, user.0, u).await?))
 }
 
 /// A film, or the last episode of a season, is watched: its preload goes after a while.

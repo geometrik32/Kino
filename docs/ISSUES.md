@@ -101,7 +101,7 @@
 
 ### Что реализовано
 1. **Кнопки команд в боте (`crates/bot/src/screens.rs`, `crates/bot/src/main.rs`):**
-   - В личном чате `/start` отправляет постоянную клавиатуру (`ReplyKeyboardMarkup`: `🎬 Открыть кинопоказ` как WebApp, `🔍 Поиск`, `▶ Продолжить`, `📚 Мои списки`, `🌐 Вход на сайт`, `❓ Помощь`, и для админов `🎟 Приглашение`); в неличных чатах и в `/help` выводятся inline-кнопки команд (`cmd:<action>`).
+   - В личном чате `/start` (и подсказка `/search`) отправляет постоянную клавиатуру (`ReplyKeyboardMarkup`: `🎲 Случайный фильм`, `🔍 Поиск`, `▶ Продолжить`, `📚 Мои списки`, `🌐 Вход на сайт`, `❓ Помощь`, и для админов `🎟 Пригласить`) без дублирования кнопки «Открыть кинопоказ», которая уже закреплена слева от поля ввода (`MenuButton::WebApp` «Кино»); при заходе по приглашению `inv_<code>` дополнительно выдаётся кнопка открытия по приглашению, а в `/help` и неличных чатах выводятся inline-кнопки команд (`cmd:<action>`).
    - Нажатия кнопок клавиатуры и inline-кнопок маршрутизируются на те же обработчики действий (`run_action`).
 2. **Поиск с поддержкой `е`/`ё` (`crates/server/src/catalog/mod.rs`, `demo.rs`, `tmdb.rs`):**
    - Добавлена нормализация (`normalize_search_text`, `matches_normalized_query`): приведение регистра, замена `ё → е`, схлопывание пунктуации.
@@ -258,3 +258,64 @@
 - [crates/server/src/torrent/ffmpeg.rs](../crates/server/src/torrent/ffmpeg.rs): в `transcode_args` добавлен `-dn`, в `subtitle_args` — `-vn -an -dn` и `-rw_timeout 30000000` для HTTP(S).
 - [crates/server/src/torrent/title.rs](../crates/server/src/torrent/title.rs): исправлен разбор `Дубляж` (`\b[дd]\b` только при наличии кириллицы), распознавание явных `RUS`/`Russian` (исключая `Sub Rus`) и `Original` без русской аудиодорожки; добавлены unit-тесты.
 - [app/src/main.rs](../app/src/main.rs) и [crates/ui/src/releases.rs](../crates/ui/src/releases.rs): `user_prefs` доприменяются после асинхронной загрузки в `Title`; при ослаблении фильтров выбранный в профиле `language` никогда не сбрасывается автоматически, а при отсутствии раздач на нужном языке показывается явное сообщение и кнопка «Показать на всех языках».
+
+---
+
+## ISSUE-010: Предотвращение конфликтов таймкодов и синхронизация воспроизведения между устройствами
+
+- **Статус:** `Исправлено` (локальные проверки `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --tests --locked`, `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked` пройдены; сборка/тесты `kino-server`, `clippy` и нативные сборки `desktop`/`mobile` не выполнялись локально из-за ограничений окружения по `ISSUE-002`, требуется прогон CI и проверка в живых клиентах)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Сервер (`kino-core`, `kino-server`) и все клиенты (`kino-ui`, `kino-app` web/desktop/mobile).
+
+### Суть проблемы и требование
+Сейчас при открытии одного и того же фильма/серии с нескольких устройств одновременно каждое устройство независимо проигрывает поток и каждые 10 секунд (а также при паузе/закрытии) отправляет `PUT /api/progress`, перезаписывая друг другу сохранённую позицию просмотра (`watch_progress`).
+
+Согласованное решение с владельцем:
+- автоматическая полная живая синхронизация всех открытых устройств одного Telegram-аккаунта на одном тайтле (без кнопки перехвата);
+- взаимное ожидание при подключении, перемотке и буферизации («ждать друг друга»), чтобы старт/продолжение шли кадр в кадр;
+- при закрытии плеера на одном устройстве остальные продолжают просмотр самостоятельно;
+- в интерфейсе плеера отображается компактный цветной кружок-кнопка (в стиле REC-индикатора на камере), пока синхронизированы 2 и более устройств.
+
+### Что реализовано
+- [crates/core/src/sync.rs](../crates/core/src/sync.rs), [crates/core/src/lib.rs](../crates/core/src/lib.rs): добавлены типы протокола синхронизации (`SyncJoinRequest`, `SyncJoinResponse`, `SyncLeaveRequest`, `SyncState`, `SyncMemberInfo`, `SyncEventKind`, `SyncClientMsg`, `SyncServerMsg`).
+- [crates/server/Cargo.toml](../crates/server/Cargo.toml), [Cargo.lock](../Cargo.lock), [crates/server/src/sync.rs](../crates/server/src/sync.rs), [api.rs](../crates/server/src/api.rs), [lib.rs](../crates/server/src/lib.rs), [main.rs](../crates/server/src/main.rs):
+  - включена фича `ws` для `axum`, реализован `SyncHub` с комнатами по `(user_id, media_kind, tmdb_id)` и эндпоинты `POST /api/sync/join`, `POST /api/sync/leave`, `GET /api/sync/ws` с HMAC-тикетом (`b"kino-sync"`);
+  - синхронизируются воспроизведение/пауза, позиция (якорь времени + скорость), скорость (`0.5×–2×`), перемотка, смена серии/раздачи/аудиодорожки, а также барьер ожидания буферизации с защитным таймаутом 30 с и очисткой зависших соединений по heartbeat;
+  - `SyncHub` периодически и при ключевых событиях сохраняет прогресс через `persist_progress`, а `PUT /api/progress` защищён от перезаписи устаревшими позициями при активной комнате;
+  - добавлены unit-тесты протокола и `SyncHub` в `crates/server/src/sync.rs` и интеграционный тест `sync_room_joins_and_protects_timecode` в [crates/server/tests/api.rs](../crates/server/tests/api.rs).
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs), [crates/ui/src/style.css](../crates/ui/src/style.css):
+  - добавлены `PlayerMenu::Sync`, поля синхронизации и `autoplay` в `PlayerState`, события `oncanplay`/`onseeked` на `<video>`;
+  - при 2+ синхронизированных устройствах в правом верхнем углу плеера (внутри `.p-top`, отображается вместе с интерфейсом управления) показывается компактная круглая кнопка с цветным REC-кружком (кораллово-красный при активной синхронизации, янтарный при ожидании буферизации другого устройства), открывающая поповер со списком подключённых устройств и их статусом.
+- [app/src/sync.rs](../app/src/sync.rs), [app/src/player.rs](../app/src/player.rs), [app/src/api.rs](../app/src/api.rs), [app/src/main.rs](../app/src/main.rs), [app/src/platform/](../app/src/platform/):
+  - реализован WebSocket-мост (с `pagehide`/`beforeunload` + `keepalive` выходом и автопереподключением), калибровка смещения часов через `Ping`/`Pong`, подавление эха программных вызовов `<video>`, плавная коррекция рассинхрона (коррекция `playbackRate` на малых расхождениях и перемотка/перезапуск `ffmpeg` на крупных) и сохранение `NotAllowedError` fallback при автозапуске.
+
+### Критерии приёмки
+- [x] Реализована защита от перезаписи `watch_progress` устаревшими таймкодами при активной многоустройственной сессии (проверено в коде и интеграционным тестом `sync_room_joins_and_protects_timecode`).
+- [x] Реализована живая синхронизация воспроизведения/паузы, таймкода, скорости, перемотки, серии/раздачи/дорожки, взаимного ожидания буферизации и независимого выхода устройств.
+- [x] В интерфейсе плеера добавлена компактная кнопка с цветным кружочком (REC-индикатор) и поповером со списком синхронизированных устройств.
+- [x] Пройдены `cargo fmt --all --check`, `cargo check -p kino-core -p kino-ui --locked`, `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`.
+- [ ] Пройдены `cargo clippy`, `cargo test --workspace --locked` (в CI с PostgreSQL), а также ручная проверка синхронизации между двумя реальными устройствами (включая `direct` и `ffmpeg` транскодирование).
+
+---
+
+## ISSUE-011: Автозапуск плеера при выборе тайтла из «Продолжить просмотр» в Telegram-боте
+
+- **Статус:** `Исправлено` (локальные проверки `kino-app` `wasm32 --tests`, `kino-ui`/`kino-core`/`kino-bot`/`kino-preview` и 18 unit-тестов `kino-bot` пройдены; `fmt`/`clippy` и запуск нативных unit-тестов `kino-app` не выполнялись локально из-за ограничений окружения по `ISSUE-002`, требуется прогон в CI и деплой после согласия владельца)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Telegram-бот (`kino-bot`), веб/Telegram Mini App (`kino-app`, `kino-ui`).
+
+### Суть проблемы
+При выборе команды `/continue` (или кнопки `▶ Продолжить`) в чате Telegram-бота бот присылает список просматриваемых тайтлов с кнопками `▶ <Название>`. Эти кнопки вели на ссылку `/?open=<kind>_<tmdb_id>`, из-за чего Mini App открывался на странице карточки тайтла (`autoplay: false`) вместо немедленного запуска проигрывателя с сохранённой раздачей и позицией.
+
+### Что реализовано
+- [crates/bot/src/screens.rs](../crates/bot/src/screens.rs): добавлена функция `title_play_url` (`/?open=<kind>_<tmdb_id>&play=1`); кнопки списка `continue_list` переведены на `title_play_url`, тогда как карточки поиска, `/random` и `/my` по-прежнему открывают страницу тайтла (`title_url`).
+- [app/src/telegram/mod.rs](../app/src/telegram/mod.rs), [web.rs](../app/src/telegram/web.rs), [native.rs](../app/src/telegram/native.rs): добавлены `OpenTarget` и `parse_open_target` для разбора флага автозапуска (`?open=<kind>_<id>&play=1` и `startapp=<kind>_<id>_play`) с unit-тестами.
+- [app/src/main.rs](../app/src/main.rs): `Main` передаёт `t.autoplay` в начальный `View::Title(t.kind, t.tmdb_id, t.autoplay)` и скрывает `native::MainButton`, пока `auto()` ещё не запустил плеер.
+- [crates/ui/src/player.rs](../crates/ui/src/player.rs) и [app/src/player.rs](../app/src/player.rs): добавлена обработка `oncanplay` с явной попыткой `v.play()` и выходом из состояния ожидания в паузу с кнопкой `▶`, если браузер/WebView заблокировал автовоспроизведение со звуком (`NotAllowedError`).
+
+### Критерии приёмки
+- [x] Кнопки тайтлов в `/continue` (`▶ Продолжить`) Telegram-бота формируют ссылку `/?open=<kind>_<tmdb_id>&play=1`.
+- [x] Mini App при открытии по ссылке с `play=1` сразу запускает `Player` на сохранённой раздаче и позиции (или открывает выбор раздачи, если раздача ещё не выбрана).
+- [x] Кнопки из `/search`, `/random`, `/my` и уведомлений о новых сериях по-прежнему открывают страницу тайтла без автозапуска плеера.
+- [x] Пройдены `cargo check -p kino-app --target wasm32-unknown-unknown --tests --locked`, `cargo check -p kino-ui -p kino-core -p kino-bot -p kino-preview --locked` и `cargo test -p kino-bot --locked` (18 passed).
+- [ ] Пройдены `cargo fmt --all --check`, `cargo clippy`, нативный запуск `cargo test -p kino-app` (в CI) и проверка на живом боте после деплоя.

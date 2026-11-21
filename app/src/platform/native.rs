@@ -71,6 +71,20 @@ pub fn now() -> (chrono::DateTime<chrono::Utc>, i32) {
     )
 }
 
+/// Current unix epoch milliseconds.
+pub fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// Unique per-player-mount identifier for sync rooms.
+pub fn random_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let ts = chrono::Utc::now().timestamp_millis() as u64;
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("n-{ts:x}-{seq:x}")
+}
+
 /// Full screen on or off.
 pub fn toggle_fullscreen() {
     let _ = eval(

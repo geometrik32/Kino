@@ -6,8 +6,8 @@ use kino_core::{
     ApiError, AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest,
     LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayRequest, PreloadItem, PreloadRequest,
     Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, SearchResults, Season,
-    ShelfPage, StatusUpdate, StreamProgress, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate,
-    UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
+    ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse, SyncLeaveRequest, TitleDetails,
+    TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -263,4 +263,12 @@ pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, 
 pub async fn set_tracks(token: &str, kind: MediaKind, id: i64, t: &TracksUpdate) -> Result<TitleState, Failure> {
     let path = format!("/api/title/{}/{id}/tracks", kind.as_str());
     send("PUT", &path, token, Some(t)).await
+}
+
+pub async fn sync_join(token: &str, req: &SyncJoinRequest) -> Result<SyncJoinResponse, Failure> {
+    send("POST", "/api/sync/join", token, Some(req)).await
+}
+
+pub async fn sync_leave(token: &str, req: &SyncLeaveRequest) -> Result<(), Failure> {
+    send("POST", "/api/sync/leave", token, Some(req)).await
 }

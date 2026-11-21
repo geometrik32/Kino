@@ -34,11 +34,22 @@ mod imp {
         pub fn paused(&self) -> bool {
             self.0.paused()
         }
+        pub fn ready_state(&self) -> u16 {
+            self.0.ready_state()
+        }
         pub fn set_current_time(&self, t: f64) {
             self.0.set_current_time(t);
         }
         pub fn play(&self) {
-            let _ = self.0.play();
+            thread_local! {
+                static IGNORE_ERR: wasm_bindgen::closure::Closure<dyn FnMut(wasm_bindgen::JsValue)> =
+                    wasm_bindgen::closure::Closure::new(|_| {});
+            }
+            if let Ok(p) = self.0.play() {
+                IGNORE_ERR.with(|cb| {
+                    let _ = p.catch(cb);
+                });
+            }
         }
         pub fn pause(&self) {
             let _ = self.0.pause();
@@ -73,12 +84,14 @@ mod imp {
         time: f64,
         duration: f64,
         paused: bool,
+        ready_state: u16,
     }
 
     static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot {
         time: 0.0,
         duration: f64::NAN,
         paused: true,
+        ready_state: 0,
     });
 
     pub struct Video;
@@ -105,6 +118,9 @@ mod imp {
         pub fn paused(&self) -> bool {
             snapshot().paused
         }
+        pub fn ready_state(&self) -> u16 {
+            snapshot().ready_state
+        }
         pub fn set_current_time(&self, t: f64) {
             SNAPSHOT.lock().expect("video snapshot").time = t;
             run(format!(
@@ -113,7 +129,9 @@ mod imp {
         }
         pub fn play(&self) {
             SNAPSHOT.lock().expect("video snapshot").paused = false;
-            run(format!("var v=document.getElementById('{VIDEO_ID}'); if(v) v.play();"));
+            run(format!(
+                "var v=document.getElementById('{VIDEO_ID}'); if(v){{var p=v.play(); if(p&&p.catch)p.catch(function(){{}});}}"
+            ));
         }
         pub fn pause(&self) {
             SNAPSHOT.lock().expect("video snapshot").paused = true;
@@ -145,14 +163,15 @@ mod imp {
                 let mut bridge = eval(&format!(
                     "setInterval(function () {{ \
                        var v = document.getElementById('{VIDEO_ID}'); \
-                       if (v) dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused]); \
+                       if (v) dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState]); \
                      }}, 250);"
                 ));
-                while let Ok((time, duration, paused)) = bridge.recv::<(f64, f64, bool)>().await {
+                while let Ok((time, duration, paused, ready_state)) = bridge.recv::<(f64, f64, bool, u16)>().await {
                     *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
                         time,
                         duration: if duration < 0.0 { f64::NAN } else { duration },
                         paused,
+                        ready_state,
                     };
                 }
             });

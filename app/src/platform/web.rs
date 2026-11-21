@@ -65,6 +65,19 @@ pub fn now() -> (chrono::DateTime<chrono::Utc>, i32) {
     (now, -(d.get_timezone_offset() as i32))
 }
 
+/// Current unix epoch milliseconds.
+pub fn now_ms() -> i64 {
+    js_sys::Date::now() as i64
+}
+
+/// Unique per-player-mount identifier for sync rooms.
+pub fn random_id() -> String {
+    let a = (js_sys::Math::random() * 1e16) as u64;
+    let b = (js_sys::Math::random() * 1e16) as u64;
+    let ts = js_sys::Date::now() as u64;
+    format!("w-{ts:x}-{a:x}-{b:x}")
+}
+
 /// Full screen on or off.
 pub fn toggle_fullscreen() {
     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {

@@ -425,16 +425,15 @@ pub fn is_fullscreen() -> bool {
 
 // --- Deep links ----------------------------------------------------------------
 
-/// A title to open at start: `?open=tv_1396` or `startapp=tv_1396` (movie_<id> likewise).
-pub fn open_target() -> Option<(kino_core::MediaKind, i64)> {
-    let raw = query().get("open").cloned().or_else(start_param)?;
-    let (kind, id) = raw.split_once('_')?;
-    let kind = match kind {
-        "movie" => kino_core::MediaKind::Movie,
-        "tv" => kino_core::MediaKind::Tv,
-        _ => return None,
-    };
-    Some((kind, id.parse().ok()?))
+/// A title to open at start: `?open=tv_1396` (with optional `&play=1`) or `startapp=tv_1396`.
+pub fn open_target() -> Option<super::OpenTarget> {
+    let q = query();
+    let start = start_param();
+    super::parse_open_target(
+        q.get("open").map(String::as_str),
+        q.get("play").map(String::as_str),
+        start.as_deref(),
+    )
 }
 
 /// All query parameters of the current page.

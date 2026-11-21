@@ -38,7 +38,7 @@ pub fn is_mobile() -> bool {
 pub fn is_fullscreen() -> bool {
     false
 }
-pub fn open_target() -> Option<(kino_core::MediaKind, i64)> {
+pub fn open_target() -> Option<super::OpenTarget> {
     None
 }
 pub fn invite() -> Option<String> {

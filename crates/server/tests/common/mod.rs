@@ -46,6 +46,7 @@ pub fn test_state_with(pool: PgPool, torrents: kino_server::config::TorrentConfi
     AppState {
         pool,
         media: Arc::new(kino_server::play::Media::new(&config.torrents)),
+        sync: Arc::new(kino_server::sync::SyncHub::new()),
         config: Arc::new(config),
         catalog: Arc::new(DemoCatalog),
         telegram: reqwest::Client::new(),

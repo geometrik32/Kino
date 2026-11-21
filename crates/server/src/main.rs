@@ -40,12 +40,14 @@ async fn main() -> anyhow::Result<()> {
             });
     let state = AppState {
         media,
+        sync: Arc::new(kino_server::sync::SyncHub::new()),
         pool,
         config: Arc::new(config),
         catalog,
         telegram,
     };
     kino_server::jobs::spawn(state.clone(), state.config.notify_every);
+    kino_server::sync::spawn_reaper(state.clone());
     axum::serve(listener, app(state))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
