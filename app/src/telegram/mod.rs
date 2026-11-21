@@ -20,6 +20,7 @@ pub struct OpenTarget {
 }
 
 /// Parses `?open=<kind>_<id>` (with optional `&play=1`) or `startapp=<kind>_<id>[_play]`.
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
 pub fn parse_open_target(open: Option<&str>, play: Option<&str>, start: Option<&str>) -> Option<OpenTarget> {
     let from_query = open.is_some();
     let raw = open.or(start)?;

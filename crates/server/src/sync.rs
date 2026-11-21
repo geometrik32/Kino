@@ -327,7 +327,7 @@ impl SyncHub {
             req.device.trim().chars().take(64).collect()
         };
 
-        let mut rooms = self.rooms.lock().expect("sync rooms lock");
+        let rooms = self.rooms.lock().expect("sync rooms lock");
         let existing_room = rooms.get(&key).cloned();
         drop(rooms);
 
@@ -767,9 +767,7 @@ impl SyncHub {
         let mut save_job = None;
         let is_empty = {
             let mut room = room_arc.lock().expect("sync room lock");
-            let Some(idx) = room.members.iter().position(|m| m.client_id == client_id) else {
-                return None;
-            };
+            let idx = room.members.iter().position(|m| m.client_id == client_id)?;
             if expected_conn_id.is_some_and(|cid| room.members[idx].conn_id != cid) {
                 return None;
             }

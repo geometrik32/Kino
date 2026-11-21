@@ -1074,7 +1074,7 @@ pub fn Player(
         let mut save = save.clone();
         let mut go_next = go_next.clone();
         let err_token = token.clone();
-        let mut mark_media_ready = mark_media_ready.clone();
+        let mut mark_media_ready = mark_media_ready;
         move |ev: &'static str| {
             let Some(v) = video() else { return };
             match ev {
