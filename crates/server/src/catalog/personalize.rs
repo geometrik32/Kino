@@ -172,7 +172,7 @@ fn select_seed_candidates<'a>(
         })
         .map(|(idx, s)| (signal_weight(s, idx), s))
         .collect();
-    positive.sort_by(|a, b| b.0.cmp(&a.0));
+    positive.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     // Prefer format diversity among top seeds when the user watched both movies and series.
     let mut picked: Vec<&'a UserTitleSignal> = Vec::new();

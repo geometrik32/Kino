@@ -129,7 +129,7 @@ impl TmdbCatalog {
             .filter_map(|r| r.into_summary(spec.meta.kind))
             .filter(|t| t.poster_path.is_some())
             .collect();
-        let total = res.total_pages.max(1).min(MAX_SHELF_PAGE);
+        let total = res.total_pages.clamp(1, MAX_SHELF_PAGE);
         Ok((items, page_num < total))
     }
 

@@ -155,23 +155,16 @@ pub fn MyView(
         .cloned()
         .collect();
     match filters.sort {
-        MySort::Updated => shown.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
-        MySort::MyRating => shown.sort_by(|a, b| {
-            b.rating
-                .unwrap_or(0)
-                .cmp(&a.rating.unwrap_or(0))
-                .then_with(|| b.updated_at.cmp(&a.updated_at))
-        }),
+        MySort::Updated => shown.sort_by_key(|a| std::cmp::Reverse(a.updated_at)),
+        MySort::MyRating => shown.sort_by_key(|a| std::cmp::Reverse((a.rating.unwrap_or(0), a.updated_at))),
         MySort::Rating => shown.sort_by(|a, b| {
             let ra = a.title.as_ref().and_then(|t| t.rating).unwrap_or(0.0);
             let rb = b.title.as_ref().and_then(|t| t.rating).unwrap_or(0.0);
             rb.total_cmp(&ra).then_with(|| b.updated_at.cmp(&a.updated_at))
         }),
-        MySort::Title => shown.sort_by(|a, b| {
-            let ta = a.title.as_ref().map(|t| t.title.to_lowercase()).unwrap_or_default();
-            let tb = b.title.as_ref().map(|t| t.title.to_lowercase()).unwrap_or_default();
-            ta.cmp(&tb)
-        }),
+        MySort::Title => {
+            shown.sort_by_cached_key(|a| a.title.as_ref().map(|t| t.title.to_lowercase()).unwrap_or_default())
+        }
     }
 
     rsx! {

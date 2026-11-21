@@ -217,7 +217,7 @@ fn demo_shelf_all(id: &str) -> Option<Vec<TitleSummary>> {
             .collect(),
         "fresh" => {
             let mut list: Vec<_> = TITLES.iter().filter(|t| t.year >= 2016).map(summary).collect();
-            list.sort_by(|a, b| b.year.cmp(&a.year));
+            list.sort_by_key(|a| std::cmp::Reverse(a.year));
             list
         }
         _ => return None,
