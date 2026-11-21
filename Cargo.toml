@@ -26,7 +26,6 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 [profile.release]
 lto = "thin"
 codegen-units = 1
-strip = true
 
 [profile.release.package.kino-app]
 opt-level = "z"
