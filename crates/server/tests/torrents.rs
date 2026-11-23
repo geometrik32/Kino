@@ -128,22 +128,49 @@ struct Qbit {
 
 /// qBittorrent: login cookie, add, progress, files, delete.
 fn qbittorrent(q: Arc<Qbit>) -> Router {
-    fn authed(h: &HeaderMap) -> bool {
-        h.get(header::COOKIE).and_then(|c| c.to_str().ok()) == Some("SID=s1")
-    }
+    qbittorrent_with_cookie(q, "SID", "s1", StatusCode::OK)
+}
+
+fn qbittorrent_with_cookie(
+    q: Arc<Qbit>,
+    cookie_name: &'static str,
+    cookie_val: &'static str,
+    login_status: StatusCode,
+) -> Router {
+    let expected = format!("{cookie_name}={cookie_val}");
+    let set_cookie = format!("{cookie_name}={cookie_val}; HttpOnly; path=/");
     Router::new()
         .route(
             "/api/v2/auth/login",
-            post(|| async { ([(header::SET_COOKIE, "SID=s1; HttpOnly; path=/")], "Ok.") }),
+            post(move || {
+                let set_cookie = set_cookie.clone();
+                async move {
+                    (
+                        login_status,
+                        [(header::SET_COOKIE, set_cookie)],
+                        if login_status == StatusCode::NO_CONTENT {
+                            ""
+                        } else {
+                            "Ok."
+                        },
+                    )
+                }
+            }),
         )
         .route(
             "/api/v2/torrents/add",
-            post(|State(q): State<Arc<Qbit>>, h: HeaderMap| async move {
-                if !authed(&h) {
-                    return StatusCode::FORBIDDEN;
+            post({
+                let expected = expected.clone();
+                move |State(q): State<Arc<Qbit>>, h: HeaderMap| {
+                    let expected = expected.clone();
+                    async move {
+                        if h.get(header::COOKIE).and_then(|c| c.to_str().ok()) != Some(expected.as_str()) {
+                            return StatusCode::FORBIDDEN;
+                        }
+                        q.added.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
                 }
-                q.added.fetch_add(1, Ordering::SeqCst);
-                StatusCode::OK
             }),
         )
         .route(
@@ -397,6 +424,42 @@ async fn preload_then_play_from_disk(pool: PgPool) {
     let deleted = q.deleted.lock().unwrap().clone();
     assert_eq!(deleted.len(), 1);
     assert!(deleted[0].contains(&item.infohash) && deleted[0].contains("deleteFiles=true"));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn qbittorrent_v5_cookie_auth_works(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let q = Arc::new(Qbit::default());
+    let qb = serve(qbittorrent_with_cookie(
+        q.clone(),
+        "QBT_SID_8085",
+        "v5sid",
+        StatusCode::NO_CONTENT,
+    ))
+    .await;
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            qbittorrent_url: Some(qb),
+            ..Default::default()
+        },
+    ));
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396?season=2", Some(&t), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let key = list.releases[0].infohash.clone();
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&t),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "infohash": key })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(q.added.load(Ordering::SeqCst), 1);
 }
 
 /// Real ffmpeg: an MKV with MPEG-4 video, AC3 sound and SRT subtitles becomes

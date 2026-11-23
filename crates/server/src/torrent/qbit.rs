@@ -12,7 +12,12 @@ pub struct QBittorrent {
     password: String,
     /// Download folder as qBittorrent sees it, e.g. `/downloads/kino`.
     save_path: Option<String>,
-    sid: Mutex<Option<String>>,
+    /// Session cookie `(name, value)` (`SID` in older qBittorrent, `QBT_SID_<port>` in 5.x+).
+    sid: Mutex<Option<(String, String)>>,
+}
+
+fn is_session_cookie(name: &str) -> bool {
+    name == "SID" || name.starts_with("QBT_SID_")
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -59,7 +64,7 @@ impl QBittorrent {
         }
     }
 
-    async fn login(&self) -> anyhow::Result<String> {
+    async fn login(&self) -> anyhow::Result<(String, String)> {
         let resp = self
             .http
             .post(format!("{}/api/v2/auth/login", self.base))
@@ -68,12 +73,12 @@ impl QBittorrent {
             .send()
             .await?
             .error_for_status()?;
-        let sid = resp
+        let cookie = resp
             .cookies()
-            .find(|c| c.name() == "SID")
-            .map(|c| c.value().to_owned())
+            .find(|c| is_session_cookie(c.name()))
+            .map(|c| (c.name().to_owned(), c.value().to_owned()))
             .ok_or_else(|| anyhow::anyhow!("qBittorrent did not accept the login"))?;
-        Ok(sid)
+        Ok(cookie)
     }
 
     /// Sends a request with the session cookie, logging in again once if it expired.
@@ -82,7 +87,7 @@ impl QBittorrent {
         make: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     ) -> anyhow::Result<reqwest::Response> {
         for attempt in 0..2 {
-            let sid = {
+            let (name, val) = {
                 let mut guard = self.sid.lock().await;
                 if guard.is_none() || attempt > 0 {
                     *guard = Some(self.login().await?);
@@ -90,7 +95,7 @@ impl QBittorrent {
                 guard.clone().unwrap_or_default()
             };
             let resp = make(&self.http, &self.base)
-                .header(reqwest::header::COOKIE, format!("SID={sid}"))
+                .header(reqwest::header::COOKIE, format!("{name}={val}"))
                 .send()
                 .await?;
             if resp.status() != reqwest::StatusCode::FORBIDDEN {
@@ -169,5 +174,18 @@ impl QBittorrent {
         })
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_session_cookie;
+
+    #[test]
+    fn recognizes_legacy_and_v5_session_cookies() {
+        assert!(is_session_cookie("SID"));
+        assert!(is_session_cookie("QBT_SID_8085"));
+        assert!(is_session_cookie("QBT_SID_8080"));
+        assert!(!is_session_cookie("session"));
     }
 }

@@ -81,7 +81,7 @@ services:
     networks: [kino, vpn]
 
   # Our own TorrServer, separate from Lampa's: streams torrents while they download.
-  # Reachable only inside this stack; stream cache lives on the HDD pool to save RAM.
+  # Reachable only inside this stack; stream cache stays in RAM to keep HDDs quiet.
   torrserver:
     image: ghcr.io/yourok/torrserver:MatriX.141.5
     restart: unless-stopped
@@ -91,15 +91,14 @@ services:
       TS_DONTKILL: "1"
       TS_CONF_PATH: /opt/ts/config
       TS_TORR_DIR: /opt/ts/torrents
-      GOMEMLIMIT: "192MiB"
+      GOMEMLIMIT: "576MiB"
     volumes:
       - ./data/torrserver:/opt/ts
-      - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}/torrserver-cache:/opt/ts/cache
     ports:
       # BitTorrent peers.
       - "32000:32000"
       - "32000:32000/udp"
-    mem_limit: 256m
+    mem_limit: 768m
     networks: [kino]
 
   # Wakes Jackett on demand when someone browses for a new title, and stops it after 10m idle.
