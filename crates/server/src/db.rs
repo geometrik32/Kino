@@ -646,10 +646,7 @@ pub async fn shared_release_choices(
 pub async fn save_device_quality(
     pool: &PgPool,
     user_id: i64,
-    kind: MediaKind,
-    tmdb_id: i64,
-    season: i32,
-    episode: i32,
+    (kind, tmdb_id, season, episode): (MediaKind, i64, i32, i32),
     device_kind: &str,
     quality_key: &str,
 ) -> Result<(), sqlx::Error> {

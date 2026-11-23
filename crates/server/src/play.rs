@@ -260,10 +260,7 @@ async fn put_release_quality(
     db::save_device_quality(
         &state.pool,
         user.0,
-        req.kind,
-        req.tmdb_id,
-        season,
-        episode,
+        (req.kind, req.tmdb_id, season, episode),
         device_kind,
         qkey,
     )
