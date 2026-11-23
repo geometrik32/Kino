@@ -686,7 +686,7 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
         pool,
         TorrentConfig {
             jackett_url: Some(jackett),
-            jackett_key: Some("secret".into()),
+            jackett_api_key: Some("secret".into()),
             ..TorrentConfig::default()
         },
     ));
