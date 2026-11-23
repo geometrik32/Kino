@@ -343,6 +343,27 @@ impl TargetQuality {
     }
 }
 
+fn choice_quality_key(c: &ReleaseChoice) -> &str {
+    c.release
+        .quality_key
+        .as_deref()
+        .or(c.release.quality.as_deref())
+        .map(normalize_quality_key)
+        .unwrap_or("")
+}
+
+fn find_any_scoped_choice(choices: &[ReleaseChoice], season: i32, episode: i32) -> Option<&ReleaseChoice> {
+    choices
+        .iter()
+        .find(|c| c.release.season == season && c.release.episode == episode)
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|c| c.release.season == season && c.release.episode == 0)
+        })
+        .or_else(|| choices.iter().find(|c| c.release.season == 0 && c.release.episode == 0))
+}
+
 fn find_scoped_choice(
     choices: &[ReleaseChoice],
     season: i32,
@@ -350,13 +371,7 @@ fn find_scoped_choice(
     pred: impl Fn(&str) -> bool,
 ) -> Option<&ReleaseChoice> {
     let matches_q = |c: &&ReleaseChoice| {
-        let k = c
-            .release
-            .quality_key
-            .as_deref()
-            .or(c.release.quality.as_deref())
-            .map(normalize_quality_key)
-            .unwrap_or("");
+        let k = choice_quality_key(c);
         !k.is_empty() && pred(k)
     };
     choices
@@ -466,6 +481,8 @@ async fn resolve_release(
         (req.season, req.episode)
     };
     let mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
+    let dev_override = db::device_quality_for(&state.pool, user.0, kind, tmdb_id, season, episode, device_kind).await?;
     let ready_preloads = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id).await?;
     let best_ready = ready_preloads
         .iter()
@@ -473,6 +490,12 @@ async fn resolve_release(
         .or_else(|| ready_preloads.iter().find(|p| p.season == 0));
 
     if let Some(rp) = best_ready {
+        let ready_qk = rp
+            .title
+            .as_deref()
+            .map(torrent::title::parse_title)
+            .map(|p| normalize_quality_key(&p.quality))
+            .unwrap_or("");
         let overridden_after = mine.iter().any(|c| {
             c.manual
                 && c.chosen_at > rp.ready_at
@@ -481,7 +504,9 @@ async fn resolve_release(
                     || (c.release.season == season && c.release.episode == episode)
                     || (c.release.season == season && c.release.episode == 0)
                     || (c.release.season == 0 && c.release.episode == 0))
-        });
+        }) || dev_override
+            .as_ref()
+            .is_some_and(|(dq, ts)| *ts > rp.ready_at && normalize_quality_key(dq) != ready_qk);
         if !overridden_after {
             let parsed = rp.title.as_deref().map(torrent::title::parse_title);
             let q = parsed.as_ref().map(|p| p.quality.clone());
@@ -504,30 +529,46 @@ async fn resolve_release(
         }
     }
 
-    let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
     let prefs = userdata::get_prefs(&state.pool, user.0).await?;
-    let dev_override = db::device_quality_for(&state.pool, user.0, kind, tmdb_id, season, episode, device_kind).await?;
-    let target = TargetQuality::from_prefs(&prefs, dev_override, req.is_mobile);
+    let dev_quality_newest = dev_override.as_ref().map(|(q, _)| normalize_quality_key(q));
+    let target = TargetQuality::from_prefs(&prefs, dev_override.as_ref().map(|(q, _)| q.clone()), req.is_mobile);
 
-    let details = state.catalog.details(kind, tmdb_id).await?;
-    if target == TargetQuality::Ask {
-        let list = fetch_release_list(&state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
-        return Ok(Json(ResolveReleaseResponse::NeedsPicker {
-            target_quality: String::new(),
-            releases: list,
-        }));
-    }
-
+    // Tier 2: user's own manual choices (`manual = TRUE`), beating profile/default quality.
+    // Only if the user switched device quality inside the player strictly *after* their newest manual pick
+    // do we filter manual picks by that explicit per-title device quality override.
     let mine_manual: Vec<ReleaseChoice> = mine.into_iter().filter(|c| c.manual).collect();
-    if let Some(c) = find_scoped_choice(&mine_manual, season, episode, |k| target.matches_key(k)) {
+    let newest_manual = find_any_scoped_choice(&mine_manual, season, episode);
+    let dev_switch_is_newer = match (&dev_override, newest_manual) {
+        (Some((dq, dev_ts)), Some(c)) => *dev_ts > c.chosen_at && normalize_quality_key(dq) != choice_quality_key(c),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    if dev_switch_is_newer {
+        if let Some(dq) = dev_quality_newest {
+            if let Some(c) = find_scoped_choice(&mine_manual, season, episode, |k| k == dq) {
+                return Ok(Json(ResolveReleaseResponse::Ready {
+                    choice: c.release.clone(),
+                    from_peer: None,
+                }));
+            }
+        }
+    } else if let Some(c) = newest_manual {
         return Ok(Json(ResolveReleaseResponse::Ready {
             choice: c.release.clone(),
             from_peer: None,
         }));
     }
 
+    // Tier 3: other users' manual choices (most picked first, then newest).
+    // Beats profile quality settings; respects an explicit per-title player quality override if set.
     let shared = db::shared_release_choices(&state.pool, user.0, kind, tmdb_id).await?;
-    if let Some(c) = find_scoped_choice(&shared, season, episode, |k| target.matches_key(k)) {
+    let shared_pick = if let Some(dq) = dev_quality_newest {
+        find_scoped_choice(&shared, season, episode, |k| k == dq)
+    } else {
+        find_scoped_choice(&shared, season, episode, |k| target.matches_key(k))
+            .or_else(|| find_any_scoped_choice(&shared, season, episode))
+    };
+    if let Some(c) = shared_pick {
         let mut adopted = c.release.clone();
         if kind == MediaKind::Movie {
             adopted.season = 0;
@@ -536,6 +577,16 @@ async fn resolve_release(
         return Ok(Json(ResolveReleaseResponse::Ready {
             choice: adopted,
             from_peer: c.picked_by.clone(),
+        }));
+    }
+
+    // Tier 4: profile / device default quality (lowest priority).
+    let details = state.catalog.details(kind, tmdb_id).await?;
+    if target == TargetQuality::Ask {
+        let list = fetch_release_list(&state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
+        return Ok(Json(ResolveReleaseResponse::NeedsPicker {
+            target_quality: String::new(),
+            releases: list,
         }));
     }
 

@@ -715,9 +715,9 @@ pub async fn device_quality_for(
     season: i32,
     episode: i32,
     device_kind: &str,
-) -> Result<Option<String>, sqlx::Error> {
-    sqlx::query_scalar(
-        "SELECT quality_key FROM release_device_quality
+) -> Result<Option<(String, DateTime<Utc>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT quality_key, updated_at FROM release_device_quality
          WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND device_kind = $6
            AND ((season = $4 AND episode = $5) OR (season = $4 AND episode = 0) OR (season = 0 AND episode = 0))
          ORDER BY (episode = $5) DESC, (season = $4) DESC, updated_at DESC
