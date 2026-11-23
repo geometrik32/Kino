@@ -7,8 +7,8 @@ mod common;
 use axum::http::{Method, StatusCode};
 use common::*;
 use kino_core::{
-    CalendarEntry, ContinueItem, HistoryEntry, HomeFeed, MediaKind, PreloadItem, PreloadState, Progress, TitleState,
-    TitleStatus, UserPrefs, UserPublicProfile, UserSocialLibrary, VideoScale,
+    CalendarEntry, ContinueItem, HistoryEntry, HomeFeed, PreloadItem, PreloadState, Progress, TitleState, TitleStatus,
+    UserPrefs, UserPublicProfile, UserSocialLibrary, VideoScale,
 };
 use serde_json::json;
 use sqlx::PgPool;
