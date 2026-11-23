@@ -398,7 +398,48 @@ async fn release_choice_is_remembered_per_season(pool: PgPool) {
         None,
     )
     .await;
-    assert_eq!(body, json!([]), "choices are per user");
+    let shared: Vec<ReleaseChoice> = serde_json::from_value(body).unwrap();
+    assert_eq!(shared.len(), 2, "other user inherits peer choices");
+    assert!(shared.iter().all(|c| c.picked_by.as_deref() == Some("Тест")));
+
+    // Picking own choice overrides only for `other`; admin keeps their original S01 choice.
+    call(
+        &app,
+        Method::PUT,
+        "/api/release-choice",
+        Some(&other.token),
+        Some(pick(1, 'd', "HDRezka")),
+    )
+    .await;
+    let (_, body_other) = call(
+        &app,
+        Method::GET,
+        "/api/release-choice/tv/1396",
+        Some(&other.token),
+        None,
+    )
+    .await;
+    let list_other: Vec<ReleaseChoice> = serde_json::from_value(body_other).unwrap();
+    assert_eq!(
+        list_other
+            .iter()
+            .find(|c| c.release.season == 1)
+            .unwrap()
+            .release
+            .infohash,
+        "d".repeat(40)
+    );
+    let (_, body_admin) = call(&app, Method::GET, "/api/release-choice/tv/1396", Some(&u.token), None).await;
+    let list_admin: Vec<ReleaseChoice> = serde_json::from_value(body_admin).unwrap();
+    assert_eq!(
+        list_admin
+            .iter()
+            .find(|c| c.release.season == 1)
+            .unwrap()
+            .release
+            .infohash,
+        "c".repeat(40)
+    );
 }
 
 #[sqlx::test(migrations = "./migrations")]
