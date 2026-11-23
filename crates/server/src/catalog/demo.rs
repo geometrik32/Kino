@@ -80,6 +80,7 @@ fn summary(t: &DemoTitle) -> TitleSummary {
         user_rating: None,
         user_status: None,
         peers: Vec::new(),
+        preloaded: false,
     }
 }
 

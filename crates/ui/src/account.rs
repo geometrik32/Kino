@@ -1,11 +1,10 @@
 //! "Мои" (titles by status, type and sort) and "Профиль" (theme, downloads, default release settings, history).
 
-use chrono::{DateTime, FixedOffset, Utc};
+use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, format_rating_short, image_url, normalize_quality_key, CalendarEntry, HistoryEntry, ImageSize,
-    MediaKind, PreloadItem, PreloadState, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile,
-    UserSocialLibrary,
+    clock, episode_code, image_url, normalize_quality_key, CalendarEntry, HistoryEntry, ImageSize, MediaKind,
+    PreloadItem, PreloadState, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
 };
 
 use crate::icons::{self, Icon};
@@ -160,6 +159,7 @@ pub fn MyView(
     #[props(default)] peer_library: Option<UserSocialLibrary>,
     #[props(default)] peer_loading: bool,
     #[props(default)] calendar: Vec<CalendarEntry>,
+    #[props(default)] today_ymd: String,
     #[props(default)] on_section: Option<EventHandler<MySection>>,
     #[props(default)] on_select_user: Option<EventHandler<i64>>,
     on_filters: EventHandler<MyFilters>,
@@ -167,6 +167,8 @@ pub fn MyView(
 ) -> Element {
     let mut open_dd = use_signal(|| None::<MyDropdown>);
     let mut peer_status_filter = use_signal(|| None::<TitleStatus>);
+    let mut cal_month = use_signal(|| None::<(i32, u32)>);
+    let mut cal_day = use_signal(|| None::<String>);
 
     let by_kind: Vec<&TitleState> = items.iter().filter(|i| filters.kind.matches(i.kind)).collect();
     let total_kind = by_kind.len();
@@ -324,9 +326,10 @@ pub fn MyView(
                     } else {
                         div { class: "grid",
                             for item in shown {
-                                if let Some(t) = item.title.clone() {
+                                if let Some(mut t) = item.title.clone() {
                                     {
                                         let r_val = item.effective_rating.or_else(|| item.rating.map(f32::from));
+                                        t.user_rating = r_val.or(t.user_rating);
                                         rsx! {
                                             div { key: "{item.kind.as_str()}{item.tmdb_id}", class: "mine",
                                                 PosterCard {
@@ -335,16 +338,9 @@ pub fn MyView(
                                                     hide_status_badge: filters.status.is_some(),
                                                     on_open,
                                                 }
-                                                div { class: "mine-meta",
-                                                    if let Some(st) = item.status.filter(|_| filters.status.is_none()) {
+                                                if let Some(st) = item.status.filter(|_| filters.status.is_none()) {
+                                                    div { class: "mine-meta",
                                                         span { class: "{status_tag_class(st)}", "{st.label()}" }
-                                                    }
-                                                    if let Some(rv) = r_val {
-                                                        if (rv - rv.round()).abs() <= 0.04 {
-                                                            span { class: "my-stars", "{stars(rv.round() as i16)}" }
-                                                        } else {
-                                                            span { class: "my-stars", "★ {format_rating_short(rv)}" }
-                                                        }
                                                     }
                                                 }
                                             }
@@ -486,15 +482,10 @@ pub fn MyView(
                                                                         hide_status_badge: true,
                                                                         on_open,
                                                                     }
-                                                                    div { class: "mine-meta",
-                                                                        if let Some(st) = item.status {
-                                                                            span { class: "{status_tag_class(st)}", "{st.label()}" }
-                                                                        }
-                                                                        if let Some(rv) = r_val {
-                                                                            if (rv - rv.round()).abs() <= 0.04 {
-                                                                                span { class: "my-stars", "{stars(rv.round() as i16)}" }
-                                                                            } else {
-                                                                                span { class: "my-stars", "★ {format_rating_short(rv)}" }
+                                                                    if item.status.is_some() {
+                                                                        div { class: "mine-meta",
+                                                                            if let Some(st) = item.status {
+                                                                                span { class: "{status_tag_class(st)}", "{st.label()}" }
                                                                             }
                                                                         }
                                                                     }
@@ -511,57 +502,175 @@ pub fn MyView(
                         }
                     }
                 },
-                MySection::Calendar => rsx! {
-                    if calendar.is_empty() {
-                        div { class: "panel muted-box",
-                            "Пока нет запланированных премьер или новых серий для ваших отслеживаемых фильмов и сериалов."
-                        }
+                MySection::Calendar => {
+                    let default_ym = calendar
+                        .first()
+                        .and_then(|e| parse_ymd_ym(&e.date))
+                        .or_else(|| parse_ymd_ym(&today_ymd))
+                        .unwrap_or((2026, 11));
+                    let (yr, mo) = cal_month().unwrap_or(default_ym);
+                    let month_prefix = format!("{yr:04}-{mo:02}-");
+                    let lead_empty = weekday_mon0(yr, mo, 1);
+                    let dim = days_in_month(yr, mo);
+                    let sel_day = cal_day();
+                    let month_entries: Vec<CalendarEntry> = calendar
+                        .iter()
+                        .filter(|e| e.date.starts_with(&month_prefix))
+                        .cloned()
+                        .collect();
+                    let shown_entries: Vec<CalendarEntry> = if let Some(d) = sel_day.as_deref() {
+                        calendar.iter().filter(|e| e.date == d).cloned().collect()
+                    } else if !month_entries.is_empty() {
+                        month_entries.clone()
                     } else {
-                        div { class: "cal-list",
-                            for entry in calendar {
-                                {
-                                    let t_opt = entry.title.clone();
-                                    let title_txt = entry
-                                        .title
-                                        .as_ref()
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("#{}", entry.tmdb_id));
-                                    let poster = entry.title.as_ref().and_then(|t| t.poster_path.clone());
-                                    let date_lbl = ru_date(&entry.date);
-                                    let ep_lbl = match (entry.season, entry.episode) {
-                                        (Some(s), Some(e)) => {
-                                            let code = episode_code(s, e);
-                                            match &entry.episode_name {
-                                                Some(n) if !n.is_empty() => format!("{code} · {n}"),
-                                                _ => code,
+                        calendar.clone()
+                    };
+                    rsx! {
+                        if calendar.is_empty() {
+                            div { class: "panel muted-box",
+                                "Пока нет запланированных премьер или новых серий для ваших отслеживаемых фильмов и сериалов."
+                            }
+                        } else {
+                            div { class: "cal-wrap",
+                                div { class: "cal-head",
+                                    button {
+                                        class: "round-act",
+                                        title: "Предыдущий месяц",
+                                        "aria-label": "Предыдущий месяц",
+                                        onclick: move |_| {
+                                            cal_day.set(None);
+                                            cal_month.set(Some(shift_ym((yr, mo), -1)));
+                                        },
+                                        Icon { svg: icons::CHEV_L, class: "ic sm" }
+                                    }
+                                    div { class: "cal-month-title", "{month_name_ru(mo)} {yr}" }
+                                    button {
+                                        class: "round-act",
+                                        title: "Следующий месяц",
+                                        "aria-label": "Следующий месяц",
+                                        onclick: move |_| {
+                                            cal_day.set(None);
+                                            cal_month.set(Some(shift_ym((yr, mo), 1)));
+                                        },
+                                        Icon { svg: icons::CHEV_R, class: "ic sm" }
+                                    }
+                                    if sel_day.is_some() {
+                                        button {
+                                            class: "chip sm",
+                                            onclick: move |_| cal_day.set(None),
+                                            "Весь месяц"
+                                        }
+                                    }
+                                }
+                                div { class: "cal-grid",
+                                    for wd in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"] {
+                                        div { key: "wd-{wd}", class: "cal-wd", "{wd}" }
+                                    }
+                                    for idx in 0..lead_empty {
+                                        div { key: "empty-{idx}", class: "cal-cell empty" }
+                                    }
+                                    for day in 1..=dim {
+                                        {
+                                            let ymd = format!("{yr:04}-{mo:02}-{day:02}");
+                                            let day_items: Vec<&CalendarEntry> =
+                                                month_entries.iter().filter(|e| e.date == ymd).collect();
+                                            let has_events = !day_items.is_empty();
+                                            let is_today = ymd == today_ymd;
+                                            let is_sel = sel_day.as_deref() == Some(ymd.as_str());
+                                            let cls = match (has_events, is_today, is_sel) {
+                                                (_, _, true) => "cal-cell active selected",
+                                                (true, true, false) => "cal-cell active today",
+                                                (true, false, false) => "cal-cell active",
+                                                (false, true, false) => "cal-cell today",
+                                                _ => "cal-cell",
+                                            };
+                                            let titles_preview: String = day_items
+                                                .iter()
+                                                .filter_map(|e| e.title.as_ref().map(|t| t.title.clone()))
+                                                .take(2)
+                                                .collect::<Vec<_>>()
+                                                .join(", ");
+                                            let ev_cnt = day_items.len();
+                                            rsx! {
+                                                button {
+                                                    key: "{ymd}",
+                                                    class: "{cls}",
+                                                    disabled: !has_events,
+                                                    title: if titles_preview.is_empty() { String::new() } else { titles_preview.clone() },
+                                                    onclick: move |_| {
+                                                        if is_sel {
+                                                            cal_day.set(None);
+                                                        } else {
+                                                            cal_day.set(Some(ymd.clone()));
+                                                        }
+                                                    },
+                                                    span { class: "cal-day-num", "{day}" }
+                                                    if has_events {
+                                                        span { class: "cal-day-dot",
+                                                            if ev_cnt > 1 { "{ev_cnt}" }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
-                                        _ => "Премьера фильма".to_owned(),
-                                    };
-                                    let st = entry.status;
-                                    let id = entry.tmdb_id;
-                                    rsx! {
-                                        button {
-                                            key: "cal-{entry.date}-{entry.kind.as_str()}-{id}",
-                                            class: "cal-row",
-                                            onclick: move |_| {
-                                                if let Some(t) = t_opt.clone() {
-                                                    on_open.call(t);
-                                                }
-                                            },
-                                            div { class: "cal-date", "{date_lbl}" }
-                                            div { class: "cal-poster",
-                                                if let Some(p) = poster {
-                                                    img { src: image_url(&p, ImageSize::Poster), alt: "{title_txt}", loading: "lazy" }
-                                                } else {
-                                                    div { class: "hist-thumb-ph", style: "background: {fallback_bg(id)}" }
+                                    }
+                                }
+                            }
+                            div { class: "cal-list",
+                                if sel_day.is_some() {
+                                    div { class: "cal-sub-head",
+                                        "События на {ru_date(sel_day.as_deref().unwrap_or(\"\"))}"
+                                    }
+                                } else if month_entries.is_empty() {
+                                    div { class: "cal-sub-head",
+                                        "В этом месяце выходов нет — ближайшие даты:"
+                                    }
+                                }
+                                for entry in shown_entries {
+                                    {
+                                        let t_opt = entry.title.clone();
+                                        let title_txt = entry
+                                            .title
+                                            .as_ref()
+                                            .map(|t| t.title.clone())
+                                            .unwrap_or_else(|| format!("#{}", entry.tmdb_id));
+                                        let poster = entry.title.as_ref().and_then(|t| t.poster_path.clone());
+                                        let date_lbl = ru_date(&entry.date);
+                                        let ep_lbl = match (entry.season, entry.episode) {
+                                            (Some(s), Some(e)) => {
+                                                let code = episode_code(s, e);
+                                                match &entry.episode_name {
+                                                    Some(n) if !n.is_empty() => format!("{code} · {n}"),
+                                                    _ => code,
                                                 }
                                             }
-                                            div { class: "cal-body",
-                                                div { class: "cal-title", "{title_txt}" }
-                                                div { class: "cal-sub", "{ep_lbl}" }
+                                            _ => "Премьера фильма".to_owned(),
+                                        };
+                                        let st = entry.status;
+                                        let id = entry.tmdb_id;
+                                        rsx! {
+                                            button {
+                                                key: "cal-{entry.date}-{entry.kind.as_str()}-{id}",
+                                                class: "cal-row",
+                                                onclick: move |_| {
+                                                    if let Some(t) = t_opt.clone() {
+                                                        on_open.call(t);
+                                                    }
+                                                },
+                                                div { class: "cal-date", "{date_lbl}" }
+                                                div { class: "cal-poster",
+                                                    if let Some(p) = poster {
+                                                        img { src: image_url(&p, ImageSize::Poster), alt: "{title_txt}", loading: "lazy" }
+                                                    } else {
+                                                        div { class: "hist-thumb-ph", style: "background: {fallback_bg(id)}" }
+                                                    }
+                                                }
+                                                div { class: "cal-body",
+                                                    div { class: "cal-title", "{title_txt}" }
+                                                    div { class: "cal-sub", "{ep_lbl}" }
+                                                }
+                                                span { class: "{status_tag_class(st)}", "{st.label()}" }
                                             }
-                                            span { class: "{status_tag_class(st)}", "{st.label()}" }
                                         }
                                     }
                                 }
@@ -574,9 +683,52 @@ pub fn MyView(
     }
 }
 
-fn stars(r: i16) -> String {
-    let r = r.clamp(0, 5) as usize;
-    format!("{}{}", "★".repeat(r), "☆".repeat(5 - r))
+fn parse_ymd_ym(ymd: &str) -> Option<(i32, u32)> {
+    let mut parts = ymd.split('-');
+    let y = parts.next()?.parse::<i32>().ok()?;
+    let m = parts.next()?.parse::<u32>().ok()?.clamp(1, 12);
+    Some((y, m))
+}
+
+fn shift_ym((y, m): (i32, u32), delta: i32) -> (i32, u32) {
+    let total = y * 12 + (m as i32 - 1) + delta;
+    let ny = total.div_euclid(12);
+    let nm = (total.rem_euclid(12) + 1) as u32;
+    (ny, nm)
+}
+
+fn days_in_month(y: i32, m: u32) -> u32 {
+    let (ny, nm) = shift_ym((y, m), 1);
+    let start = NaiveDate::from_ymd_opt(y, m, 1);
+    let end = NaiveDate::from_ymd_opt(ny, nm, 1);
+    match (start, end) {
+        (Some(a), Some(b)) => (b - a).num_days().max(28) as u32,
+        _ => 30,
+    }
+}
+
+fn weekday_mon0(y: i32, m: u32, d: u32) -> u32 {
+    NaiveDate::from_ymd_opt(y, m, d)
+        .map(|dt| dt.weekday().num_days_from_monday())
+        .unwrap_or(0)
+}
+
+fn month_name_ru(m: u32) -> &'static str {
+    const NAMES: [&str; 12] = [
+        "Январь",
+        "Февраль",
+        "Март",
+        "Апрель",
+        "Май",
+        "Июнь",
+        "Июль",
+        "Август",
+        "Сентябрь",
+        "Октябрь",
+        "Ноябрь",
+        "Декабрь",
+    ];
+    NAMES.get((m.saturating_sub(1)) as usize).copied().unwrap_or("")
 }
 
 /// Quality and language options offered in the settings.
@@ -1030,7 +1182,12 @@ fn PreloadRow(
     rsx! {
         div { class: "dl-row", onclick: move |_| on_open.call((kind, tmdb_id)),
             div { class: "dl-poster", style: "background: {fallback_bg(tmdb_id)}",
-                span { class: "dl-poster-tag", "{badge_lbl}" }
+                if let Some(p) = &item.poster_path {
+                    img { src: image_url(p, ImageSize::Poster), alt: "{title}", loading: "lazy" }
+                    span { class: "dl-poster-tag over", "{badge_lbl}" }
+                } else {
+                    span { class: "dl-poster-tag", "{badge_lbl}" }
+                }
             }
             div { class: "dl-body",
                 div { class: "dl-title", "{title}" }

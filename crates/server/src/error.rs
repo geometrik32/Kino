@@ -11,6 +11,7 @@ pub struct AppError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    pub available_episodes: Vec<(i32, i32)>,
 }
 
 impl AppError {
@@ -19,6 +20,15 @@ impl AppError {
             status,
             code,
             message: message.into(),
+            available_episodes: Vec::new(),
+        }
+    }
+    pub fn missing_episode(message: impl Into<String>, available_episodes: Vec<(i32, i32)>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "no_file",
+            message: message.into(),
+            available_episodes,
         }
     }
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -40,6 +50,7 @@ impl IntoResponse for AppError {
         let body = ApiError {
             code: self.code.to_owned(),
             message: self.message,
+            available_episodes: self.available_episodes,
         };
         (self.status, Json(body)).into_response()
     }

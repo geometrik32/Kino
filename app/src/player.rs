@@ -61,15 +61,12 @@ fn next_target_episode(
     matching.into_iter().next()
 }
 
-fn find_scoped_choice(choices: &[ReleaseChoiceUpdate], season: i32, episode: i32) -> Option<ReleaseChoiceUpdate> {
-    choices
-        .iter()
-        .find(|c| c.season == season && c.episode == episode)
-        .or_else(|| choices.iter().find(|c| c.season == season && c.episode == 0))
-        .cloned()
-}
-
-fn best_per_quality(list: &[ReleaseOption], active: &ReleaseChoiceUpdate) -> Vec<ReleaseOption> {
+fn best_per_quality(
+    list: &[ReleaseOption],
+    choices: &[ReleaseChoiceUpdate],
+    active: &ReleaseChoiceUpdate,
+    season: i32,
+) -> Vec<ReleaseOption> {
     let mut out = Vec::new();
     let active_q = active.quality.as_deref().map(normalize_quality_key);
     let active_voice = active.voice.as_deref().unwrap_or("");
@@ -80,12 +77,35 @@ fn best_per_quality(list: &[ReleaseOption], active: &ReleaseChoiceUpdate) -> Vec
                 continue;
             }
         }
+        let user_hash = choices
+            .iter()
+            .filter(|c| {
+                c.quality_key
+                    .as_deref()
+                    .or(c.quality.as_deref())
+                    .map(normalize_quality_key)
+                    == Some(bucket)
+            })
+            .find(|c| c.season == season)
+            .or_else(|| {
+                choices.iter().find(|c| {
+                    c.season == 0
+                        && c.quality_key
+                            .as_deref()
+                            .or(c.quality.as_deref())
+                            .map(normalize_quality_key)
+                            == Some(bucket)
+                })
+            })
+            .map(|c| c.infohash.as_str());
         let best = list
             .iter()
             .filter(|r| normalize_quality_key(&r.quality) == bucket)
             .max_by_key(|r| {
+                let is_user = user_hash.is_some_and(|h| h == r.infohash);
+                let peer_picks = r.picked_by.len();
                 let same_voice = !active_voice.is_empty() && r.voice.eq_ignore_ascii_case(active_voice);
-                (same_voice, r.seeders, r.size_bytes)
+                (r.preloaded, is_user, peer_picks, same_voice, r.seeders, r.size_bytes)
             });
         if let Some(r) = best {
             out.push(r.clone());
@@ -747,6 +767,7 @@ pub fn Player(
                 s.src.clear();
                 s.subtitles_src = None;
                 s.error = None;
+                s.next_available = None;
                 s.menu = None;
                 s.position = initial_pos;
                 s.duration = None;
@@ -906,9 +927,24 @@ pub fn Player(
                             duration_sec: None,
                             file_index: None,
                         });
+                        let next_avail = if e.code == "no_file" && !e.available_episodes.is_empty() {
+                            e.available_episodes
+                                .iter()
+                                .copied()
+                                .find(|&(s, ep)| s == season && ep > episode)
+                                .or_else(|| {
+                                    e.available_episodes
+                                        .iter()
+                                        .copied()
+                                        .find(|&(s, ep)| (s, ep) > (season, episode))
+                                })
+                        } else {
+                            None
+                        };
                         ui.with_mut(|s| {
                             s.status = None;
                             s.progress = None;
+                            s.next_available = next_avail;
                             s.error = Some(e.message);
                         });
                     }
@@ -949,6 +985,7 @@ pub fn Player(
                 s.src.clear();
                 s.subtitles_src = None;
                 s.error = None;
+                s.next_available = None;
                 s.menu = None;
                 s.position = 0.0;
                 s.duration = None;
@@ -1495,17 +1532,6 @@ pub fn Player(
                     season: ns,
                     episode: ne,
                     release: None,
-                });
-                begin_playback(false);
-                return;
-            }
-            if let Some(c) = find_scoped_choice(&choices.peek(), ns, ne) {
-                release.set(c.clone());
-                target.set((ns, ne));
-                sync::send(&SyncClientMsg::Episode {
-                    season: ns,
-                    episode: ne,
-                    release: Some(c),
                 });
                 begin_playback(false);
                 return;
@@ -2374,11 +2400,12 @@ pub fn Player(
                         quality_loading.set(true);
                         let tok = menu_token.clone();
                         let cur_rel = release.peek().clone();
+                        let cur_choices = choices.peek().clone();
                         spawn(async move {
                             let res = api::releases(&tok, kind, id, scope_s).await;
                             quality_loading.set(false);
                             let items = res
-                                .map(|l| best_per_quality(&l.releases, &cur_rel))
+                                .map(|l| best_per_quality(&l.releases, &cur_choices, &cur_rel, scope_s))
                                 .unwrap_or_default();
                             quality_cache.set(Some((scope_s, items)));
                         });
@@ -2409,10 +2436,6 @@ pub fn Player(
                     quality_key: Some(qk.clone()),
                     voice: (!rel.voice.is_empty()).then(|| rel.voice.clone()),
                 };
-                choices.with_mut(|v| {
-                    v.retain(|c| !(c.season == scope_s && c.episode == scope_e && c.quality_key == Some(qk.clone())));
-                    v.insert(0, new_choice.clone());
-                });
                 release.set(new_choice.clone());
                 let my_gen = play_gen() + 1;
                 play_gen.set(my_gen);
@@ -2421,7 +2444,6 @@ pub fn Player(
                     s.active_infohash = Some(new_choice.infohash.clone());
                 });
                 let tok = qual_token.clone();
-                let choice_save = new_choice.clone();
                 let req_q = api::SetDeviceQualityRequest {
                     kind,
                     tmdb_id: id,
@@ -2431,7 +2453,6 @@ pub fn Player(
                     quality_key: qk,
                 };
                 spawn(async move {
-                    let _ = api::save_release_choice(&tok, &choice_save).await;
                     let _ = api::set_release_quality(&tok, &req_q).await;
                 });
                 sync::send(&SyncClientMsg::Episode {
@@ -2440,6 +2461,21 @@ pub fn Player(
                     release: Some(new_choice.clone()),
                 });
                 start_fetch_qual(cur_s, cur_e, new_choice, cur_pos, my_gen);
+            })),
+            on_jump_episode: Some(Callback::new({
+                let mut jump_fetch = start_play_fetch.clone();
+                move |(ns, ne): (i32, i32)| {
+                    let rel = release.peek().clone();
+                    let my_gen = play_gen() + 1;
+                    play_gen.set(my_gen);
+                    target.set((ns, ne));
+                    sync::send(&SyncClientMsg::Episode {
+                        season: ns,
+                        episode: ne,
+                        release: None,
+                    });
+                    jump_fetch(ns, ne, rel, 0.0, my_gen);
+                }
             })),
             on_audio: {
                 let save_tracks = save_tracks.clone();

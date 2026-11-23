@@ -18,8 +18,9 @@ const MIN_BECAUSE_ITEMS: usize = 4;
 const BECAUSE_PREFIX: &str = "because:";
 
 /// Ordered category chips offered on the home screen.
-const CATEGORY_CATALOG: [(&str, &str); 12] = [
+const CATEGORY_CATALOG: [(&str, &str); 13] = [
     ("for_you", "Для вас"),
+    ("preloaded", "Скачано на сервер"),
     ("rewatch", "Пересматривай любимое"),
     ("tv", "Сериалы"),
     ("movies", "Фильмы"),
@@ -434,6 +435,7 @@ mod tests {
             user_rating: None,
             user_status: None,
             peers: Vec::new(),
+            preloaded: false,
         }
     }
 

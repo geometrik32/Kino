@@ -66,6 +66,7 @@ fn with_timeout(req: RequestBuilder, _secs: u64) -> RequestBuilder {
 pub struct Failure {
     pub code: String,
     pub message: String,
+    pub available_episodes: Vec<(i32, i32)>,
 }
 
 impl Failure {
@@ -73,6 +74,7 @@ impl Failure {
         Self {
             code: "network".into(),
             message: format!("Нет связи с сервером: {e}"),
+            available_episodes: Vec::new(),
         }
     }
 }
@@ -86,10 +88,12 @@ async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, Failure> {
         Ok(e) => Err(Failure {
             code: e.code,
             message: e.message,
+            available_episodes: e.available_episodes,
         }),
         Err(_) => Err(Failure {
             code: "http".into(),
             message: format!("HTTP {}", status.as_u16()),
+            available_episodes: Vec::new(),
         }),
     }
 }

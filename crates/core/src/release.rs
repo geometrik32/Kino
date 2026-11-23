@@ -45,6 +45,12 @@ pub struct ReleaseOption {
     /// `bitrate_kbps` is an estimate (size ÷ running time, so it includes the sound).
     #[serde(default)]
     pub bitrate_approx: bool,
+    /// Display names of participants who manually chose this release for this title/scope.
+    #[serde(default)]
+    pub picked_by: Vec<String>,
+    /// True when this infohash is already downloaded and ready on the server's disk.
+    #[serde(default)]
+    pub preloaded: bool,
 }
 
 /// Minimum seeders needed for mobile auto-selection to pick `720p` over `SD`.
@@ -381,6 +387,8 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     bitrate_kbps: estimate_bitrate_kbps(size_bytes, if tv { 500.0 } else { 140.0 }),
                     // A few releases state the bitrate in their name; the rest are estimated.
                     bitrate_approx: !matches!(h, 'b' | 'g'),
+                    picked_by: Vec::new(),
+                    preloaded: false,
                 }
             },
         )

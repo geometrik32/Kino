@@ -900,6 +900,7 @@ fn preload_from_row(row: &PgRow) -> Result<PreloadItem, sqlx::Error> {
         requested_at: row.try_get("requested_at")?,
         ready_at: row.try_get("ready_at")?,
         delete_after: row.try_get("delete_after")?,
+        poster_path: None,
     })
 }
 
@@ -947,21 +948,20 @@ pub async fn preload_delete(pool: &PgPool, user_id: i64, id: i64) -> Result<Opti
     .await
 }
 
-/// Once a film or a season is watched, its preloads are scheduled for removal.
+/// Once a film or a season is watched, its server preload is shortened to `at` (never exceeding the 7-day ready cap).
 pub async fn preload_schedule_removal(
     pool: &PgPool,
-    user_id: i64,
+    _user_id: i64,
     kind: MediaKind,
     tmdb_id: i64,
     season: i32,
     at: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
     let r = sqlx::query(
-        "UPDATE preload SET delete_after = $5
-         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND season = $4
-           AND state <> 'deleted' AND delete_after IS NULL",
+        "UPDATE preload
+         SET delete_after = LEAST(COALESCE(delete_after, $4), $4)
+         WHERE media_kind = $1 AND tmdb_id = $2 AND season = $3 AND state <> 'deleted'",
     )
-    .bind(user_id)
     .bind(kind.as_str())
     .bind(tmdb_id)
     .bind(season)
@@ -990,6 +990,7 @@ pub async fn preloads_active(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> 
 }
 
 /// Progress from the torrent client, for every user who asked for this release.
+/// Finished downloads are kept on disk for at most 7 days unless watched earlier.
 pub async fn preload_progress(
     pool: &PgPool,
     infohash: &str,
@@ -999,7 +1000,11 @@ pub async fn preload_progress(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE preload SET state = $2, progress = $3, size_bytes = COALESCE($4, size_bytes),
-             ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END
+             ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END,
+             delete_after = CASE
+                 WHEN $2 = 'ready' THEN LEAST(COALESCE(delete_after, now() + interval '7 days'), now() + interval '7 days')
+                 ELSE delete_after
+             END
          WHERE infohash = $1 AND state IN ('queued', 'downloading')",
     )
     .bind(infohash)
@@ -1009,6 +1014,63 @@ pub async fn preload_progress(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Ready-to-play server download metadata.
+#[derive(Debug, Clone)]
+pub struct ReadyPreload {
+    pub infohash: String,
+    pub season: i32,
+    pub title: Option<String>,
+    pub ready_at: DateTime<Utc>,
+}
+
+/// All ready server preloads for a title, newest finished download first.
+pub async fn ready_preloads_for_title(
+    pool: &PgPool,
+    kind: MediaKind,
+    tmdb_id: i64,
+) -> Result<Vec<ReadyPreload>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT infohash, season, title, COALESCE(ready_at, requested_at) AS ready_ts
+         FROM preload
+         WHERE media_kind = $1 AND tmdb_id = $2 AND state = 'ready'
+         ORDER BY ready_ts DESC",
+    )
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter()
+        .map(|r| {
+            Ok(ReadyPreload {
+                infohash: r.try_get("infohash")?,
+                season: r.try_get("season")?,
+                title: r.try_get("title")?,
+                ready_at: r.try_get("ready_ts")?,
+            })
+        })
+        .collect()
+}
+
+/// Distinct `(kind, tmdb_id)` titles currently downloaded and ready on the server, newest first.
+pub async fn ready_preloaded_keys(pool: &PgPool) -> Result<Vec<(MediaKind, i64)>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT media_kind, tmdb_id
+         FROM preload
+         WHERE state = 'ready'
+         GROUP BY media_kind, tmdb_id
+         ORDER BY MAX(COALESCE(ready_at, requested_at)) DESC",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in rows {
+        let kind = kind_of(&r)?;
+        let id: i64 = r.try_get("tmdb_id")?;
+        out.push((kind, id));
+    }
+    Ok(out)
 }
 
 /// Whether someone else still keeps this release on the server.

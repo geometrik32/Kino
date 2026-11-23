@@ -216,6 +216,28 @@ pub async fn enrich_summaries(
         }
     }
 
+    let ready_preloads: HashSet<(MediaKind, i64)> = sqlx::query(
+        "SELECT DISTINCT p.media_kind, p.tmdb_id
+         FROM preload p
+         JOIN UNNEST($1::text[], $2::bigint[]) AS q(k, id)
+           ON p.media_kind = q.k AND p.tmdb_id = q.id
+         WHERE p.state = 'ready'",
+    )
+    .bind(&kinds)
+    .bind(&ids)
+    .fetch_all(pool)
+    .await
+    .map(|rws| {
+        rws.into_iter()
+            .filter_map(|r| {
+                let k = r.try_get::<String, _>("media_kind").ok()?;
+                let id = r.try_get::<i64, _>("tmdb_id").ok()?;
+                Some((MediaKind::parse(&k)?, id))
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+
     for item in items.iter_mut() {
         if let Some(&(st, rt)) = mine.get(&(item.kind, item.tmdb_id)) {
             item.user_status = st;
@@ -223,6 +245,9 @@ pub async fn enrich_summaries(
         }
         if let Some(peers) = peers_map.get(&(item.kind, item.tmdb_id)) {
             item.peers = peers.clone();
+        }
+        if ready_preloads.contains(&(item.kind, item.tmdb_id)) {
+            item.preloaded = true;
         }
     }
 }
@@ -249,6 +274,7 @@ pub async fn title_peers(
         user_rating: None,
         user_status: None,
         peers: Vec::new(),
+        preloaded: false,
     }];
     enrich_summaries(pool, secret, sync, viewer_id, &mut dummy).await;
     dummy.into_iter().next().map(|s| s.peers).unwrap_or_default()

@@ -190,7 +190,7 @@ impl Config {
                     .max(1),
             ),
             preload_keep: chrono::Duration::days(
-                var_or("PRELOAD_KEEP_DAYS", "7")
+                var_or("PRELOAD_KEEP_DAYS", "2")
                     .parse()
                     .context("PRELOAD_KEEP_DAYS must be a number")?,
             ),

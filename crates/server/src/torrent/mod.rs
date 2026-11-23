@@ -112,6 +112,8 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
         codec: p.codec,
         bitrate_kbps,
         bitrate_approx,
+        picked_by: Vec::new(),
+        preloaded: false,
     }
 }
 
@@ -893,6 +895,7 @@ mod tests {
                 user_rating: None,
                 user_status: None,
                 peers: Vec::new(),
+                preloaded: false,
             },
             genres: vec![],
             runtime_min: None,

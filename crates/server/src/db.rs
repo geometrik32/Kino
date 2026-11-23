@@ -1,5 +1,7 @@
 //! Database access. Queries are checked at runtime (no live DB needed to build).
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use kino_core::{
     is_finished, normalize_quality_key, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice,
@@ -543,11 +545,11 @@ pub async fn save_release_choice(
     }
     let chosen_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO release_choice
-            (user_id, media_kind, tmdb_id, season, episode, quality_key, infohash, release_title, quality, voice, chosen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+            (user_id, media_kind, tmdb_id, season, episode, quality_key, infohash, release_title, quality, voice, manual, chosen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, TRUE, now())
          ON CONFLICT (user_id, media_kind, tmdb_id, season, episode, quality_key) DO UPDATE SET
            infohash = EXCLUDED.infohash, release_title = EXCLUDED.release_title,
-           quality = EXCLUDED.quality, voice = EXCLUDED.voice, chosen_at = EXCLUDED.chosen_at
+           quality = EXCLUDED.quality, voice = EXCLUDED.voice, manual = TRUE, chosen_at = EXCLUDED.chosen_at
          RETURNING chosen_at",
     )
     .bind(user_id)
@@ -566,6 +568,7 @@ pub async fn save_release_choice(
         release: stored,
         chosen_at,
         picked_by: None,
+        manual: true,
     })
 }
 
@@ -590,10 +593,11 @@ fn choice_from_row(
         },
         chosen_at: row.try_get("chosen_at")?,
         picked_by,
+        manual: row.try_get("manual").unwrap_or(true),
     })
 }
 
-/// All remembered releases for a title for one user (by season, episode and quality), newest first.
+/// All remembered releases for a title for one user (by season, episode and quality), manual and newest first.
 pub async fn release_choices(
     pool: &PgPool,
     user_id: i64,
@@ -601,10 +605,10 @@ pub async fn release_choices(
     tmdb_id: i64,
 ) -> Result<Vec<ReleaseChoice>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT season, episode, quality_key, infohash, release_title, quality, voice, chosen_at
+        "SELECT season, episode, quality_key, infohash, release_title, quality, voice, chosen_at, manual
          FROM release_choice
          WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3
-         ORDER BY chosen_at DESC",
+         ORDER BY manual DESC, chosen_at DESC",
     )
     .bind(user_id)
     .bind(kind.as_str())
@@ -614,7 +618,7 @@ pub async fn release_choices(
     rows.iter().map(|r| choice_from_row(r, kind, tmdb_id, None)).collect()
 }
 
-/// Release choices made by OTHER users for this title, newest first.
+/// Manual release choices made by OTHER users for this title, most popular first then newest.
 pub async fn shared_release_choices(
     pool: &PgPool,
     exclude_user_id: i64,
@@ -623,12 +627,13 @@ pub async fn shared_release_choices(
 ) -> Result<Vec<ReleaseChoice>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT rc.season, rc.episode, rc.quality_key, rc.infohash, rc.release_title,
-                rc.quality, rc.voice, rc.chosen_at,
-                COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS picker_name
+                rc.quality, rc.voice, rc.chosen_at, rc.manual,
+                COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS picker_name,
+                COUNT(*) OVER (PARTITION BY rc.infohash) AS pick_count
          FROM release_choice rc
          JOIN users u ON u.id = rc.user_id
-         WHERE rc.user_id <> $1 AND rc.media_kind = $2 AND rc.tmdb_id = $3
-         ORDER BY rc.chosen_at DESC",
+         WHERE rc.user_id <> $1 AND rc.media_kind = $2 AND rc.tmdb_id = $3 AND rc.manual = TRUE
+         ORDER BY pick_count DESC, rc.chosen_at DESC",
     )
     .bind(exclude_user_id)
     .bind(kind.as_str())
@@ -641,6 +646,39 @@ pub async fn shared_release_choices(
             choice_from_row(r, kind, tmdb_id, Some(who))
         })
         .collect()
+}
+
+/// Unique display names of users who manually chose each release (`infohash`) for this title/season.
+pub async fn release_pickers(
+    pool: &PgPool,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT rc.infohash,
+                COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS picker_name
+         FROM release_choice rc
+         JOIN users u ON u.id = rc.user_id
+         WHERE rc.media_kind = $1 AND rc.tmdb_id = $2 AND rc.manual = TRUE
+           AND ($1 = 'movie' OR rc.season = 0 OR $3 = 0 OR rc.season = $3)
+         ORDER BY rc.chosen_at DESC",
+    )
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(season)
+    .fetch_all(pool)
+    .await?;
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+    for r in rows {
+        let hash: String = r.try_get("infohash")?;
+        let name: String = r.try_get("picker_name")?;
+        let entry = map.entry(hash).or_default();
+        if !entry.contains(&name) {
+            entry.push(name);
+        }
+    }
+    Ok(map)
 }
 
 pub async fn save_device_quality(

@@ -84,6 +84,7 @@ async fn establish() -> Session {
             Ok(_) => Err(api::Failure {
                 code: "expired".into(),
                 message: "Ссылка для входа устарела. Отправьте боту /login ещё раз.".into(),
+                available_episodes: Vec::new(),
             }),
             Err(f) => Err(f),
         };
@@ -364,6 +365,29 @@ enum View {
     },
 }
 
+fn view_url(view: &View, my_section: MySection, query: &str) -> String {
+    match view {
+        View::Tab(Tab::Home) => "/".to_owned(),
+        View::Tab(Tab::Search) => {
+            let trimmed = query.trim();
+            if trimmed.is_empty() {
+                "/?tab=search".to_owned()
+            } else {
+                format!("/?tab=search&q={}", urlencoding::encode(trimmed))
+            }
+        }
+        View::Tab(Tab::Mine) => match my_section {
+            MySection::Lists => "/?tab=my".to_owned(),
+            MySection::Users => "/?tab=my&sec=users".to_owned(),
+            MySection::Calendar => "/?tab=my&sec=calendar".to_owned(),
+        },
+        View::Tab(Tab::Profile) => "/?tab=profile".to_owned(),
+        View::Title(kind, id, _) => format!("/?open={}_{id}", kind.as_str()),
+        View::Person(id) => format!("/?person={id}"),
+        View::Shelf { id, .. } => format!("/?shelf={}", urlencoding::encode(id)),
+    }
+}
+
 #[component]
 fn Main(
     token: String,
@@ -373,19 +397,44 @@ fn Main(
     on_theme: EventHandler<Theme>,
     on_logout: EventHandler<()>,
 ) -> Element {
-    // A link to a title (from a bot message) opens it, with Home behind it.
-    let link = use_hook(telegram::open_target);
+    let initial_route = use_hook(telegram::initial_route);
+    let initial_my_sec = match &initial_route {
+        telegram::InitialRoute::Mine(Some(s)) if s == "users" => MySection::Users,
+        telegram::InitialRoute::Mine(Some(s)) if s == "calendar" => MySection::Calendar,
+        _ => MySection::Lists,
+    };
+    let initial_query = match &initial_route {
+        telegram::InitialRoute::Search(q) => q.clone(),
+        _ => String::new(),
+    };
+    let initial_view = match &initial_route {
+        telegram::InitialRoute::Home => View::Tab(Tab::Home),
+        telegram::InitialRoute::Search(_) => View::Tab(Tab::Search),
+        telegram::InitialRoute::Mine(_) => View::Tab(Tab::Mine),
+        telegram::InitialRoute::Profile => View::Tab(Tab::Profile),
+        telegram::InitialRoute::Title(t) => View::Title(t.kind, t.tmdb_id, t.autoplay),
+        telegram::InitialRoute::Person(id) => View::Person(*id),
+        telegram::InitialRoute::Shelf(id) => View::Shelf {
+            id: id.clone(),
+            title: String::new(),
+            subtitle: None,
+        },
+    };
+    let has_initial_trail = !matches!(initial_route, telegram::InitialRoute::Home);
+    let mut view = use_signal(|| initial_view.clone());
+    let mut trail = use_signal(|| {
+        if has_initial_trail {
+            vec![View::Tab(Tab::Home)]
+        } else {
+            Vec::new()
+        }
+    });
+    let mut query = use_signal(|| initial_query.clone());
+    let mut my_section = use_signal(|| initial_my_sec);
     use_hook(|| {
-        let initial_url = link.map(|t| format!("/?open={}_{}", t.kind.as_str(), t.tmdb_id));
-        telegram::init_history(link.is_some(), initial_url.as_deref());
+        let init_url = view_url(&initial_view, initial_my_sec, &initial_query);
+        telegram::init_history(has_initial_trail, (init_url != "/").then_some(init_url.as_str()));
     });
-    let mut view = use_signal(|| match link {
-        Some(t) => View::Title(t.kind, t.tmdb_id, t.autoplay),
-        None => View::Tab(Tab::Home),
-    });
-    // Where "Back" goes from a title page.
-    let mut trail = use_signal(|| link.map(|_| vec![View::Tab(Tab::Home)]).unwrap_or_default());
-    let mut query = use_signal(String::new);
     let mut home_category = use_signal(|| "for_you".to_owned());
     let mut my_filters = use_signal(MyFilters::default);
     // Restore saved "Мои" filters on startup.
@@ -411,11 +460,39 @@ fn Main(
              }",
         );
     });
-    // Lightweight active-download check for the topbar badge / mobile avatar dot.
+    // Lightweight active-download check for the topbar badge / mobile avatar dot (auto-polls while active).
     let t_dl = token.clone();
-    let active_preloads = use_resource(move || {
+    let mut active_preloads = use_resource(move || {
         let t = t_dl.clone();
         async move { api::preloads(&t).await.ok() }
+    });
+    let has_active_dl = active_preloads
+        .read()
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|list| {
+            list.iter()
+                .any(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
+        });
+    let mut top_poll_gen = use_signal(|| 0u64);
+    use_effect(use_reactive!(|has_active_dl| {
+        let gen = *top_poll_gen.peek() + 1;
+        top_poll_gen.set(gen);
+        if has_active_dl {
+            spawn(async move {
+                loop {
+                    platform::sleep(4_000).await;
+                    if *top_poll_gen.peek() != gen {
+                        break;
+                    }
+                    active_preloads.restart();
+                }
+            });
+        }
+    }));
+    use_drop(move || {
+        let next = *top_poll_gen.peek() + 1;
+        top_poll_gen.set(next);
     });
     let dl_percent: Option<u8> = active_preloads
         .read()
@@ -455,7 +532,7 @@ fn Main(
             })
         });
         view.set(View::Person(id));
-        telegram::push_history(Some("/"));
+        telegram::push_history(Some(&format!("/?person={id}")));
     };
     let open_shelf = move |(id, title, subtitle): (String, String, Option<String>)| {
         telegram::haptic(telegram::Haptic::Tap);
@@ -465,8 +542,9 @@ fn Main(
                 v => v,
             })
         });
+        let url = format!("/?shelf={}", urlencoding::encode(&id));
         view.set(View::Shelf { id, title, subtitle });
-        telegram::push_history(Some("/"));
+        telegram::push_history(Some(&url));
     };
     let go_back = move |_: ()| {
         telegram::haptic(telegram::Haptic::Tap);
@@ -516,9 +594,14 @@ fn Main(
                         View::Title(k, i, _) => View::Title(k, i, false),
                         v => v,
                     };
+                    let next = View::Tab(t);
+                    let url = view_url(&next, *my_section.peek(), &query.peek());
                     trail.with_mut(|tr| tr.push(prev));
-                    view.set(View::Tab(t));
-                    telegram::push_history(Some("/"));
+                    view.set(next);
+                    telegram::push_history(Some(&url));
+                }
+                if t == Tab::Profile {
+                    active_preloads.restart();
                 }
                 if t == Tab::Search {
                     spawn(async move {
@@ -548,12 +631,15 @@ fn Main(
                             View::Title(k, i, _) => View::Title(k, i, false),
                             v => v,
                         };
+                        let url = view_url(&View::Tab(Tab::Search), *my_section.peek(), &q);
                         trail.with_mut(|tr| tr.push(prev));
-                        telegram::push_history(Some("/"));
+                        telegram::push_history(Some(&url));
                     } else {
                         trail.set(Vec::new());
                     }
                     view.set(View::Tab(Tab::Search));
+                } else {
+                    telegram::replace_history(&view_url(&View::Tab(Tab::Search), *my_section.peek(), &q));
                 }
                 query.set(q);
             },
@@ -572,7 +658,12 @@ fn Main(
                 View::Tab(Tab::Mine) => rsx! {
                     Mine {
                         token: token.clone(),
+                        section: my_section,
                         filters: my_filters,
+                        on_section: move |s: MySection| {
+                            my_section.set(s);
+                            telegram::replace_history(&view_url(&View::Tab(Tab::Mine), s, &query.peek()));
+                        },
                         on_filters: move |f: MyFilters| {
                             telegram::haptic(telegram::Haptic::Select);
                             my_filters.set(f);
@@ -588,6 +679,7 @@ fn Main(
                         avatar_url: avatar_url.clone(),
                         theme,
                         on_theme,
+                        on_preloads_changed: move |_| active_preloads.restart(),
                         on_open: move |(k, id)| open_title(k, id, false),
                         on_logout,
                     }
@@ -599,6 +691,7 @@ fn Main(
                         kind,
                         id,
                         autoplay: play,
+                        on_preloads_changed: move |_| active_preloads.restart(),
                         on_open: open,
                         on_person: open_person,
                         // Closing a player started directly from Home / deep-link returns to the previous screen.
@@ -1068,11 +1161,12 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
 #[component]
 fn Mine(
     token: String,
+    section: Signal<MySection>,
     filters: Signal<MyFilters>,
+    on_section: EventHandler<MySection>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
-    let mut section = use_signal(MySection::default);
     let mut selected_user_id = use_signal(|| None::<i64>);
     let t_items = token.clone();
     let items = use_resource(move || {
@@ -1124,7 +1218,8 @@ fn Mine(
                     peer_library,
                     peer_loading,
                     calendar,
-                    on_section: move |s| section.set(s),
+                    today_ymd: today_ymd(),
+                    on_section,
                     on_select_user: move |id| selected_user_id.set(Some(id)),
                     on_filters,
                     on_open,
@@ -1223,6 +1318,7 @@ fn Profile(
     avatar_url: Option<String>,
     theme: Theme,
     on_theme: EventHandler<Theme>,
+    on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
@@ -1236,6 +1332,31 @@ fn Profile(
     });
     let mut prefs_now = use_signal(|| None::<UserPrefs>);
     let state = data.read().clone();
+    let has_active_dl = matches!(
+        &state,
+        Some(Ok((_, pl, _))) if pl.iter().any(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
+    );
+    let mut poll_gen = use_signal(|| 0u64);
+    use_effect(use_reactive!(|has_active_dl| {
+        let gen = *poll_gen.peek() + 1;
+        poll_gen.set(gen);
+        if has_active_dl {
+            spawn(async move {
+                loop {
+                    platform::sleep(3_000).await;
+                    if *poll_gen.peek() != gen {
+                        break;
+                    }
+                    data.restart();
+                    on_preloads_changed.call(());
+                }
+            });
+        }
+    }));
+    use_drop(move || {
+        let next = *poll_gen.peek() + 1;
+        poll_gen.set(next);
+    });
     let (history, preloads, prefs) = match state {
         None => return loading(),
         Some(Err(e)) => return error_text(&e.message),
@@ -1269,10 +1390,14 @@ fn Profile(
                 spawn(async move {
                     if api::delete_preload(&t, pid).await.is_ok() {
                         data.restart();
+                        on_preloads_changed.call(());
                     }
                 });
             },
-            on_refresh: move |_| data.restart(),
+            on_refresh: move |_| {
+                data.restart();
+                on_preloads_changed.call(());
+            },
             on_open,
             on_logout,
         }
@@ -1338,6 +1463,7 @@ fn Title(
     kind: MediaKind,
     id: i64,
     autoplay: bool,
+    on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<TitleSummary>,
     on_person: EventHandler<i64>,
     on_exit: EventHandler<bool>,
@@ -1507,8 +1633,17 @@ fn Title(
     };
     let status = status_now().unwrap_or(st.status);
     let my_rating = rating_now().unwrap_or(st.rating);
-    let mut choices: Vec<ReleaseChoiceUpdate> = picked_now();
-    choices.extend(loaded.into_iter().map(|c| c.release));
+    let mut manual_choices: Vec<ReleaseChoiceUpdate> = picked_now();
+    for c in &loaded {
+        if c.picked_by.is_none() && c.manual {
+            manual_choices.push(c.release.clone());
+        }
+    }
+    let peer_choices: Vec<ReleaseChoiceUpdate> = loaded
+        .iter()
+        .filter(|c| c.picked_by.is_some())
+        .map(|c| c.release.clone())
+        .collect();
     let season_key = move |t: &PlayTarget| if kind == MediaKind::Tv { t.season } else { 0 };
     let loaded_prefs_opt = user_prefs.read().clone().flatten();
     let is_mobile = telegram::is_mobile();
@@ -1520,27 +1655,45 @@ fn Title(
         }
     });
     let ask_each_time = dev_pref_q == Some("ask");
-    let choice_for_target = {
-        let choices = choices.clone();
+    let display_choice_for = {
+        let manual_choices = manual_choices.clone();
+        let peer_choices = peer_choices.clone();
         let dev_pref_q = dev_pref_q.map(str::to_owned);
         move |s: i32, e: i32| -> Option<ReleaseChoiceUpdate> {
             if ask_each_time {
                 return scoped_choice(&picked_now(), kind, s, e, None);
             }
-            if is_mobile && matches!(dev_pref_q.as_deref(), None | Some("auto")) {
-                return scoped_choice(&choices, kind, s, e, Some("720p"))
-                    .or_else(|| scoped_choice(&choices, kind, s, e, Some("SD")));
-            }
-            let want = dev_pref_q.as_deref().map(normalize_quality_key).unwrap_or("1080p");
-            scoped_choice(&choices, kind, s, e, Some(want))
+            let want_fn = |list: &[ReleaseChoiceUpdate]| -> Option<ReleaseChoiceUpdate> {
+                if is_mobile && matches!(dev_pref_q.as_deref(), None | Some("auto")) {
+                    scoped_choice(list, kind, s, e, Some("720p"))
+                        .or_else(|| scoped_choice(list, kind, s, e, Some("SD")))
+                } else {
+                    let want = dev_pref_q.as_deref().map(normalize_quality_key).unwrap_or("1080p");
+                    scoped_choice(list, kind, s, e, Some(want))
+                }
+            };
+            want_fn(&manual_choices)
+                .or_else(|| want_fn(&peer_choices))
+                .or_else(|| scoped_choice(&manual_choices, kind, s, e, None))
+                .or_else(|| scoped_choice(&peer_choices, kind, s, e, None))
         }
     };
-    let latest = choices.first().cloned();
+    let latest = manual_choices.first().or_else(|| peer_choices.first()).cloned();
     let (target, play_label) = play_target(&details, &progress);
     let default_target = target.clone();
-    let release_label = choice_for_target(target.season, target.episode)
-        .or_else(|| scoped_choice(&choices, kind, target.season, target.episode, None))
-        .map(|c| choice_label(&c));
+    let release_label = if details.summary.preloaded && picked_now().is_empty() {
+        Some("На сервере · готово".to_owned())
+    } else {
+        display_choice_for(target.season, target.episode).map(|c| choice_label(&c))
+    };
+    let cur_season_data = season.read().clone().flatten();
+    let season_release_label = cur_season_data.as_ref().and_then(|sd| {
+        manual_choices
+            .iter()
+            .chain(peer_choices.iter())
+            .find(|c| c.season == sd.number && c.episode == 0)
+            .map(|c| format!("Раздача: {}", choice_label(c)))
+    });
     let watched: Vec<String> = progress
         .iter()
         .filter_map(|p| p.release.as_ref().map(|r| r.infohash.clone()))
@@ -1548,10 +1701,10 @@ fn Title(
 
     let mut open_picker_with_scope = {
         let latest = latest.clone();
-        let choices = choices.clone();
+        let manual_choices = manual_choices.clone();
         let loaded_prefs_opt = loaded_prefs_opt.clone();
         move |t: PlayTarget, ep_scoped: bool| {
-            let base = match (scoped_choice(&choices, kind, t.season, t.episode, None), &latest) {
+            let base = match (scoped_choice(&manual_choices, kind, t.season, t.episode, None), &latest) {
                 (None, Some(prev)) => ReleaseFilter::like(prev),
                 _ => ReleaseFilter::default(),
             };
@@ -1622,14 +1775,9 @@ fn Title(
         },
     );
     let on_play_rewatch = Callback::new({
-        let choice_for_target = choice_for_target.clone();
         let tok_res = token.clone();
         move |(t, mode): (PlayTarget, RewatchMode)| {
             telegram::haptic(telegram::Haptic::Tap);
-            if let Some(c) = choice_for_target(t.season, t.episode) {
-                start_playback.call((t, c, mode, false));
-                return;
-            }
             if *resolving.peek() {
                 return;
             }
@@ -1645,14 +1793,6 @@ fn Title(
                 resolving.set(false);
                 match res {
                     Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
-                        picked_now.with_mut(|v| {
-                            v.retain(|c| {
-                                !(c.season == choice.season
-                                    && c.episode == choice.episode
-                                    && c.quality_key == choice.quality_key)
-                            });
-                            v.insert(0, choice.clone());
-                        });
                         start_playback.call((t, choice, mode, false));
                     }
                     Ok(ResolveReleaseResponse::NeedsPicker { releases, .. }) => {
@@ -1675,7 +1815,11 @@ fn Title(
     let heading = picker().map(|p| {
         let mut h = details.summary.title.clone();
         if kind == MediaKind::Tv {
-            h.push_str(&format!(" · {}", kino_core::episode_code(p.season, p.episode)));
+            if p.episode > 0 {
+                h.push_str(&format!(" · {}", kino_core::episode_code(p.season, p.episode)));
+            } else if p.season > 0 {
+                h.push_str(&format!(" · Сезон {}", p.season));
+            }
         }
         if p.position_sec > 0.0 {
             h.push_str(&format!(" · продолжить с {}", kino_core::clock(p.position_sec)));
@@ -1684,7 +1828,7 @@ fn Title(
     });
     let picker_season = picker().map(|p| season_key(&p));
     let chosen_hash = picker()
-        .and_then(|p| scoped_choice(&choices, kind, p.season, p.episode, None))
+        .and_then(|p| scoped_choice(&manual_choices, kind, p.season, p.episode, None))
         .map(|c| c.infohash);
     let summary = details.summary.clone();
     let t3 = token.clone();
@@ -1714,7 +1858,7 @@ fn Title(
         }
         TitleView {
             details: details.clone(),
-            season: season.read().clone().flatten(),
+            season: cur_season_data,
             progress,
             status,
             my_rating,
@@ -1724,9 +1868,20 @@ fn Title(
             peers: st.peers.clone(),
             today_ymd: today_ymd(),
             release_label,
+            season_release_label,
             on_play,
             on_play_rewatch: Some(on_play_rewatch),
             on_change_release: open_picker.clone(),
+            on_change_season_release: Some(Callback::new({
+                let mut open_picker = open_picker.clone();
+                move |s_num: i32| {
+                    open_picker(PlayTarget {
+                        season: s_num,
+                        episode: 0,
+                        position_sec: 0.0,
+                    });
+                }
+            })),
             on_change_episode_release: Some(Callback::new(open_episode_picker)),
             on_status: {
                 let token = token.clone();
@@ -1931,7 +2086,10 @@ fn Title(
                         telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
                             let msg = match api::add_preload(&t, &req).await {
-                                Ok(_) => format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки»."),
+                                Ok(_) => {
+                                    on_preloads_changed.call(());
+                                    format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки».")
+                                }
                                 Err(e) => format!("Не удалось поставить в загрузку: {}", e.message),
                             };
                             if !*notice_pushed.peek() {
@@ -1972,7 +2130,7 @@ fn Title(
                     poster: details.summary.backdrop_path.as_deref().map(|p| image_url(p, ImageSize::Backdrop)),
                     season: t.season,
                     episode: t.episode,
-                    choices: choices.clone(),
+                    choices: manual_choices.clone(),
                     release: rel,
                     explicit_episode,
                     explicit_release,

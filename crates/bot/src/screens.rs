@@ -887,30 +887,45 @@ pub fn trend_settings(p: &TrendPrefs) -> Screen {
     Screen::new(text, rows)
 }
 
-/// HTML caption attached to the first poster of a "Сегодня в тренде" media group.
-pub fn trending_album_caption(base: &Url, items: &[TitleSummary]) -> String {
+/// HTML caption attached to the first poster of a "Сегодня в тренде" media group (no external browser links).
+pub fn trending_album_caption(items: &[TitleSummary]) -> String {
     let mut text = String::from("<b>🔥 Сегодня в тренде</b>\n");
     for (idx, item) in items.iter().enumerate() {
-        let url = title_url(base, item.kind, item.tmdb_id);
+        let icon = if item.kind == MediaKind::Tv { "📺" } else { "🎬" };
         let name = name_with_year(item);
         let rate = item
             .rating
             .filter(|r| *r > 0.0)
             .map(|r| format!(" · ★ {r:.1}"))
             .unwrap_or_default();
-        let line = format!(
-            "\n{}. <a href=\"{}\">{}</a>{}",
-            idx + 1,
-            esc(url.as_str()),
-            esc(&name),
-            rate
-        );
+        let line = format!("\n{}. {icon} <b>{}</b>{}", idx + 1, esc(&name), rate);
         if text.chars().count() + line.chars().count() > CAPTION_MAX_CHARS {
             break;
         }
         text.push_str(&line);
     }
     text
+}
+
+/// Mini App inline buttons under the "Сегодня в тренде" digest so titles open right inside Telegram.
+pub fn trending_buttons(base: &Url, items: &[TitleSummary], is_private: bool) -> InlineKeyboardMarkup {
+    let rows: Vec<Vec<InlineKeyboardButton>> = items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let icon = if item.kind == MediaKind::Tv { "📺" } else { "🎬" };
+            let name = truncate_chars(&name_with_year(item), 38);
+            let label = format!("{}. {icon} {name}", idx + 1);
+            let url = title_url(base, item.kind, item.tmdb_id);
+            let btn = if is_private {
+                open_title_url(label, url)
+            } else {
+                InlineKeyboardButton::url(label, url)
+            };
+            vec![btn]
+        })
+        .collect();
+    InlineKeyboardMarkup::new(rows)
 }
 
 /// Counts of titles per status, for the "Мои" menu.
@@ -996,6 +1011,7 @@ mod tests {
             user_rating: None,
             user_status: None,
             peers: Vec::new(),
+            preloaded: false,
         }
     }
 
@@ -1333,10 +1349,16 @@ mod tests {
             summary(MediaKind::Movie, 603, "Матрица", Some(1999)),
             summary(MediaKind::Movie, 155, "Тёмный рыцарь", Some(2008)),
         ];
-        let cap = trending_album_caption(&base(), &items);
+        let cap = trending_album_caption(&items);
         assert!(cap.contains("Сегодня в тренде"));
-        assert!(cap.contains("https://kino.example.com/?open=movie_603"));
+        assert!(!cap.contains("<a href="));
         assert!(cap.contains("Матрица (1999)"));
         assert!(cap.chars().count() <= 1024);
+        let kb = trending_buttons(&base(), &items, true);
+        assert_eq!(kb.inline_keyboard.len(), 2);
+        assert_eq!(
+            web_app_url(&kb.inline_keyboard[0][0]),
+            "https://kino.example.com/?open=movie_603"
+        );
     }
 }

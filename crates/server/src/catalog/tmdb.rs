@@ -614,6 +614,7 @@ impl ListItem {
             user_rating: None,
             user_status: None,
             peers: Vec::new(),
+            preloaded: false,
         })
     }
 }
@@ -1824,6 +1825,7 @@ mod tests {
             user_rating: None,
             user_status: None,
             peers: Vec::new(),
+            preloaded: false,
         };
         let mut list = vec![item(MediaKind::Movie, 1, "Другой фильм")];
         merge_unique(

@@ -15,8 +15,8 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
     demo_releases, language_name, normalize_quality_key, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest,
-    PlayRequest, ReleaseChoice, ReleaseList, ReleaseOption, ResolveReleaseRequest, ResolveReleaseResponse,
-    StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
+    PlayRequest, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ReleaseOption, ResolveReleaseRequest,
+    ResolveReleaseResponse, StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
 };
 use serde::Deserialize;
 use tower::ServiceExt;
@@ -179,16 +179,48 @@ struct SeasonQuery {
     season: Option<i32>,
 }
 
+async fn enrich_release_meta(
+    pool: &sqlx::PgPool,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    releases: &mut [ReleaseOption],
+) -> Result<(), AppError> {
+    if releases.is_empty() {
+        return Ok(());
+    }
+    let pickers = db::release_pickers(pool, kind, tmdb_id, season).await?;
+    let ready: std::collections::HashSet<String> = userdata::ready_preloads_for_title(pool, kind, tmdb_id)
+        .await?
+        .into_iter()
+        .filter(|p| kind == MediaKind::Movie || p.season == 0 || season == 0 || p.season == season)
+        .map(|p| p.infohash)
+        .collect();
+    for r in releases.iter_mut() {
+        if let Some(names) = pickers.get(&r.infohash) {
+            r.picked_by = names.clone();
+        }
+        if ready.contains(&r.infohash) {
+            r.preloaded = true;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_release_list(
     state: &AppState,
     details: &TitleDetails,
     season: Option<i32>,
 ) -> Result<ReleaseList, AppError> {
     let kind = details.summary.kind;
+    let tmdb_id = details.summary.tmdb_id;
+    let season_val = if kind == MediaKind::Tv { season.unwrap_or(0) } else { 0 };
     let Some(jackett) = &state.media.jackett else {
         let s = (kind == MediaKind::Tv).then(|| season.unwrap_or(1));
+        let mut releases = demo_releases(&details.summary, s);
+        enrich_release_meta(&state.pool, kind, tmdb_id, season_val, &mut releases).await?;
         return Ok(ReleaseList {
-            releases: demo_releases(&details.summary, s),
+            releases,
             configured: false,
         });
     };
@@ -211,6 +243,7 @@ async fn fetch_release_list(
             r.infohash = h.clone();
         }
     }
+    enrich_release_meta(&state.pool, kind, tmdb_id, season_val, &mut releases).await?;
     Ok(ReleaseList {
         releases,
         configured: true,
@@ -412,7 +445,11 @@ fn auto_pick_release<'a>(
     })
 }
 
-/// Automatically picks a release by quality (device default / prefs) and other users' choices.
+/// Automatically picks a release following strict 4-tier priority:
+/// 1. Ready preloaded release on server disk (unless user manually chose another release *after* it finished).
+/// 2. User's own manual choice for this scope & quality.
+/// 3. Other users' manual choice for this scope & quality (most popular first).
+/// 4. Device default quality (popular by seeders, not written as a manual user pick).
 async fn resolve_release(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -428,6 +465,45 @@ async fn resolve_release(
     } else {
         (req.season, req.episode)
     };
+    let mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    let ready_preloads = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id).await?;
+    let best_ready = ready_preloads
+        .iter()
+        .find(|p| kind == MediaKind::Movie || p.season == season)
+        .or_else(|| ready_preloads.iter().find(|p| p.season == 0));
+
+    if let Some(rp) = best_ready {
+        let overridden_after = mine.iter().any(|c| {
+            c.manual
+                && c.chosen_at > rp.ready_at
+                && c.release.infohash != rp.infohash
+                && (kind == MediaKind::Movie
+                    || (c.release.season == season && c.release.episode == episode)
+                    || (c.release.season == season && c.release.episode == 0)
+                    || (c.release.season == 0 && c.release.episode == 0))
+        });
+        if !overridden_after {
+            let parsed = rp.title.as_deref().map(torrent::title::parse_title);
+            let q = parsed.as_ref().map(|p| p.quality.clone());
+            let qk = q.as_deref().map(|v| normalize_quality_key(v).to_owned());
+            let voice = parsed.as_ref().map(|p| p.voice.clone()).filter(|v| !v.is_empty());
+            return Ok(Json(ResolveReleaseResponse::Ready {
+                choice: ReleaseChoiceUpdate {
+                    kind,
+                    tmdb_id,
+                    season: if kind == MediaKind::Movie { 0 } else { rp.season },
+                    episode: 0,
+                    infohash: rp.infohash.clone(),
+                    title: rp.title.clone(),
+                    quality: q,
+                    quality_key: qk,
+                    voice,
+                },
+                from_peer: None,
+            }));
+        }
+    }
+
     let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
     let prefs = userdata::get_prefs(&state.pool, user.0).await?;
     let dev_override = db::device_quality_for(&state.pool, user.0, kind, tmdb_id, season, episode, device_kind).await?;
@@ -442,8 +518,8 @@ async fn resolve_release(
         }));
     }
 
-    let mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
-    if let Some(c) = find_scoped_choice(&mine, season, episode, |k| target.matches_key(k)) {
+    let mine_manual: Vec<ReleaseChoice> = mine.into_iter().filter(|c| c.manual).collect();
+    if let Some(c) = find_scoped_choice(&mine_manual, season, episode, |k| target.matches_key(k)) {
         return Ok(Json(ResolveReleaseResponse::Ready {
             choice: c.release.clone(),
             from_peer: None,
@@ -457,14 +533,13 @@ async fn resolve_release(
             adopted.season = 0;
             adopted.episode = 0;
         }
-        let _ = db::save_release_choice(&state.pool, user.0, &adopted).await;
         return Ok(Json(ResolveReleaseResponse::Ready {
             choice: adopted,
             from_peer: c.picked_by.clone(),
         }));
     }
 
-    let preferred_voice = mine
+    let preferred_voice = mine_manual
         .first()
         .or_else(|| shared.first())
         .and_then(|c| c.release.voice.clone());
@@ -487,7 +562,6 @@ async fn resolve_release(
                 season
             };
             let choice = best.to_scoped_choice(&details.summary, save_season, 0);
-            db::save_release_choice(&state.pool, user.0, &choice).await?;
             Ok(Json(ResolveReleaseResponse::Ready {
                 choice,
                 from_peer: None,
@@ -561,11 +635,15 @@ async fn play(
     let episode = (req.kind == MediaKind::Tv).then_some((req.season.max(1), req.episode.max(1)));
 
     // A release downloaded in advance is played from disk; otherwise through TorrServer.
-    let local = preloaded_files(&state, user.0, &hash).await;
+    let local = preloaded_files(&state, &hash).await;
     let (file, input, preloaded) = match local {
         Some((list, dir)) => {
-            let f = files::pick(&list, episode).cloned().ok_or_else(no_file)?;
-            let path = safe_join_canonical(&dir, &f.path).await.ok_or_else(no_file)?;
+            let f = files::pick(&list, episode)
+                .cloned()
+                .ok_or_else(|| missing_file(&list, episode))?;
+            let path = safe_join_canonical(&dir, &f.path)
+                .await
+                .ok_or_else(|| missing_file(&list, episode))?;
             let input = path.to_string_lossy().into_owned();
             (f, input, true)
         }
@@ -583,7 +661,9 @@ async fn play(
                     "Нет раздающих: не удалось получить список файлов. Попробуйте «Скачать заранее».",
                 ));
             }
-            let f = files::pick(&list, episode).cloned().ok_or_else(no_file)?;
+            let f = files::pick(&list, episode)
+                .cloned()
+                .ok_or_else(|| missing_file(&list, episode))?;
             // Load the start of the file now, so the player can show how far it got.
             ts.warm_up(&hash, f.index);
             let input = ts.stream_url_for_ffmpeg(&hash, f.index);
@@ -768,21 +848,34 @@ async fn play_progress(
     }
 }
 
-fn no_file() -> AppError {
-    AppError::new(StatusCode::NOT_FOUND, "no_file", "В раздаче нет этой серии")
+fn missing_file(list: &[FileEntry], episode: Option<(i32, i32)>) -> AppError {
+    match episode {
+        Some((s, e)) => {
+            let avail = files::available_episodes(list, s);
+            let msg = if avail.is_empty() {
+                format!("Серии {} нет в этой раздаче.", kino_core::episode_code(s, e))
+            } else {
+                format!(
+                    "Серии {} нет в этой раздаче. В ней доступны: {}.",
+                    kino_core::episode_code(s, e),
+                    kino_core::format_episode_ranges(&avail)
+                )
+            };
+            AppError::missing_episode(msg, avail)
+        }
+        None => AppError::new(StatusCode::NOT_FOUND, "no_file", "В раздаче нет видеофайла"),
+    }
 }
 
-/// Files of a finished preload of this user, with the folder they are in.
-async fn preloaded_files(state: &AppState, user_id: i64, hash: &str) -> Option<(Vec<FileEntry>, PathBuf)> {
+/// Files of any finished preload on server disk, with the folder they are in.
+async fn preloaded_files(state: &AppState, hash: &str) -> Option<(Vec<FileEntry>, PathBuf)> {
     let (qbit, dir) = (state.media.qbit.as_ref()?, state.media.preload_dir.clone()?);
-    let ready: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM preload WHERE user_id = $1 AND infohash = $2 AND state = 'ready')",
-    )
-    .bind(user_id)
-    .bind(hash)
-    .fetch_one(&state.pool)
-    .await
-    .ok()?;
+    let ready: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND state = 'ready')")
+            .bind(hash)
+            .fetch_one(&state.pool)
+            .await
+            .ok()?;
     if !ready {
         return None;
     }
@@ -1179,6 +1272,7 @@ mod tests {
                 user_rating: None,
                 user_status: None,
                 peers: Vec::new(),
+                preloaded: false,
             },
             genres: vec![],
             runtime_min: None,

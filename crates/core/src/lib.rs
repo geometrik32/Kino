@@ -145,6 +145,9 @@ pub struct ReleaseChoice {
     /// Name of another user if this choice was inherited from them.
     #[serde(default)]
     pub picked_by: Option<String>,
+    /// True when picked explicitly by a user in the picker (rather than automatic quality fallback).
+    #[serde(default = "default_true")]
+    pub manual: bool,
 }
 
 /// Body of `POST /api/auth/webapp`: the raw `Telegram.WebApp.initData` string.
@@ -221,6 +224,9 @@ pub struct ApiError {
     /// Stable machine-readable code, e.g. `not_invited`.
     pub code: String,
     pub message: String,
+    /// Present for `no_file` errors on series: `(season, episode)` pairs actually found in the release.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_episodes: Vec<(i32, i32)>,
 }
 
 #[cfg(test)]
@@ -286,6 +292,9 @@ pub struct TitleSummary {
     /// Other users who watched, are watching, want or rated this title.
     #[serde(default)]
     pub peers: Vec<PeerBadge>,
+    /// True when a preloaded release of this title is ready on the server's disk.
+    #[serde(default)]
+    pub preloaded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -353,6 +362,59 @@ impl TitleDetails {
                     Some("Rumored" | "Planned" | "In Production" | "Post Production")
                 ))
     }
+
+    /// Human-readable Russian label for TMDB project status (`Продолжается`, `Завершён`, `Закрыт`, ...).
+    pub fn localized_status(&self) -> Option<&'static str> {
+        localized_project_status(self.summary.kind, self.series_status.as_deref())
+    }
+}
+
+/// Translates TMDB `status` values (`Returning Series`, `Ended`, `Canceled`, ...) to Russian.
+pub fn localized_project_status(kind: MediaKind, raw: Option<&str>) -> Option<&'static str> {
+    match raw?.trim() {
+        "Returning Series" => Some("Продолжается"),
+        "Ended" => Some("Завершён"),
+        "Canceled" => Some("Закрыт"),
+        "In Production" => Some("В производстве"),
+        "Post Production" => Some("Постпродакшн"),
+        "Planned" => Some("Планируется"),
+        "Pilot" => Some("Пилот"),
+        "Rumored" => Some("Анонсирован"),
+        "Released" if kind == MediaKind::Movie => Some("Вышел"),
+        _ => None,
+    }
+}
+
+/// Formats sorted `(season, episode)` pairs into compact ranges such as `S01E01–E02, S01E04–E06`.
+pub fn format_episode_ranges(episodes: &[(i32, i32)]) -> String {
+    if episodes.is_empty() {
+        return String::new();
+    }
+    let mut sorted = episodes.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut groups: Vec<(i32, i32, i32)> = Vec::new();
+    for (s, e) in sorted {
+        if let Some(last) = groups.last_mut() {
+            if last.0 == s && e == last.2 + 1 {
+                last.2 = e;
+                continue;
+            }
+        }
+        groups.push((s, e, e));
+    }
+    groups
+        .into_iter()
+        .take(12)
+        .map(|(s, start, end)| {
+            if start == end {
+                episode_code(s, start)
+            } else {
+                format!("{}–E{end:02}", episode_code(s, start))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1021,8 +1083,11 @@ pub struct PreloadItem {
     pub size_bytes: Option<i64>,
     pub requested_at: DateTime<Utc>,
     pub ready_at: Option<DateTime<Utc>>,
-    /// Set once watched: the files are removed after this moment.
+    /// Set once watched or ready: the files are removed after this moment.
     pub delete_after: Option<DateTime<Utc>>,
+    /// TMDB poster path for thumbnails in Profile -> Server Downloads.
+    #[serde(default)]
+    pub poster_path: Option<String>,
 }
 
 #[cfg(test)]
@@ -1041,5 +1106,18 @@ mod catalog_tests {
             Some(VideoScale::FitHeight)
         );
         assert_eq!(VideoScale::parse("fill"), None);
+        assert_eq!(
+            localized_project_status(MediaKind::Tv, Some("Returning Series")),
+            Some("Продолжается")
+        );
+        assert_eq!(localized_project_status(MediaKind::Tv, Some("Ended")), Some("Завершён"));
+        assert_eq!(
+            localized_project_status(MediaKind::Tv, Some("Canceled")),
+            Some("Закрыт")
+        );
+        assert_eq!(
+            format_episode_ranges(&[(1, 1), (1, 2), (1, 4), (1, 5), (2, 1)]),
+            "S01E01–E02, S01E04–E05, S02E01"
+        );
     }
 }

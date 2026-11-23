@@ -267,6 +267,18 @@ pub fn push_history(url: Option<&str>) {
     let _ = h.push_state_with_url(&JsValue::from_f64(f64::from(next)), "", url);
 }
 
+/// Updates the current URL in place without adding a history step (e.g. switching subtabs or search text).
+pub fn replace_history(url: &str) {
+    if is_telegram() {
+        return;
+    }
+    let Some(h) = web_sys::window().and_then(|w| w.history().ok()) else {
+        return;
+    };
+    let cur = HISTORY_DEPTH.with(|d| d.get());
+    let _ = h.replace_state_with_url(&JsValue::from_f64(f64::from(cur)), "", Some(url));
+}
+
 /// Steps browser history back by one entry after a UI Back button click.
 pub fn pop_history() {
     if is_telegram() || IN_POPSTATE.with(|p| p.get()) {
@@ -441,15 +453,11 @@ pub fn is_fullscreen() -> bool {
 
 // --- Deep links ----------------------------------------------------------------
 
-/// A title to open at start: `?open=tv_1396` (with optional `&play=1`) or `startapp=tv_1396`.
-pub fn open_target() -> Option<super::OpenTarget> {
+/// Initial screen parsed from URL query or Telegram `start_param`.
+pub fn initial_route() -> super::InitialRoute {
     let q = query();
     let start = start_param();
-    super::parse_open_target(
-        q.get("open").map(String::as_str),
-        q.get("play").map(String::as_str),
-        start.as_deref(),
-    )
+    super::parse_initial_route(&q, start.as_deref())
 }
 
 /// All query parameters of the current page.

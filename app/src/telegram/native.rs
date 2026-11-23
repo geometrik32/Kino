@@ -73,6 +73,7 @@ pub fn pop_back(id: u64) {
 }
 pub fn init_history(_has_initial_trail: bool, _initial_url: Option<&str>) {}
 pub fn push_history(_url: Option<&str>) {}
+pub fn replace_history(_url: &str) {}
 pub fn pop_history() {}
 pub fn reset_history() {}
 pub fn in_popstate() -> bool {
@@ -98,8 +99,8 @@ pub fn is_mobile() -> bool {
 pub fn is_fullscreen() -> bool {
     false
 }
-pub fn open_target() -> Option<super::OpenTarget> {
-    None
+pub fn initial_route() -> super::InitialRoute {
+    super::InitialRoute::Home
 }
 pub fn invite() -> Option<String> {
     None

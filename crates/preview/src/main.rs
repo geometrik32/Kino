@@ -403,6 +403,7 @@ async fn main() -> anyhow::Result<()> {
         requested_at: Utc::now() - Duration::hours(3),
         ready_at: None,
         delete_after: delete_days.map(|d| Utc::now() + Duration::days(d) + Duration::hours(1)),
+        poster_path: None,
     };
     let preloads = vec![
         preload(

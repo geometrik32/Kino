@@ -504,6 +504,7 @@ async fn put_status(
             watched: true,
         };
         userdata::mark(&state.pool, user.0, &m).await?;
+        after_finished(&state, user.0, kind, tmdb_id, 0, 0).await?;
         st = userdata::get_state(&state.pool, user.0, kind, tmdb_id).await?;
     }
     st.peers = social::title_peers(
@@ -1004,7 +1005,34 @@ async fn user_titles(
 }
 
 async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Vec<PreloadItem>>, AppError> {
-    Ok(Json(userdata::preloads(&state.pool, user.0).await?))
+    use futures_util::stream::{self, StreamExt};
+
+    if state.media.qbit.is_some() {
+        let _ = crate::jobs::sync_preloads(&state).await;
+    }
+    let mut list = userdata::preloads(&state.pool, user.0).await?;
+    if !list.is_empty() {
+        let mut unique: Vec<(MediaKind, i64)> = Vec::new();
+        for p in &list {
+            let key = (p.kind, p.tmdb_id);
+            if !unique.contains(&key) {
+                unique.push(key);
+            }
+        }
+        let fetched: HashMap<(MediaKind, i64), Option<String>> = stream::iter(unique.into_iter().map(|(k, id)| {
+            let state = &state;
+            async move { ((k, id), summary_of(state, k, id).await.and_then(|s| s.poster_path)) }
+        }))
+        .buffer_unordered(8)
+        .collect()
+        .await;
+        for p in &mut list {
+            if let Some(Some(path)) = fetched.get(&(p.kind, p.tmdb_id)) {
+                p.poster_path = Some(path.clone());
+            }
+        }
+    }
+    Ok(Json(list))
 }
 
 const MAX_ACTIVE_PRELOADS: usize = 10;
@@ -1189,6 +1217,43 @@ async fn hydrate_keys(state: &AppState, user_id: i64, keys: &[(MediaKind, i64)])
     summaries
 }
 
+async fn preloaded_shelf_row(state: &AppState, user_id: i64, page: u32) -> Result<Option<CatalogRow>, AppError> {
+    let all_keys = userdata::ready_preloaded_keys(&state.pool).await?;
+    if all_keys.is_empty() {
+        return Ok(None);
+    }
+    let page = page.max(1);
+    let start = ((page - 1) as usize) * CUSTOM_SHELF_PAGE_SIZE;
+    if start >= all_keys.len() {
+        return Ok(Some(CatalogRow {
+            id: "preloaded".into(),
+            title: "Скачано на сервер".into(),
+            subtitle: Some("Готово к просмотру — запускается сразу с диска".into()),
+            categories: vec!["for_you".into(), "preloaded".into()],
+            loaded: true,
+            has_more: false,
+            page,
+            items: Vec::new(),
+        }));
+    }
+    let end = (start + CUSTOM_SHELF_PAGE_SIZE).min(all_keys.len());
+    let has_more = end < all_keys.len();
+    let items = hydrate_keys(state, user_id, &all_keys[start..end]).await;
+    if items.is_empty() && page == 1 {
+        return Ok(None);
+    }
+    Ok(Some(CatalogRow {
+        id: "preloaded".into(),
+        title: "Скачано на сервер".into(),
+        subtitle: Some("Готово к просмотру — запускается сразу с диска".into()),
+        categories: vec!["for_you".into(), "preloaded".into()],
+        loaded: true,
+        has_more,
+        page,
+        items,
+    }))
+}
+
 async fn rewatch_shelf_row(state: &AppState, user_id: i64, page: u32) -> Result<Option<CatalogRow>, AppError> {
     let favs = userdata::rewatch_favorites(&state.pool, user_id).await?;
     if favs.is_empty() {
@@ -1315,12 +1380,20 @@ async fn catalog_home(State(state): State<AppState>, user: CurrentUser) -> Resul
     state.media.wake_jackett();
     let taste = build_full_taste(&state, user.0, true).await?;
     let mut feed = state.catalog.home_for(&taste).await?;
-    let (peers_res, rewatch_res) = tokio::join!(
+    let (preloaded_res, peers_res, rewatch_res) = tokio::join!(
+        preloaded_shelf_row(&state, user.0, 1),
         peers_shelf_row(&state, user.0, &taste.excluded, 1),
         rewatch_shelf_row(&state, user.0, 1)
     );
+    let has_preloaded = if let Ok(Some(pre)) = preloaded_res {
+        feed.rows.insert(0, pre);
+        true
+    } else {
+        false
+    };
     if let Ok(Some(peers)) = peers_res {
-        let pos = taste.personal_rows.len().min(feed.rows.len());
+        let base_pos = taste.personal_rows.len() + usize::from(has_preloaded);
+        let pos = base_pos.min(feed.rows.len());
         feed.rows.insert(pos, peers);
     }
     if let Ok(Some(rewatch)) = rewatch_res {
@@ -1375,6 +1448,19 @@ async fn catalog_shelf(
     }
     let page = q.page.unwrap_or(1).clamp(1, 20);
     let taste = build_full_taste(&state, user.0, false).await?;
+    if id == "preloaded" {
+        let row = preloaded_shelf_row(&state, user.0, page)
+            .await?
+            .ok_or_else(AppError::not_found)?;
+        return Ok(Json(ShelfPage {
+            id: row.id,
+            title: row.title,
+            subtitle: row.subtitle,
+            page: row.page,
+            has_more: row.has_more,
+            items: row.items,
+        }));
+    }
     if id == "rewatch" {
         let row = rewatch_shelf_row(&state, user.0, page)
             .await?
@@ -1628,6 +1714,7 @@ mod tests {
                 user_rating: None,
                 user_status: None,
                 peers: Vec::new(),
+                preloaded: false,
             },
             genres: vec![],
             runtime_min: None,

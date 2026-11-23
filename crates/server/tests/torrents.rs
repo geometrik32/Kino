@@ -21,7 +21,8 @@ use axum::{
 };
 use common::*;
 use kino_core::{
-    PlayInfo, PreloadItem, PreloadState, ReleaseList, ResolveReleaseResponse, StreamPhase, StreamProgress, UserPrefs,
+    ApiError, PlayInfo, PreloadItem, PreloadState, ReleaseChoice, ReleaseList, ResolveReleaseResponse, StreamPhase,
+    StreamProgress, UserPrefs,
 };
 use kino_server::{app, config::TorrentConfig, jobs};
 use serde_json::json;
@@ -396,6 +397,10 @@ async fn preload_then_play_from_disk(pool: PgPool) {
     let items: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
     assert_eq!(items[0].state, PreloadState::Ready);
     assert_eq!(items[0].size_bytes, Some(2000));
+    assert!(
+        items[0].delete_after.is_some(),
+        "ready preloads get a max-retention deadline automatically"
+    );
 
     // Played from disk, no TorrServer configured at all.
     let (code, body) = call(
@@ -694,7 +699,8 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
     let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
     let peer = login_ok(&app, 2003, inv["code"].as_str()).await;
 
-    // Mobile auto: torznab.xml has 720p with 12 seeders (>= 7) -> picks 720p automatically.
+    // Mobile auto: torznab.xml has 720p with 12 seeders (>= 7) -> picks 720p automatically
+    // without saving a manual override in `release_choice`.
     let (code, body) = call(
         &app,
         Method::POST,
@@ -712,8 +718,18 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
         }
         other => panic!("expected Ready 720p, got {other:?}"),
     }
+    let (_, choices) = call(
+        &app,
+        Method::GET,
+        "/api/release-choice/tv/1396",
+        Some(&peer.token),
+        None,
+    )
+    .await;
+    let choices: Vec<ReleaseChoice> = serde_json::from_value(choices).unwrap();
+    assert!(choices.is_empty(), "auto-pick must not create manual release choices");
 
-    // Desktop default: 1080p -> picks 1080p automatically for Admin.
+    // Desktop default: 1080p -> picks 1080p automatically for Admin (also not manual).
     let (code, body) = call(
         &app,
         Method::POST,
@@ -723,14 +739,60 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{body}");
-    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
-        ResolveReleaseResponse::Ready { choice, .. } => {
+    let admin_pick = match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, from_peer } => {
             assert_eq!(choice.quality_key.as_deref(), Some("1080p"));
+            assert_eq!(from_peer, None);
+            choice
         }
         other => panic!("expected Ready 1080p, got {other:?}"),
-    }
+    };
+    let (_, admin_choices) = call(
+        &app,
+        Method::GET,
+        "/api/release-choice/tv/1396",
+        Some(&admin.token),
+        None,
+    )
+    .await;
+    let admin_choices: Vec<ReleaseChoice> = serde_json::from_value(admin_choices).unwrap();
+    assert!(
+        admin_choices.is_empty(),
+        "auto-pick must not create manual release choices"
+    );
 
-    // Peer sharing: User 3 asking for 1080p adopts Admin's choice without calling Jackett or picking manually.
+    // Only explicit manual picks (via PUT /api/release-choice) appear in `picked_by`
+    // and are shared across peers as Tier 3 recommendations.
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&admin.token), None).await;
+    let before_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert!(before_list.releases.iter().all(|r| r.picked_by.is_empty()));
+
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/release-choice/tv/1396",
+        Some(&admin.token),
+        Some(json!({
+            "season": 2,
+            "episode": 1,
+            "infohash": admin_pick.infohash,
+            "quality_key": "1080p",
+            "title": admin_pick.title,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&admin.token), None).await;
+    let after_list: ReleaseList = serde_json::from_value(body).unwrap();
+    let picked = after_list
+        .releases
+        .iter()
+        .find(|r| r.infohash == admin_pick.infohash)
+        .unwrap();
+    assert_eq!(picked.picked_by.len(), 1);
+
+    // Peer sharing: User 3 asking for 1080p adopts Admin's manual choice without calling Jackett.
     let (_, inv2) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
     let peer2 = login_ok(&app, 2004, inv2["code"].as_str()).await;
     let (code, body) = call(
@@ -777,4 +839,163 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
         serde_json::from_value::<ResolveReleaseResponse>(body).unwrap(),
         ResolveReleaseResponse::NeedsPicker { .. }
     ));
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn ready_preload_wins_tier1_unless_manual_override_is_newer(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let q = Arc::new(Qbit::default());
+    *q.progress.lock().unwrap() = 1.0;
+    let qb = serve(qbittorrent(q)).await;
+    let dir = temp_dir("tier1");
+    std::fs::create_dir_all(dir.join("Breaking Bad S02")).unwrap();
+    std::fs::write(dir.join(EPISODES[0]), b"PRELOADED-EP1").unwrap();
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            qbittorrent_url: Some(qb),
+            preload_dir: Some(dir),
+            ffprobe: "kino-test-no-ffprobe".into(),
+            ..Default::default()
+        },
+    ));
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer = login_ok(&app, 2005, inv["code"].as_str()).await;
+
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&admin.token), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let lostfilm = list.releases.iter().find(|r| r.voice == "LostFilm").unwrap();
+    let kinozal = list.releases.iter().find(|r| r.tracker == "Kinozal").unwrap();
+
+    // Peer saves an earlier manual 2160p choice before the preload finishes.
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/release-choice/tv/1396",
+        Some(&peer.token),
+        Some(json!({
+            "season": 2,
+            "episode": 1,
+            "infohash": kinozal.infohash,
+            "quality_key": "2160p",
+            "title": kinozal.title,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+
+    // Admin preloads the 1080p LostFilm release; GET /api/preload syncs it to Ready immediately.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&admin.token),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "infohash": lostfilm.infohash })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let preload: PreloadItem = serde_json::from_value(body).unwrap();
+    let (_, body) = call(&app, Method::GET, "/api/preload", Some(&admin.token), None).await;
+    let preloads: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
+    assert_eq!(preloads[0].state, PreloadState::Ready);
+
+    // Release listing marks the preloaded release.
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&peer.token), None).await;
+    let rel_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert!(rel_list
+        .releases
+        .iter()
+        .any(|r| r.infohash == preload.infohash && r.preloaded));
+
+    // Tier 1: Ready preload beats Peer's older manual choice.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, from_peer } => {
+            assert_eq!(choice.infohash, preload.infohash);
+            assert_eq!(from_peer, None);
+        }
+        other => panic!("expected Tier 1 preload, got {other:?}"),
+    }
+
+    // Peer saves a newer manual override after ready_at -> Peer now gets their manual choice.
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/release-choice/tv/1396",
+        Some(&peer.token),
+        Some(json!({
+            "season": 2,
+            "episode": 1,
+            "infohash": kinozal.infohash,
+            "quality_key": "2160p",
+            "title": kinozal.title,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, .. } => {
+            assert_eq!(choice.infohash, kinozal.infohash);
+        }
+        other => panic!("expected newer manual override, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn missing_episode_reports_available_episodes(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let ts = serve(torrserver()).await;
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            torrserver_url: Some(ts),
+            ffprobe: "kino-test-no-ffprobe".into(),
+            ..Default::default()
+        },
+    ));
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&t), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let lostfilm = list.releases.iter().find(|r| r.voice == "LostFilm").unwrap();
+
+    // Fixture has only S02E01 and S02E02 -> requesting S02E05 reports available episodes.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/play",
+        Some(&t),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "episode": 5, "release": lostfilm.infohash })),
+    )
+    .await;
+    assert!(code.is_client_error(), "expected 4xx, got {code}: {body}");
+    let err: ApiError = serde_json::from_value(body).unwrap();
+    assert_eq!(err.code, "no_file");
+    assert!(
+        err.available_episodes.iter().any(|(s, e)| *s == 2 && *e == 2),
+        "expected S02E02 in available_episodes, got {:?}",
+        err.available_episodes
+    );
 }

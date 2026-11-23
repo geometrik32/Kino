@@ -75,6 +75,23 @@ pub fn pick(files: &[FileEntry], episode: Option<(i32, i32)>) -> Option<&FileEnt
     }
 }
 
+/// Distinct `(season, episode)` pairs actually present among video files of a torrent.
+/// Season-less packs are placed under `default_season`.
+pub fn available_episodes(files: &[FileEntry], default_season: i32) -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = files
+        .iter()
+        .filter(|f| is_video(&f.path))
+        .filter_map(|f| {
+            let (s, e) = episode_of(&f.path);
+            let ep = e?;
+            Some((s.unwrap_or(default_season.max(1)), ep))
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +134,6 @@ mod tests {
         assert_eq!(pick(&film, None).unwrap().index, 2);
         let plain = files(&["a.mkv", "b.mkv", "c.mkv"]);
         assert_eq!(pick(&plain, Some((1, 3))).unwrap().path, "c.mkv");
+        assert_eq!(available_episodes(&f, 1), vec![(1, 1), (1, 2), (2, 1)]);
     }
 }

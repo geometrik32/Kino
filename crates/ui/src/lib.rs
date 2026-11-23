@@ -341,11 +341,6 @@ pub fn PosterCard(
                     div { class: "placeholder", style: "background: {fallback_bg(item.tmdb_id)}", "{item.title}" }
                 }
                 match eff_status {
-                    Some(TitleStatus::Watched) => rsx! {
-                        span { class: "p-badge status seen", title: "Просмотрено",
-                            Icon { svg: icons::CHECK, class: "ic sm" }
-                        }
-                    },
                     Some(TitleStatus::Want) => rsx! {
                         span { class: "p-badge status want", title: "Хочу посмотреть",
                             Icon { svg: icons::BOOKMARK, class: "ic sm" }
@@ -378,6 +373,13 @@ pub fn PosterCard(
                         if peer_count > 1 || any_live {
                             span { "{peer_count}" }
                         }
+                    }
+                }
+                if item.preloaded {
+                    span {
+                        class: "p-badge preloaded",
+                        title: "Скачано на сервер — запускается мгновенно",
+                        Icon { svg: icons::DOWNLOAD, class: "ic xs" }
                     }
                 }
             }
@@ -1133,9 +1135,13 @@ pub fn TitleView(
     /// The remembered release for the season about to play, e.g. "LostFilm · 1080p".
     /// "Смотреть" uses it without asking; `None` means the picker opens.
     release_label: Option<String>,
+    /// Label of the active release for the currently selected season tab (series only).
+    #[props(default)]
+    season_release_label: Option<String>,
     on_play: EventHandler<PlayTarget>,
     #[props(default)] on_play_rewatch: Option<EventHandler<(PlayTarget, RewatchMode)>>,
     on_change_release: EventHandler<PlayTarget>,
+    #[props(default)] on_change_season_release: Option<EventHandler<i32>>,
     #[props(default)] on_change_episode_release: Option<EventHandler<PlayTarget>>,
     on_status: EventHandler<Option<TitleStatus>>,
     on_rate: EventHandler<Option<i16>>,
@@ -1273,6 +1279,23 @@ pub fn TitleView(
                             span { class: "rate-pill",
                                 Icon { svg: icons::STAR, class: "ic xs" }
                                 "{r}"
+                            }
+                        }
+                        if let Some(proj) = details.localized_status() {
+                            {
+                                let cls = match details.series_status.as_deref() {
+                                    Some("Returning Series") => "proj-pill ongoing",
+                                    Some("Ended" | "Released") => "proj-pill ended",
+                                    Some("Canceled") => "proj-pill canceled",
+                                    _ => "proj-pill",
+                                };
+                                rsx! { span { class: "{cls}", "{proj}" } }
+                            }
+                        }
+                        if s.preloaded {
+                            span { class: "proj-pill ready", title: "Готово на диске сервера — запускается без буферизации",
+                                Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                "На сервере"
                             }
                         }
                         for m in meta { span { "{m}" } }
@@ -1494,6 +1517,31 @@ pub fn TitleView(
                                         }
                                     }
                                     span { class: "sec-sub", "{done_in_s} из {total_in_s} просмотрено" }
+                                    if s_num > 0 {
+                                        {
+                                            let s_rel_lbl = season_release_label
+                                                .clone()
+                                                .unwrap_or_else(|| format!("Раздача {s_num} сезона"));
+                                            let s_rel_active = season_release_label.is_some();
+                                            let on_sr = on_change_season_release;
+                                            let on_cr = on_change_release;
+                                            rsx! {
+                                                button {
+                                                    class: if s_rel_active { "chip sm active" } else { "chip sm" },
+                                                    title: "Выбрать раздачу для этого сезона",
+                                                    onclick: move |_| {
+                                                        if let Some(cb) = on_sr {
+                                                            cb.call(s_num);
+                                                        } else {
+                                                            on_cr.call(PlayTarget { season: s_num, episode: 0, position_sec: 0.0 });
+                                                        }
+                                                    },
+                                                    Icon { svg: icons::SWAP, class: "ic xs" }
+                                                    "{s_rel_lbl}"
+                                                }
+                                            }
+                                        }
+                                    }
                                     button {
                                         class: if all_done { "chip sm active" } else { "chip sm" },
                                         onclick: move |_| on_mark.call((s_num, all.clone(), !all_done)),
@@ -2074,6 +2122,7 @@ mod tests {
                 user_rating: None,
                 user_status: None,
                 peers: vec![],
+                preloaded: false,
             },
             genres: vec![],
             runtime_min: None,

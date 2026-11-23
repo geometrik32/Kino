@@ -608,10 +608,28 @@ fn ReleaseRow(
             div { class: "rel-main",
                 div { class: "rel-voice",
                     strong { "{release.voice}" }
+                    if release.preloaded {
+                        span { class: "tag ok", title: "Файл уже скачан на сервер и запускается мгновенно",
+                            Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                            "На сервере"
+                        }
+                    }
                     if chosen {
                         span { class: "tag acc", "Ваша раздача" }
                     } else if watched {
                         span { class: "tag ok", "Смотрели" }
+                    }
+                    if !release.picked_by.is_empty() {
+                        {
+                            let cnt = release.picked_by.len();
+                            let tip = format!("Выбрали участники: {}", release.picked_by.join(", "));
+                            rsx! {
+                                span { class: "tag acc", title: "{tip}",
+                                    Icon { svg: icons::USERS, class: "ic xs" }
+                                    "{cnt}"
+                                }
+                            }
+                        }
                     }
                     if release.direct_play || native_player {
                         span { class: "tag ok",
@@ -698,6 +716,7 @@ mod tests {
             user_rating: None,
             user_status: None,
             peers: vec![],
+            preloaded: false,
         }
     }
 

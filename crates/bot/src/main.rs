@@ -861,7 +861,8 @@ async fn send_trending_album(
         .zip(posters)
         .filter_map(|(item, bytes)| bytes.filter(|b| !b.is_empty()).map(|b| (item, b)))
         .collect();
-    let caption = screens::trending_album_caption(&state.public_url, &pool_items);
+    let caption = screens::trending_album_caption(&pool_items);
+    let markup = screens::trending_buttons(&state.public_url, &pool_items, is_private);
 
     if with_photos.len() >= 2 {
         let mut media: Vec<InputMedia> = Vec::with_capacity(with_photos.len());
@@ -880,6 +881,9 @@ async fn send_trending_album(
             media.push(InputMedia::Photo(photo));
         }
         if bot.send_media_group(chat, media).await.is_ok() {
+            bot.send_message(chat, "Откройте нужный фильм или сериал прямо в Telegram:")
+                .reply_markup(markup)
+                .await?;
             return Ok(());
         }
     } else if let Some((item, bytes)) = with_photos.into_iter().next() {
@@ -893,14 +897,18 @@ async fn send_trending_album(
             .send_photo(chat, InputFile::memory(bytes).file_name(filename))
             .caption(caption.clone())
             .parse_mode(ParseMode::Html)
+            .reply_markup(markup.clone())
             .await
             .is_ok()
         {
             return Ok(());
         }
     }
-    let _ = is_private;
-    say(bot, chat, &caption).await
+    bot.send_message(chat, caption)
+        .parse_mode(ParseMode::Html)
+        .reply_markup(markup)
+        .await?;
+    Ok(())
 }
 
 async fn send_trending_menu(

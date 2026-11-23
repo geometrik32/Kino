@@ -6,7 +6,9 @@ use std::rc::Rc;
 use dioxus::html::MountedData;
 use dioxus::prelude::*;
 pub use kino_core::VideoScale;
-use kino_core::{clock, normalize_quality_key, MediaTrack, ReleaseOption, StreamProgress, SyncMemberInfo};
+use kino_core::{
+    clock, episode_code, normalize_quality_key, MediaTrack, ReleaseOption, StreamProgress, SyncMemberInfo,
+};
 
 use crate::human_size;
 use crate::icons::{self, Icon};
@@ -21,6 +23,7 @@ pub enum PlayerMenu {
     Subtitles,
     Quality,
     Speed,
+    Scale,
     Episodes,
     Sync,
 }
@@ -121,6 +124,8 @@ pub struct PlayerState {
     pub qualities_loaded: bool,
     /// Optional label shown when rewatching favorite episodes (e.g. `Только любимые (5★)`).
     pub rewatch_label: Option<String>,
+    /// Next episode actually present in the current release when the requested episode is missing.
+    pub next_available: Option<(i32, i32)>,
 }
 
 impl Default for PlayerState {
@@ -168,6 +173,7 @@ impl Default for PlayerState {
             active_infohash: None,
             qualities_loaded: false,
             rewatch_label: None,
+            next_available: None,
         }
     }
 }
@@ -257,6 +263,7 @@ pub fn PlayerView(
     #[props(default)] on_sync_sound: Option<EventHandler<String>>,
     #[props(default)] on_activity: Option<EventHandler<()>>,
     #[props(default)] on_pick_quality: Option<EventHandler<ReleaseOption>>,
+    #[props(default)] on_jump_episode: Option<EventHandler<(i32, i32)>>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
@@ -299,9 +306,10 @@ pub fn PlayerView(
             _ => "ru",
         })
         .unwrap_or("ru");
-    let audio_sub_open = matches!(
+    let headphones_open = matches!(s.menu, Some(PlayerMenu::Audio | PlayerMenu::Subtitles));
+    let settings_open = matches!(
         s.menu,
-        Some(PlayerMenu::Audio | PlayerMenu::Subtitles | PlayerMenu::Quality)
+        Some(PlayerMenu::Quality | PlayerMenu::Speed | PlayerMenu::Scale)
     );
     let shown = controls_shown(locked(), &s, scrub().is_some());
     let busy = s.error.is_none() && (s.waiting || s.status.is_some());
@@ -579,7 +587,15 @@ pub fn PlayerView(
                         div { class: "p-err-acts",
                             button { class: "btn primary sm", onclick: move |_| on_pick_release.call(()),
                                 Icon { svg: icons::SWAP, class: "ic sm" }
-                                "Другая раздача"
+                                "Выбрать другую раздачу"
+                            }
+                            if let (Some((ns, ne)), Some(cb)) = (s.next_available, on_jump_episode) {
+                                button {
+                                    class: "btn glass sm",
+                                    onclick: move |_| cb.call((ns, ne)),
+                                    Icon { svg: icons::PLAY, class: "ic sm" }
+                                    "Перейти к {episode_code(ns, ne)}"
+                                }
                             }
                             button { class: "btn glass sm", onclick: move |_| on_close.call(()), "Закрыть" }
                         }
@@ -783,40 +799,23 @@ pub fn PlayerView(
                                 span { class: "long", "Серии" }
                             }
                         }
-                        // Unified Audio + Subtitles button (icon-only on phones so all controls fit cleanly).
+                        // Button 1: Headphones (Audio + Subtitles).
                         button {
-                            class: if audio_sub_open { "p-glass-btn audio-btn active" } else { "p-glass-btn audio-btn" },
-                            title: "Звук и субтитры",
-                            "aria-label": "Звук и субтитры",
-                            onclick: move |_| on_menu.call(if audio_sub_open { None } else { Some(PlayerMenu::Audio) }),
+                            class: if headphones_open { "p-glass-btn audio-btn active" } else { "p-glass-btn audio-btn" },
+                            title: "Наушники: звук и субтитры",
+                            "aria-label": "Наушники: звук и субтитры",
+                            onclick: move |_| on_menu.call(if headphones_open { None } else { Some(PlayerMenu::Audio) }),
                             Icon { svg: icons::AUDIO_CC, class: "ic sm" }
-                            span { class: "long", "Звук и субтитры" }
+                            span { class: "long", "Наушники" }
                         }
+                        // Button 2: Settings (Quality + Speed + Scale).
                         button {
-                            class: if s.menu == Some(PlayerMenu::Speed) { "p-glass-btn active" } else { "p-glass-btn" },
-                            title: "Скорость воспроизведения",
-                            onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Speed) { None } else { Some(PlayerMenu::Speed) }),
-                            "{speed_label(rate)}"
-                        }
-                        button {
-                            class: "p-glass-btn p-scale-btn",
-                            title: if s.scale == VideoScale::FitWidth {
-                                "Масштаб: по ширине экрана (нажмите для «По высоте»)"
-                            } else {
-                                "Масштаб: по высоте экрана (нажмите для «По ширине»)"
-                            },
-                            "aria-label": if s.scale == VideoScale::FitWidth {
-                                "Масштаб: по ширине"
-                            } else {
-                                "Масштаб: по высоте"
-                            },
-                            onclick: move |_| on_scale.call(()),
-                            Icon {
-                                svg: if s.scale == VideoScale::FitWidth { icons::FIT_WIDTH } else { icons::FIT_HEIGHT },
-                                class: "ic sm"
-                            }
-                            span { class: "long", "{s.scale.label()}" }
-                            span { class: "short", "{s.scale.short_label()}" }
+                            class: if settings_open { "p-glass-btn settings-btn active" } else { "p-glass-btn settings-btn" },
+                            title: "Настройки: качество, скорость и масштаб",
+                            "aria-label": "Настройки",
+                            onclick: move |_| on_menu.call(if settings_open { None } else { Some(PlayerMenu::Quality) }),
+                            Icon { svg: icons::SETTINGS, class: "ic sm" }
+                            span { class: "long", "Настройки" }
                         }
                         button {
                             class: "p-glass-btn icon p-fs-btn",
@@ -831,12 +830,11 @@ pub fn PlayerView(
                 if let Some(menu) = s.menu {
                     div {
                         class: match menu {
-                            PlayerMenu::Speed => "p-popover speed",
                             PlayerMenu::Sync => "p-popover sync",
                             _ => "p-popover",
                         },
                         onpointerdown: move |_| ping_activity(),
-                        if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles | PlayerMenu::Quality) {
+                        if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
                             div { class: "p-pop-tabs",
                                 button {
                                     class: if menu == PlayerMenu::Audio { "active" } else { "" },
@@ -850,13 +848,6 @@ pub fn PlayerView(
                                         "Субтитры (Вкл)"
                                     } else {
                                         "Субтитры ({s.subtitle_tracks.len()})"
-                                    }
-                                }
-                                if on_pick_quality.is_some() {
-                                    button {
-                                        class: if menu == PlayerMenu::Quality { "active" } else { "" },
-                                        onclick: move |_| on_menu.call(Some(PlayerMenu::Quality)),
-                                        "Качество"
                                     }
                                 }
                             }
@@ -876,48 +867,6 @@ pub fn PlayerView(
                                             span { "{t.label()}" }
                                         }
                                         span { class: "tag", "{t.codec.to_uppercase()}" }
-                                    }
-                                }
-                            } else if menu == PlayerMenu::Quality {
-                                if s.available_qualities.is_empty() {
-                                    p { class: "muted small p-pop-note",
-                                        if s.qualities_loaded {
-                                            "Других вариантов качества не нашлось."
-                                        } else {
-                                            "Загружаем доступные качества…"
-                                        }
-                                    }
-                                }
-                                for rel in s.available_qualities.clone() {
-                                    {
-                                        let is_cur = s.active_infohash.as_deref() == Some(rel.infohash.as_str());
-                                        let qk = normalize_quality_key(&rel.quality);
-                                        let info = if !rel.voice.is_empty() {
-                                            rel.voice.clone()
-                                        } else {
-                                            rel.tracker.clone()
-                                        };
-                                        let sz = human_size(rel.size_bytes);
-                                        let rel_click = rel.clone();
-                                        rsx! {
-                                            button {
-                                                key: "q-{rel.infohash}",
-                                                class: if is_cur { "p-opt on" } else { "p-opt" },
-                                                onclick: move |_| {
-                                                    if let Some(cb) = on_pick_quality {
-                                                        cb.call(rel_click.clone());
-                                                    }
-                                                },
-                                                span { class: "p-opt-l",
-                                                    if is_cur {
-                                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
-                                                    }
-                                                    strong { "{qk}" }
-                                                    span { class: "muted small", "{info}" }
-                                                }
-                                                span { class: "tag", "{sz} · {rel.seeders}с" }
-                                            }
-                                        }
                                     }
                                 }
                             } else {
@@ -951,27 +900,129 @@ pub fn PlayerView(
                                     }
                                 }
                             }
-                            div { class: "p-opt-div",
-                                button {
-                                    class: "p-opt",
-                                    onclick: move |_| on_pick_release.call(()),
-                                    span { class: "p-opt-l",
-                                        Icon { svg: icons::SWAP, class: "ic sm acc" }
-                                        span { "Выбрать другую раздачу" }
+                            p { class: "muted small p-pop-note", "Выбор дорожки и субтитров запоминается для этого тайтла." }
+                        } else if matches!(menu, PlayerMenu::Quality | PlayerMenu::Speed | PlayerMenu::Scale) {
+                            div { class: "p-pop-tabs",
+                                if on_pick_quality.is_some() {
+                                    button {
+                                        class: if menu == PlayerMenu::Quality { "active" } else { "" },
+                                        onclick: move |_| on_menu.call(Some(PlayerMenu::Quality)),
+                                        "Качество"
                                     }
-                                    Icon { svg: icons::CHEV_R, class: "ic sm muted" }
+                                }
+                                button {
+                                    class: if menu == PlayerMenu::Speed { "active" } else { "" },
+                                    onclick: move |_| on_menu.call(Some(PlayerMenu::Speed)),
+                                    "Скорость"
+                                }
+                                button {
+                                    class: if menu == PlayerMenu::Scale { "active" } else { "" },
+                                    onclick: move |_| on_menu.call(Some(PlayerMenu::Scale)),
+                                    "Масштаб"
                                 }
                             }
-                            p { class: "muted small p-pop-note", "Выбор запоминается для этого тайтла на всех устройствах." }
-                        } else if menu == PlayerMenu::Speed {
-                            h4 { "Скорость воспроизведения" }
-                            div { class: "p-speed-grid",
-                                for r in SPEEDS {
+                            if menu == PlayerMenu::Quality {
+                                if s.available_qualities.is_empty() {
+                                    p { class: "muted small p-pop-note",
+                                        if s.qualities_loaded {
+                                            "Других вариантов качества не нашлось."
+                                        } else {
+                                            "Загружаем доступные качества…"
+                                        }
+                                    }
+                                }
+                                for rel in s.available_qualities.clone() {
+                                    {
+                                        let is_cur = s.active_infohash.as_deref() == Some(rel.infohash.as_str());
+                                        let qk = normalize_quality_key(&rel.quality);
+                                        let info = if !rel.voice.is_empty() {
+                                            rel.voice.clone()
+                                        } else {
+                                            rel.tracker.clone()
+                                        };
+                                        let sz = human_size(rel.size_bytes);
+                                        let rel_click = rel.clone();
+                                        let pick_cnt = rel.picked_by.len();
+                                        rsx! {
+                                            button {
+                                                key: "q-{rel.infohash}",
+                                                class: if is_cur { "p-opt on" } else { "p-opt" },
+                                                onclick: move |_| {
+                                                    if let Some(cb) = on_pick_quality {
+                                                        cb.call(rel_click.clone());
+                                                    }
+                                                },
+                                                span { class: "p-opt-l",
+                                                    if is_cur {
+                                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
+                                                    }
+                                                    strong { "{qk}" }
+                                                    span { class: "muted small", "{info}" }
+                                                    if rel.preloaded {
+                                                        span { class: "tag ok", "На сервере" }
+                                                    } else if pick_cnt > 0 {
+                                                        span { class: "tag acc", "👥 {pick_cnt}" }
+                                                    }
+                                                }
+                                                span { class: "tag", "{sz} · {rel.seeders} сидов" }
+                                            }
+                                        }
+                                    }
+                                }
+                                div { class: "p-opt-div",
                                     button {
-                                        key: "r{r}",
-                                        class: if (rate - r).abs() < 0.001 { "p-opt on" } else { "p-opt" },
-                                        onclick: move |_| on_speed.call(r),
-                                        "{speed_label(r)}"
+                                        class: "p-opt",
+                                        onclick: move |_| on_pick_release.call(()),
+                                        span { class: "p-opt-l",
+                                            Icon { svg: icons::SWAP, class: "ic sm acc" }
+                                            span { "Выбрать другую раздачу" }
+                                        }
+                                        Icon { svg: icons::CHEV_R, class: "ic sm muted" }
+                                    }
+                                }
+                                p { class: "muted small p-pop-note", "Выбор качества запоминается для этого устройства." }
+                            } else if menu == PlayerMenu::Speed {
+                                div { class: "p-speed-grid",
+                                    for r in SPEEDS {
+                                        button {
+                                            key: "r{r}",
+                                            class: if (rate - r).abs() < 0.001 { "p-opt on" } else { "p-opt" },
+                                            onclick: move |_| on_speed.call(r),
+                                            "{speed_label(r)}"
+                                        }
+                                    }
+                                }
+                            } else {
+                                button {
+                                    class: if s.scale == VideoScale::FitWidth { "p-opt on" } else { "p-opt" },
+                                    onclick: move |_| {
+                                        if s.scale != VideoScale::FitWidth {
+                                            on_scale.call(());
+                                        }
+                                        on_menu.call(None);
+                                    },
+                                    span { class: "p-opt-l",
+                                        Icon { svg: icons::FIT_WIDTH, class: "ic sm" }
+                                        span { "По ширине экрана" }
+                                    }
+                                    if s.scale == VideoScale::FitWidth {
+                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
+                                    }
+                                }
+                                button {
+                                    class: if s.scale == VideoScale::FitHeight { "p-opt on" } else { "p-opt" },
+                                    onclick: move |_| {
+                                        if s.scale != VideoScale::FitHeight {
+                                            on_scale.call(());
+                                        }
+                                        on_menu.call(None);
+                                    },
+                                    span { class: "p-opt-l",
+                                        Icon { svg: icons::FIT_HEIGHT, class: "ic sm" }
+                                        span { "По высоте экрана" }
+                                    }
+                                    if s.scale == VideoScale::FitHeight {
+                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
                                     }
                                 }
                             }

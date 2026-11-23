@@ -39,6 +39,49 @@ pub fn parse_open_target(open: Option<&str>, play: Option<&str>, start: Option<&
     })
 }
 
+/// Initial route parsed from the URL query or Telegram `start_param` (preserves screen across reloads).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InitialRoute {
+    Home,
+    Search(String),
+    Mine(Option<String>),
+    Profile,
+    Title(OpenTarget),
+    Person(i64),
+    Shelf(String),
+}
+
+/// Parses the URL query and optional Mini App `start_param` into an initial screen.
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+pub fn parse_initial_route(params: &std::collections::BTreeMap<String, String>, start: Option<&str>) -> InitialRoute {
+    if let Some(t) = parse_open_target(
+        params.get("open").map(String::as_str),
+        params.get("play").map(String::as_str),
+        start,
+    ) {
+        return InitialRoute::Title(t);
+    }
+    if let Some(tab) = params.get("tab").map(String::as_str) {
+        match tab {
+            "profile" => return InitialRoute::Profile,
+            "my" | "mine" => return InitialRoute::Mine(params.get("sec").cloned()),
+            "search" => return InitialRoute::Search(params.get("q").cloned().unwrap_or_default()),
+            _ => {}
+        }
+    }
+    if let Some(id) = params
+        .get("person")
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&id| id > 0)
+    {
+        return InitialRoute::Person(id);
+    }
+    if let Some(id) = params.get("shelf").filter(|s| !s.is_empty()) {
+        return InitialRoute::Shelf(id.clone());
+    }
+    InitialRoute::Home
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,5 +143,36 @@ mod tests {
         );
         assert_eq!(parse_open_target(None, None, Some("inv_abc")), None);
         assert_eq!(parse_open_target(Some("tv_abc"), Some("1"), None), None);
+    }
+
+    #[test]
+    fn parses_initial_routes_for_tabs_and_pages() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert_eq!(parse_initial_route(&map(&[]), None), InitialRoute::Home);
+        assert_eq!(
+            parse_initial_route(&map(&[("tab", "profile")]), None),
+            InitialRoute::Profile
+        );
+        assert_eq!(
+            parse_initial_route(&map(&[("tab", "my"), ("sec", "calendar")]), None),
+            InitialRoute::Mine(Some("calendar".into()))
+        );
+        assert_eq!(
+            parse_initial_route(&map(&[("tab", "search"), ("q", "дюна")]), None),
+            InitialRoute::Search("дюна".into())
+        );
+        assert_eq!(
+            parse_initial_route(&map(&[("person", "42")]), None),
+            InitialRoute::Person(42)
+        );
+        assert_eq!(
+            parse_initial_route(&map(&[("shelf", "rewatch")]), None),
+            InitialRoute::Shelf("rewatch".into())
+        );
     }
 }
