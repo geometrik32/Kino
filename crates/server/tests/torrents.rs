@@ -770,9 +770,11 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
     let (code, _) = call(
         &app,
         Method::PUT,
-        "/api/release-choice/tv/1396",
+        "/api/release-choice",
         Some(&admin.token),
         Some(json!({
+            "kind": "tv",
+            "tmdb_id": 1396,
             "season": 2,
             "episode": 1,
             "infohash": admin_pick.infohash,
@@ -874,9 +876,11 @@ async fn ready_preload_wins_tier1_unless_manual_override_is_newer(pool: PgPool) 
     let (code, _) = call(
         &app,
         Method::PUT,
-        "/api/release-choice/tv/1396",
+        "/api/release-choice",
         Some(&peer.token),
         Some(json!({
+            "kind": "tv",
+            "tmdb_id": 1396,
             "season": 2,
             "episode": 1,
             "infohash": kinozal.infohash,
@@ -933,9 +937,11 @@ async fn ready_preload_wins_tier1_unless_manual_override_is_newer(pool: PgPool) 
     let (code, _) = call(
         &app,
         Method::PUT,
-        "/api/release-choice/tv/1396",
+        "/api/release-choice",
         Some(&peer.token),
         Some(json!({
+            "kind": "tv",
+            "tmdb_id": 1396,
             "season": 2,
             "episode": 1,
             "infohash": kinozal.infohash,
