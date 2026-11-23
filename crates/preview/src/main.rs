@@ -559,6 +559,7 @@ async fn main() -> anyhow::Result<()> {
         sync_waiting_for: Vec::new(),
         sync_client_id: String::new(),
         sync_sound_client_id: None,
+        ..PlayerState::default()
     };
     let filtered = ReleaseFilter {
         quality: Some("2160p".into()),
