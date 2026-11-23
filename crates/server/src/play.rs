@@ -15,8 +15,8 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
     demo_releases, language_name, normalize_quality_key, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest,
-    PlayRequest, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ReleaseOption, ResolveReleaseRequest,
-    ResolveReleaseResponse, StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
+    PlayRequest, ReleaseChoice, ReleaseList, ReleaseOption, ResolveReleaseRequest, ResolveReleaseResponse,
+    StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
 };
 use serde::Deserialize;
 use tower::ServiceExt;

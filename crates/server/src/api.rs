@@ -1137,7 +1137,7 @@ const CUSTOM_SHELF_PAGE_SIZE: usize = 20;
 
 async fn hydrate_keys(state: &AppState, user_id: i64, keys: &[(MediaKind, i64)]) -> Vec<TitleSummary> {
     use futures_util::stream::{self, StreamExt};
-    let mut items: Vec<TitleSummary> = stream::iter(
+    let mut items: Vec<(usize, TitleSummary)> = stream::iter(
         keys.iter()
             .copied()
             .enumerate()
@@ -1148,12 +1148,7 @@ async fn hydrate_keys(state: &AppState, user_id: i64, keys: &[(MediaKind, i64)])
     .await
     .into_iter()
     .filter_map(|(i, s)| s.map(|v| (i, v)))
-    .collect::<Vec<_>>()
-    .into_iter()
-    .fold(Vec::new(), |mut acc, item| {
-        acc.push(item);
-        acc
-    });
+    .collect();
     items.sort_by_key(|(i, _)| *i);
     let mut summaries: Vec<TitleSummary> = items.into_iter().map(|(_, s)| s).collect();
     social::enrich_summaries(

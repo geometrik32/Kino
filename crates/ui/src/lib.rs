@@ -323,7 +323,7 @@ pub fn PosterCard(
         None => kind_label(item.kind).to_owned(),
     };
     let rate = rating(&item);
-    let eff_status = status_badge.or_else(|| if hide_status_badge { None } else { item.user_status });
+    let eff_status = status_badge.or(if hide_status_badge { None } else { item.user_status });
     let peer_tip = if item.peers.is_empty() {
         String::new()
     } else {
