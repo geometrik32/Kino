@@ -475,6 +475,24 @@ async fn put_status(
         return Err(AppError::bad_request("tmdb_id must be positive"));
     }
     let kind = parse_kind(&kind)?;
+    if u.status == Some(TitleStatus::WaitingRelease) {
+        if kind != MediaKind::Movie {
+            return Err(AppError::bad_request("Статус «Жду» доступен только для фильмов"));
+        }
+        let msk = FixedOffset::east_opt(3 * 3600).expect("UTC+3");
+        let today = Utc::now().with_timezone(&msk).format("%Y-%m-%d").to_string();
+        let details = state.catalog.details(kind, tmdb_id).await?;
+        if !details.is_unreleased_movie(&today) {
+            return Err(AppError::bad_request(
+                "Статус «Жду» доступен только для невышедших фильмов",
+            ));
+        }
+    }
+    if u.status == Some(TitleStatus::WaitingEpisode) && kind != MediaKind::Tv {
+        return Err(AppError::bad_request(
+            "Статус «Жду следующей серии» доступен только для сериалов",
+        ));
+    }
     let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, u.status).await?;
     // Marking a film "Просмотрено" by hand also marks it watched for "Continue watching".
     if u.status == Some(TitleStatus::Watched) && kind == MediaKind::Movie {
@@ -488,6 +506,15 @@ async fn put_status(
         userdata::mark(&state.pool, user.0, &m).await?;
         st = userdata::get_state(&state.pool, user.0, kind, tmdb_id).await?;
     }
+    st.peers = social::title_peers(
+        &state.pool,
+        &state.config.session_secret,
+        &state.sync,
+        user.0,
+        kind,
+        tmdb_id,
+    )
+    .await;
     Ok(Json(st))
 }
 

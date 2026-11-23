@@ -174,7 +174,8 @@ async fn rating_tracks_prefs(pool: PgPool) {
     let prefs = json!({
         "quality": "2160p", "voice": null, "subtitle_lang": null, "language": "Русский",
         "hdr": false, "dolby_vision": null, "subtitles": true, "codec": "H.264", "direct_play": true,
-        "min_seeders": 5, "max_size_gb": 40, "sort": "bitrate"
+        "min_seeders": 5, "max_size_gb": 40, "sort": "bitrate",
+        "desktop_quality": null, "mobile_quality": null
     });
     let (code, _) = call(&app, Method::PUT, "/api/prefs", Some(&t), Some(prefs.clone())).await;
     assert_eq!(code, StatusCode::OK);
