@@ -1234,9 +1234,13 @@ mod tests {
         assert_eq!(flat.len(), TitleStatus::ALL.len());
         assert_eq!(flat[0].text, "▶ Смотрю · 2");
         match &flat[1].kind {
-            InlineKeyboardButtonKind::CallbackData(d) => assert_eq!(d, "my:want"),
+            InlineKeyboardButtonKind::CallbackData(d) => assert_eq!(d, "my:waiting_episode"),
             other => panic!("{other:?}"),
         }
+        assert!(flat.iter().any(|b| matches!(
+            &b.kind,
+            InlineKeyboardButtonKind::CallbackData(d) if d == "my:want"
+        )));
     }
 
     #[test]
