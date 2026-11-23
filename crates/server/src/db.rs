@@ -2,8 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use kino_core::{
-    is_finished, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice, ReleaseChoiceUpdate, ReleaseRef,
-    Role, WatchlistItem,
+    is_finished, normalize_quality_key, ContinueItem, Me, MediaKind, Progress, ProgressUpdate, ReleaseChoice,
+    ReleaseChoiceUpdate, ReleaseRef, Role, WatchlistItem,
 };
 use rand::{distr::Alphanumeric, Rng};
 use sqlx::{PgPool, Row};
@@ -450,7 +450,7 @@ pub async fn continue_watching(pool: &PgPool, user_id: i64, limit: i64) -> Resul
            AND NOT EXISTS (
              SELECT 1 FROM title_state ts
              WHERE ts.user_id = $1 AND ts.media_kind = latest.media_kind AND ts.tmdb_id = latest.tmdb_id
-               AND ts.status IN ('dropped', 'watched'))
+               AND ts.status IN ('dropped', 'watched', 'waiting_episode', 'waiting_release'))
          ORDER BY updated_at DESC LIMIT $2"
     ))
     .bind(user_id)
@@ -521,17 +521,31 @@ pub async fn watchlist_remove(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb
     Ok(r.rows_affected() > 0)
 }
 
-/// Remembers the release picked for a film or a season, replacing an earlier one.
+fn quality_key_of(c: &ReleaseChoiceUpdate) -> String {
+    c.quality_key
+        .as_deref()
+        .or(c.quality.as_deref())
+        .map(normalize_quality_key)
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// Remembers the release picked for a film, series, season or episode under its quality bucket.
 pub async fn save_release_choice(
     pool: &PgPool,
     user_id: i64,
     c: &ReleaseChoiceUpdate,
 ) -> Result<ReleaseChoice, sqlx::Error> {
+    let qkey = quality_key_of(c);
+    let mut stored = c.clone();
+    if stored.quality_key.is_none() && !qkey.is_empty() {
+        stored.quality_key = Some(qkey.clone());
+    }
     let chosen_at: DateTime<Utc> = sqlx::query_scalar(
         "INSERT INTO release_choice
-            (user_id, media_kind, tmdb_id, season, infohash, release_title, quality, voice, chosen_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-         ON CONFLICT (user_id, media_kind, tmdb_id, season) DO UPDATE SET
+            (user_id, media_kind, tmdb_id, season, episode, quality_key, infohash, release_title, quality, voice, chosen_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+         ON CONFLICT (user_id, media_kind, tmdb_id, season, episode, quality_key) DO UPDATE SET
            infohash = EXCLUDED.infohash, release_title = EXCLUDED.release_title,
            quality = EXCLUDED.quality, voice = EXCLUDED.voice, chosen_at = EXCLUDED.chosen_at
          RETURNING chosen_at",
@@ -540,6 +554,8 @@ pub async fn save_release_choice(
     .bind(c.kind.as_str())
     .bind(c.tmdb_id)
     .bind(c.season)
+    .bind(c.episode)
+    .bind(&qkey)
     .bind(&c.infohash)
     .bind(c.title.as_deref())
     .bind(c.quality.as_deref())
@@ -547,12 +563,37 @@ pub async fn save_release_choice(
     .fetch_one(pool)
     .await?;
     Ok(ReleaseChoice {
-        release: c.clone(),
+        release: stored,
         chosen_at,
+        picked_by: None,
     })
 }
 
-/// All remembered releases for a title (one per season for a series), newest first.
+fn choice_from_row(
+    row: &sqlx::postgres::PgRow,
+    kind: MediaKind,
+    tmdb_id: i64,
+    picked_by: Option<String>,
+) -> Result<ReleaseChoice, sqlx::Error> {
+    let qkey: String = row.try_get("quality_key")?;
+    Ok(ReleaseChoice {
+        release: ReleaseChoiceUpdate {
+            kind,
+            tmdb_id,
+            season: row.try_get("season")?,
+            episode: row.try_get("episode")?,
+            infohash: row.try_get("infohash")?,
+            title: row.try_get("release_title")?,
+            quality: row.try_get("quality")?,
+            quality_key: (!qkey.is_empty()).then_some(qkey),
+            voice: row.try_get("voice")?,
+        },
+        chosen_at: row.try_get("chosen_at")?,
+        picked_by,
+    })
+}
+
+/// All remembered releases for a title for one user (by season, episode and quality), newest first.
 pub async fn release_choices(
     pool: &PgPool,
     user_id: i64,
@@ -560,28 +601,99 @@ pub async fn release_choices(
     tmdb_id: i64,
 ) -> Result<Vec<ReleaseChoice>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT season, infohash, release_title, quality, voice, chosen_at FROM release_choice
-         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 ORDER BY chosen_at DESC",
+        "SELECT season, episode, quality_key, infohash, release_title, quality, voice, chosen_at
+         FROM release_choice
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3
+         ORDER BY chosen_at DESC",
     )
     .bind(user_id)
     .bind(kind.as_str())
     .bind(tmdb_id)
     .fetch_all(pool)
     .await?;
+    rows.iter().map(|r| choice_from_row(r, kind, tmdb_id, None)).collect()
+}
+
+/// Release choices made by OTHER users for this title, newest first.
+pub async fn shared_release_choices(
+    pool: &PgPool,
+    exclude_user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+) -> Result<Vec<ReleaseChoice>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT rc.season, rc.episode, rc.quality_key, rc.infohash, rc.release_title,
+                rc.quality, rc.voice, rc.chosen_at,
+                COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS picker_name
+         FROM release_choice rc
+         JOIN users u ON u.id = rc.user_id
+         WHERE rc.user_id <> $1 AND rc.media_kind = $2 AND rc.tmdb_id = $3
+         ORDER BY rc.chosen_at DESC",
+    )
+    .bind(exclude_user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .fetch_all(pool)
+    .await?;
     rows.iter()
-        .map(|row| {
-            Ok(ReleaseChoice {
-                release: ReleaseChoiceUpdate {
-                    kind,
-                    tmdb_id,
-                    season: row.try_get("season")?,
-                    infohash: row.try_get("infohash")?,
-                    title: row.try_get("release_title")?,
-                    quality: row.try_get("quality")?,
-                    voice: row.try_get("voice")?,
-                },
-                chosen_at: row.try_get("chosen_at")?,
-            })
+        .map(|r| {
+            let who: String = r.try_get("picker_name")?;
+            choice_from_row(r, kind, tmdb_id, Some(who))
         })
         .collect()
+}
+
+pub async fn save_device_quality(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+    device_kind: &str,
+    quality_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO release_device_quality
+            (user_id, media_kind, tmdb_id, season, episode, device_kind, quality_key, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+         ON CONFLICT (user_id, media_kind, tmdb_id, season, episode, device_kind) DO UPDATE SET
+           quality_key = EXCLUDED.quality_key, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(season)
+    .bind(episode)
+    .bind(device_kind)
+    .bind(quality_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn device_quality_for(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+    device_kind: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT quality_key FROM release_device_quality
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND device_kind = $6
+           AND ((season = $4 AND episode = $5) OR (season = $4 AND episode = 0) OR (season = 0 AND episode = 0))
+         ORDER BY (episode = $5) DESC, (season = $4) DESC, updated_at DESC
+         LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(season)
+    .bind(episode)
+    .bind(device_kind)
+    .fetch_optional(pool)
+    .await
 }

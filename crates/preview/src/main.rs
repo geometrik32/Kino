@@ -357,11 +357,15 @@ async fn main() -> anyhow::Result<()> {
             tmdb_id: id,
             status: Some(st),
             rating,
+            effective_rating: rating.map(f32::from),
+            season_ratings: Vec::new(),
+            episode_ratings: Vec::new(),
             audio_track: None,
             subtitle_track: None,
             video_scale: None,
             updated_at: Utc::now(),
             title: title_of(k, id).await,
+            peers: Vec::new(),
         });
     }
     let hist = |k, id, s, e, from: f64, to: f64, ago_h: i64, dev: &str| HistoryEntry {

@@ -14,12 +14,13 @@ use player::{PlayStart, Player};
 
 use dioxus::prelude::*;
 use kino_core::{
-    image_url, AuthResponse, HomeFeed, ImageSize, MarkWatched, MediaKind, PreloadRequest, PreloadState,
-    ReleaseChoiceUpdate, TitleStatus, TitleSummary, UserPrefs, VideoScale, WidgetAuthRequest,
+    image_url, normalize_quality_key, AuthResponse, HomeFeed, ImageSize, MarkWatched, MediaKind, PreloadRequest,
+    PreloadState, ReleaseChoiceUpdate, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, TitleStatus,
+    TitleSummary, UserPrefs, VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
-    icons, play_target, HomeView, Icon, LoginView, MyFilters, MyView, PersonView, PickerPanel, PlayTarget, ProfileView,
-    ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell, Tab, Theme,
+    icons, play_target, HomeView, Icon, LoginView, MyFilters, MySection, MyView, PersonView, PickerPanel, PlayTarget,
+    ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell, Tab, Theme,
     TitleExtrasView, TitleView, FAVICON_URI, STYLE,
 };
 
@@ -1071,17 +1072,65 @@ fn Mine(
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
+    let mut section = use_signal(MySection::default);
+    let mut selected_user_id = use_signal(|| None::<i64>);
+    let t_items = token.clone();
     let items = use_resource(move || {
-        let t = token.clone();
+        let t = t_items.clone();
         async move { api::my(&t).await }
+    });
+    let t_users = token.clone();
+    let users_res = use_resource(move || {
+        let t = t_users.clone();
+        async move { api::users(&t).await.unwrap_or_default() }
+    });
+    let t_cal = token.clone();
+    let calendar_res = use_resource(move || {
+        let t = t_cal.clone();
+        async move { api::calendar(&t).await.unwrap_or_default() }
+    });
+    let t_peer = token.clone();
+    let peer_res = use_resource(move || {
+        let t = t_peer.clone();
+        let uid = selected_user_id().or_else(|| users_res.read().as_ref().and_then(|v| v.first().map(|u| u.id)));
+        async move {
+            match uid {
+                Some(id) => api::user_titles(&t, id).await.ok(),
+                None => None,
+            }
+        }
     });
     let state = items.read().clone();
     match state {
         None => loading(),
         Some(Err(e)) => error_text(&e.message),
-        Some(Ok(items)) => rsx! {
-            MyView { items, filters: filters(), on_filters, on_open }
-        },
+        Some(Ok(items)) => {
+            let users = users_res.read().clone().unwrap_or_default();
+            let active_uid = selected_user_id().or_else(|| users.first().map(|u| u.id));
+            let peer_library = peer_res
+                .read()
+                .clone()
+                .flatten()
+                .filter(|l| Some(l.profile.id) == active_uid);
+            let peer_loading = active_uid.is_some() && peer_library.is_none() && !users.is_empty();
+            let calendar = calendar_res.read().clone().unwrap_or_default();
+            rsx! {
+                MyView {
+                    items,
+                    filters: filters(),
+                    section: section(),
+                    users,
+                    selected_user_id: active_uid,
+                    peer_library,
+                    peer_loading,
+                    calendar,
+                    on_section: move |s| section.set(s),
+                    on_select_user: move |id| selected_user_id.set(Some(id)),
+                    on_filters,
+                    on_open,
+                }
+            }
+        }
     }
 }
 
@@ -1238,6 +1287,51 @@ fn choice_label(c: &ReleaseChoiceUpdate) -> String {
     }
 }
 
+fn today_ymd() -> String {
+    let (now, offset_min) = platform::now();
+    let tz = chrono::FixedOffset::east_opt(offset_min * 60)
+        .unwrap_or_else(|| chrono::FixedOffset::east_opt(0).expect("UTC"));
+    now.with_timezone(&tz).format("%Y-%m-%d").to_string()
+}
+
+fn scoped_choice(
+    choices: &[ReleaseChoiceUpdate],
+    kind: MediaKind,
+    season: i32,
+    episode: i32,
+    want_q: Option<&str>,
+) -> Option<ReleaseChoiceUpdate> {
+    let s = if kind == MediaKind::Tv { season } else { 0 };
+    let e = if kind == MediaKind::Tv { episode } else { 0 };
+    let matches_q = |c: &&ReleaseChoiceUpdate| -> bool {
+        let Some(q) = want_q else { return true };
+        let k = c
+            .quality_key
+            .as_deref()
+            .or(c.quality.as_deref())
+            .map(normalize_quality_key)
+            .unwrap_or("");
+        k == q
+    };
+    choices
+        .iter()
+        .filter(matches_q)
+        .find(|c| c.season == s && c.episode == e)
+        .or_else(|| {
+            choices
+                .iter()
+                .filter(matches_q)
+                .find(|c| c.season == s && c.episode == 0)
+        })
+        .or_else(|| {
+            choices
+                .iter()
+                .filter(matches_q)
+                .find(|c| c.season == 0 && c.episode == 0)
+        })
+        .cloned()
+}
+
 #[component]
 fn Title(
     token: String,
@@ -1297,6 +1391,9 @@ fn Title(
     // Choices made in this visit, newest first; they override the loaded ones.
     let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
     let mut picker = use_signal(|| None::<PlayTarget>);
+    let mut picker_ep_scoped = use_signal(|| false);
+    let mut picker_preloaded = use_signal(|| None::<(i32, kino_core::ReleaseList)>);
+    let mut resolving = use_signal(|| false);
     let mut filter = use_signal(ReleaseFilter::default);
     // The user's default filters are applied when the picker opens; if they leave
     // nothing, the list is shown without them (once the releases have loaded).
@@ -1310,7 +1407,7 @@ fn Title(
     });
     let mut sort = use_signal(ReleaseSort::default);
     let mut panel = use_signal(|| None::<PickerPanel>);
-    let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate, bool, bool)>);
+    let mut playing = use_signal(|| None::<(PlayTarget, ReleaseChoiceUpdate, bool, bool, RewatchMode)>);
     let mut auto = use_signal(|| autoplay);
     let mut exit_on_close = use_signal(|| autoplay);
     let mut overlay_pushed = use_signal(|| false);
@@ -1323,6 +1420,11 @@ fn Title(
         async move {
             let p = open?;
             let season = if kind == MediaKind::Tv { p.season } else { 0 };
+            if let Some((ps, list)) = picker_preloaded.peek().clone() {
+                if ps == season {
+                    return Some(Ok(list));
+                }
+            }
             Some(api::releases(&t, kind, id, season).await)
         }
     });
@@ -1408,28 +1510,48 @@ fn Title(
     let mut choices: Vec<ReleaseChoiceUpdate> = picked_now();
     choices.extend(loaded.into_iter().map(|c| c.release));
     let season_key = move |t: &PlayTarget| if kind == MediaKind::Tv { t.season } else { 0 };
-    let choice_for = {
+    let loaded_prefs_opt = user_prefs.read().clone().flatten();
+    let is_mobile = telegram::is_mobile();
+    let dev_pref_q = loaded_prefs_opt.as_ref().and_then(|p| {
+        if is_mobile {
+            p.mobile_quality.as_deref()
+        } else {
+            p.desktop_quality.as_deref()
+        }
+    });
+    let ask_each_time = dev_pref_q == Some("ask");
+    let choice_for_target = {
         let choices = choices.clone();
-        move |s: i32| choices.iter().find(|c| c.season == s).cloned()
+        let dev_pref_q = dev_pref_q.map(str::to_owned);
+        move |s: i32, e: i32| -> Option<ReleaseChoiceUpdate> {
+            if ask_each_time {
+                return scoped_choice(&picked_now(), kind, s, e, None);
+            }
+            if is_mobile && matches!(dev_pref_q.as_deref(), None | Some("auto")) {
+                return scoped_choice(&choices, kind, s, e, Some("720p"))
+                    .or_else(|| scoped_choice(&choices, kind, s, e, Some("SD")));
+            }
+            let want = dev_pref_q.as_deref().map(normalize_quality_key).unwrap_or("1080p");
+            scoped_choice(&choices, kind, s, e, Some(want))
+        }
     };
     let latest = choices.first().cloned();
     let (target, play_label) = play_target(&details, &progress);
     let default_target = target.clone();
-    let release_label = choice_for(season_key(&target)).map(|c| choice_label(&c));
+    let release_label = choice_for_target(target.season, target.episode)
+        .or_else(|| scoped_choice(&choices, kind, target.season, target.episode, None))
+        .map(|c| choice_label(&c));
     let watched: Vec<String> = progress
         .iter()
         .filter_map(|p| p.release.as_ref().map(|r| r.infohash.clone()))
         .collect();
 
-    let loaded_prefs_opt = user_prefs.read().clone().flatten();
-    let open_picker = {
+    let mut open_picker_with_scope = {
         let latest = latest.clone();
-        let choice_for = choice_for.clone();
-        move |t: PlayTarget| {
-            // A new season starts pre-filtered to the quality and voice-over picked last time,
-            // then the user's default filters, and a series always to the season of the
-            // episode about to play.
-            let base = match (choice_for(season_key(&t)), &latest) {
+        let choices = choices.clone();
+        let loaded_prefs_opt = loaded_prefs_opt.clone();
+        move |t: PlayTarget, ep_scoped: bool| {
+            let base = match (scoped_choice(&choices, kind, t.season, t.episode, None), &latest) {
                 (None, Some(prev)) => ReleaseFilter::like(prev),
                 _ => ReleaseFilter::default(),
             };
@@ -1444,6 +1566,7 @@ fn Title(
             } else {
                 f
             };
+            picker_ep_scoped.set(ep_scoped);
             filter.set(f);
             sort.set(ReleaseSort::from_key(prefs_now.sort.as_deref()));
             defaults_pending.set(true);
@@ -1457,8 +1580,24 @@ fn Title(
             picker.set(Some(t));
         }
     };
+    let open_picker = {
+        let mut open_picker_with_scope = open_picker_with_scope.clone();
+        move |t: PlayTarget| {
+            picker_preloaded.set(None);
+            open_picker_with_scope(t, false);
+        }
+    };
+    let open_episode_picker = {
+        let mut open_picker_with_scope = open_picker_with_scope.clone();
+        move |t: PlayTarget| {
+            picker_preloaded.set(None);
+            open_picker_with_scope(t, true);
+        }
+    };
     let close_picker = Callback::new(move |_: ()| {
         picker.set(None);
+        picker_preloaded.set(None);
+        picker_ep_scoped.set(false);
         if *overlay_pushed.peek() {
             overlay_pushed.set(false);
             telegram::pop_history();
@@ -1471,26 +1610,66 @@ fn Title(
             telegram::pop_history();
         }
     });
-    let on_play = Callback::new({
-        let choice_for = choice_for.clone();
-        let mut open_picker = open_picker.clone();
-        let default_target = default_target.clone();
-        move |t: PlayTarget| {
-            telegram::haptic(telegram::Haptic::Tap);
-            match choice_for(season_key(&t)) {
-                Some(c) => {
-                    if !*exit_on_close.peek() && !*overlay_pushed.peek() {
-                        overlay_pushed.set(true);
-                        telegram::push_history(None);
-                    }
-                    let explicit_ep = t.season != default_target.season || t.episode != default_target.episode;
-                    playing.set(Some((t, c, explicit_ep, false)));
-                }
-                None => {
-                    open_picker(t);
-                }
+    let open_picker_scope = Callback::new(move |(t, ep_scoped)| open_picker_with_scope(t, ep_scoped));
+    let start_playback = Callback::new(
+        move |(t, c, mode, explicit_rel): (PlayTarget, ReleaseChoiceUpdate, RewatchMode, bool)| {
+            if !*exit_on_close.peek() && !*overlay_pushed.peek() {
+                overlay_pushed.set(true);
+                telegram::push_history(None);
             }
+            let explicit_ep = t.season != default_target.season || t.episode != default_target.episode;
+            playing.set(Some((t, c, explicit_ep, explicit_rel, mode)));
+        },
+    );
+    let on_play_rewatch = Callback::new({
+        let choice_for_target = choice_for_target.clone();
+        let tok_res = token.clone();
+        move |(t, mode): (PlayTarget, RewatchMode)| {
+            telegram::haptic(telegram::Haptic::Tap);
+            if let Some(c) = choice_for_target(t.season, t.episode) {
+                start_playback.call((t, c, mode, false));
+                return;
+            }
+            if *resolving.peek() {
+                return;
+            }
+            resolving.set(true);
+            let tok = tok_res.clone();
+            let req = ResolveReleaseRequest {
+                season: if kind == MediaKind::Tv { t.season } else { 0 },
+                episode: if kind == MediaKind::Tv { t.episode } else { 0 },
+                is_mobile: telegram::is_mobile(),
+            };
+            spawn(async move {
+                let res = api::resolve_release(&tok, kind, id, &req).await;
+                resolving.set(false);
+                match res {
+                    Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
+                        picked_now.with_mut(|v| {
+                            v.retain(|c| {
+                                !(c.season == choice.season
+                                    && c.episode == choice.episode
+                                    && c.quality_key == choice.quality_key)
+                            });
+                            v.insert(0, choice.clone());
+                        });
+                        start_playback.call((t, choice, mode, false));
+                    }
+                    Ok(ResolveReleaseResponse::NeedsPicker { releases, .. }) => {
+                        let sk = if kind == MediaKind::Tv { t.season } else { 0 };
+                        picker_preloaded.set(Some((sk, releases)));
+                        open_picker_scope.call((t, false));
+                    }
+                    Err(_) => {
+                        picker_preloaded.set(None);
+                        open_picker_scope.call((t, false));
+                    }
+                }
+            });
         }
+    });
+    let on_play = Callback::new(move |t: PlayTarget| {
+        on_play_rewatch.call((t, RewatchMode::All));
     });
 
     let heading = picker().map(|p| {
@@ -1504,7 +1683,9 @@ fn Title(
         h
     });
     let picker_season = picker().map(|p| season_key(&p));
-    let chosen_hash = picker_season.and_then(&choice_for).map(|c| c.infohash);
+    let chosen_hash = picker()
+        .and_then(|p| scoped_choice(&choices, kind, p.season, p.episode, None))
+        .map(|c| c.infohash);
     let summary = details.summary.clone();
     let t3 = token.clone();
     let main_label = format!("▶ {play_label}");
@@ -1537,9 +1718,16 @@ fn Title(
             progress,
             status,
             my_rating,
+            effective_rating: st.effective_rating,
+            season_ratings: st.season_ratings.clone(),
+            episode_ratings: st.episode_ratings.clone(),
+            peers: st.peers.clone(),
+            today_ymd: today_ymd(),
             release_label,
             on_play,
+            on_play_rewatch: Some(on_play_rewatch),
             on_change_release: open_picker.clone(),
+            on_change_episode_release: Some(Callback::new(open_episode_picker)),
             on_status: {
                 let token = token.clone();
                 move |s: Option<TitleStatus>| {
@@ -1578,9 +1766,7 @@ fn Title(
                                 if r.is_some() && *status_now.peek() == Some(Some(TitleStatus::Watched)) {
                                     status_now.set(Some(updated.status));
                                 }
-                                if r.is_some() {
-                                    data.restart();
-                                }
+                                data.restart();
                             }
                             Err(_) if *rate_seq.peek() == seq => {
                                 rating_now.set(None);
@@ -1593,6 +1779,32 @@ fn Title(
                     });
                 }
             },
+            on_rate_season: Some(Callback::new({
+                let token = token.clone();
+                move |(s_num, r): (i32, Option<i16>)| {
+                    telegram::haptic(telegram::Haptic::Select);
+                    let t = token.clone();
+                    spawn(async move {
+                        if api::set_season_rating(&t, id, s_num, r).await.is_ok() {
+                            status_now.set(None);
+                            data.restart();
+                        }
+                    });
+                }
+            })),
+            on_rate_episode: Some(Callback::new({
+                let token = token.clone();
+                move |(s_num, ep_num, r): (i32, i32, Option<i16>)| {
+                    telegram::haptic(telegram::Haptic::Select);
+                    let t = token.clone();
+                    spawn(async move {
+                        if api::set_episode_rating(&t, id, s_num, ep_num, r).await.is_ok() {
+                            status_now.set(None);
+                            data.restart();
+                        }
+                    });
+                }
+            })),
             on_mark: {
                 let token = token.clone();
                 move |(season, episodes, watched): (i32, Vec<i32>, bool)| {
@@ -1667,18 +1879,38 @@ fn Title(
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),
                 on_pick: move |r: ReleaseOption| {
-                    let choice = r.to_choice(&summary, season_key(&target));
+                    let ep_scope = if kind == MediaKind::Tv && *picker_ep_scoped.peek() {
+                        target.episode
+                    } else {
+                        0
+                    };
+                    let choice = r.to_scoped_choice(&summary, season_key(&target), ep_scope);
                     picked_now.with_mut(|v| {
-                        v.retain(|c| c.season != choice.season);
+                        v.retain(|c| !(c.season == choice.season && c.episode == choice.episode && c.quality_key == choice.quality_key));
                         v.insert(0, choice.clone());
                     });
                     picker.set(None);
+                    picker_preloaded.set(None);
+                    picker_ep_scoped.set(false);
                     let explicit_ep =
                         target.season != default_target.season || target.episode != default_target.episode;
-                    playing.set(Some((target.clone(), choice.clone(), explicit_ep, true)));
+                    let qk = choice
+                        .quality_key
+                        .clone()
+                        .unwrap_or_else(|| normalize_quality_key(&r.quality).to_owned());
+                    playing.set(Some((target.clone(), choice.clone(), explicit_ep, true, RewatchMode::All)));
                     let t = t3.clone();
+                    let req_q = api::SetDeviceQualityRequest {
+                        kind,
+                        tmdb_id: id,
+                        season: choice.season,
+                        episode: choice.episode,
+                        is_mobile: telegram::is_mobile(),
+                        quality_key: qk,
+                    };
                     spawn(async move {
                         let _ = api::save_release_choice(&t, &choice).await;
+                        let _ = api::set_release_quality(&t, &req_q).await;
                     });
                 },
                 on_preload: {
@@ -1714,6 +1946,13 @@ fn Title(
             } },
             }
         }
+        if resolving() {
+            div { class: "sheet-bg",
+                div { class: "sheet",
+                    p { class: "muted", "Подбираем подходящую раздачу…" }
+                }
+            }
+        }
         if let Some(text) = notice() {
             div { class: "sheet-bg", onclick: move |_| close_notice.call(()),
                 div { class: "sheet", onclick: move |e| e.stop_propagation(),
@@ -1722,7 +1961,7 @@ fn Title(
                 }
             }
         }
-        if let Some((t, rel, explicit_episode, explicit_release)) = playing() {
+        if let Some((t, rel, explicit_episode, explicit_release, rewatch_mode)) = playing() {
             Player {
                 key: "{t.season}-{t.episode}-{rel.infohash}",
                 token: token.clone(),
@@ -1738,6 +1977,8 @@ fn Title(
                     explicit_episode,
                     explicit_release,
                     video_scale: scale_now().or(st.video_scale),
+                    rewatch_mode,
+                    episode_ratings: st.episode_ratings.clone(),
                 },
                 on_scale: {
                     let t = token.clone();

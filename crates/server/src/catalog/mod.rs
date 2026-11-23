@@ -8,6 +8,7 @@ mod tmdb;
 use async_trait::async_trait;
 use kino_core::{
     CatalogRow, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, ShelfPage, TitleDetails, TitleExtras,
+    TitleSummary,
 };
 
 pub use demo::DemoCatalog;
@@ -121,6 +122,8 @@ pub trait Catalog: Send + Sync {
     /// An actor with their filmography.
     async fn person(&self, id: i64) -> Result<PersonDetails, CatalogError>;
     async fn season(&self, tmdb_id: i64, number: i32) -> Result<Season, CatalogError>;
+    /// Daily trending movies or series ("Сегодня в тренде").
+    async fn trending_today(&self, kind: MediaKind, limit: usize) -> Result<Vec<TitleSummary>, CatalogError>;
     /// Raw image bytes and content type for `/api/img/{size}/{file}`.
     async fn image(&self, size: &str, file: &str) -> Result<(Vec<u8>, String), CatalogError>;
 }

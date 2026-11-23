@@ -47,6 +47,23 @@ pub struct ReleaseOption {
     pub bitrate_approx: bool,
 }
 
+/// Minimum seeders needed for mobile auto-selection to pick `720p` over `SD`.
+pub const MOBILE_720P_MIN_SEEDERS: u32 = 7;
+
+/// Maps raw tracker quality labels into canonical storage buckets (`2160p`, `1080p`, `720p`, `SD`).
+pub fn normalize_quality_key(q: &str) -> &'static str {
+    let digits: u32 = q.trim().trim_end_matches(['p', 'P']).parse().unwrap_or(0);
+    if digits >= 2160 || q.eq_ignore_ascii_case("4k") || q.eq_ignore_ascii_case("uhd") {
+        "2160p"
+    } else if digits >= 1080 {
+        "1080p"
+    } else if digits >= 720 {
+        "720p"
+    } else {
+        "SD"
+    }
+}
+
 /// Average bitrate of a file of `size_bytes` that runs `minutes`, in kbit/s.
 pub fn estimate_bitrate_kbps(size_bytes: u64, minutes: f64) -> Option<u32> {
     if size_bytes == 0 || minutes < 1.0 {
@@ -76,13 +93,20 @@ impl ReleaseOption {
 
     /// What to remember when the user picks this release.
     pub fn to_choice(&self, title: &TitleSummary, season: i32) -> ReleaseChoiceUpdate {
+        self.to_scoped_choice(title, season, 0)
+    }
+
+    /// What to remember at a specific `(season, episode)` scope (and normalized quality bucket).
+    pub fn to_scoped_choice(&self, title: &TitleSummary, season: i32, episode: i32) -> ReleaseChoiceUpdate {
         ReleaseChoiceUpdate {
             kind: title.kind,
             tmdb_id: title.tmdb_id,
             season,
+            episode,
             infohash: self.infohash.clone(),
             title: Some(self.title.clone()),
             quality: Some(self.quality.clone()),
+            quality_key: Some(normalize_quality_key(&self.quality).to_owned()),
             voice: Some(self.voice.clone()),
         }
     }
@@ -114,6 +138,33 @@ pub struct ReleaseList {
     pub releases: Vec<ReleaseOption>,
     /// False when no indexer is configured and the list is demo data.
     pub configured: bool,
+}
+
+/// Request of `POST /api/releases/{kind}/{id}/resolve` to pick a release automatically
+/// using saved choices (including other users') and the current device's quality rules.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolveReleaseRequest {
+    #[serde(default)]
+    pub season: i32,
+    #[serde(default)]
+    pub episode: i32,
+    #[serde(default)]
+    pub is_mobile: bool,
+}
+
+/// Outcome of automatic release resolution.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ResolveReleaseResponse {
+    Ready {
+        choice: ReleaseChoiceUpdate,
+        #[serde(default)]
+        from_peer: Option<String>,
+    },
+    NeedsPicker {
+        target_quality: String,
+        releases: ReleaseList,
+    },
 }
 
 /// Sample releases, used when no indexer is configured and for screenshots.

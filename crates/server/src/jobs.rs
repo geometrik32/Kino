@@ -3,7 +3,9 @@
 
 use std::{future::Future, sync::Arc, time::Duration};
 
+use chrono::{FixedOffset, Utc};
 use kino_core::{episode_code, MediaKind, PreloadState, TitleStatus};
+use sqlx::Row;
 
 use crate::{api::AppState, userdata};
 
@@ -40,7 +42,7 @@ where
                     continue;
                 }
                 sent += 1;
-                if f.status == TitleStatus::Watched {
+                if matches!(f.status, TitleStatus::Watched | TitleStatus::WaitingEpisode) {
                     userdata::set_status(
                         &state.pool,
                         f.user_id,
@@ -53,6 +55,44 @@ where
             }
         }
         userdata::set_notified(&state.pool, f.user_id, f.tmdb_id, latest).await?;
+    }
+    Ok(sent)
+}
+
+/// Checks "Жду" movies and transitions released ones to "Хочу посмотреть", notifying the user.
+pub async fn check_released_movies<F, Fut>(state: &AppState, send: F) -> anyhow::Result<usize>
+where
+    F: Fn(i64, String, String) -> Fut,
+    Fut: Future<Output = anyhow::Result<()>>,
+{
+    let msk = FixedOffset::east_opt(3 * 3600).expect("UTC+3");
+    let today = Utc::now().with_timezone(&msk).format("%Y-%m-%d").to_string();
+    let rows = sqlx::query(
+        "SELECT s.user_id, u.telegram_id, s.tmdb_id
+         FROM title_state s JOIN users u ON u.id = s.user_id
+         WHERE s.media_kind = 'movie' AND s.status = 'waiting_release'",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut sent = 0usize;
+    for r in rows {
+        let user_id: i64 = r.try_get("user_id")?;
+        let telegram_id: i64 = r.try_get("telegram_id")?;
+        let tmdb_id: i64 = r.try_get("tmdb_id")?;
+        let Ok(d) = state.catalog.details(MediaKind::Movie, tmdb_id).await else {
+            continue;
+        };
+        if !d.is_unreleased_movie(&today) {
+            userdata::set_status(&state.pool, user_id, MediaKind::Movie, tmdb_id, Some(TitleStatus::Want)).await?;
+            let text = format!("Вышел фильм «{}», который вы ждали.", d.summary.title);
+            let open_url = format!("{}/?open=movie_{tmdb_id}", state.config.public_url);
+            if let Err(e) = send(telegram_id, text, open_url).await {
+                tracing::warn!(error = %e, user = user_id, "movie release message failed");
+            } else {
+                sent += 1;
+            }
+        }
     }
     Ok(sent)
 }
@@ -207,10 +247,15 @@ pub fn spawn(state: AppState, every: Duration) {
                     let (client, api_base, token) = (client.clone(), api_base.clone(), token.clone());
                     async move { telegram_send(&client, &api_base, &token, chat, text, open_url).await }
                 };
-                match check_new_episodes(&state, send).await {
+                match check_new_episodes(&state, &send).await {
                     Ok(n) if n > 0 => tracing::info!(sent = n, "new-episode notifications"),
                     Ok(_) => {}
                     Err(e) => tracing::warn!(error = %e, "new-episode check failed"),
+                }
+                match check_released_movies(&state, &send).await {
+                    Ok(n) if n > 0 => tracing::info!(sent = n, "movie-release notifications"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "movie-release check failed"),
                 }
             }
         }

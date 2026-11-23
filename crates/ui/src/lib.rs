@@ -11,8 +11,9 @@ use std::rc::Rc;
 use dioxus::html::{geometry::PixelsVector2D, MountedData, ScrollBehavior};
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, image_url, CastMember, ContinueItem, HomeFeed, ImageSize, MediaKind, PersonDetails, Progress,
-    SearchResults, Season, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
+    clock, episode_code, format_rating_short, image_url, rating_description, CastMember, ContinueItem, EpisodeRating,
+    HomeFeed, ImageSize, MediaKind, PeerBadge, PersonDetails, Progress, RewatchMode, SearchResults, Season,
+    SeasonRating, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
 };
 
 /// The stylesheet all components rely on.
@@ -297,10 +298,24 @@ pub fn Shell(
 // Cards
 // ---------------------------------------------------------------------------
 
+fn peer_summary_line(p: &PeerBadge) -> String {
+    let mut parts = vec![p.name.clone()];
+    if p.watching_now {
+        parts.push("смотрит сейчас".to_owned());
+    } else if let Some(st) = p.status {
+        parts.push(st.label().to_lowercase());
+    }
+    if let Some(r) = p.rating {
+        parts.push(format!("{}★", format_rating_short(r)));
+    }
+    parts.join(" · ")
+}
+
 #[component]
 pub fn PosterCard(
     item: TitleSummary,
     #[props(default)] status_badge: Option<TitleStatus>,
+    #[props(default)] hide_status_badge: bool,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
     let sub = match item.year {
@@ -308,6 +323,14 @@ pub fn PosterCard(
         None => kind_label(item.kind).to_owned(),
     };
     let rate = rating(&item);
+    let eff_status = status_badge.or_else(|| if hide_status_badge { None } else { item.user_status });
+    let peer_tip = if item.peers.is_empty() {
+        String::new()
+    } else {
+        item.peers.iter().map(peer_summary_line).collect::<Vec<_>>().join("\n")
+    };
+    let any_live = item.peers.iter().any(|p| p.watching_now);
+    let peer_count = item.peers.len();
     let it = item.clone();
     rsx! {
         button { class: "poster", onclick: move |_| on_open.call(it.clone()),
@@ -317,7 +340,7 @@ pub fn PosterCard(
                 } else {
                     div { class: "placeholder", style: "background: {fallback_bg(item.tmdb_id)}", "{item.title}" }
                 }
-                match status_badge {
+                match eff_status {
                     Some(TitleStatus::Watched) => rsx! {
                         span { class: "p-badge status seen", title: "Просмотрено",
                             Icon { svg: icons::CHECK, class: "ic sm" }
@@ -328,10 +351,34 @@ pub fn PosterCard(
                             Icon { svg: icons::BOOKMARK, class: "ic sm" }
                         }
                     },
+                    Some(TitleStatus::Watching) => rsx! {
+                        span { class: "p-badge status watching", title: "Смотрю",
+                            Icon { svg: icons::PLAY, class: "ic xs" }
+                        }
+                    },
+                    Some(TitleStatus::WaitingEpisode | TitleStatus::WaitingRelease) => rsx! {
+                        span { class: "p-badge status waiting", title: eff_status.map_or("", TitleStatus::label),
+                            Icon { svg: icons::CLOCK, class: "ic sm" }
+                        }
+                    },
                     _ => rsx! {},
                 }
-                if let Some(r) = rate {
+                if let Some(ur) = item.user_rating.filter(|r| *r > 0.0) {
+                    span { class: "p-badge rate mine", title: "Моя оценка",
+                        "★ {format_rating_short(ur)}"
+                    }
+                } else if let Some(r) = rate {
                     span { class: "p-badge rate", "{r}" }
+                }
+                if peer_count > 0 {
+                    span {
+                        class: if any_live { "p-badge peers live" } else { "p-badge peers" },
+                        title: "{peer_tip}",
+                        Icon { svg: icons::USERS, class: "ic xs" }
+                        if peer_count > 1 || any_live {
+                            span { "{peer_count}" }
+                        }
+                    }
                 }
             }
             div { class: "name", "{item.title}" }
@@ -1056,6 +1103,17 @@ pub fn play_target(details: &TitleDetails, progress: &[Progress]) -> (PlayTarget
     }
 }
 
+fn rewatch_targets(episode_ratings: &[EpisodeRating], mode: RewatchMode) -> Vec<(i32, i32)> {
+    let mut eps: Vec<(i32, i32)> = episode_ratings
+        .iter()
+        .filter(|e| e.season > 0 && mode.matches(Some(e.rating)))
+        .map(|e| (e.season, e.episode))
+        .collect();
+    eps.sort_unstable();
+    eps.dedup();
+    eps
+}
+
 #[component]
 pub fn TitleView(
     details: TitleDetails,
@@ -1065,23 +1123,40 @@ pub fn TitleView(
     status: Option<TitleStatus>,
     /// The user's own 1–5 rating.
     my_rating: Option<i16>,
+    /// Effective 1–5 rating (e.g. derived bottom-up average once ≥80% is rated).
+    #[props(default)]
+    effective_rating: Option<f32>,
+    #[props(default)] season_ratings: Vec<SeasonRating>,
+    #[props(default)] episode_ratings: Vec<EpisodeRating>,
+    #[props(default)] peers: Vec<PeerBadge>,
+    #[props(default)] today_ymd: String,
     /// The remembered release for the season about to play, e.g. "LostFilm · 1080p".
     /// "Смотреть" uses it without asking; `None` means the picker opens.
     release_label: Option<String>,
     on_play: EventHandler<PlayTarget>,
+    #[props(default)] on_play_rewatch: Option<EventHandler<(PlayTarget, RewatchMode)>>,
     on_change_release: EventHandler<PlayTarget>,
+    #[props(default)] on_change_episode_release: Option<EventHandler<PlayTarget>>,
     on_status: EventHandler<Option<TitleStatus>>,
     on_rate: EventHandler<Option<i16>>,
+    #[props(default)] on_rate_season: Option<EventHandler<(i32, Option<i16>)>>,
+    #[props(default)] on_rate_episode: Option<EventHandler<(i32, i32, Option<i16>)>>,
     /// Mark episodes watched (`true`) or not: `(season, episodes, watched)`.
     on_mark: EventHandler<(i32, Vec<i32>, bool)>,
     on_season: EventHandler<i32>,
 ) -> Element {
+    let mut rewatch_open = use_signal(|| false);
     let s = &details.summary;
     let (target, play_label) = play_target(&details, &progress);
     let current = progress
         .iter()
         .max_by_key(|p| p.updated_at)
         .map(|p| (p.season, p.episode));
+    let is_unreleased_movie = !today_ymd.is_empty() && details.is_unreleased_movie(&today_ymd);
+    let selectable_statuses = TitleStatus::selectable_for(s.kind, is_unreleased_movie);
+    let fav5 = rewatch_targets(&episode_ratings, RewatchMode::Only5);
+    let fav4 = rewatch_targets(&episode_ratings, RewatchMode::FourPlus);
+    let has_rewatch_modes = s.kind == MediaKind::Tv && !fav4.is_empty() && on_play_rewatch.is_some();
     let mut meta: Vec<String> = Vec::new();
     if let Some(y) = s.year {
         meta.push(y.to_string());
@@ -1104,6 +1179,22 @@ pub fn TitleView(
             }
         }
         _ => {}
+    }
+    if is_unreleased_movie {
+        if let Some(d) = details.release_date.as_deref().filter(|d| !d.is_empty()) {
+            meta.push(format!("Премьера {}", ru_date(d)));
+        }
+    }
+    if status == Some(TitleStatus::WaitingEpisode) {
+        if let Some(ne) = &details.next_episode {
+            let when = ne.air_date.as_deref().map(ru_date);
+            match when {
+                Some(d) if !d.is_empty() => {
+                    meta.push(format!("Новая серия {} · {d}", episode_code(ne.season, ne.episode),))
+                }
+                _ => meta.push(format!("Новая серия {}", episode_code(ne.season, ne.episode))),
+            }
+        }
     }
     let rate = rating(s);
     // Active resume progress for the inset bar inside the Play CTA button.
@@ -1203,16 +1294,120 @@ pub fn TitleView(
                         p { class: "overview", "{o}" }
                     }
                     div { class: "cta-row",
-                        button {
-                            class: "play-cta-card",
-                            onclick: move |_| on_play.call(t_play.clone()),
-                            div { class: "play-cta-top",
-                                Icon { svg: icons::PLAY, class: "ic sm" }
-                                span { "{play_label}" }
+                        if has_rewatch_modes {
+                            {
+                                let t_all = t_play.clone();
+                                let t_menu_all = t_play.clone();
+                                let first5 = fav5.first().copied();
+                                let first4 = fav4.first().copied();
+                                let c5 = fav5.len();
+                                let c4 = fav4.len();
+                                let offer_menu_on_main =
+                                    status == Some(TitleStatus::Watched) && target.position_sec == 0.0;
+                                rsx! {
+                                    div { class: "play-split",
+                                        if rewatch_open() {
+                                            div { class: "dd-backdrop", onclick: move |_| rewatch_open.set(false) }
+                                        }
+                                        button {
+                                            class: "play-cta-card",
+                                            onclick: move |_| {
+                                                if offer_menu_on_main {
+                                                    rewatch_open.toggle();
+                                                } else if let Some(cb) = on_play_rewatch {
+                                                    cb.call((t_all.clone(), RewatchMode::All));
+                                                } else {
+                                                    on_play.call(t_all.clone());
+                                                }
+                                            },
+                                            div { class: "play-cta-top",
+                                                Icon { svg: icons::PLAY, class: "ic sm" }
+                                                span { "{play_label}" }
+                                            }
+                                            if let Some(pct) = cta_pct {
+                                                div { class: "play-cta-inset-track",
+                                                    div { style: "width: {pct:.1}%" }
+                                                }
+                                            }
+                                        }
+                                        button {
+                                            class: if rewatch_open() { "play-split-toggle open" } else { "play-split-toggle" },
+                                            title: "Режим запуска",
+                                            "aria-label": "Режим запуска",
+                                            "aria-expanded": "{rewatch_open()}",
+                                            onclick: move |_| rewatch_open.toggle(),
+                                            Icon { svg: icons::CHEV_D, class: "ic sm" }
+                                        }
+                                        if rewatch_open() {
+                                            div { class: "rewatch-menu",
+                                                button {
+                                                    class: "st-item",
+                                                    onclick: move |_| {
+                                                        rewatch_open.set(false);
+                                                        if let Some(cb) = on_play_rewatch {
+                                                            cb.call((t_menu_all.clone(), RewatchMode::All));
+                                                        }
+                                                    },
+                                                    span { class: "st-item-l",
+                                                        Icon { svg: icons::PLAY, class: "ic xs acc" }
+                                                        span { "{RewatchMode::All.label()}" }
+                                                    }
+                                                }
+                                                if let Some((fs, fe)) = first5 {
+                                                    button {
+                                                        class: "st-item",
+                                                        onclick: move |_| {
+                                                            rewatch_open.set(false);
+                                                            if let Some(cb) = on_play_rewatch {
+                                                                cb.call((
+                                                                    PlayTarget { season: fs, episode: fe, position_sec: 0.0 },
+                                                                    RewatchMode::Only5,
+                                                                ));
+                                                            }
+                                                        },
+                                                        span { class: "st-item-l",
+                                                            Icon { svg: icons::STAR, class: "ic xs" }
+                                                            span { "{RewatchMode::Only5.label()}" }
+                                                        }
+                                                        span { class: "st-auto", "{c5}" }
+                                                    }
+                                                }
+                                                if let Some((fs, fe)) = first4 {
+                                                    button {
+                                                        class: "st-item",
+                                                        onclick: move |_| {
+                                                            rewatch_open.set(false);
+                                                            if let Some(cb) = on_play_rewatch {
+                                                                cb.call((
+                                                                    PlayTarget { season: fs, episode: fe, position_sec: 0.0 },
+                                                                    RewatchMode::FourPlus,
+                                                                ));
+                                                            }
+                                                        },
+                                                        span { class: "st-item-l",
+                                                            Icon { svg: icons::STAR, class: "ic xs" }
+                                                            span { "{RewatchMode::FourPlus.label()}" }
+                                                        }
+                                                        span { class: "st-auto", "{c4}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            if let Some(pct) = cta_pct {
-                                div { class: "play-cta-inset-track",
-                                    div { style: "width: {pct:.1}%" }
+                        } else {
+                            button {
+                                class: "play-cta-card",
+                                onclick: move |_| on_play.call(t_play.clone()),
+                                div { class: "play-cta-top",
+                                    Icon { svg: icons::PLAY, class: "ic sm" }
+                                    span { "{play_label}" }
+                                }
+                                if let Some(pct) = cta_pct {
+                                    div { class: "play-cta-inset-track",
+                                        div { style: "width: {pct:.1}%" }
+                                    }
                                 }
                             }
                         }
@@ -1228,8 +1423,43 @@ pub fn TitleView(
                         }
                     }
                     div { class: "user-meta-row",
-                        StatusDropdown { status, on_status }
-                        Stars { rating: my_rating, on_rate }
+                        StatusDropdown { status, selectable: selectable_statuses.to_vec(), on_status }
+                        Stars {
+                            rating: my_rating,
+                            effective: effective_rating,
+                            show_caption: true,
+                            on_rate,
+                        }
+                    }
+                    if !peers.is_empty() {
+                        div { class: "peers-strip",
+                            span { class: "peers-lbl",
+                                Icon { svg: icons::USERS, class: "ic xs" }
+                                "Участники:"
+                            }
+                            for p in peers.iter() {
+                                span {
+                                    key: "{p.user_id}",
+                                    class: if p.watching_now { "peer-chip live" } else { "peer-chip" },
+                                    span { class: "peer-av",
+                                        AvatarContent {
+                                            initial: initials(&p.name),
+                                            url: p.avatar_url.clone(),
+                                            alt: p.name.clone(),
+                                        }
+                                    }
+                                    span { class: "peer-name", "{p.name}" }
+                                    if p.watching_now {
+                                        span { class: "peer-meta live", "смотрит" }
+                                    } else if let Some(st) = p.status {
+                                        span { class: "peer-meta", "{st.label()}" }
+                                    }
+                                    if let Some(r) = p.rating {
+                                        span { class: "peer-rate", "★ {format_rating_short(r)}" }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1244,12 +1474,25 @@ pub fn TitleView(
                     .count();
                 let all_done = total_in_s > 0 && done_in_s == total_in_s;
                 let s_num = season.number;
+                let sr = season_ratings.iter().find(|r| r.season == s_num);
+                let sr_manual = sr.and_then(|r| r.manual_rating);
+                let sr_eff = sr.and_then(|r| r.effective_rating);
                 rsx! {
                     section { class: "section",
                         div { class: "sec-head",
                             h2 { "Сезоны и серии" }
                             if total_in_s > 0 {
                                 div { class: "season-head-r",
+                                    if s_num > 0 {
+                                        if let Some(on_rs) = on_rate_season {
+                                            Stars {
+                                                rating: sr_manual,
+                                                effective: sr_eff,
+                                                compact: true,
+                                                on_rate: move |r| on_rs.call((s_num, r)),
+                                            }
+                                        }
+                                    }
                                     span { class: "sec-sub", "{done_in_s} из {total_in_s} просмотрено" }
                                     button {
                                         class: if all_done { "chip sm active" } else { "chip sm" },
@@ -1271,21 +1514,36 @@ pub fn TitleView(
                         }
                         div { class: "ep-list",
                             for ep in season.episodes.iter().cloned() {
-                                EpisodeRow {
-                                    key: "{ep.number}",
-                                    tmdb_id: s.tmdb_id,
-                                    season: season.number,
-                                    number: ep.number,
-                                    name: ep.name.clone(),
-                                    overview: ep.overview.clone(),
-                                    still_path: ep.still_path.clone(),
-                                    runtime_min: ep.runtime_min,
-                                    air_date: ep.air_date.clone(),
-                                    progress: progress.iter().find(|p| p.season == season.number && p.episode == ep.number).cloned(),
-                                    current: current == Some((season.number, ep.number)),
-                                    on_play,
-                                    on_change_release,
-                                    on_mark,
+                                {
+                                    let ep_num = ep.number;
+                                    let ep_r = episode_ratings
+                                        .iter()
+                                        .find(|r| r.season == season.number && r.episode == ep_num)
+                                        .map(|r| r.rating);
+                                    rsx! {
+                                        EpisodeRow {
+                                            key: "{ep.number}",
+                                            tmdb_id: s.tmdb_id,
+                                            season: season.number,
+                                            number: ep.number,
+                                            name: ep.name.clone(),
+                                            overview: ep.overview.clone(),
+                                            still_path: ep.still_path.clone(),
+                                            runtime_min: ep.runtime_min,
+                                            air_date: ep.air_date.clone(),
+                                            progress: progress.iter().find(|p| p.season == season.number && p.episode == ep.number).cloned(),
+                                            current: current == Some((season.number, ep.number)),
+                                            rating: ep_r,
+                                            on_play,
+                                            on_change_release: on_change_episode_release.unwrap_or(on_change_release),
+                                            on_mark,
+                                            on_rate: move |r| {
+                                                if let Some(cb) = on_rate_episode {
+                                                    cb.call((s_num, ep_num, r));
+                                                }
+                                            },
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1427,9 +1685,11 @@ fn EpisodeRow(
     air_date: Option<String>,
     progress: Option<Progress>,
     current: bool,
+    #[props(default)] rating: Option<i16>,
     on_play: EventHandler<PlayTarget>,
     on_change_release: EventHandler<PlayTarget>,
     on_mark: EventHandler<(i32, Vec<i32>, bool)>,
+    #[props(default)] on_rate: Option<EventHandler<Option<i16>>>,
 ) -> Element {
     let mut sub = Vec::new();
     if let Some(m) = runtime_min {
@@ -1495,6 +1755,15 @@ fn EpisodeRow(
                     Some(p) if p.position_sec > 0.0 => rsx! { div { class: "ep-state", "на {clock(p.position_sec)}" } },
                     _ => rsx! {},
                 }
+                if season > 0 {
+                    if let Some(cb) = on_rate {
+                        Stars {
+                            rating,
+                            compact: true,
+                            on_rate: move |r| cb.call(r),
+                        }
+                    }
+                }
                 div { class: "ep-acts",
                     button {
                         class: "round-act",
@@ -1519,6 +1788,7 @@ fn EpisodeRow(
 fn status_dot_class(st: Option<TitleStatus>) -> &'static str {
     match st {
         Some(TitleStatus::Watching) => "st-dot watching",
+        Some(TitleStatus::WaitingEpisode | TitleStatus::WaitingRelease) => "st-dot waiting",
         Some(TitleStatus::Want) => "st-dot want",
         Some(TitleStatus::Watched) => "st-dot watched",
         Some(TitleStatus::Dropped) => "st-dot dropped",
@@ -1529,7 +1799,9 @@ fn status_dot_class(st: Option<TitleStatus>) -> &'static str {
 fn status_auto_hint(st: TitleStatus) -> &'static str {
     match st {
         TitleStatus::Watching => "авто",
+        TitleStatus::WaitingEpisode => "авто",
         TitleStatus::Want => "вручную",
+        TitleStatus::WaitingRelease => "до выхода",
         TitleStatus::Watched => "≥ 90%",
         TitleStatus::Dropped => "авто",
     }
@@ -1537,13 +1809,22 @@ fn status_auto_hint(st: TitleStatus) -> &'static str {
 
 /// Compact mutually-exclusive status dropdown with automatic-status hints.
 #[component]
-pub fn StatusDropdown(status: Option<TitleStatus>, on_status: EventHandler<Option<TitleStatus>>) -> Element {
+pub fn StatusDropdown(
+    status: Option<TitleStatus>,
+    #[props(default)] selectable: Vec<TitleStatus>,
+    on_status: EventHandler<Option<TitleStatus>>,
+) -> Element {
     let mut open = use_signal(|| false);
     let label = status.map_or("Статус просмотра", TitleStatus::label);
     let show_auto = matches!(
         status,
-        Some(TitleStatus::Watching | TitleStatus::Watched | TitleStatus::Dropped)
+        Some(TitleStatus::Watching | TitleStatus::WaitingEpisode | TitleStatus::Watched | TitleStatus::Dropped)
     );
+    let options: &[TitleStatus] = if selectable.is_empty() {
+        &TitleStatus::ALL
+    } else {
+        &selectable
+    };
     rsx! {
         div { class: "status-dd-wrap",
             if open() {
@@ -1564,7 +1845,7 @@ pub fn StatusDropdown(status: Option<TitleStatus>, on_status: EventHandler<Optio
             }
             if open() {
                 div { class: "status-menu",
-                    for st in TitleStatus::ALL {
+                    for st in options.iter().copied() {
                         button {
                             class: if status == Some(st) { "st-item on" } else { "st-item" },
                             onclick: move |_| {
@@ -1598,25 +1879,44 @@ pub fn StatusDropdown(status: Option<TitleStatus>, on_status: EventHandler<Optio
     }
 }
 
-/// Clean interactive 1–5 star rating capsule (no duplicate numeric text; animated pop + sparkle on click).
+/// Interactive 1–5 star rating capsule with proportional fill, hover descriptions, and fractional display.
 #[component]
-pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element {
+pub fn Stars(
+    rating: Option<i16>,
+    #[props(default)] effective: Option<f32>,
+    #[props(default)] compact: bool,
+    #[props(default)] show_caption: bool,
+    on_rate: EventHandler<Option<i16>>,
+) -> Element {
     let mut hover = use_signal(|| None::<i16>);
     let mut popped = use_signal(|| None::<(i16, u32)>);
     let mut tick = use_signal(|| 0u32);
-    let active = hover().or(rating).unwrap_or(0);
+    let hovered = hover();
+    let display_val = hovered
+        .map(f32::from)
+        .or(effective)
+        .or_else(|| rating.map(f32::from))
+        .unwrap_or(0.0);
+    let show_fraction =
+        hovered.is_none() && effective.is_some_and(|e| (e - e.round()).abs() > 0.04 || rating.is_none());
     let pop_state = popped();
     rsx! {
         div {
-            class: "rating-widget",
+            class: if compact { "rating-widget compact" } else { "rating-widget" },
             role: "radiogroup",
             "aria-label": "Ваша оценка",
             onmouseleave: move |_| hover.set(None),
+            if show_caption {
+                if let Some(h) = hovered {
+                    div { class: "rating-tip", "{h}★ — {rating_description(h)}" }
+                }
+            }
             div { class: "rating-stars",
                 for n in 1..=5i16 {
                     {
-                        let is_on = n <= active;
-                        let is_popped = pop_state.is_some_and(|(pn, _)| pn == n) && rating == Some(n);
+                        let fill = ((display_val - f32::from(n - 1)).clamp(0.0, 1.0) * 100.0).round();
+                        let is_on = fill > 0.0;
+                        let is_popped = !compact && pop_state.is_some_and(|(pn, _)| pn == n) && rating == Some(n);
                         let pop_key = if is_popped {
                             format!("star-{n}-{}", pop_state.map(|(_, t)| t).unwrap_or(0))
                         } else {
@@ -1627,14 +1927,20 @@ pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element
                             (true, false) => "r-star on",
                             _ => "r-star",
                         };
+                        let desc = rating_description(n);
+                        let tip = if rating == Some(n) {
+                            format!("{n}/5 — {desc} (нажмите, чтобы снять)")
+                        } else {
+                            format!("{n}/5 — {desc}")
+                        };
                         rsx! {
                             button {
                                 key: "{pop_key}",
                                 class: "{cls}",
                                 role: "radio",
                                 "aria-checked": if rating == Some(n) { "true" } else { "false" },
-                                title: if rating == Some(n) { "Убрать оценку" } else { "Поставить {n} из 5" },
-                                "aria-label": "{n} из 5",
+                                title: "{tip}",
+                                "aria-label": "{n} из 5: {desc}",
                                 onmouseenter: move |_| hover.set(Some(n)),
                                 onclick: move |_| {
                                     let next = if rating == Some(n) { None } else { Some(n) };
@@ -1647,7 +1953,14 @@ pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element
                                     }
                                     on_rate.call(next);
                                 },
-                                Icon { svg: icons::STAR, class: "ic star-ic" }
+                                span { class: "r-star-stack",
+                                    span { class: "r-star-bg",
+                                        Icon { svg: icons::STAR, class: "ic star-ic" }
+                                    }
+                                    span { class: "r-star-fill", style: "width: {fill:.0}%",
+                                        Icon { svg: icons::STAR, class: "ic star-ic" }
+                                    }
+                                }
                                 if is_popped {
                                     span { class: "r-spark",
                                         Icon { svg: icons::SPARKLE, class: "ic xs" }
@@ -1655,6 +1968,11 @@ pub fn Stars(rating: Option<i16>, on_rate: EventHandler<Option<i16>>) -> Element
                                 }
                             }
                         }
+                    }
+                }
+                if show_fraction {
+                    if let Some(eff) = effective {
+                        span { class: "r-val", "{format_rating_short(eff)}" }
                     }
                 }
             }
@@ -1753,6 +2071,9 @@ mod tests {
                 backdrop_path: None,
                 rating: None,
                 overview: None,
+                user_rating: None,
+                user_status: None,
+                peers: vec![],
             },
             genres: vec![],
             runtime_min: None,
@@ -1760,6 +2081,9 @@ mod tests {
             seasons: vec![season_sum(1, 2), season_sum(2, 3)],
             imdb_id: None,
             last_episode: Some((2, 3)),
+            series_status: None,
+            release_date: None,
+            next_episode: None,
         };
         let ep = |season, episode, finished| Progress {
             kind: MediaKind::Tv,

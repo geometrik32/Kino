@@ -18,8 +18,9 @@ const MIN_BECAUSE_ITEMS: usize = 4;
 const BECAUSE_PREFIX: &str = "because:";
 
 /// Ordered category chips offered on the home screen.
-const CATEGORY_CATALOG: [(&str, &str); 11] = [
+const CATEGORY_CATALOG: [(&str, &str); 12] = [
     ("for_you", "Для вас"),
+    ("rewatch", "Пересматривай любимое"),
     ("tv", "Сериалы"),
     ("movies", "Фильмы"),
     ("fresh", "Новинки"),
@@ -65,8 +66,18 @@ pub fn exclusions_only(signals: &[UserTitleSignal]) -> UserTaste {
     let mut watching = HashSet::new();
     for s in signals {
         let key = (s.kind, s.tmdb_id);
-        let is_watched = s.status == Some(TitleStatus::Watched) || (s.kind == MediaKind::Movie && s.finished);
-        if is_watched || s.status == Some(TitleStatus::Dropped) {
+        let is_excluded = s.rating.is_some()
+            || matches!(
+                s.status,
+                Some(
+                    TitleStatus::Watched
+                        | TitleStatus::Dropped
+                        | TitleStatus::WaitingEpisode
+                        | TitleStatus::WaitingRelease
+                )
+            )
+            || (s.kind == MediaKind::Movie && s.finished);
+        if is_excluded {
             excluded.insert(key);
         } else if s.status == Some(TitleStatus::Watching) {
             watching.insert(key);
@@ -148,8 +159,9 @@ fn signal_weight(s: &UserTitleSignal, recency_idx: usize) -> i32 {
     };
     score += match s.status {
         Some(TitleStatus::Watched) => 45,
+        Some(TitleStatus::WaitingEpisode) => 42,
         Some(TitleStatus::Watching) => 35,
-        Some(TitleStatus::Want) => 20,
+        Some(TitleStatus::Want | TitleStatus::WaitingRelease) => 20,
         _ => 0,
     };
     if s.kind == MediaKind::Movie && s.finished {
@@ -419,6 +431,9 @@ mod tests {
             backdrop_path: None,
             rating: Some(8.0),
             overview: None,
+            user_rating: None,
+            user_status: None,
+            peers: Vec::new(),
         }
     }
 

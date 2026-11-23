@@ -31,8 +31,12 @@ pub const CARD_CALLBACK: &str = "card:";
 /// Callback data for the random movie recommender: `rnd:<op>:<state>`.
 pub const RANDOM_CALLBACK: &str = "rnd:";
 
+/// Callback data for daily trending digest settings: `trend:<op>`.
+pub const TREND_CALLBACK: &str = "trend:";
+
 pub const BTN_OPEN_APP: &str = "🎬 Открыть кинопоказ";
 pub const BTN_RANDOM: &str = "🎲 Случайный фильм";
+pub const BTN_TRENDING: &str = "🔥 Сегодня в тренде";
 pub const BTN_SEARCH: &str = "🔍 Поиск";
 pub const BTN_CONTINUE: &str = "▶ Продолжить";
 pub const BTN_MY: &str = "📚 Мои списки";
@@ -43,6 +47,7 @@ pub const BTN_INVITE: &str = "🎟 Пригласить";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BotAction {
     Random,
+    Trending,
     Search,
     Continue,
     My,
@@ -55,6 +60,7 @@ impl BotAction {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Random => "random",
+            Self::Trending => "trending",
             Self::Search => "search",
             Self::Continue => "continue",
             Self::My => "my",
@@ -67,6 +73,7 @@ impl BotAction {
     pub fn parse_button(text: &str) -> Option<Self> {
         match text.trim() {
             BTN_RANDOM => Some(Self::Random),
+            BTN_TRENDING => Some(Self::Trending),
             BTN_SEARCH => Some(Self::Search),
             BTN_CONTINUE => Some(Self::Continue),
             BTN_MY => Some(Self::My),
@@ -80,6 +87,7 @@ impl BotAction {
     pub fn parse_callback(suffix: &str) -> Option<Self> {
         match suffix {
             "random" => Some(Self::Random),
+            "trending" => Some(Self::Trending),
             "search" => Some(Self::Search),
             "continue" => Some(Self::Continue),
             "my" => Some(Self::My),
@@ -353,12 +361,13 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// Persistent keyboard in private chats showing bot commands without duplicating the left WebApp button.
 pub fn main_reply_keyboard(is_admin: bool) -> KeyboardMarkup {
     let mut rows = vec![
-        vec![KeyboardButton::new(BTN_RANDOM), KeyboardButton::new(BTN_SEARCH)],
-        vec![KeyboardButton::new(BTN_CONTINUE), KeyboardButton::new(BTN_MY)],
-        vec![KeyboardButton::new(BTN_LOGIN), KeyboardButton::new(BTN_HELP)],
+        vec![KeyboardButton::new(BTN_RANDOM), KeyboardButton::new(BTN_TRENDING)],
+        vec![KeyboardButton::new(BTN_SEARCH), KeyboardButton::new(BTN_CONTINUE)],
+        vec![KeyboardButton::new(BTN_MY), KeyboardButton::new(BTN_LOGIN)],
+        vec![KeyboardButton::new(BTN_HELP)],
     ];
     if is_admin {
-        rows.push(vec![KeyboardButton::new(BTN_INVITE)]);
+        rows.last_mut().unwrap().push(KeyboardButton::new(BTN_INVITE));
     }
     KeyboardMarkup::new(rows)
         .resize_keyboard()
@@ -372,15 +381,19 @@ fn command_inline_rows(base: &Url, is_admin: bool) -> Vec<Vec<InlineKeyboardButt
     };
     let mut rows = vec![
         vec![open_app(base, BTN_OPEN_APP)],
-        vec![cmd(BTN_RANDOM, BotAction::Random), cmd(BTN_SEARCH, BotAction::Search)],
-        vec![cmd(BTN_CONTINUE, BotAction::Continue), cmd(BTN_MY, BotAction::My)],
+        vec![
+            cmd(BTN_RANDOM, BotAction::Random),
+            cmd(BTN_TRENDING, BotAction::Trending),
+        ],
+        vec![
+            cmd(BTN_SEARCH, BotAction::Search),
+            cmd(BTN_CONTINUE, BotAction::Continue),
+        ],
+        vec![cmd(BTN_MY, BotAction::My), cmd(BTN_LOGIN, BotAction::Login)],
     ];
-    let last = if is_admin {
-        vec![cmd(BTN_LOGIN, BotAction::Login), cmd(BTN_INVITE, BotAction::Invite)]
-    } else {
-        vec![cmd(BTN_LOGIN, BotAction::Login)]
-    };
-    rows.push(last);
+    if is_admin {
+        rows.push(vec![cmd(BTN_INVITE, BotAction::Invite)]);
+    }
     rows
 }
 
@@ -417,10 +430,11 @@ pub fn help(base: &Url, is_admin: bool) -> Screen {
         "<b>Орловский кинопоказ — что умеет бот</b>\n\n\
          <b>Поиск и подбор</b>\n\
          • /search <i>название</i> — поиск фильма или сериала (можно просто написать название в чат)\n\
-         • /random — случайный фильм (без рамок или по жанру, длительности, рейтингу и допуску)\n\n\
+         • /random — случайный фильм (без рамок или по жанру, длительности, рейтингу и допуску)\n\
+         • /trending — настроить ежедневную рассылку постеров «Сегодня в тренде»\n\n\
          <b>Просмотр и списки</b>\n\
          • /continue — продолжить с места остановки\n\
-         • /my — списки: смотрю, хочу посмотреть, просмотрено, брошено\n\n\
+         • /my — списки: смотрю, жду, хочу посмотреть, просмотрено, брошено\n\n\
          <b>Доступ</b>\n\
          • /login — быстрый вход на сайт в браузере\n\
          • /start — открыть кинопоказ и показать кнопки команд\n\
@@ -786,10 +800,117 @@ pub fn continue_list(base: &Url, rows: &[ContinueRow]) -> Screen {
 fn status_icon(s: TitleStatus) -> &'static str {
     match s {
         TitleStatus::Watching => "▶",
+        TitleStatus::WaitingEpisode => "⏳",
         TitleStatus::Want => "🔖",
+        TitleStatus::WaitingRelease => "🗓",
         TitleStatus::Watched => "✅",
         TitleStatus::Dropped => "⏸",
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrendPrefs {
+    pub enabled: bool,
+    pub include_tv: bool,
+    pub send_hour: i16,
+    pub item_limit: i16,
+}
+
+impl Default for TrendPrefs {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            include_tv: false,
+            send_hour: 19,
+            item_limit: 5,
+        }
+    }
+}
+
+pub fn trend_settings(p: &TrendPrefs) -> Screen {
+    let status = if p.enabled {
+        "Включена"
+    } else {
+        "Выключена"
+    };
+    let kinds = if p.include_tv {
+        "Фильмы и сериалы"
+    } else {
+        "Только фильмы"
+    };
+    let text = format!(
+        "<b>🔥 Сегодня в тренде</b>\n\
+         Бот будет присылать подборку популярных постеров за день одним сообщением.\n\n\
+         • <b>Рассылка:</b> {status}\n\
+         • <b>Что присылать:</b> {kinds}\n\
+         • <b>Время (МСК):</b> {:02}:00\n\
+         • <b>Количество постеров:</b> {}",
+        p.send_hour, p.item_limit
+    );
+    let cb = |op: &str| format!("{TREND_CALLBACK}{op}");
+    let toggle_lbl = if p.enabled {
+        "🔕 Выключить рассылку"
+    } else {
+        "🔔 Включить рассылку"
+    };
+    let kind_lbl = if p.include_tv {
+        "🎬 Только фильмы"
+    } else {
+        "📺 Добавить сериалы"
+    };
+    let hr_btn = |h: i16| {
+        let lbl = if p.send_hour == h {
+            format!("✓ {h:02}:00")
+        } else {
+            format!("{h:02}:00")
+        };
+        InlineKeyboardButton::callback(lbl, cb(&format!("hr:{h}")))
+    };
+    let lim_btn = |n: i16| {
+        let lbl = if p.item_limit == n {
+            format!("✓ {n} шт.")
+        } else {
+            format!("{n} шт.")
+        };
+        InlineKeyboardButton::callback(lbl, cb(&format!("lim:{n}")))
+    };
+    let rows = vec![
+        vec![InlineKeyboardButton::callback(toggle_lbl, cb("toggle"))],
+        vec![InlineKeyboardButton::callback(kind_lbl, cb("tv"))],
+        vec![hr_btn(10), hr_btn(14), hr_btn(19), hr_btn(21)],
+        vec![lim_btn(3), lim_btn(5), lim_btn(8)],
+        vec![InlineKeyboardButton::callback(
+            "✨ Прислать сегодня в тренде сейчас",
+            cb("now"),
+        )],
+    ];
+    Screen::new(text, rows)
+}
+
+/// HTML caption attached to the first poster of a "Сегодня в тренде" media group.
+pub fn trending_album_caption(base: &Url, items: &[TitleSummary]) -> String {
+    let mut text = String::from("<b>🔥 Сегодня в тренде</b>\n");
+    for (idx, item) in items.iter().enumerate() {
+        let url = title_url(base, item.kind, item.tmdb_id);
+        let name = name_with_year(item);
+        let rate = item
+            .rating
+            .filter(|r| *r > 0.0)
+            .map(|r| format!(" · ★ {r:.1}"))
+            .unwrap_or_default();
+        let line = format!(
+            "\n{}. <a href=\"{}\">{}</a>{}",
+            idx + 1,
+            esc(url.as_str()),
+            esc(&name),
+            rate
+        );
+        if text.chars().count() + line.chars().count() > CAPTION_MAX_CHARS {
+            break;
+        }
+        text.push_str(&line);
+    }
+    text
 }
 
 /// Counts of titles per status, for the "Мои" menu.
@@ -872,6 +993,9 @@ mod tests {
             backdrop_path: None,
             rating: Some(8.24),
             overview: None,
+            user_rating: None,
+            user_status: None,
+            peers: Vec::new(),
         }
     }
 
@@ -1021,6 +1145,9 @@ mod tests {
                 seasons: vec![],
                 imdb_id: None,
                 last_episode: None,
+                series_status: None,
+                release_date: None,
+                next_episode: None,
             },
             relaxed: true,
         };
@@ -1104,7 +1231,7 @@ mod tests {
         let counts: Vec<_> = TitleStatus::ALL.iter().map(|s| (*s, 2usize)).collect();
         let s = my_menu(&counts);
         let flat: Vec<_> = s.keyboard.inline_keyboard.iter().flatten().collect();
-        assert_eq!(flat.len(), 4);
+        assert_eq!(flat.len(), TitleStatus::ALL.len());
         assert_eq!(flat[0].text, "▶ Смотрю · 2");
         match &flat[1].kind {
             InlineKeyboardButtonKind::CallbackData(d) => assert_eq!(d, "my:want"),
@@ -1179,10 +1306,33 @@ mod tests {
             seasons: vec![],
             imdb_id: None,
             last_episode: None,
+            series_status: None,
+            release_date: None,
+            next_episode: None,
         };
         let s = title_details_card(&base(), &d);
         assert!(s.text.contains("🎬 Фильм · ★ 8.2 · 136 мин"));
         assert!(s.text.contains("<i>фантастика, боевик</i>"));
         assert!(s.text.contains("Описание фильма."));
+    }
+
+    #[test]
+    fn trend_settings_callbacks_fit_limit_and_album_caption_links_titles() {
+        let p = TrendPrefs::default();
+        let s = trend_settings(&p);
+        for btn in s.keyboard.inline_keyboard.iter().flatten() {
+            if let InlineKeyboardButtonKind::CallbackData(d) = &btn.kind {
+                assert!(d.len() <= 64, "callback too long: {d}");
+            }
+        }
+        let items = vec![
+            summary(MediaKind::Movie, 603, "Матрица", Some(1999)),
+            summary(MediaKind::Movie, 155, "Тёмный рыцарь", Some(2008)),
+        ];
+        let cap = trending_album_caption(&base(), &items);
+        assert!(cap.contains("Сегодня в тренде"));
+        assert!(cap.contains("https://kino.example.com/?open=movie_603"));
+        assert!(cap.contains("Матрица (1999)"));
+        assert!(cap.chars().count() <= 1024);
     }
 }

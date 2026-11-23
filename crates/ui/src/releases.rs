@@ -695,6 +695,9 @@ mod tests {
             backdrop_path: None,
             rating: None,
             overview: None,
+            user_rating: None,
+            user_status: None,
+            peers: vec![],
         }
     }
 

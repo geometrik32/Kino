@@ -10,6 +10,7 @@ publish.workspace = true
 kino-core.workspace = true
 kino-server.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -17,6 +18,3 @@ tracing-subscriber.workspace = true
 teloxide = { version = "0.17", default-features = false, features = ["macros", "ctrlc_handler", "rustls"] }
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"] }
-
-[dev-dependencies]
-chrono.workspace = true

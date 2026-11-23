@@ -659,14 +659,26 @@ async fn personalized_home_lazy_shelves_and_pagination(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     let feed: kino_core::HomeFeed = serde_json::from_value(body).unwrap();
     assert!(!feed.categories.is_empty());
+    assert!(feed.categories.iter().any(|c| c.id == "rewatch"));
     assert!(feed.rows.iter().any(|r| r.id == "because:movie:603" && r.loaded));
+    let rewatch = feed
+        .rows
+        .iter()
+        .find(|r| r.id == "rewatch")
+        .expect("rewatch row present");
+    let item_603 = rewatch
+        .items
+        .iter()
+        .find(|i| i.kind == kino_core::MediaKind::Movie && i.tmdb_id == 603)
+        .expect("watched 5-star film appears in rewatch row");
+    assert_eq!(item_603.user_rating, Some(5.0));
     assert!(
         feed.rows.iter().any(|r| !r.loaded),
         "should keep trailing shelves deferred"
     );
 
-    // Excluded titles (watched 603 and dropped 155) must not appear in loaded shelves.
-    for row in feed.rows.iter().filter(|r| r.loaded) {
+    // Excluded titles (watched 603 and dropped 155) must not appear in loaded discovery shelves.
+    for row in feed.rows.iter().filter(|r| r.loaded && r.id != "rewatch") {
         for item in &row.items {
             assert!(!(item.kind == kino_core::MediaKind::Movie && (item.tmdb_id == 603 || item.tmdb_id == 155)));
         }

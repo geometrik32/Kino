@@ -276,6 +276,26 @@ impl SyncHub {
         Self::default()
     }
 
+    /// Snapshot of currently active players across all users (`user_id -> (kind, tmdb_id, season, episode, paused)`).
+    pub fn active_watchers(&self) -> HashMap<i64, (MediaKind, i64, i32, i32, bool)> {
+        let now = Self::now_ms();
+        let rooms = self.rooms.lock().expect("sync rooms lock");
+        let mut out: HashMap<i64, (MediaKind, i64, i32, i32, bool)> = HashMap::new();
+        for (key, room_arc) in rooms.iter() {
+            if let Ok(room) = room_arc.try_lock() {
+                let alive = room
+                    .members
+                    .iter()
+                    .any(|m| now - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS);
+                if alive {
+                    out.entry(key.user_id)
+                        .or_insert((key.kind, key.tmdb_id, room.season, room.episode, room.paused));
+                }
+            }
+        }
+        out
+    }
+
     fn now_ms() -> i64 {
         Utc::now().timestamp_millis()
     }
@@ -1176,9 +1196,11 @@ mod tests {
             kind: MediaKind::Movie,
             tmdb_id: 603,
             season: 0,
+            episode: 0,
             infohash: ch.to_string().repeat(40),
             title: Some(format!("Release {ch}")),
             quality: Some("1080p".into()),
+            quality_key: Some("1080p".into()),
             voice: Some("Дубляж".into()),
         }
     }

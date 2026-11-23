@@ -8,14 +8,15 @@ use axum::{
     extract::{Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
-    demo_releases, language_name, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest, PlayRequest,
-    ReleaseList, StreamProgress, TitleDetails, UserPrefs,
+    demo_releases, language_name, normalize_quality_key, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest,
+    PlayRequest, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ReleaseOption, ResolveReleaseRequest,
+    ResolveReleaseResponse, StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
 };
 use serde::Deserialize;
 use tower::ServiceExt;
@@ -133,6 +134,8 @@ impl Media {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/releases/{kind}/{tmdb_id}", get(releases))
+        .route("/releases/{kind}/{tmdb_id}/resolve", post(resolve_release))
+        .route("/release-quality", put(put_release_quality))
         .route("/play", post(play))
         .route("/play/probe", post(play_probe))
         .route("/play/progress/{release}", get(play_progress))
@@ -176,24 +179,21 @@ struct SeasonQuery {
     season: Option<i32>,
 }
 
-/// Releases of a title from every tracker in Jackett, or demo data without it.
-async fn releases(
-    State(state): State<AppState>,
-    _user: CurrentUser,
-    Path((kind, tmdb_id)): Path<(String, i64)>,
-    Query(q): Query<SeasonQuery>,
-) -> Result<Json<ReleaseList>, AppError> {
-    let kind = parse_kind(&kind)?;
-    let details = state.catalog.details(kind, tmdb_id).await?;
+async fn fetch_release_list(
+    state: &AppState,
+    details: &TitleDetails,
+    season: Option<i32>,
+) -> Result<ReleaseList, AppError> {
+    let kind = details.summary.kind;
     let Some(jackett) = &state.media.jackett else {
-        let season = (kind == MediaKind::Tv).then(|| q.season.unwrap_or(1));
-        return Ok(Json(ReleaseList {
-            releases: demo_releases(&details.summary, season),
+        let s = (kind == MediaKind::Tv).then(|| season.unwrap_or(1));
+        return Ok(ReleaseList {
+            releases: demo_releases(&details.summary, s),
             configured: false,
-        }));
+        });
     };
-    let items = torrent::search_cached(&state.media.searches, &state.pool, jackett, &details).await?;
-    let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, &details)).collect();
+    let items = torrent::search_cached(&state.media.searches, &state.pool, jackett, details).await?;
+    let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, details)).collect();
     // Releases downloaded before are shown by their real info-hash, so the
     // remembered choice and "По просмотренным" find them.
     let keys: Vec<String> = releases
@@ -211,10 +211,296 @@ async fn releases(
             r.infohash = h.clone();
         }
     }
-    Ok(Json(ReleaseList {
+    Ok(ReleaseList {
         releases,
         configured: true,
-    }))
+    })
+}
+
+/// Releases of a title from every tracker in Jackett, or demo data without it.
+async fn releases(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Query(q): Query<SeasonQuery>,
+) -> Result<Json<ReleaseList>, AppError> {
+    let kind = parse_kind(&kind)?;
+    let details = state.catalog.details(kind, tmdb_id).await?;
+    Ok(Json(fetch_release_list(&state, &details, q.season).await?))
+}
+
+#[derive(Deserialize)]
+struct SetDeviceQualityRequest {
+    kind: MediaKind,
+    tmdb_id: i64,
+    #[serde(default)]
+    season: i32,
+    #[serde(default)]
+    episode: i32,
+    #[serde(default)]
+    is_mobile: bool,
+    quality_key: String,
+}
+
+async fn put_release_quality(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(req): Json<SetDeviceQualityRequest>,
+) -> Result<StatusCode, AppError> {
+    if req.tmdb_id <= 0 || req.season < 0 || req.episode < 0 {
+        return Err(AppError::bad_request("invalid tmdb_id or season/episode"));
+    }
+    let qkey = normalize_quality_key(&req.quality_key);
+    let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
+    let (season, episode) = if req.kind == MediaKind::Movie {
+        (0, 0)
+    } else {
+        (req.season, req.episode)
+    };
+    db::save_device_quality(
+        &state.pool,
+        user.0,
+        req.kind,
+        req.tmdb_id,
+        season,
+        episode,
+        device_kind,
+        qkey,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TargetQuality {
+    Ask,
+    Exact(String),
+    MobileAuto,
+}
+
+impl TargetQuality {
+    fn from_prefs(prefs: &UserPrefs, device_override: Option<String>, is_mobile: bool) -> Self {
+        if let Some(q) = device_override {
+            return Self::Exact(normalize_quality_key(&q).to_owned());
+        }
+        let configured = if is_mobile {
+            prefs.mobile_quality.as_deref()
+        } else {
+            prefs.desktop_quality.as_deref().or(prefs.quality.as_deref())
+        };
+        match configured {
+            Some("ask") => Self::Ask,
+            Some("auto") | None if is_mobile => Self::MobileAuto,
+            None => Self::Exact("1080p".to_owned()),
+            Some(q) => Self::Exact(normalize_quality_key(q).to_owned()),
+        }
+    }
+
+    fn matches_key(&self, qkey: &str) -> bool {
+        match self {
+            Self::Ask => false,
+            Self::Exact(want) => qkey == want,
+            Self::MobileAuto => qkey == "720p" || qkey == "SD",
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Ask => String::new(),
+            Self::Exact(q) => q.clone(),
+            Self::MobileAuto => "720p".to_owned(),
+        }
+    }
+}
+
+fn find_scoped_choice(
+    choices: &[ReleaseChoice],
+    season: i32,
+    episode: i32,
+    pred: impl Fn(&str) -> bool,
+) -> Option<&ReleaseChoice> {
+    let matches_q = |c: &&ReleaseChoice| {
+        let k = c
+            .release
+            .quality_key
+            .as_deref()
+            .or(c.release.quality.as_deref())
+            .map(normalize_quality_key)
+            .unwrap_or("");
+        !k.is_empty() && pred(k)
+    };
+    choices
+        .iter()
+        .filter(matches_q)
+        .find(|c| c.release.season == season && c.release.episode == episode)
+        .or_else(|| {
+            choices
+                .iter()
+                .filter(matches_q)
+                .find(|c| c.release.season == season && c.release.episode == 0)
+        })
+        .or_else(|| {
+            choices
+                .iter()
+                .filter(matches_q)
+                .find(|c| c.release.season == 0 && c.release.episode == 0)
+        })
+}
+
+fn auto_pick_release<'a>(
+    releases: &'a [ReleaseOption],
+    kind: MediaKind,
+    season: i32,
+    target: &TargetQuality,
+    preferred_voice: Option<&str>,
+    preferred_lang: Option<&str>,
+    is_mobile: bool,
+) -> Option<&'a ReleaseOption> {
+    let for_season: Vec<&ReleaseOption> = releases
+        .iter()
+        .filter(|r| kind == MediaKind::Movie || r.season.is_none() || r.season == Some(season))
+        .collect();
+    if for_season.is_empty() {
+        return None;
+    }
+    let pool: Vec<&ReleaseOption> = match preferred_lang {
+        Some(lang) => {
+            let matching: Vec<&ReleaseOption> = for_season.iter().copied().filter(|r| r.language == lang).collect();
+            if matching.is_empty() {
+                for_season
+            } else {
+                matching
+            }
+        }
+        None => for_season,
+    };
+
+    let chosen_bucket: &'static str = match target {
+        TargetQuality::Ask => return None,
+        TargetQuality::Exact(q) => normalize_quality_key(q),
+        TargetQuality::MobileAuto => {
+            let best_720 = pool
+                .iter()
+                .filter(|r| normalize_quality_key(&r.quality) == "720p")
+                .map(|r| r.seeders)
+                .max();
+            let best_sd = pool
+                .iter()
+                .filter(|r| normalize_quality_key(&r.quality) == "SD")
+                .map(|r| r.seeders)
+                .max();
+            match (best_720, best_sd) {
+                (Some(s720), _) if s720 >= MOBILE_720P_MIN_SEEDERS => "720p",
+                (Some(s720), Some(ssd)) if ssd > s720 => "SD",
+                (Some(_), _) => "720p",
+                (None, Some(_)) => "SD",
+                (None, None) => return None,
+            }
+        }
+    };
+
+    let candidates: Vec<&ReleaseOption> = pool
+        .into_iter()
+        .filter(|r| normalize_quality_key(&r.quality) == chosen_bucket)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.into_iter().max_by_key(|r| {
+        let voice_match = preferred_voice.is_some_and(|v| r.voice.eq_ignore_ascii_case(v));
+        let rus_match = r.language == preferred_lang.unwrap_or("Русский");
+        let season_exact = kind == MediaKind::Tv && r.season == Some(season);
+        let direct_bonus = !is_mobile && r.direct_play && r.seeders >= 5;
+        (voice_match, rus_match, season_exact, direct_bonus, r.seeders)
+    })
+}
+
+/// Automatically picks a release by quality (device default / prefs) and other users' choices.
+async fn resolve_release(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((kind, tmdb_id)): Path<(String, i64)>,
+    Json(req): Json<ResolveReleaseRequest>,
+) -> Result<Json<ResolveReleaseResponse>, AppError> {
+    let kind = parse_kind(&kind)?;
+    if tmdb_id <= 0 || req.season < 0 || req.episode < 0 {
+        return Err(AppError::bad_request("invalid tmdb_id or season/episode"));
+    }
+    let (season, episode) = if kind == MediaKind::Movie {
+        (0, 0)
+    } else {
+        (req.season, req.episode)
+    };
+    let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
+    let prefs = userdata::get_prefs(&state.pool, user.0).await?;
+    let dev_override = db::device_quality_for(&state.pool, user.0, kind, tmdb_id, season, episode, device_kind).await?;
+    let target = TargetQuality::from_prefs(&prefs, dev_override, req.is_mobile);
+
+    let details = state.catalog.details(kind, tmdb_id).await?;
+    if target == TargetQuality::Ask {
+        let list = fetch_release_list(&state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
+        return Ok(Json(ResolveReleaseResponse::NeedsPicker {
+            target_quality: String::new(),
+            releases: list,
+        }));
+    }
+
+    let mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    if let Some(c) = find_scoped_choice(&mine, season, episode, |k| target.matches_key(k)) {
+        return Ok(Json(ResolveReleaseResponse::Ready {
+            choice: c.release.clone(),
+            from_peer: None,
+        }));
+    }
+
+    let shared = db::shared_release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    if let Some(c) = find_scoped_choice(&shared, season, episode, |k| target.matches_key(k)) {
+        let mut adopted = c.release.clone();
+        if kind == MediaKind::Movie {
+            adopted.season = 0;
+            adopted.episode = 0;
+        }
+        let _ = db::save_release_choice(&state.pool, user.0, &adopted).await;
+        return Ok(Json(ResolveReleaseResponse::Ready {
+            choice: adopted,
+            from_peer: c.picked_by.clone(),
+        }));
+    }
+
+    let preferred_voice = mine
+        .first()
+        .or_else(|| shared.first())
+        .and_then(|c| c.release.voice.clone());
+    let list = fetch_release_list(&state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
+
+    let picked = auto_pick_release(
+        &list.releases,
+        kind,
+        season,
+        &target,
+        preferred_voice.as_deref(),
+        prefs.language.as_deref(),
+        req.is_mobile,
+    );
+    match picked {
+        Some(best) => {
+            let save_season = if kind == MediaKind::Movie || best.season.is_none() {
+                0
+            } else {
+                season
+            };
+            let choice = best.to_scoped_choice(&details.summary, save_season, 0);
+            db::save_release_choice(&state.pool, user.0, &choice).await?;
+            Ok(Json(ResolveReleaseResponse::Ready {
+                choice,
+                from_peer: None,
+            }))
+        }
+        None => Ok(Json(ResolveReleaseResponse::NeedsPicker {
+            target_quality: target.label(),
+            releases: list,
+        })),
+    }
 }
 
 /// Starts the release search for a title in the background, so the list is ready
@@ -893,6 +1179,9 @@ mod tests {
                 backdrop_path: None,
                 rating: None,
                 overview: None,
+                user_rating: None,
+                user_status: None,
+                peers: Vec::new(),
             },
             genres: vec![],
             runtime_min: None,
@@ -900,6 +1189,9 @@ mod tests {
             seasons: vec![season(1, 7), season(2, 13), season(3, 13)],
             imdb_id: None,
             last_episode: Some((3, 5)),
+            series_status: None,
+            release_date: None,
+            next_episode: None,
         };
         assert_eq!(next_episode(&d, (1, 6)), Some((1, 7)));
         assert_eq!(next_episode(&d, (1, 7)), Some((2, 1)));

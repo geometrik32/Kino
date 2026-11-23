@@ -3,12 +3,13 @@
 use std::sync::LazyLock;
 
 use kino_core::{
-    ApiError, AuthResponse, CatalogRow, ContinueItem, HistoryEntry, HomeFeed, LoginLink, LoginLinkRequest,
-    LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayProbe, PlayProbeRequest, PlayRequest,
-    PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate,
-    ReleaseList, SearchResults, Season, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse,
-    SyncLeaveRequest, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, VideoScale,
-    WebAppAuthRequest, WidgetAuthRequest,
+    ApiError, AuthResponse, CalendarEntry, CatalogRow, ContinueItem, EpisodeRatingUpdate, HistoryEntry, HomeFeed,
+    LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayProbe,
+    PlayProbeRequest, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice,
+    ReleaseChoiceUpdate, ReleaseList, ResolveReleaseRequest, ResolveReleaseResponse, SearchResults, Season,
+    SeasonRatingUpdate, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse, SyncLeaveRequest,
+    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary,
+    VideoScale, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -242,12 +243,45 @@ pub async fn set_rating(token: &str, kind: MediaKind, id: i64, rating: Option<i1
     send("PUT", &path, token, Some(&RatingUpdate { rating })).await
 }
 
+pub async fn set_season_rating(
+    token: &str,
+    tmdb_id: i64,
+    season: i32,
+    rating: Option<i16>,
+) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/tv/{tmdb_id}/season/{season}/rating");
+    send("PUT", &path, token, Some(&SeasonRatingUpdate { rating })).await
+}
+
+pub async fn set_episode_rating(
+    token: &str,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+    rating: Option<i16>,
+) -> Result<TitleState, Failure> {
+    let path = format!("/api/title/tv/{tmdb_id}/season/{season}/episode/{episode}/rating");
+    send("PUT", &path, token, Some(&EpisodeRatingUpdate { rating })).await
+}
+
 pub async fn mark(token: &str, m: &MarkWatched) -> Result<(), Failure> {
     send("POST", "/api/marks", token, Some(m)).await
 }
 
 pub async fn my(token: &str) -> Result<Vec<TitleState>, Failure> {
     get("/api/my", token).await
+}
+
+pub async fn calendar(token: &str) -> Result<Vec<CalendarEntry>, Failure> {
+    get("/api/calendar", token).await
+}
+
+pub async fn users(token: &str) -> Result<Vec<UserPublicProfile>, Failure> {
+    get("/api/users", token).await
+}
+
+pub async fn user_titles(token: &str, user_id: i64) -> Result<UserSocialLibrary, Failure> {
+    get(&format!("/api/users/{user_id}/titles"), token).await
 }
 
 pub async fn history(token: &str) -> Result<Vec<HistoryEntry>, Failure> {
@@ -274,8 +308,32 @@ pub async fn delete_preload(token: &str, id: i64) -> Result<(), Failure> {
     send("DELETE", &format!("/api/preload/{id}"), token, None::<&()>).await
 }
 
+#[derive(serde::Serialize)]
+pub struct SetDeviceQualityRequest {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub season: i32,
+    pub episode: i32,
+    pub is_mobile: bool,
+    pub quality_key: String,
+}
+
 pub async fn releases(token: &str, kind: MediaKind, id: i64, season: i32) -> Result<ReleaseList, Failure> {
     get(&format!("/api/releases/{}/{id}?season={season}", kind.as_str()), token).await
+}
+
+pub async fn resolve_release(
+    token: &str,
+    kind: MediaKind,
+    id: i64,
+    req: &ResolveReleaseRequest,
+) -> Result<ResolveReleaseResponse, Failure> {
+    let path = format!("/api/releases/{}/{id}/resolve", kind.as_str());
+    send_timeout("POST", &path, token, Some(req), Some(60)).await
+}
+
+pub async fn set_release_quality(token: &str, req: &SetDeviceQualityRequest) -> Result<(), Failure> {
+    send("PUT", "/api/release-quality", token, Some(req)).await
 }
 
 pub async fn play(token: &str, r: &PlayRequest) -> Result<PlayInfo, Failure> {

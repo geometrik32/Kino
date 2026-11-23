@@ -114,18 +114,24 @@ pub struct WatchlistItem {
     pub added_at: DateTime<Utc>,
 }
 
-/// Body of `PUT /api/release-choice`: the release picked for a film or a season.
+/// Body of `PUT /api/release-choice`: the release picked for a film, series, season or episode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReleaseChoiceUpdate {
     pub kind: MediaKind,
     pub tmdb_id: i64,
-    /// 0 for films.
+    /// 0 for films or whole-series packs.
     #[serde(default)]
     pub season: i32,
+    /// 0 for films, whole-series packs, or whole-season releases.
+    #[serde(default)]
+    pub episode: i32,
     pub infohash: String,
     pub title: Option<String>,
     /// "1080p", "2160p", ...
     pub quality: Option<String>,
+    /// Normalized quality bucket ("2160p", "1080p", "720p", "SD").
+    #[serde(default)]
+    pub quality_key: Option<String>,
     /// Voice-over, e.g. "LostFilm".
     pub voice: Option<String>,
 }
@@ -136,6 +142,9 @@ pub struct ReleaseChoice {
     #[serde(flatten)]
     pub release: ReleaseChoiceUpdate,
     pub chosen_at: DateTime<Utc>,
+    /// Name of another user if this choice was inherited from them.
+    #[serde(default)]
+    pub picked_by: Option<String>,
 }
 
 /// Body of `POST /api/auth/webapp`: the raw `Telegram.WebApp.initData` string.
@@ -238,6 +247,21 @@ mod tests {
 // Catalog (metadata from TMDB)
 // ---------------------------------------------------------------------------
 
+/// Another user's activity on a title (for poster badges, tooltips and title cards).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerBadge {
+    pub user_id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub status: Option<TitleStatus>,
+    #[serde(default)]
+    pub rating: Option<f32>,
+    #[serde(default)]
+    pub watching_now: bool,
+}
+
 /// A title as shown on a poster card.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TitleSummary {
@@ -253,6 +277,15 @@ pub struct TitleSummary {
     /// TMDB user rating, 0–10.
     pub rating: Option<f32>,
     pub overview: Option<String>,
+    /// Current user's own rating (1.0–5.0, fractional for series averages) when rated.
+    #[serde(default)]
+    pub user_rating: Option<f32>,
+    /// Current user's own status on this title.
+    #[serde(default)]
+    pub user_status: Option<TitleStatus>,
+    /// Other users who watched, are watching, want or rated this title.
+    #[serde(default)]
+    pub peers: Vec<PeerBadge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -261,6 +294,18 @@ pub struct SeasonSummary {
     pub name: String,
     pub episode_count: i32,
     pub year: Option<i32>,
+}
+
+/// Next scheduled episode of an ongoing series.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NextEpisodeInfo {
+    pub season: i32,
+    pub episode: i32,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `YYYY-MM-DD`.
+    #[serde(default)]
+    pub air_date: Option<String>,
 }
 
 /// Everything the title page needs.
@@ -277,6 +322,37 @@ pub struct TitleDetails {
     /// Latest aired episode `(season, episode)` of a series.
     #[serde(default)]
     pub last_episode: Option<(i32, i32)>,
+    /// TMDB status (e.g. "Returning Series", "Ended", "In Production", "Planned", "Released").
+    #[serde(default)]
+    pub series_status: Option<String>,
+    /// Movie release date or series first air date (`YYYY-MM-DD`).
+    #[serde(default)]
+    pub release_date: Option<String>,
+    /// Upcoming episode when a series is ongoing.
+    #[serde(default)]
+    pub next_episode: Option<NextEpisodeInfo>,
+}
+
+impl TitleDetails {
+    /// True while a series can still receive new episodes.
+    pub fn is_ongoing_series(&self) -> bool {
+        self.summary.kind == MediaKind::Tv
+            && (self.next_episode.is_some()
+                || matches!(
+                    self.series_status.as_deref(),
+                    Some("Returning Series" | "In Production" | "Planned")
+                ))
+    }
+
+    /// True when a movie is not out yet relative to `today_ymd` (`YYYY-MM-DD`).
+    pub fn is_unreleased_movie(&self, today_ymd: &str) -> bool {
+        self.summary.kind == MediaKind::Movie
+            && (self.release_date.as_deref().is_some_and(|d| d > today_ymd)
+                || matches!(
+                    self.series_status.as_deref(),
+                    Some("Rumored" | "Planned" | "In Production" | "Post Production")
+                ))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -475,27 +551,59 @@ pub fn clock(sec: f64) -> String {
 pub enum TitleStatus {
     /// Started: set on the first play.
     Watching,
-    /// The film, or every aired episode, is watched.
+    /// All currently aired episodes of an ongoing series are watched.
+    #[serde(rename = "waiting_episode")]
+    WaitingEpisode,
+    /// The film, or every episode of a finished series, is watched.
     Watched,
     /// "Хочу посмотреть"; cleared when playback starts.
     Want,
+    /// Waiting for an unreleased film to come out.
+    #[serde(rename = "waiting_release")]
+    WaitingRelease,
     /// Given up; hidden from "Continue watching".
     Dropped,
 }
 
 impl TitleStatus {
-    pub const ALL: [TitleStatus; 4] = [
+    pub const ALL: [TitleStatus; 6] = [
         TitleStatus::Watching,
+        TitleStatus::WaitingEpisode,
         TitleStatus::Want,
+        TitleStatus::WaitingRelease,
         TitleStatus::Watched,
         TitleStatus::Dropped,
     ];
 
+    /// Statuses selectable in UI for a given title.
+    pub fn selectable_for(kind: MediaKind, unreleased_movie: bool) -> &'static [TitleStatus] {
+        match kind {
+            MediaKind::Movie if unreleased_movie => {
+                &[TitleStatus::WaitingRelease, TitleStatus::Want, TitleStatus::Dropped]
+            }
+            MediaKind::Movie => &[
+                TitleStatus::Watching,
+                TitleStatus::Want,
+                TitleStatus::Watched,
+                TitleStatus::Dropped,
+            ],
+            MediaKind::Tv => &[
+                TitleStatus::Watching,
+                TitleStatus::WaitingEpisode,
+                TitleStatus::Want,
+                TitleStatus::Watched,
+                TitleStatus::Dropped,
+            ],
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             TitleStatus::Watching => "watching",
+            TitleStatus::WaitingEpisode => "waiting_episode",
             TitleStatus::Watched => "watched",
             TitleStatus::Want => "want",
+            TitleStatus::WaitingRelease => "waiting_release",
             TitleStatus::Dropped => "dropped",
         }
     }
@@ -507,8 +615,10 @@ impl TitleStatus {
     pub fn label(self) -> &'static str {
         match self {
             TitleStatus::Watching => "Смотрю",
+            TitleStatus::WaitingEpisode => "Жду следующей серии",
             TitleStatus::Watched => "Просмотрено",
             TitleStatus::Want => "Хочу посмотреть",
+            TitleStatus::WaitingRelease => "Жду",
             TitleStatus::Dropped => "Брошено",
         }
     }
@@ -564,14 +674,100 @@ impl VideoScale {
     }
 }
 
+/// Agreed 1–5 star hover descriptions.
+pub const RATING_DESCRIPTIONS: [(i16, &str); 5] = [
+    (1, "Зря потратил время — совсем не понравилось"),
+    (2, "Впустую, но пара удачных сцен была — в целом не стоило просмотра"),
+    (3, "Достоинства есть, но не зашло — минусы оказались критичнее"),
+    (4, "Понравилось, но с огрехами — плюсов больше, получил удовольствие"),
+    (5, "Отлично, всё супер — недостатков не вижу или они совсем не мешают"),
+];
+
+pub fn rating_description(stars: i16) -> &'static str {
+    RATING_DESCRIPTIONS
+        .iter()
+        .find(|(n, _)| *n == stars)
+        .map(|(_, text)| *text)
+        .unwrap_or("")
+}
+
+/// Formats 1–5 rating cleanly: integer if whole (`4`), else 1 decimal (`4.3`).
+pub fn format_rating_short(r: f32) -> String {
+    let rounded = (r * 10.0).round() / 10.0;
+    if (rounded - rounded.round()).abs() < 0.05 {
+        format!("{:.0}", rounded.round())
+    } else {
+        format!("{rounded:.1}")
+    }
+}
+
+/// Minimum fraction of aired episodes/seasons rated before bottom-up arithmetic mean dominates.
+pub fn meets_average_threshold(rated: usize, total: usize) -> bool {
+    total > 0 && rated.saturating_mul(5) >= total.saturating_mul(4)
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeasonRating {
+    pub season: i32,
+    pub manual_rating: Option<i16>,
+    pub effective_rating: Option<f32>,
+    pub rated_episodes: i32,
+    pub aired_episodes: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeRating {
+    pub season: i32,
+    pub episode: i32,
+    pub rating: i16,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewatchMode {
+    #[default]
+    All,
+    Only5,
+    FourPlus,
+}
+
+impl RewatchMode {
+    pub const ALL: [RewatchMode; 3] = [RewatchMode::All, RewatchMode::Only5, RewatchMode::FourPlus];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RewatchMode::All => "Все серии подряд",
+            RewatchMode::Only5 => "Только любимые (5★)",
+            RewatchMode::FourPlus => "Хорошие и любимые (4–5★)",
+        }
+    }
+
+    pub fn matches(self, manual_episode_rating: Option<i16>) -> bool {
+        match self {
+            RewatchMode::All => true,
+            RewatchMode::Only5 => manual_episode_rating == Some(5),
+            RewatchMode::FourPlus => manual_episode_rating.is_some_and(|r| r >= 4),
+        }
+    }
+}
+
 /// Everything the user has set or the server has derived for one title.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TitleState {
     pub kind: MediaKind,
     pub tmdb_id: i64,
     pub status: Option<TitleStatus>,
-    /// 1–5 stars.
+    /// Explicit manual 1–5 star rating on the title itself.
     pub rating: Option<i16>,
+    /// Displayed rating (manual or bottom-up arithmetic mean once >=80% below are rated).
+    #[serde(default)]
+    pub effective_rating: Option<f32>,
+    /// Per-season manual and computed ratings (series only).
+    #[serde(default)]
+    pub season_ratings: Vec<SeasonRating>,
+    /// Per-episode manual ratings (series only).
+    #[serde(default)]
+    pub episode_ratings: Vec<EpisodeRating>,
     /// Audio and subtitle tracks picked in the player, restored next time.
     pub audio_track: Option<String>,
     pub subtitle_track: Option<String>,
@@ -582,6 +778,9 @@ pub struct TitleState {
     /// Name and poster, filled in by the server for lists.
     #[serde(default)]
     pub title: Option<TitleSummary>,
+    /// Other users' activity on this title.
+    #[serde(default)]
+    pub peers: Vec<PeerBadge>,
 }
 
 /// Body of `PUT /api/title/{kind}/{id}/status`; `null` clears it.
@@ -593,6 +792,18 @@ pub struct StatusUpdate {
 /// Body of `PUT /api/title/{kind}/{id}/rating`: 1–5, or `null` to remove.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RatingUpdate {
+    pub rating: Option<i16>,
+}
+
+/// Body of `PUT /api/title/tv/{id}/season/{season}/rating`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SeasonRatingUpdate {
+    pub rating: Option<i16>,
+}
+
+/// Body of `PUT /api/title/tv/{id}/season/{season}/episode/{episode}/rating`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EpisodeRatingUpdate {
     pub rating: Option<i16>,
 }
 
@@ -677,6 +888,66 @@ pub struct UserPrefs {
     /// How the releases are sorted: "seeders", "size", "bitrate", "name", "source", "date", "watched".
     #[serde(default)]
     pub sort: Option<String>,
+    /// Default auto-selected quality on desktop ("1080p", "2160p", "720p", "SD", "ask").
+    #[serde(default)]
+    pub desktop_quality: Option<String>,
+    /// Default auto-selected quality on phones ("auto", "720p", "SD", "1080p", "ask").
+    #[serde(default)]
+    pub mobile_quality: Option<String>,
+}
+
+/// Active title being watched right now by a user.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WatchingNowItem {
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub season: i32,
+    pub episode: i32,
+    #[serde(default)]
+    pub title: Option<TitleSummary>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Another user's public profile shown in "Мои -> Участники".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserPublicProfile {
+    pub id: i64,
+    pub name: String,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub avatar_url: Option<String>,
+    #[serde(default)]
+    pub watching_now: Option<WatchingNowItem>,
+    pub watched_count: i64,
+    pub watching_count: i64,
+    pub want_count: i64,
+    pub waiting_count: i64,
+}
+
+/// Full profile view of another user (`GET /api/users/{id}/titles`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserSocialLibrary {
+    pub profile: UserPublicProfile,
+    pub items: Vec<TitleState>,
+}
+
+/// Upcoming release item in "Мои -> Календарь".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalendarEntry {
+    /// `YYYY-MM-DD`.
+    pub date: String,
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    #[serde(default)]
+    pub season: Option<i32>,
+    #[serde(default)]
+    pub episode: Option<i32>,
+    #[serde(default)]
+    pub episode_name: Option<String>,
+    #[serde(default)]
+    pub title: Option<TitleSummary>,
+    pub status: TitleStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

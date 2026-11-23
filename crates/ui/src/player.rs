@@ -6,8 +6,9 @@ use std::rc::Rc;
 use dioxus::html::MountedData;
 use dioxus::prelude::*;
 pub use kino_core::VideoScale;
-use kino_core::{clock, MediaTrack, StreamProgress, SyncMemberInfo};
+use kino_core::{clock, normalize_quality_key, MediaTrack, ReleaseOption, StreamProgress, SyncMemberInfo};
 
+use crate::human_size;
 use crate::icons::{self, Icon};
 
 /// `id` of the `<video>` element; the app drives it through the DOM.
@@ -18,6 +19,7 @@ pub const VIDEO_ID: &str = "kino-video";
 pub enum PlayerMenu {
     Audio,
     Subtitles,
+    Quality,
     Speed,
     Episodes,
     Sync,
@@ -111,6 +113,14 @@ pub struct PlayerState {
     pub sync_client_id: String,
     /// Identifier of the device currently outputting playback sound in the sync room.
     pub sync_sound_client_id: Option<String>,
+    /// Representative releases per quality bucket (`2160p`, `1080p`, `720p`, `SD`) for the Quality tab.
+    pub available_qualities: Vec<ReleaseOption>,
+    /// Currently playing release infohash.
+    pub active_infohash: Option<String>,
+    /// Whether quality list finished loading for the current title/season.
+    pub qualities_loaded: bool,
+    /// Optional label shown when rewatching favorite episodes (e.g. `Только любимые (5★)`).
+    pub rewatch_label: Option<String>,
 }
 
 impl Default for PlayerState {
@@ -154,6 +164,10 @@ impl Default for PlayerState {
             sync_waiting_for: Vec::new(),
             sync_client_id: String::new(),
             sync_sound_client_id: None,
+            available_qualities: Vec::new(),
+            active_infohash: None,
+            qualities_loaded: false,
+            rewatch_label: None,
         }
     }
 }
@@ -242,6 +256,7 @@ pub fn PlayerView(
     #[props(default)] on_unmute: Option<EventHandler<()>>,
     #[props(default)] on_sync_sound: Option<EventHandler<String>>,
     #[props(default)] on_activity: Option<EventHandler<()>>,
+    #[props(default)] on_pick_quality: Option<EventHandler<ReleaseOption>>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
@@ -284,7 +299,10 @@ pub fn PlayerView(
             _ => "ru",
         })
         .unwrap_or("ru");
-    let audio_sub_open = matches!(s.menu, Some(PlayerMenu::Audio | PlayerMenu::Subtitles));
+    let audio_sub_open = matches!(
+        s.menu,
+        Some(PlayerMenu::Audio | PlayerMenu::Subtitles | PlayerMenu::Quality)
+    );
     let shown = controls_shown(locked(), &s, scrub().is_some());
     let busy = s.error.is_none() && (s.waiting || s.status.is_some());
     let rate = if s.rate > 0.0 { s.rate } else { 1.0 };
@@ -479,6 +497,7 @@ pub fn PlayerView(
                             div { class: "p-title-s",
                                 if let Some(sub) = &s.subtitle { span { "{sub} · " } }
                                 span { "{s.release}" }
+                                if let Some(rw) = &s.rewatch_label { span { class: "tag acc", "{rw}" } }
                                 if s.preloaded { span { class: "tag ok", "с диска" } }
                                 if s.transcoded { span { class: "tag warn", "перекодируется" } }
                             }
@@ -817,7 +836,7 @@ pub fn PlayerView(
                             _ => "p-popover",
                         },
                         onpointerdown: move |_| ping_activity(),
-                        if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
+                        if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles | PlayerMenu::Quality) {
                             div { class: "p-pop-tabs",
                                 button {
                                     class: if menu == PlayerMenu::Audio { "active" } else { "" },
@@ -829,10 +848,15 @@ pub fn PlayerView(
                                     onclick: move |_| on_menu.call(Some(PlayerMenu::Subtitles)),
                                     if s.subtitle_track.is_some() {
                                         "Субтитры (Вкл)"
-                                    } else if s.subtitle_tracks.is_empty() {
-                                        "Субтитры (Нет)"
                                     } else {
                                         "Субтитры ({s.subtitle_tracks.len()})"
+                                    }
+                                }
+                                if on_pick_quality.is_some() {
+                                    button {
+                                        class: if menu == PlayerMenu::Quality { "active" } else { "" },
+                                        onclick: move |_| on_menu.call(Some(PlayerMenu::Quality)),
+                                        "Качество"
                                     }
                                 }
                             }
@@ -852,6 +876,48 @@ pub fn PlayerView(
                                             span { "{t.label()}" }
                                         }
                                         span { class: "tag", "{t.codec.to_uppercase()}" }
+                                    }
+                                }
+                            } else if menu == PlayerMenu::Quality {
+                                if s.available_qualities.is_empty() {
+                                    p { class: "muted small p-pop-note",
+                                        if s.qualities_loaded {
+                                            "Других вариантов качества не нашлось."
+                                        } else {
+                                            "Загружаем доступные качества…"
+                                        }
+                                    }
+                                }
+                                for rel in s.available_qualities.clone() {
+                                    {
+                                        let is_cur = s.active_infohash.as_deref() == Some(rel.infohash.as_str());
+                                        let qk = normalize_quality_key(&rel.quality);
+                                        let info = if !rel.voice.is_empty() {
+                                            rel.voice.clone()
+                                        } else {
+                                            rel.tracker.clone()
+                                        };
+                                        let sz = human_size(rel.size_bytes);
+                                        let rel_click = rel.clone();
+                                        rsx! {
+                                            button {
+                                                key: "q-{rel.infohash}",
+                                                class: if is_cur { "p-opt on" } else { "p-opt" },
+                                                onclick: move |_| {
+                                                    if let Some(cb) = on_pick_quality {
+                                                        cb.call(rel_click.clone());
+                                                    }
+                                                },
+                                                span { class: "p-opt-l",
+                                                    if is_cur {
+                                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
+                                                    }
+                                                    strong { "{qk}" }
+                                                    span { class: "muted small", "{info}" }
+                                                }
+                                                span { class: "tag", "{sz} · {rel.seeders}с" }
+                                            }
+                                        }
                                     }
                                 }
                             } else {

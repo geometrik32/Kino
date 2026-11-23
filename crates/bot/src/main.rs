@@ -2,22 +2,24 @@
 //! (or just a title typed in the chat), `/continue`, `/my`, `/login` for the
 //! website, `/help`, and `/invite` for admins.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::Context;
-use kino_core::{ImageSize, MediaKind, TitleStatus};
+use chrono::{FixedOffset, NaiveDate, Timelike, Utc};
+use kino_core::{ImageSize, MediaKind, TitleStatus, TitleSummary};
 use kino_server::{
     catalog::{self, Catalog},
     config::{env_value, parse_ids},
     db,
     telegram_auth::TelegramUser,
+    userdata,
 };
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use teloxide::{
     prelude::*,
     types::{
         BotCommand, BotCommandScope, CallbackQuery, ChatAction, InlineKeyboardButton, InlineKeyboardMarkup, InputFile,
-        MenuButton, ParseMode, Recipient, WebAppInfo,
+        InputMedia, InputMediaPhoto, MenuButton, ParseMode, Recipient, WebAppInfo,
     },
     utils::command::BotCommands,
 };
@@ -45,6 +47,8 @@ mod commands {
         Search(String),
         #[command(description = "случайный фильм по параметрам")]
         Random,
+        #[command(description = "подборка «Сегодня в тренде»")]
+        Trending,
         #[command(description = "продолжить просмотр")]
         Continue,
         #[command(description = "мои списки: смотрю, хочу, просмотрено")]
@@ -200,6 +204,13 @@ async fn handle_callback(bot: Bot, q: CallbackQuery, state: Arc<BotState>) -> Re
             return Ok(());
         };
         return handle_random_callback(&bot, &q, is_private, action, &state).await;
+    }
+    if let Some(suffix) = data.strip_prefix(screens::TREND_CALLBACK) {
+        let _ = bot.answer_callback_query(q.id.clone()).await;
+        if !require_allowed(&bot, chat, Some(&q.from), &state).await? {
+            return Ok(());
+        }
+        return handle_trend_callback(&bot, &q, is_private, suffix, &state).await;
     }
     let Some(token) = data.strip_prefix(LOGIN_CALLBACK) else {
         let _ = bot.answer_callback_query(q.id).await;
@@ -742,6 +753,290 @@ async fn handle_random_callback(
     }
 }
 
+async fn load_trend_prefs(pool: &PgPool, user_id: i64) -> Result<screens::TrendPrefs, sqlx::Error> {
+    let row = sqlx::query("SELECT enabled, include_tv, send_hour, item_limit FROM bot_trend_prefs WHERE user_id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(match row {
+        Some(r) => screens::TrendPrefs {
+            enabled: r.try_get("enabled")?,
+            include_tv: r.try_get("include_tv")?,
+            send_hour: r.try_get("send_hour")?,
+            item_limit: r.try_get("item_limit")?,
+        },
+        None => screens::TrendPrefs::default(),
+    })
+}
+
+async fn save_trend_prefs(pool: &PgPool, user_id: i64, p: &screens::TrendPrefs) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO bot_trend_prefs (user_id, enabled, include_tv, send_hour, item_limit, updated_at)
+         VALUES ($1, $2, $3, $4, $5, now())
+         ON CONFLICT (user_id) DO UPDATE SET
+           enabled = EXCLUDED.enabled,
+           include_tv = EXCLUDED.include_tv,
+           send_hour = EXCLUDED.send_hour,
+           item_limit = EXCLUDED.item_limit,
+           updated_at = now()",
+    )
+    .bind(user_id)
+    .bind(p.enabled)
+    .bind(p.include_tv)
+    .bind(p.send_hour)
+    .bind(p.item_limit)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn send_trending_album(
+    bot: &Bot,
+    chat: ChatId,
+    is_private: bool,
+    user_id: Option<i64>,
+    include_tv: bool,
+    limit: usize,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let _ = bot.send_chat_action(chat, ChatAction::UploadPhoto).await;
+    let excluded: HashSet<(MediaKind, i64)> = match user_id {
+        Some(uid) => userdata::excluded_titles(&state.pool, uid)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        None => HashSet::new(),
+    };
+    let mut pool_items: Vec<TitleSummary> = state
+        .catalog
+        .trending_today(MediaKind::Movie, 20)
+        .await
+        .unwrap_or_default();
+    if include_tv {
+        let tv = state
+            .catalog
+            .trending_today(MediaKind::Tv, 20)
+            .await
+            .unwrap_or_default();
+        // Interleave movies and series so both appear in top picks.
+        let movies = std::mem::take(&mut pool_items);
+        let mut mi = movies.into_iter();
+        let mut ti = tv.into_iter();
+        loop {
+            match (mi.next(), ti.next()) {
+                (Some(m), Some(t)) => {
+                    pool_items.push(m);
+                    pool_items.push(t);
+                }
+                (Some(m), None) => pool_items.push(m),
+                (None, Some(t)) => pool_items.push(t),
+                (None, None) => break,
+            }
+        }
+    }
+    pool_items.retain(|t| !excluded.contains(&(t.kind, t.tmdb_id)));
+    pool_items.truncate(limit.clamp(1, 8));
+    if pool_items.is_empty() {
+        return say(bot, chat, "Сегодняшняя подборка трендов пока пуста.").await;
+    }
+
+    let mut posters: Vec<Option<Vec<u8>>> = vec![None; pool_items.len()];
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, item) in pool_items.iter().enumerate() {
+        if let Some(path) = item.poster_path.clone() {
+            let catalog = state.catalog.clone();
+            set.spawn(async move {
+                let bytes = fetch_poster(catalog.as_ref(), Some(&path)).await.map(|(b, _)| b);
+                (idx, bytes)
+            });
+        }
+    }
+    while let Some(Ok((idx, bytes))) = set.join_next().await {
+        posters[idx] = bytes;
+    }
+
+    let with_photos: Vec<(&TitleSummary, Vec<u8>)> = pool_items
+        .iter()
+        .zip(posters)
+        .filter_map(|(item, bytes)| bytes.filter(|b| !b.is_empty()).map(|b| (item, b)))
+        .collect();
+    let caption = screens::trending_album_caption(&state.public_url, &pool_items);
+
+    if with_photos.len() >= 2 {
+        let mut media: Vec<InputMedia> = Vec::with_capacity(with_photos.len());
+        for (idx, (item, bytes)) in with_photos.into_iter().enumerate() {
+            let filename = item
+                .poster_path
+                .as_deref()
+                .and_then(|p| p.rsplit('/').next())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("poster.jpg")
+                .to_owned();
+            let mut photo = InputMediaPhoto::new(InputFile::memory(bytes).file_name(filename));
+            if idx == 0 {
+                photo = photo.caption(caption.clone()).parse_mode(ParseMode::Html);
+            }
+            media.push(InputMedia::Photo(photo));
+        }
+        if bot.send_media_group(chat, media).await.is_ok() {
+            return Ok(());
+        }
+    } else if let Some((item, bytes)) = with_photos.into_iter().next() {
+        let filename = item
+            .poster_path
+            .as_deref()
+            .and_then(|p| p.rsplit('/').next())
+            .unwrap_or("poster.jpg")
+            .to_owned();
+        if bot
+            .send_photo(chat, InputFile::memory(bytes).file_name(filename))
+            .caption(caption.clone())
+            .parse_mode(ParseMode::Html)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+    }
+    let _ = is_private;
+    say(bot, chat, &caption).await
+}
+
+async fn send_trending_menu(
+    bot: &Bot,
+    chat: ChatId,
+    is_private: bool,
+    from: Option<&teloxide::types::User>,
+    state: &BotState,
+) -> ResponseResult<()> {
+    if !require_allowed(bot, chat, from, state).await? {
+        return Ok(());
+    }
+    let Some(u) = from else { return Ok(()) };
+    if !is_private {
+        return say(
+            bot,
+            chat,
+            "Настроить ежедневную подборку «Сегодня в тренде» можно в личных сообщениях с ботом.",
+        )
+        .await;
+    }
+    let Ok(Some(user)) = db::user_by_telegram(&state.pool, u.id.0 as i64).await else {
+        return send_screen(bot, chat, is_private, screens::not_registered(&state.public_url)).await;
+    };
+    match load_trend_prefs(&state.pool, user.id).await {
+        Ok(p) => send_screen(bot, chat, is_private, screens::trend_settings(&p)).await,
+        Err(e) => db_failed(bot, chat, e).await,
+    }
+}
+
+async fn handle_trend_callback(
+    bot: &Bot,
+    q: &CallbackQuery,
+    is_private: bool,
+    suffix: &str,
+    state: &BotState,
+) -> ResponseResult<()> {
+    let chat = q
+        .regular_message()
+        .map(|m| m.chat.id)
+        .unwrap_or_else(|| ChatId(q.from.id.0 as i64));
+    let Ok(Some(user)) = db::user_by_telegram(&state.pool, q.from.id.0 as i64).await else {
+        return send_screen(bot, chat, is_private, screens::not_registered(&state.public_url)).await;
+    };
+    let mut prefs = match load_trend_prefs(&state.pool, user.id).await {
+        Ok(p) => p,
+        Err(e) => return db_failed(bot, chat, e).await,
+    };
+    if suffix == "now" {
+        return send_trending_album(
+            bot,
+            chat,
+            is_private,
+            Some(user.id),
+            prefs.include_tv,
+            prefs.item_limit as usize,
+            state,
+        )
+        .await;
+    }
+    match suffix {
+        "toggle" => prefs.enabled = !prefs.enabled,
+        "tv" => prefs.include_tv = !prefs.include_tv,
+        _ if suffix.starts_with("hr:") => {
+            if let Ok(h) = suffix[3..].parse::<i16>() {
+                if (0..=23).contains(&h) {
+                    prefs.send_hour = h;
+                }
+            }
+        }
+        _ if suffix.starts_with("lim:") => {
+            if let Ok(n) = suffix[4..].parse::<i16>() {
+                if (3..=8).contains(&n) {
+                    prefs.item_limit = n;
+                }
+            }
+        }
+        _ => return Ok(()),
+    }
+    if let Err(e) = save_trend_prefs(&state.pool, user.id, &prefs).await {
+        return db_failed(bot, chat, e).await;
+    }
+    show_or_edit_screen(bot, q, is_private, screens::trend_settings(&prefs)).await
+}
+
+async fn run_daily_trends_tick(bot: &Bot, state: &BotState) {
+    let msk = FixedOffset::east_opt(3 * 3600).expect("UTC+3");
+    let now_msk = Utc::now().with_timezone(&msk);
+    let today: NaiveDate = now_msk.date_naive();
+    let hour = now_msk.hour() as i16;
+    let Ok(rows) = sqlx::query(
+        "SELECT p.user_id, u.telegram_id, p.include_tv, p.item_limit
+         FROM bot_trend_prefs p
+         JOIN users u ON u.id = p.user_id
+         WHERE p.enabled = TRUE
+           AND p.send_hour <= $1
+           AND (p.last_sent_date IS NULL OR p.last_sent_date < $2)",
+    )
+    .bind(hour)
+    .bind(today)
+    .fetch_all(&state.pool)
+    .await
+    else {
+        return;
+    };
+    for r in rows {
+        let (Ok(uid), Ok(tg_id), Ok(include_tv), Ok(limit)) = (
+            r.try_get::<i64, _>("user_id"),
+            r.try_get::<i64, _>("telegram_id"),
+            r.try_get::<bool, _>("include_tv"),
+            r.try_get::<i16, _>("item_limit"),
+        ) else {
+            continue;
+        };
+        if let Err(e) = send_trending_album(
+            bot,
+            ChatId(tg_id),
+            true,
+            Some(uid),
+            include_tv,
+            limit.clamp(3, 8) as usize,
+            state,
+        )
+        .await
+        {
+            tracing::warn!(user = uid, error = %e, "daily trending album failed");
+            continue;
+        }
+        let _ = sqlx::query("UPDATE bot_trend_prefs SET last_sent_date = $2 WHERE user_id = $1")
+            .bind(uid)
+            .bind(today)
+            .execute(&state.pool)
+            .await;
+    }
+}
+
 async fn run_action(
     bot: &Bot,
     chat: ChatId,
@@ -763,6 +1058,7 @@ async fn run_action(
             )
             .await
         }
+        BotAction::Trending => send_trending_menu(bot, chat, is_private, from, state).await,
         BotAction::Search => send_search_prompt(bot, chat, is_private, from, state).await,
         BotAction::Continue => continue_watching(bot, chat, is_private, from, state).await,
         BotAction::My => my(bot, chat, is_private, from, state).await,
@@ -828,6 +1124,7 @@ async fn handle(bot: Bot, msg: Message, cmd: Command, state: Arc<BotState>) -> R
         Command::Help => run_action(&bot, msg.chat.id, is_private, from, BotAction::Help, &state).await?,
         Command::Search(query) => search(&bot, &msg, &query, &state).await?,
         Command::Random => run_action(&bot, msg.chat.id, is_private, from, BotAction::Random, &state).await?,
+        Command::Trending => run_action(&bot, msg.chat.id, is_private, from, BotAction::Trending, &state).await?,
         Command::Continue => run_action(&bot, msg.chat.id, is_private, from, BotAction::Continue, &state).await?,
         Command::My => run_action(&bot, msg.chat.id, is_private, from, BotAction::My, &state).await?,
         Command::Login => run_action(&bot, msg.chat.id, is_private, from, BotAction::Login, &state).await?,
@@ -928,6 +1225,15 @@ async fn main() -> anyhow::Result<()> {
         admin_ids,
         bot_username,
     });
+    let trend_bot = bot.clone();
+    let trend_state = state.clone();
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(600));
+        loop {
+            tick.tick().await;
+            run_daily_trends_tick(&trend_bot, &trend_state).await;
+        }
+    });
     let handler = dptree::entry()
         .branch(Update::filter_message().filter_command::<Command>().endpoint(handle))
         .branch(
@@ -967,7 +1273,7 @@ mod tests {
         let names = |admin| menu(admin).into_iter().map(|c| c.command).collect::<Vec<_>>();
         assert_eq!(
             names(false),
-            ["start", "search", "random", "continue", "my", "login", "help"]
+            ["start", "search", "random", "trending", "continue", "my", "login", "help"]
         );
         assert_eq!(names(true).last().map(String::as_str), Some("invite"));
     }

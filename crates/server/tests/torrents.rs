@@ -20,7 +20,9 @@ use axum::{
     Json, Router,
 };
 use common::*;
-use kino_core::{PlayInfo, PreloadItem, PreloadState, ReleaseList, StreamPhase, StreamProgress};
+use kino_core::{
+    PlayInfo, PreloadItem, PreloadState, ReleaseList, ResolveReleaseResponse, StreamPhase, StreamProgress, UserPrefs,
+};
 use kino_server::{app, config::TorrentConfig, jobs};
 use serde_json::json;
 use sqlx::PgPool;
@@ -675,4 +677,104 @@ async fn old_releases_are_forgotten_unless_in_use(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(left, [chosen, fresh]);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_key: Some("secret".into()),
+            ..TorrentConfig::default()
+        },
+    ));
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer = login_ok(&app, 2003, inv["code"].as_str()).await;
+
+    // Mobile auto: torznab.xml has 720p with 12 seeders (>= 7) -> picks 720p automatically.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let resolved: ResolveReleaseResponse = serde_json::from_value(body).unwrap();
+    match resolved {
+        ResolveReleaseResponse::Ready { choice, from_peer } => {
+            assert_eq!(choice.quality_key.as_deref(), Some("720p"));
+            assert_eq!(from_peer, None);
+        }
+        other => panic!("expected Ready 720p, got {other:?}"),
+    }
+
+    // Desktop default: 1080p -> picks 1080p automatically for Admin.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&admin.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, .. } => {
+            assert_eq!(choice.quality_key.as_deref(), Some("1080p"));
+        }
+        other => panic!("expected Ready 1080p, got {other:?}"),
+    }
+
+    // Peer sharing: User 3 asking for 1080p adopts Admin's choice without calling Jackett or picking manually.
+    let (_, inv2) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer2 = login_ok(&app, 2004, inv2["code"].as_str()).await;
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer2.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, from_peer } => {
+            assert_eq!(choice.quality_key.as_deref(), Some("1080p"));
+            assert!(from_peer.is_some());
+        }
+        other => panic!("expected Ready from peer, got {other:?}"),
+    }
+
+    // Missing quality (SD is not in torznab.xml): falls back to NeedsPicker.
+    let prefs = UserPrefs {
+        desktop_quality: Some("SD".into()),
+        ..UserPrefs::default()
+    };
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/prefs",
+        Some(&peer2.token),
+        Some(serde_json::to_value(prefs).unwrap()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer2.token),
+        Some(json!({ "season": 1, "episode": 1, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(matches!(
+        serde_json::from_value::<ResolveReleaseResponse>(body).unwrap(),
+        ResolveReleaseResponse::NeedsPicker { .. }
+    ));
 }

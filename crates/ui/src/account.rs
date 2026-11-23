@@ -3,13 +3,23 @@
 use chrono::{DateTime, FixedOffset, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, image_url, HistoryEntry, ImageSize, MediaKind, PreloadItem, PreloadState, TitleState,
-    TitleStatus, TitleSummary, UserPrefs,
+    clock, episode_code, format_rating_short, image_url, normalize_quality_key, CalendarEntry, HistoryEntry, ImageSize,
+    MediaKind, PreloadItem, PreloadState, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile,
+    UserSocialLibrary,
 };
 
 use crate::icons::{self, Icon};
 use crate::releases::{ReleaseSort, CODECS, SEEDER_STEPS, SIZE_STEPS};
-use crate::{fallback_bg, PosterCard};
+use crate::{fallback_bg, ru_date, AvatarContent, PosterCard};
+
+/// Sub-section inside "Мои".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MySection {
+    #[default]
+    Lists,
+    Users,
+    Calendar,
+}
 
 /// Filter by media kind in "Мои" and Search.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -129,20 +139,34 @@ enum MyDropdown {
 fn status_tag_class(st: TitleStatus) -> &'static str {
     match st {
         TitleStatus::Watching => "tag acc",
+        TitleStatus::WaitingEpisode | TitleStatus::WaitingRelease => "tag wait",
         TitleStatus::Watched => "tag ok",
         TitleStatus::Dropped => "tag warn",
         TitleStatus::Want => "tag",
     }
 }
 
+fn state_rating_val(s: &TitleState) -> f32 {
+    s.effective_rating.or_else(|| s.rating.map(f32::from)).unwrap_or(0.0)
+}
+
 #[component]
 pub fn MyView(
     items: Vec<TitleState>,
     filters: MyFilters,
+    #[props(default)] section: MySection,
+    #[props(default)] users: Vec<UserPublicProfile>,
+    #[props(default)] selected_user_id: Option<i64>,
+    #[props(default)] peer_library: Option<UserSocialLibrary>,
+    #[props(default)] peer_loading: bool,
+    #[props(default)] calendar: Vec<CalendarEntry>,
+    #[props(default)] on_section: Option<EventHandler<MySection>>,
+    #[props(default)] on_select_user: Option<EventHandler<i64>>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
     let mut open_dd = use_signal(|| None::<MyDropdown>);
+    let mut peer_status_filter = use_signal(|| None::<TitleStatus>);
 
     let by_kind: Vec<&TitleState> = items.iter().filter(|i| filters.kind.matches(i.kind)).collect();
     let total_kind = by_kind.len();
@@ -156,7 +180,11 @@ pub fn MyView(
         .collect();
     match filters.sort {
         MySort::Updated => shown.sort_by_key(|a| std::cmp::Reverse(a.updated_at)),
-        MySort::MyRating => shown.sort_by_key(|a| std::cmp::Reverse((a.rating.unwrap_or(0), a.updated_at))),
+        MySort::MyRating => shown.sort_by(|a, b| {
+            state_rating_val(b)
+                .total_cmp(&state_rating_val(a))
+                .then_with(|| b.updated_at.cmp(&a.updated_at))
+        }),
         MySort::Rating => shown.sort_by(|a, b| {
             let ra = a.title.as_ref().and_then(|t| t.rating).unwrap_or(0.0);
             let rb = b.title.as_ref().and_then(|t| t.rating).unwrap_or(0.0);
@@ -172,109 +200,369 @@ pub fn MyView(
             if open_dd().is_some() {
                 div { class: "dd-backdrop", onclick: move |_| open_dd.set(None) }
             }
-            div { class: "unified-bar",
-                div { class: "pill-group status-pills",
+            if let Some(on_sec) = on_section {
+                div { class: "my-subtabs",
                     button {
-                        class: if filters.status.is_none() { "pill-btn active" } else { "pill-btn" },
-                        onclick: move |_| on_filters.call(MyFilters { status: None, ..filters }),
-                        "Все · {total_kind}"
+                        class: if section == MySection::Lists { "pill-btn active" } else { "pill-btn outline" },
+                        onclick: move |_| on_sec.call(MySection::Lists),
+                        Icon { svg: icons::BOOKMARK, class: "ic xs" }
+                        span { "Мои списки" }
                     }
-                    for st in TitleStatus::ALL {
-                        button {
-                            class: if filters.status == Some(st) { "pill-btn active" } else { "pill-btn" },
-                            onclick: move |_| on_filters.call(MyFilters { status: Some(st), ..filters }),
-                            "{st.label()} · {count(st)}"
-                        }
+                    button {
+                        class: if section == MySection::Users { "pill-btn active" } else { "pill-btn outline" },
+                        onclick: move |_| on_sec.call(MySection::Users),
+                        Icon { svg: icons::USERS, class: "ic xs" }
+                        span { "Участники · {users.len()}" }
                     }
-                }
-                div { class: "pill-group right-pills",
-                    div { class: "dd-wrap",
-                        button {
-                            class: if filters.kind != MyKindFilter::All || open_dd() == Some(MyDropdown::Kind) {
-                                "pill-btn accent"
-                            } else {
-                                "pill-btn outline"
-                            },
-                            onclick: move |_| {
-                                let next = if open_dd() == Some(MyDropdown::Kind) { None } else { Some(MyDropdown::Kind) };
-                                open_dd.set(next);
-                            },
-                            span { "{filters.kind.label()}" }
-                            Icon { svg: icons::CHEV_D, class: "ic xs" }
-                        }
-                        if open_dd() == Some(MyDropdown::Kind) {
-                            div { class: "dd-menu right",
-                                for k in MyKindFilter::ALL {
-                                    button {
-                                        class: if filters.kind == k { "st-item on" } else { "st-item" },
-                                        onclick: move |_| {
-                                            open_dd.set(None);
-                                            on_filters.call(MyFilters { kind: k, ..filters });
-                                        },
-                                        span { "{k.label()}" }
-                                        if filters.kind == k { Icon { svg: icons::CHECK, class: "ic xs" } }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    div { class: "dd-wrap",
-                        button {
-                            class: if filters.sort != MySort::Updated || open_dd() == Some(MyDropdown::Sort) {
-                                "pill-btn accent"
-                            } else {
-                                "pill-btn outline"
-                            },
-                            onclick: move |_| {
-                                let next = if open_dd() == Some(MyDropdown::Sort) { None } else { Some(MyDropdown::Sort) };
-                                open_dd.set(next);
-                            },
-                            Icon { svg: icons::SORT, class: "ic xs" }
-                            span { "{filters.sort.label()}" }
-                            Icon { svg: icons::CHEV_D, class: "ic xs" }
-                        }
-                        if open_dd() == Some(MyDropdown::Sort) {
-                            div { class: "dd-menu right",
-                                for s in MySort::ALL {
-                                    button {
-                                        class: if filters.sort == s { "st-item on" } else { "st-item" },
-                                        onclick: move |_| {
-                                            open_dd.set(None);
-                                            on_filters.call(MyFilters { sort: s, ..filters });
-                                        },
-                                        span { "{s.label()}" }
-                                        if filters.sort == s { Icon { svg: icons::CHECK, class: "ic xs" } }
-                                    }
-                                }
-                            }
+                    button {
+                        class: if section == MySection::Calendar { "pill-btn active" } else { "pill-btn outline" },
+                        onclick: move |_| on_sec.call(MySection::Calendar),
+                        Icon { svg: icons::CALENDAR, class: "ic xs" }
+                        if calendar.is_empty() {
+                            span { "Календарь" }
+                        } else {
+                            span { "Календарь · {calendar.len()}" }
                         }
                     }
                 }
             }
-            if shown.is_empty() {
-                p { class: "muted",
-                    if items.is_empty() {
-                        "Здесь пока пусто. Статус появляется сам, когда вы начинаете смотреть, или его можно поставить на странице фильма."
-                    } else {
-                        "Под выбранные фильтры ничего не подходит."
-                    }
-                }
-            } else {
-                div { class: "grid",
-                    for item in shown {
-                        if let Some(t) = item.title.clone() {
-                            div { key: "{item.kind.as_str()}{item.tmdb_id}", class: "mine",
-                                PosterCard {
-                                    item: t,
-                                    status_badge: if filters.status.is_none() { item.status } else { None },
-                                    on_open,
-                                }
-                                div { class: "mine-meta",
-                                    if let Some(st) = item.status.filter(|_| filters.status.is_none()) {
-                                        span { class: "{status_tag_class(st)}", "{st.label()}" }
+
+            match section {
+                MySection::Lists => rsx! {
+                    div { class: "unified-bar",
+                        div { class: "pill-group status-pills",
+                            button {
+                                class: if filters.status.is_none() { "pill-btn active" } else { "pill-btn" },
+                                onclick: move |_| on_filters.call(MyFilters { status: None, ..filters }),
+                                "Все · {total_kind}"
+                            }
+                            for st in TitleStatus::ALL {
+                                {
+                                    let cnt = count(st);
+                                    rsx! {
+                                        button {
+                                            class: if filters.status == Some(st) { "pill-btn active" } else { "pill-btn" },
+                                            onclick: move |_| on_filters.call(MyFilters { status: Some(st), ..filters }),
+                                            "{st.label()} · {cnt}"
+                                        }
                                     }
-                                    if let Some(r) = item.rating {
-                                        span { class: "my-stars", "{stars(r)}" }
+                                }
+                            }
+                        }
+                        div { class: "pill-group right-pills",
+                            div { class: "dd-wrap",
+                                button {
+                                    class: if filters.kind != MyKindFilter::All || open_dd() == Some(MyDropdown::Kind) {
+                                        "pill-btn accent"
+                                    } else {
+                                        "pill-btn outline"
+                                    },
+                                    onclick: move |_| {
+                                        let next = if open_dd() == Some(MyDropdown::Kind) { None } else { Some(MyDropdown::Kind) };
+                                        open_dd.set(next);
+                                    },
+                                    span { "{filters.kind.label()}" }
+                                    Icon { svg: icons::CHEV_D, class: "ic xs" }
+                                }
+                                if open_dd() == Some(MyDropdown::Kind) {
+                                    div { class: "dd-menu right",
+                                        for k in MyKindFilter::ALL {
+                                            button {
+                                                class: if filters.kind == k { "st-item on" } else { "st-item" },
+                                                onclick: move |_| {
+                                                    open_dd.set(None);
+                                                    on_filters.call(MyFilters { kind: k, ..filters });
+                                                },
+                                                span { "{k.label()}" }
+                                                if filters.kind == k { Icon { svg: icons::CHECK, class: "ic xs" } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "dd-wrap",
+                                button {
+                                    class: if filters.sort != MySort::Updated || open_dd() == Some(MyDropdown::Sort) {
+                                        "pill-btn accent"
+                                    } else {
+                                        "pill-btn outline"
+                                    },
+                                    onclick: move |_| {
+                                        let next = if open_dd() == Some(MyDropdown::Sort) { None } else { Some(MyDropdown::Sort) };
+                                        open_dd.set(next);
+                                    },
+                                    Icon { svg: icons::SORT, class: "ic xs" }
+                                    span { "{filters.sort.label()}" }
+                                    Icon { svg: icons::CHEV_D, class: "ic xs" }
+                                }
+                                if open_dd() == Some(MyDropdown::Sort) {
+                                    div { class: "dd-menu right",
+                                        for s in MySort::ALL {
+                                            button {
+                                                class: if filters.sort == s { "st-item on" } else { "st-item" },
+                                                onclick: move |_| {
+                                                    open_dd.set(None);
+                                                    on_filters.call(MyFilters { sort: s, ..filters });
+                                                },
+                                                span { "{s.label()}" }
+                                                if filters.sort == s { Icon { svg: icons::CHECK, class: "ic xs" } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if shown.is_empty() {
+                        p { class: "muted",
+                            if items.is_empty() {
+                                "Здесь пока пусто. Статус появляется сам, когда вы начинаете смотреть, или его можно поставить на странице фильма."
+                            } else {
+                                "Под выбранные фильтры ничего не подходит."
+                            }
+                        }
+                    } else {
+                        div { class: "grid",
+                            for item in shown {
+                                if let Some(t) = item.title.clone() {
+                                    {
+                                        let r_val = item.effective_rating.or_else(|| item.rating.map(f32::from));
+                                        rsx! {
+                                            div { key: "{item.kind.as_str()}{item.tmdb_id}", class: "mine",
+                                                PosterCard {
+                                                    item: t,
+                                                    status_badge: if filters.status.is_none() { item.status } else { None },
+                                                    hide_status_badge: filters.status.is_some(),
+                                                    on_open,
+                                                }
+                                                div { class: "mine-meta",
+                                                    if let Some(st) = item.status.filter(|_| filters.status.is_none()) {
+                                                        span { class: "{status_tag_class(st)}", "{st.label()}" }
+                                                    }
+                                                    if let Some(rv) = r_val {
+                                                        if (rv - rv.round()).abs() <= 0.04 {
+                                                            span { class: "my-stars", "{stars(rv.round() as i16)}" }
+                                                        } else {
+                                                            span { class: "my-stars", "★ {format_rating_short(rv)}" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                MySection::Users => {
+                    let active_id = selected_user_id.or_else(|| users.first().map(|u| u.id));
+                    rsx! {
+                        if users.is_empty() {
+                            p { class: "muted", "Пока нет других участников." }
+                        } else {
+                            div { class: "users-grid",
+                                for u in users {
+                                    {
+                                        let uid = u.id;
+                                        let is_sel = active_id == Some(uid);
+                                        let init = crate::initials(&u.name);
+                                        rsx! {
+                                            button {
+                                                key: "{uid}",
+                                                class: if is_sel { "user-card active" } else { "user-card" },
+                                                onclick: move |_| {
+                                                    peer_status_filter.set(None);
+                                                    if let Some(cb) = on_select_user {
+                                                        cb.call(uid);
+                                                    }
+                                                },
+                                                div { class: "user-card-head",
+                                                    div { class: "user-av",
+                                                        AvatarContent {
+                                                            initial: init,
+                                                            url: u.avatar_url.clone(),
+                                                            alt: u.name.clone(),
+                                                        }
+                                                    }
+                                                    div { class: "user-card-info",
+                                                        div { class: "user-card-name", "{u.name}" }
+                                                        div { class: "user-card-counts",
+                                                            "Смотрит: {u.watching_count} · Посмотрел: {u.watched_count} · Хочет: {u.want_count}"
+                                                        }
+                                                    }
+                                                }
+                                                if let Some(wn) = &u.watching_now {
+                                                    if let Some(wt) = &wn.title {
+                                                        div { class: "user-now-pill",
+                                                            span { class: "live-dot" }
+                                                            span {
+                                                                if wn.kind == MediaKind::Tv && wn.season > 0 {
+                                                                    "Сейчас: {wt.title} ({episode_code(wn.season, wn.episode)})"
+                                                                } else {
+                                                                    "Сейчас: {wt.title}"
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if peer_loading {
+                                p { class: "muted", "Загружаем коллекцию участника…" }
+                            } else if let Some(lib) = peer_library {
+                                {
+                                    let pfilter = peer_status_filter();
+                                    let filtered: Vec<TitleState> = lib
+                                        .items
+                                        .iter()
+                                        .filter(|it| pfilter.is_none() || it.status == pfilter)
+                                        .cloned()
+                                        .collect();
+                                    rsx! {
+                                        div { class: "peer-lib-head",
+                                            h3 { "Коллекция: {lib.profile.name}" }
+                                            if let Some(wn) = lib.profile.watching_now.as_ref().and_then(|w| w.title.clone().map(|t| (w.clone(), t))) {
+                                                {
+                                                    let (w_meta, w_title) = wn;
+                                                    let wt_open = w_title.clone();
+                                                    rsx! {
+                                                        button {
+                                                            class: "pill-btn accent",
+                                                            onclick: move |_| on_open.call(wt_open.clone()),
+                                                            Icon { svg: icons::PLAY, class: "ic xs" }
+                                                            if w_meta.kind == MediaKind::Tv && w_meta.season > 0 {
+                                                                "Смотрит: {w_title.title} · {episode_code(w_meta.season, w_meta.episode)}"
+                                                            } else {
+                                                                "Смотрит: {w_title.title}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        div { class: "pill-group status-pills",
+                                            button {
+                                                class: if pfilter.is_none() { "pill-btn active" } else { "pill-btn" },
+                                                onclick: move |_| peer_status_filter.set(None),
+                                                "Все · {lib.items.len()}"
+                                            }
+                                            for st in TitleStatus::ALL {
+                                                {
+                                                    let cnt = lib.items.iter().filter(|i| i.status == Some(st)).count();
+                                                    if cnt > 0 {
+                                                        rsx! {
+                                                            button {
+                                                                class: if pfilter == Some(st) { "pill-btn active" } else { "pill-btn" },
+                                                                onclick: move |_| peer_status_filter.set(Some(st)),
+                                                                "{st.label()} · {cnt}"
+                                                            }
+                                                        }
+                                                    } else {
+                                                        rsx! {}
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        if filtered.is_empty() {
+                                            p { class: "muted", "В этом списке пока пусто." }
+                                        } else {
+                                            div { class: "grid",
+                                                for item in filtered {
+                                                    if let Some(mut t) = item.title.clone() {
+                                                        {
+                                                            let r_val = item.effective_rating.or_else(|| item.rating.map(f32::from));
+                                                            if r_val.is_some() {
+                                                                t.user_rating = r_val;
+                                                            }
+                                                            rsx! {
+                                                                div { key: "peer-{item.kind.as_str()}{item.tmdb_id}", class: "mine",
+                                                                    PosterCard {
+                                                                        item: t,
+                                                                        status_badge: item.status,
+                                                                        hide_status_badge: true,
+                                                                        on_open,
+                                                                    }
+                                                                    div { class: "mine-meta",
+                                                                        if let Some(st) = item.status {
+                                                                            span { class: "{status_tag_class(st)}", "{st.label()}" }
+                                                                        }
+                                                                        if let Some(rv) = r_val {
+                                                                            if (rv - rv.round()).abs() <= 0.04 {
+                                                                                span { class: "my-stars", "{stars(rv.round() as i16)}" }
+                                                                            } else {
+                                                                                span { class: "my-stars", "★ {format_rating_short(rv)}" }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                MySection::Calendar => rsx! {
+                    if calendar.is_empty() {
+                        div { class: "panel muted-box",
+                            "Пока нет запланированных премьер или новых серий для ваших отслеживаемых фильмов и сериалов."
+                        }
+                    } else {
+                        div { class: "cal-list",
+                            for entry in calendar {
+                                {
+                                    let t_opt = entry.title.clone();
+                                    let title_txt = entry
+                                        .title
+                                        .as_ref()
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_else(|| format!("#{}", entry.tmdb_id));
+                                    let poster = entry.title.as_ref().and_then(|t| t.poster_path.clone());
+                                    let date_lbl = ru_date(&entry.date);
+                                    let ep_lbl = match (entry.season, entry.episode) {
+                                        (Some(s), Some(e)) => {
+                                            let code = episode_code(s, e);
+                                            match &entry.episode_name {
+                                                Some(n) if !n.is_empty() => format!("{code} · {n}"),
+                                                _ => code,
+                                            }
+                                        }
+                                        _ => "Премьера фильма".to_owned(),
+                                    };
+                                    let st = entry.status;
+                                    let id = entry.tmdb_id;
+                                    rsx! {
+                                        button {
+                                            key: "cal-{entry.date}-{entry.kind.as_str()}-{id}",
+                                            class: "cal-row",
+                                            onclick: move |_| {
+                                                if let Some(t) = t_opt.clone() {
+                                                    on_open.call(t);
+                                                }
+                                            },
+                                            div { class: "cal-date", "{date_lbl}" }
+                                            div { class: "cal-poster",
+                                                if let Some(p) = poster {
+                                                    img { src: image_url(&p, ImageSize::Poster), alt: "{title_txt}", loading: "lazy" }
+                                                } else {
+                                                    div { class: "hist-thumb-ph", style: "background: {fallback_bg(id)}" }
+                                                }
+                                            }
+                                            div { class: "cal-body",
+                                                div { class: "cal-title", "{title_txt}" }
+                                                div { class: "cal-sub", "{ep_lbl}" }
+                                            }
+                                            span { class: "{status_tag_class(st)}", "{st.label()}" }
+                                        }
                                     }
                                 }
                             }
@@ -331,8 +619,29 @@ impl Theme {
     }
 }
 
+fn device_quality_label(raw: Option<&str>) -> Option<String> {
+    match raw.map(str::trim).filter(|s| !s.is_empty())? {
+        "ask" => Some("Спрашивать".to_owned()),
+        other => Some(normalize_quality_key(other).to_owned()),
+    }
+}
+
+fn device_quality_value(lbl: Option<&str>) -> Option<String> {
+    match lbl?.trim() {
+        "Спрашивать" => Some("ask".to_owned()),
+        other if !other.is_empty() => Some(normalize_quality_key(other).to_owned()),
+        _ => None,
+    }
+}
+
 fn prefs_summary(p: &UserPrefs) -> Vec<(String, bool)> {
     let mut tags = Vec::new();
+    if let Some(dq) = device_quality_label(p.desktop_quality.as_deref()) {
+        tags.push((format!("ПК: {dq}"), true));
+    }
+    if let Some(mq) = device_quality_label(p.mobile_quality.as_deref()) {
+        tags.push((format!("Телефон: {mq}"), true));
+    }
     if let Some(q) = &p.quality {
         tags.push((if q == "2160p" { "4K".into() } else { q.clone() }, true));
     }
@@ -520,7 +829,37 @@ pub fn ProfileView(
                 if prefs_open() {
                     div { class: "panel acc-body",
                         p { class: "muted acc-note", "Эти фильтры сразу применяются при открытии списка раздач. Выбранный язык озвучки сохраняется всегда; если по остальным ограничениям ничего не нашлось, ослабляются только они." }
-                        PrefRow { name: "Качество", any: "Любое", options: QUALITIES.map(String::from).to_vec(), selected: p.quality.clone(),
+                        PrefRow {
+                            name: "Качество на ПК",
+                            any: "Авто (1080p)",
+                            options: ["2160p", "1080p", "720p", "SD", "Спрашивать"].map(String::from).to_vec(),
+                            selected: device_quality_label(p.desktop_quality.as_deref()),
+                            on_select: {
+                                let p = p.clone();
+                                move |v: Option<String>| {
+                                    on_prefs.call(UserPrefs {
+                                        desktop_quality: device_quality_value(v.as_deref()),
+                                        ..p.clone()
+                                    })
+                                }
+                            },
+                        }
+                        PrefRow {
+                            name: "Качество на телефоне",
+                            any: "Авто (720p / SD)",
+                            options: ["720p", "SD", "1080p", "2160p", "Спрашивать"].map(String::from).to_vec(),
+                            selected: device_quality_label(p.mobile_quality.as_deref()),
+                            on_select: {
+                                let p = p.clone();
+                                move |v: Option<String>| {
+                                    on_prefs.call(UserPrefs {
+                                        mobile_quality: device_quality_value(v.as_deref()),
+                                        ..p.clone()
+                                    })
+                                }
+                            },
+                        }
+                        PrefRow { name: "Фильтр качества", any: "Любое", options: QUALITIES.map(String::from).to_vec(), selected: p.quality.clone(),
                             on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { quality: v, subtitle_lang: None, subtitles: None, ..p.clone() }) } }
                         PrefRow { name: "Язык озвучки", any: "Любой", options: LANGUAGES.map(String::from).to_vec(), selected: p.language.clone(),
                             on_select: { let p = p.clone(); move |v| on_prefs.call(UserPrefs { language: v, subtitle_lang: None, subtitles: None, ..p.clone() }) } }

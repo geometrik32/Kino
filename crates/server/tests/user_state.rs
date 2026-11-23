@@ -7,7 +7,8 @@ mod common;
 use axum::http::{Method, StatusCode};
 use common::*;
 use kino_core::{
-    ContinueItem, HistoryEntry, PreloadItem, PreloadState, Progress, TitleState, TitleStatus, UserPrefs, VideoScale,
+    CalendarEntry, ContinueItem, HistoryEntry, HomeFeed, MediaKind, PreloadItem, PreloadState, Progress, TitleState,
+    TitleStatus, UserPrefs, UserPublicProfile, UserSocialLibrary, VideoScale,
 };
 use serde_json::json;
 use sqlx::PgPool;
@@ -440,4 +441,209 @@ async fn rating_marks_film_and_all_series_episodes_watched(pool: PgPool) {
     let (_, prog) = call(&app, Method::GET, "/api/progress/tv/70523", Some(&t), None).await;
     let prog: Vec<Progress> = serde_json::from_value(prog).unwrap();
     assert_eq!(prog.iter().filter(|p| p.finished).count(), 26);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn hierarchical_ratings_80_percent_and_no_top_down_overwrite(pool: PgPool) {
+    let app = test_app(pool);
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let t = admin.token.as_str();
+
+    // Rate S02 manually 3: marks S02 episodes watched, series becomes Watching, no episode ratings overwritten.
+    let (code, body) = call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/season/2/rating",
+        Some(t),
+        Some(json!({ "rating": 3 })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    assert_eq!(st.status, Some(TitleStatus::Watching));
+    assert!(st.episode_ratings.is_empty());
+    let s2 = st.season_ratings.iter().find(|r| r.season == 2).unwrap();
+    assert_eq!(s2.manual_rating, Some(3));
+    assert_eq!(s2.effective_rating, Some(3.0));
+
+    // Rate 6/8 episodes of S02 (75% < 80%): manual season rating 3 still dominates.
+    for ep in 1..=6 {
+        let (code, _) = call(
+            &app,
+            Method::PUT,
+            &format!("/api/title/tv/70523/season/2/episode/{ep}/rating"),
+            Some(t),
+            Some(json!({ "rating": 5 })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+    }
+    let (_, body) = call(&app, Method::GET, "/api/title/tv/70523/state", Some(t), None).await;
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    let s2 = st.season_ratings.iter().find(|r| r.season == 2).unwrap();
+    assert_eq!(s2.effective_rating, Some(3.0));
+
+    // Rate 7th episode (7/8 = 87.5% >= 80%): mean 5.0 dominates manual 3; 8th ep = 3 -> (35+3)/8 = 4.75.
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/season/2/episode/7/rating",
+        Some(t),
+        Some(json!({ "rating": 5 })),
+    )
+    .await;
+    let (_, body) = call(&app, Method::GET, "/api/title/tv/70523/state", Some(t), None).await;
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    let s2 = st.season_ratings.iter().find(|r| r.season == 2).unwrap();
+    assert_eq!(s2.manual_rating, Some(3));
+    assert_eq!(s2.effective_rating, Some(5.0));
+
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/season/2/episode/8/rating",
+        Some(t),
+        Some(json!({ "rating": 3 })),
+    )
+    .await;
+
+    // Rate S01 & S03 manually -> 3/3 seasons >= 80% -> overrides manual series rating of 2.
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/status",
+        Some(t),
+        Some(json!({ "status": "watching" })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/season/1/rating",
+        Some(t),
+        Some(json!({ "rating": 4 })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/70523/season/3/rating",
+        Some(t),
+        Some(json!({ "rating": 3 })),
+    )
+    .await;
+
+    let (_, body) = call(&app, Method::GET, "/api/title/tv/70523/state", Some(t), None).await;
+    let st: TitleState = serde_json::from_value(body).unwrap();
+    let eff = st.effective_rating.expect("80%+ seasons gives mean");
+    let expected_mean = (4.0 + 4.75 + 3.0) / 3.0;
+    assert!(
+        (eff - expected_mean).abs() < 0.01,
+        "got {eff}, expected {expected_mean}"
+    );
+
+    // Top-down manual rating on a fresh series does NOT populate season or episode ratings.
+    let (code, body) = call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/1396/rating",
+        Some(t),
+        Some(json!({ "rating": 4 })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let st2: TitleState = serde_json::from_value(body).unwrap();
+    assert_eq!(st2.rating, Some(4));
+    assert_eq!(st2.effective_rating, Some(4.0));
+    assert!(st2.season_ratings.is_empty());
+    assert!(st2.episode_ratings.is_empty());
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn social_users_calendar_and_rewatch_excludes_unfinished(pool: PgPool) {
+    let app = test_app(pool);
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer = login_ok(&app, 2002, inv["code"].as_str()).await;
+
+    // Movie 603 finished + 5★ -> eligible for rewatch; Movie 27205 watching + 5★ -> excluded from rewatch.
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/status",
+        Some(&admin.token),
+        Some(json!({ "status": "watched" })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/rating",
+        Some(&admin.token),
+        Some(json!({ "rating": 5 })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/27205/rating",
+        Some(&admin.token),
+        Some(json!({ "rating": 5 })),
+    )
+    .await;
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/27205/status",
+        Some(&admin.token),
+        Some(json!({ "status": "watching" })),
+    )
+    .await;
+
+    let (code, home_body) = call(&app, Method::GET, "/api/catalog/home", Some(&admin.token), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let home: HomeFeed = serde_json::from_value(home_body).unwrap();
+    let rewatch = home.rows.iter().find(|r| r.id == "rewatch").expect("rewatch shelf");
+    assert!(rewatch.items.iter().any(|i| i.tmdb_id == 603));
+    assert!(!rewatch.items.iter().any(|i| i.tmdb_id == 27205));
+
+    // Peer sees admin in /api/users and /api/users/{id}/titles and sees peer badges on title state & home.
+    let (code, users_body) = call(&app, Method::GET, "/api/users", Some(&peer.token), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let users: Vec<UserPublicProfile> = serde_json::from_value(users_body).unwrap();
+    assert_eq!(users.len(), 1);
+    assert_eq!(users[0].id, admin.me.id);
+    assert_eq!(users[0].watched_count, 1);
+
+    let (code, lib_body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/users/{}/titles", admin.me.id),
+        Some(&peer.token),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    let lib: UserSocialLibrary = serde_json::from_value(lib_body).unwrap();
+    assert_eq!(lib.items.len(), 2);
+
+    let (_, st_body) = call(&app, Method::GET, "/api/title/movie/603/state", Some(&peer.token), None).await;
+    let peer_st: TitleState = serde_json::from_value(st_body).unwrap();
+    assert_eq!(peer_st.peers.len(), 1);
+    assert_eq!(peer_st.peers[0].rating, Some(5.0));
+
+    // WaitingRelease is forbidden on TV series.
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/title/tv/1396/status",
+        Some(&peer.token),
+        Some(json!({ "status": "waiting_release" })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+
+    let (code, cal_body) = call(&app, Method::GET, "/api/calendar", Some(&peer.token), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let _: Vec<CalendarEntry> = serde_json::from_value(cal_body).unwrap();
 }

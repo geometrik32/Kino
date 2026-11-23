@@ -4,11 +4,12 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    episode_code, MediaKind, MediaTrack, PlayInfo, PlayProbeRequest, PlayRequest, ProgressUpdate, ReleaseChoiceUpdate,
-    ReleaseRef, StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState,
+    episode_code, normalize_quality_key, EpisodeRating, MediaKind, MediaTrack, PlayInfo, PlayProbeRequest, PlayRequest,
+    ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode,
+    StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState,
     TracksUpdate,
 };
-use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, VideoScale};
+use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale};
 
 use crate::{
     api, native, platform,
@@ -35,6 +36,62 @@ pub struct PlayStart {
     pub explicit_release: bool,
     /// Remembered picture scaling mode for this title from the server DB.
     pub video_scale: Option<VideoScale>,
+    /// Episode filter active while rewatching favorites (`All` normally).
+    pub rewatch_mode: RewatchMode,
+    /// User's manual 1–5 ratings per episode (used by `RewatchMode::Only5` / `FourPlus`).
+    pub episode_ratings: Vec<EpisodeRating>,
+}
+
+fn next_target_episode(
+    cur_season: i32,
+    cur_ep: i32,
+    server_next: Option<(i32, i32)>,
+    mode: RewatchMode,
+    ratings: &[EpisodeRating],
+) -> Option<(i32, i32)> {
+    if mode == RewatchMode::All {
+        return server_next;
+    }
+    let mut matching: Vec<(i32, i32)> = ratings
+        .iter()
+        .filter(|e| e.season > 0 && mode.matches(Some(e.rating)) && (e.season, e.episode) > (cur_season, cur_ep))
+        .map(|e| (e.season, e.episode))
+        .collect();
+    matching.sort_unstable();
+    matching.into_iter().next()
+}
+
+fn find_scoped_choice(choices: &[ReleaseChoiceUpdate], season: i32, episode: i32) -> Option<ReleaseChoiceUpdate> {
+    choices
+        .iter()
+        .find(|c| c.season == season && c.episode == episode)
+        .or_else(|| choices.iter().find(|c| c.season == season && c.episode == 0))
+        .cloned()
+}
+
+fn best_per_quality(list: &[ReleaseOption], active: &ReleaseChoiceUpdate) -> Vec<ReleaseOption> {
+    let mut out = Vec::new();
+    let active_q = active.quality.as_deref().map(normalize_quality_key);
+    let active_voice = active.voice.as_deref().unwrap_or("");
+    for bucket in ["2160p", "1080p", "720p", "SD"] {
+        if active_q == Some(bucket) {
+            if let Some(exact) = list.iter().find(|r| r.infohash == active.infohash) {
+                out.push(exact.clone());
+                continue;
+            }
+        }
+        let best = list
+            .iter()
+            .filter(|r| normalize_quality_key(&r.quality) == bucket)
+            .max_by_key(|r| {
+                let same_voice = !active_voice.is_empty() && r.voice.eq_ignore_ascii_case(active_voice);
+                (same_voice, r.seeders, r.size_bytes)
+            });
+        if let Some(r) = best {
+            out.push(r.clone());
+        }
+    }
+    out
 }
 
 /// How often the position is saved while playing, seconds of video.
@@ -213,14 +270,22 @@ pub fn Player(
     let client_id = use_hook(platform::random_id);
     let device = use_hook(device_name);
 
+    let rewatch_mode = start.rewatch_mode;
+    let ep_ratings = start.episode_ratings.clone();
+    let mut choices = use_signal(|| start.choices.clone());
     let mut target = use_signal(|| (start.season, start.episode));
     let mut release = use_signal(|| start.release.clone());
     let mut info = use_signal(|| None::<PlayInfo>);
+    let mut quality_cache = use_signal(|| None::<(i32, Vec<ReleaseOption>)>);
+    let mut quality_loading = use_signal(|| false);
+    let mut override_seek = use_signal(|| None::<f64>);
     let mut ui = use_signal(|| PlayerState {
         title: start.title.clone(),
         poster: start.poster.clone(),
         status: Some("Подключаемся к раздаче…".into()),
         sync_client_id: client_id.clone(),
+        active_infohash: Some(start.release.infohash.clone()),
+        rewatch_label: (rewatch_mode != RewatchMode::All).then(|| rewatch_mode.label().to_owned()),
         ..PlayerState::default()
     });
 
@@ -646,9 +711,11 @@ pub fn Player(
     let start_play_fetch = {
         let token = token.clone();
         let save = save.clone();
+        let ep_ratings_ctx = start.episode_ratings.clone();
         move |season: i32, episode: i32, rel: ReleaseChoiceUpdate, initial_pos: f64, my_gen: u32| {
             let t = token.clone();
             let save_for_probe = save.clone();
+            let ep_ratings_fetch = ep_ratings_ctx.clone();
             spawn(async move {
                 platform::sleep(95_000).await;
                 if play_gen() != my_gen || closing() {
@@ -685,6 +752,7 @@ pub fn Player(
                 s.duration = None;
                 s.waiting = false;
                 s.release = release_label(&rel);
+                s.active_infohash = Some(rel.infohash.clone());
                 s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
                 s.status = Some("Подключаемся к раздаче…".into());
                 s.progress = None;
@@ -711,6 +779,8 @@ pub fn Player(
                         let should_probe = i.duration.is_none();
                         let probe_stream = i.stream.clone();
                         let probe_native = i.native;
+                        let computed_next =
+                            next_target_episode(season, episode, i.next, rewatch_mode, &ep_ratings_fetch);
                         ui.with_mut(|s| {
                             s.duration = i.duration;
                             s.audio = i.audio.clone();
@@ -721,14 +791,20 @@ pub fn Player(
                             } else {
                                 None
                             };
-                            s.next = i.next.map(|(s, e)| episode_code(s, e));
+                            s.next = computed_next.map(|(s, e)| episode_code(s, e));
                             s.preloaded = i.preloaded;
                         });
-                        let at = sync_state
-                            .peek()
-                            .as_ref()
-                            .filter(|st| kind != MediaKind::Tv || (st.season == season && st.episode == episode))
-                            .map(|st| clock.peek().expected_position(st, platform::now_ms()))
+                        let at = override_seek
+                            .with_mut(|o| o.take())
+                            .or_else(|| {
+                                sync_state
+                                    .peek()
+                                    .as_ref()
+                                    .filter(|st| {
+                                        kind != MediaKind::Tv || (st.season == season && st.episode == episode)
+                                    })
+                                    .map(|st| clock.peek().expected_position(st, platform::now_ms()))
+                            })
                             .unwrap_or_else(|| f64::from(i.start_at));
                         last_saved.set(at);
                         info.set(Some(i));
@@ -1402,33 +1478,70 @@ pub fn Player(
     let mut go_next = {
         let mut save = save.clone();
         let mut begin_playback = begin_playback.clone();
-        let choices = start.choices.clone();
+        let tok_next = token.clone();
+        let ep_ratings_next = ep_ratings.clone();
         move || {
-            let Some((ns, ne)) = info.peek().as_ref().and_then(|i| i.next) else {
+            let (season, cur_ep) = target();
+            let server_next = info.peek().as_ref().and_then(|i| i.next);
+            let Some((ns, ne)) = next_target_episode(season, cur_ep, server_next, rewatch_mode, &ep_ratings_next)
+            else {
                 return;
             };
             save(true);
-            let (season, _) = target();
-            let mut next_rel = None;
-            if ns != season {
-                match choices.iter().find(|c| c.season == ns) {
-                    Some(c) => {
-                        release.set(c.clone());
-                        next_rel = Some(c.clone());
-                    }
-                    None => {
-                        on_need_release.call((ns, ne));
-                        return;
-                    }
-                }
+            let need_switch = ns != season || release.peek().episode > 0;
+            if !need_switch {
+                target.set((ns, ne));
+                sync::send(&SyncClientMsg::Episode {
+                    season: ns,
+                    episode: ne,
+                    release: None,
+                });
+                begin_playback(false);
+                return;
             }
-            target.set((ns, ne));
-            sync::send(&SyncClientMsg::Episode {
+            if let Some(c) = find_scoped_choice(&choices.peek(), ns, ne) {
+                release.set(c.clone());
+                target.set((ns, ne));
+                sync::send(&SyncClientMsg::Episode {
+                    season: ns,
+                    episode: ne,
+                    release: Some(c),
+                });
+                begin_playback(false);
+                return;
+            }
+            let tok = tok_next.clone();
+            let req = ResolveReleaseRequest {
                 season: ns,
                 episode: ne,
-                release: next_rel,
+                is_mobile: telegram::is_mobile(),
+            };
+            let mut begin_async = begin_playback.clone();
+            spawn(async move {
+                match api::resolve_release(&tok, kind, id, &req).await {
+                    Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
+                        choices.with_mut(|v| {
+                            v.retain(|c| {
+                                !(c.season == choice.season
+                                    && c.episode == choice.episode
+                                    && c.quality_key == choice.quality_key)
+                            });
+                            v.insert(0, choice.clone());
+                        });
+                        release.set(choice.clone());
+                        target.set((ns, ne));
+                        sync::send(&SyncClientMsg::Episode {
+                            season: ns,
+                            episode: ne,
+                            release: Some(choice),
+                        });
+                        begin_async(false);
+                    }
+                    _ => {
+                        on_need_release.call((ns, ne));
+                    }
+                }
             });
-            begin_playback(false);
         }
     };
 
@@ -1525,6 +1638,7 @@ pub fn Player(
         let mut go_next = go_next.clone();
         let err_token = token.clone();
         let mut mark_media_ready = mark_media_ready;
+        let ep_ratings_ev = ep_ratings.clone();
         move |ev: &'static str| {
             let Some(v) = video() else { return };
             match ev {
@@ -1708,7 +1822,9 @@ pub fn Player(
                 }
                 "ended" => {
                     save(true);
-                    if info.peek().as_ref().and_then(|i| i.next).is_some() {
+                    let (cur_s, cur_e) = *target.peek();
+                    let s_next = info.peek().as_ref().and_then(|i| i.next);
+                    if next_target_episode(cur_s, cur_e, s_next, rewatch_mode, &ep_ratings_ev).is_some() {
                         go_next();
                     } else {
                         desired_paused.set(true);
@@ -2172,8 +2288,21 @@ pub fn Player(
         st.muted = muted();
         st.show_volume = !finger;
         st.episodes = season_list.read().clone().unwrap_or_default();
+        let scope_s = if kind == MediaKind::Tv { season } else { 0 };
+        if let Some((qs, qlist)) = quality_cache() {
+            if qs == scope_s {
+                st.available_qualities = qlist;
+                st.qualities_loaded = true;
+            }
+        }
+        st.active_infohash = Some(release().infohash);
         st
     };
+
+    let menu_token = token.clone();
+    let qual_token = token.clone();
+    let mut start_fetch_qual = start_play_fetch.clone();
+    let mut save_qual = save.clone();
 
     rsx! {
         native::BackButton { on_back: move |_| close.call(()) }
@@ -2239,8 +2368,79 @@ pub fn Player(
                             "var e = document.querySelector('.p-popover .p-opt.on'); if (e) { e.scrollIntoView({ block: 'center' }); }",
                         );
                     });
+                } else if m == Some(PlayerMenu::Quality) {
+                    let scope_s = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
+                    if quality_cache.peek().as_ref().map(|(s, _)| *s) != Some(scope_s) && !*quality_loading.peek() {
+                        quality_loading.set(true);
+                        let tok = menu_token.clone();
+                        let cur_rel = release.peek().clone();
+                        spawn(async move {
+                            let res = api::releases(&tok, kind, id, scope_s).await;
+                            quality_loading.set(false);
+                            let items = res
+                                .map(|l| best_per_quality(&l.releases, &cur_rel))
+                                .unwrap_or_default();
+                            quality_cache.set(Some((scope_s, items)));
+                        });
+                    }
                 }
             },
+            on_pick_quality: Some(Callback::new(move |rel: ReleaseOption| {
+                let cur_pos = ui.peek().position;
+                save_qual(false);
+                override_seek.set(Some(cur_pos));
+                let (cur_s, cur_e) = *target.peek();
+                let (scope_s, scope_e) = if kind == MediaKind::Movie {
+                    (0, 0)
+                } else if release.peek().episode > 0 {
+                    (cur_s, cur_e)
+                } else {
+                    (cur_s, 0)
+                };
+                let qk = normalize_quality_key(&rel.quality).to_owned();
+                let new_choice = ReleaseChoiceUpdate {
+                    kind,
+                    tmdb_id: id,
+                    season: scope_s,
+                    episode: scope_e,
+                    infohash: rel.infohash.clone(),
+                    title: Some(rel.title.clone()),
+                    quality: Some(rel.quality.clone()),
+                    quality_key: Some(qk.clone()),
+                    voice: (!rel.voice.is_empty()).then(|| rel.voice.clone()),
+                };
+                choices.with_mut(|v| {
+                    v.retain(|c| !(c.season == scope_s && c.episode == scope_e && c.quality_key == Some(qk.clone())));
+                    v.insert(0, new_choice.clone());
+                });
+                release.set(new_choice.clone());
+                let my_gen = play_gen() + 1;
+                play_gen.set(my_gen);
+                ui.with_mut(|s| {
+                    s.menu = None;
+                    s.active_infohash = Some(new_choice.infohash.clone());
+                });
+                let tok = qual_token.clone();
+                let choice_save = new_choice.clone();
+                let req_q = api::SetDeviceQualityRequest {
+                    kind,
+                    tmdb_id: id,
+                    season: scope_s,
+                    episode: scope_e,
+                    is_mobile: telegram::is_mobile(),
+                    quality_key: qk,
+                };
+                spawn(async move {
+                    let _ = api::save_release_choice(&tok, &choice_save).await;
+                    let _ = api::set_release_quality(&tok, &req_q).await;
+                });
+                sync::send(&SyncClientMsg::Episode {
+                    season: cur_s,
+                    episode: cur_e,
+                    release: Some(new_choice.clone()),
+                });
+                start_fetch_qual(cur_s, cur_e, new_choice, cur_pos, my_gen);
+            })),
             on_audio: {
                 let save_tracks = save_tracks.clone();
                 move |a: i32| {

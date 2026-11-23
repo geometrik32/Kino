@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use futures_util::{future::join_all, StreamExt};
 use kino_core::{
-    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, PersonDetails, SearchResults, Season, SeasonSummary,
-    ShelfPage, TitleDetails, TitleExtras, TitleSummary,
+    CastMember, CatalogRow, Episode, HomeFeed, MediaKind, NextEpisodeInfo, PersonDetails, SearchResults, Season,
+    SeasonSummary, ShelfPage, TitleDetails, TitleExtras, TitleSummary,
 };
 use rand::Rng;
 use serde::{de::DeserializeOwned, Deserialize};
@@ -611,6 +611,9 @@ impl ListItem {
             backdrop_path: self.backdrop_path,
             rating: self.vote_average.filter(|r| *r > 0.0),
             overview: self.overview.filter(|o| !o.is_empty()),
+            user_rating: None,
+            user_status: None,
+            peers: Vec::new(),
         })
     }
 }
@@ -631,10 +634,12 @@ struct Details {
     episode_run_time: Vec<i32>,
     tagline: Option<String>,
     imdb_id: Option<String>,
+    status: Option<String>,
     #[serde(default)]
     seasons: Vec<RawSeason>,
     external_ids: Option<ExternalIds>,
     last_episode_to_air: Option<RawEpisodeRef>,
+    next_episode_to_air: Option<RawEpisodeRef>,
 }
 
 /// `credits`, `recommendations` and `similar` of a title, as `append_to_response` returns them.
@@ -765,6 +770,8 @@ pub(crate) fn person_from(raw: serde_json::Value) -> Result<PersonDetails, Catal
 struct RawEpisodeRef {
     season_number: i32,
     episode_number: i32,
+    name: Option<String>,
+    air_date: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -800,6 +807,12 @@ struct RawEpisode {
 
 pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<TitleDetails, CatalogError> {
     let d: Details = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
+    let release_date = d
+        .item
+        .release_date
+        .clone()
+        .or_else(|| d.item.first_air_date.clone())
+        .filter(|s| !s.is_empty());
     let summary = d.item.into_summary(Some(kind)).ok_or(CatalogError::NotFound)?;
     let mut seasons: Vec<SeasonSummary> = d
         .seasons
@@ -824,6 +837,14 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
         seasons,
         imdb_id: d.imdb_id.or(d.external_ids.and_then(|e| e.imdb_id)),
         last_episode: d.last_episode_to_air.map(|e| (e.season_number, e.episode_number)),
+        series_status: d.status.filter(|s| !s.is_empty()),
+        release_date,
+        next_episode: d.next_episode_to_air.map(|e| NextEpisodeInfo {
+            season: e.season_number,
+            episode: e.episode_number,
+            name: e.name.filter(|n| !n.is_empty()),
+            air_date: e.air_date.filter(|a| !a.is_empty()),
+        }),
     })
 }
 
@@ -1469,6 +1490,9 @@ impl Catalog for TmdbCatalog {
                 seasons: Vec::new(),
                 imdb_id: None,
                 last_episode: None,
+                series_status: None,
+                release_date: None,
+                next_episode: None,
             },
         };
         Ok(RandomMoviePick { details, relaxed })
@@ -1516,6 +1540,21 @@ impl Catalog for TmdbCatalog {
                 })
                 .collect(),
         })
+    }
+
+    async fn trending_today(&self, kind: MediaKind, limit: usize) -> Result<Vec<TitleSummary>, CatalogError> {
+        let path = match kind {
+            MediaKind::Movie => "/trending/movie/day",
+            MediaKind::Tv => "/trending/tv/day",
+        };
+        let page: Page = self.get(path, &[]).await?;
+        Ok(page
+            .results
+            .into_iter()
+            .filter_map(|i| i.into_summary(Some(kind)))
+            .filter(|t| t.poster_path.is_some())
+            .take(limit)
+            .collect())
     }
 
     async fn image(&self, size: &str, file: &str) -> Result<(Vec<u8>, String), CatalogError> {
@@ -1782,6 +1821,9 @@ mod tests {
             backdrop_path: None,
             rating: None,
             overview: None,
+            user_rating: None,
+            user_status: None,
+            peers: Vec::new(),
         };
         let mut list = vec![item(MediaKind::Movie, 1, "Другой фильм")];
         merge_unique(

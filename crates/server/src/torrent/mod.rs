@@ -890,6 +890,9 @@ mod tests {
                 backdrop_path: None,
                 rating: None,
                 overview: None,
+                user_rating: None,
+                user_status: None,
+                peers: Vec::new(),
             },
             genres: vec![],
             runtime_min: None,
@@ -897,6 +900,9 @@ mod tests {
             seasons: vec![],
             imdb_id: None,
             last_episode: None,
+            series_status: None,
+            release_date: None,
+            next_episode: None,
         }
     }
 

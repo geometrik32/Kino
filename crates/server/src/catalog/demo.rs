@@ -77,6 +77,9 @@ fn summary(t: &DemoTitle) -> TitleSummary {
         backdrop_path: None,
         rating: Some(t.rating),
         overview: Some(t.overview.to_owned()),
+        user_rating: None,
+        user_status: None,
+        peers: Vec::new(),
     }
 }
 
@@ -417,6 +420,9 @@ impl Catalog for DemoCatalog {
             seasons,
             imdb_id: None,
             last_episode: t.seasons.last().map(|&n| (t.seasons.len() as i32, n)),
+            series_status: (t.kind == MediaKind::Tv).then(|| "Ended".to_owned()),
+            release_date: Some(format!("{}-01-01", t.year)),
+            next_episode: None,
         })
     }
 
@@ -492,6 +498,15 @@ impl Catalog for DemoCatalog {
                 })
                 .collect(),
         })
+    }
+
+    async fn trending_today(&self, kind: MediaKind, limit: usize) -> Result<Vec<TitleSummary>, CatalogError> {
+        Ok(TITLES
+            .iter()
+            .filter(|t| t.kind == kind)
+            .map(summary)
+            .take(limit)
+            .collect())
     }
 
     async fn image(&self, _size: &str, _file: &str) -> Result<(Vec<u8>, String), CatalogError> {
