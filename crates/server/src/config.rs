@@ -74,6 +74,12 @@ pub struct TorrentConfig {
     pub hwaccel: String,
     /// Maximum concurrent ffmpeg transcodes (0 uses default = 2).
     pub max_transcodes: usize,
+    /// Optional SSD directory for pause-resume stream caching.
+    pub pause_cache_dir: Option<PathBuf>,
+    /// Maximum disk budget for `pause_cache_dir` in megabytes (default 5120 = 5 GiB).
+    pub pause_cache_max_mb: u64,
+    /// How long an untouched pause-cache entry lives on disk, in hours (default 72h).
+    pub pause_cache_ttl_hours: u64,
 }
 
 impl TorrentConfig {
@@ -105,6 +111,15 @@ impl TorrentConfig {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4)
                 .clamp(1, 8),
+            pause_cache_dir: opt("PAUSE_CACHE_DIR").map(PathBuf::from),
+            pause_cache_max_mb: opt("PAUSE_CACHE_MAX_MB")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5120)
+                .clamp(128, 51_200),
+            pause_cache_ttl_hours: opt("PAUSE_CACHE_TTL_HOURS")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(72)
+                .clamp(1, 720),
         }
     }
 }
@@ -130,6 +145,9 @@ impl std::fmt::Debug for Config {
             .field("qbittorrent", &self.torrents.qbittorrent_url)
             .field("hwaccel", &self.torrents.hwaccel)
             .field("max_transcodes", &self.torrents.max_transcodes)
+            .field("pause_cache_dir", &self.torrents.pause_cache_dir)
+            .field("pause_cache_max_mb", &self.torrents.pause_cache_max_mb)
+            .field("pause_cache_ttl_hours", &self.torrents.pause_cache_ttl_hours)
             .finish_non_exhaustive()
     }
 }

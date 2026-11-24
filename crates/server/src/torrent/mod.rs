@@ -4,6 +4,7 @@
 pub mod bencode;
 pub mod ffmpeg;
 pub mod files;
+pub mod pause_cache;
 pub mod qbit;
 pub mod search_cache;
 pub mod title;

@@ -342,7 +342,19 @@ pub async fn persist_progress(state: &AppState, user_id: i64, mut u: ProgressUpd
     if let Some(r) = &mut u.release {
         r.infohash.make_ascii_lowercase();
     }
+    let infohash = u.release.as_ref().map(|r| r.infohash.clone());
     let p = db::save_progress(&state.pool, user_id, &u).await?;
+    state.media.pause_cache.on_progress(
+        user_id,
+        p.kind,
+        p.tmdb_id,
+        p.season,
+        p.episode,
+        infohash.as_deref(),
+        p.position_sec,
+        p.duration_sec,
+        p.finished,
+    );
     userdata::refresh_status(&state.pool, &*state.catalog, user_id, p.kind, p.tmdb_id, true).await?;
     if p.finished {
         after_finished(state, user_id, p.kind, p.tmdb_id, p.season, p.episode).await?;
@@ -501,6 +513,9 @@ async fn put_status(
         ));
     }
     let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, effective_status).await?;
+    if matches!(effective_status, Some(TitleStatus::Watched | TitleStatus::Dropped)) {
+        state.media.pause_cache.evict_title(user.0, kind, tmdb_id).await;
+    }
     // Marking a film "Просмотрено" by hand also marks it watched for "Continue watching".
     if effective_status == Some(TitleStatus::Watched) && kind == MediaKind::Movie {
         let m = MarkWatched {
@@ -881,6 +896,17 @@ async fn post_marks(
     userdata::mark(&state.pool, user.0, &m).await?;
     userdata::refresh_status(&state.pool, &*state.catalog, user.0, m.kind, m.tmdb_id, false).await?;
     if m.watched {
+        if m.episodes.is_empty() {
+            state.media.pause_cache.evict_title(user.0, m.kind, m.tmdb_id).await;
+        } else {
+            for &ep in &m.episodes {
+                state
+                    .media
+                    .pause_cache
+                    .evict_episode(user.0, m.kind, m.tmdb_id, m.season, ep)
+                    .await;
+            }
+        }
         let last = m.episodes.iter().copied().max().unwrap_or(0);
         after_finished(&state, user.0, m.kind, m.tmdb_id, m.season, last).await?;
     }

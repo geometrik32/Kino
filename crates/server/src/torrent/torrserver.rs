@@ -200,6 +200,35 @@ impl TorrServer {
         });
     }
 
+    /// Preloads a specific byte window (`[start .. start + len)`) in TorrServer so
+    /// resuming from a pause cache finds the continuation pieces already in RAM.
+    pub async fn warm_up_range(&self, hash: &str, index: i32, start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        let end = start.saturating_add(len - 1);
+        let url = self.stream_url(hash, index);
+        let req = self
+            .get(&url)
+            .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+            .timeout(std::time::Duration::from_secs(45));
+        let Ok(resp) = req.send().await else {
+            return;
+        };
+        if !resp.status().is_success() {
+            return;
+        }
+        use futures_util::StreamExt;
+        let mut stream = resp.bytes_stream();
+        let mut read = 0u64;
+        while let Some(Ok(chunk)) = stream.next().await {
+            read = read.saturating_add(chunk.len() as u64);
+            if read >= len {
+                break;
+            }
+        }
+    }
+
     /// URL of the raw file stream (supports Range).
     pub fn stream_url(&self, infohash: &str, index: i32) -> String {
         format!("{}/stream/video?link={infohash}&index={index}&play", self.base)
@@ -221,6 +250,11 @@ impl TorrServer {
     /// Request for the stream, with credentials.
     pub fn get(&self, url: &str) -> reqwest::RequestBuilder {
         self.req(self.http.get(url))
+    }
+
+    /// HEAD request for the stream, with credentials.
+    pub fn head(&self, url: &str) -> reqwest::RequestBuilder {
+        self.req(self.http.head(url))
     }
 }
 

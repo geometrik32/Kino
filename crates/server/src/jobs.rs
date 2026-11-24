@@ -253,6 +253,7 @@ pub fn spawn(state: AppState, every: Duration) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-dropping stale titles failed"),
             }
+            state.media.pause_cache.prune().await;
             since_check += Duration::from_secs(3600);
             if since_check >= every {
                 since_check = Duration::ZERO;

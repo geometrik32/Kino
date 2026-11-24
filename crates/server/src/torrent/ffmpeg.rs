@@ -4,10 +4,10 @@
 use std::process::Stdio;
 
 use kino_core::MediaTrack;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::process::{Child, Command};
 
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Probe {
     pub duration: Option<f64>,
     /// ffprobe format names, e.g. "matroska,webm" or "mov,mp4,m4a,3gp,3g2,mj2".

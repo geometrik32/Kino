@@ -226,7 +226,7 @@ const SAVE_EVERY: f64 = 10.0;
 /// How often the player sends a sync heartbeat & checks drift, milliseconds.
 const SYNC_TICK_MS: u32 = 2_000;
 
-/// How long the controls stay on screen after user activity, milliseconds.
+/// How long the controls stay on screen during playback after user activity, milliseconds.
 const CONTROLS_MS: u32 = 3_500;
 
 const SCALE_STORAGE_KEY: &str = "kino.player.scale";
@@ -503,11 +503,14 @@ pub fn Player(
         ui.with_mut(|s| s.auto_muted = false);
     };
 
-    // Shows the controls and hides them again after `CONTROLS_MS` of inactivity (even while paused).
+    // Shows the controls and hides them again after `CONTROLS_MS` of playback inactivity (never while paused).
     let mut show_controls = move || {
         last_activity_ms.set(platform::now_ms());
         if !ui.peek().controls {
             ui.with_mut(|s| s.controls = true);
+        }
+        if ui.peek().paused || ui.peek().menu.is_some() {
+            return;
         }
         if *controls_timer.peek() {
             return;
@@ -515,17 +518,21 @@ pub fn Player(
         controls_timer.set(true);
         spawn(async move {
             loop {
+                if closing() || ui.peek().paused || !ui.peek().controls || ui.peek().menu.is_some() {
+                    controls_timer.set(false);
+                    break;
+                }
                 let elapsed = (platform::now_ms() - *last_activity_ms.peek()).max(0);
                 let remain = i64::from(CONTROLS_MS) - elapsed;
                 if remain <= 25 {
-                    if ui.peek().menu.is_none() && ui.peek().controls {
+                    if !ui.peek().paused && ui.peek().menu.is_none() && ui.peek().controls {
                         ui.with_mut(|s| s.controls = false);
                     }
                     controls_timer.set(false);
                     break;
                 }
                 platform::sleep(remain as u32).await;
-                if closing() || !ui.peek().controls || ui.peek().menu.is_some() {
+                if closing() || ui.peek().paused || !ui.peek().controls || ui.peek().menu.is_some() {
                     controls_timer.set(false);
                     break;
                 }
@@ -869,12 +876,16 @@ pub fn Player(
                 show_controls();
             }
         } else {
+            let was_paused = ui.peek().paused;
             ui.with_mut(|s| {
                 s.waiting = false;
                 s.paused = false;
                 s.progress = None;
                 s.status = None;
             });
+            if was_paused && ui.peek().controls {
+                show_controls();
+            }
             if video().is_some_and(|v| v.paused()) {
                 attempt_play(play_gen(), false);
             }
@@ -1435,19 +1446,34 @@ pub fn Player(
                                                         s.status = None;
                                                     }
                                                 });
-                                                if !is_self && st.paused != was_paused {
+                                                if (!is_self && st.paused != was_paused)
+                                                    || (was_paused && !st.paused && ui.peek().controls)
+                                                {
                                                     show_controls();
                                                 }
+                                                if hold {
+                                                    if paused_since_ms().is_none() {
+                                                        paused_since_ms.set(Some(now_ms));
+                                                    }
+                                                }
 
-                                                if video().is_some() {
+                                                if let Some(v) = video() {
                                                     if hold {
                                                         pause_video();
-                                                    } else if !awaiting_ready()
-                                                        && info.peek().is_some()
-                                                        && video().is_some_and(|v| v.paused())
-                                                    {
-                                                        attempt_play(play_gen(), false);
+                                                    } else if !awaiting_ready() && info.peek().is_some() && v.paused() {
+                                                        let paused_ms = paused_since_ms().map_or(0, |t| now_ms - t);
+                                                        paused_since_ms.set(None);
+                                                        if ui.peek().transcoded && (v.ended() || paused_ms >= 45_000) {
+                                                            let expected = clock.peek().expected_position(&st, now_ms);
+                                                            open_source(expected, true);
+                                                        } else {
+                                                            attempt_play(play_gen(), false);
+                                                        }
+                                                    } else if !hold {
+                                                        paused_since_ms.set(None);
                                                     }
+                                                } else if !hold {
+                                                    paused_since_ms.set(None);
                                                 }
 
                                                 if is_self {
@@ -1605,6 +1631,30 @@ pub fn Player(
                                         if now_sync_muted != was_sync_muted {
                                             if let Some(v) = video() {
                                                 v.set_muted(now_sync_muted || muted() || auto_muted());
+                                            }
+                                        }
+                                        let diff_ep = kind == MediaKind::Tv
+                                            && (rejoin.state.season, rejoin.state.episode) != *target.peek();
+                                        let diff_rel = rejoin.state.release.infohash != release.peek().infohash;
+                                        if diff_ep || diff_rel {
+                                            target.set((rejoin.state.season, rejoin.state.episode));
+                                            release.set(rejoin.state.release.clone());
+                                            rate.set(rejoin.state.rate);
+                                            let n_gen = play_gen() + 1;
+                                            play_gen.set(n_gen);
+                                            ws_start_fetch(
+                                                rejoin.state.season,
+                                                rejoin.state.episode,
+                                                rejoin.state.release.clone(),
+                                                rejoin.state.position_sec,
+                                                n_gen,
+                                            );
+                                        } else {
+                                            let hold = rejoin.state.paused || rejoin.state.waiting;
+                                            desired_paused.set(hold);
+                                            ui.with_mut(|s| s.paused = rejoin.state.paused);
+                                            if hold {
+                                                pause_video();
                                             }
                                         }
                                         ticket = rejoin.ticket;
@@ -1973,9 +2023,13 @@ pub fn Player(
                 return;
             };
             save(true);
+            let was_paused = ui.peek().paused;
             desired_paused.set(false);
             paused_since_ms.set(None);
             ui.with_mut(|s| s.paused = false);
+            if was_paused && ui.peek().controls {
+                show_controls();
+            }
             let cur_rel = release.peek().clone();
             let need_switch = ns != season || cur_rel.episode > 0;
             if !need_switch {
@@ -2137,12 +2191,19 @@ pub fn Player(
                     sync::send(&SyncClientMsg::Play { position_sec: cur_pos });
                 }
                 if !waiting_peer {
-                    if ui.peek().transcoded && (v.ended() || paused_ms >= 45_000) {
+                    let sync_expected = st_opt
+                        .as_ref()
+                        .filter(|st| !st.paused && !st.waiting)
+                        .map(|st| clock.peek().expected_position(st, now_ms));
+                    let need_transcode_reload = ui.peek().transcoded
+                        && (v.ended()
+                            || paused_ms >= 45_000
+                            || sync_expected.is_some_and(|exp| (cur_pos - exp).abs() > 2.0));
+                    if need_transcode_reload {
                         ui.with_mut(|s| s.paused = false);
-                        open_source(cur_pos, true);
+                        open_source(sync_expected.unwrap_or(cur_pos), true);
                     } else {
-                        if let Some(st) = st_opt.as_ref().filter(|st| !st.paused && !st.waiting) {
-                            let expected = clock.peek().expected_position(st, now_ms);
+                        if let Some(expected) = sync_expected {
                             if (cur_pos - expected).abs() > 1.5 && !ui.peek().transcoded {
                                 v.set_current_time(expected);
                                 ui.with_mut(|s| s.position = expected);
@@ -2888,6 +2949,7 @@ pub fn Player(
         st.volume = volume();
         st.muted = muted();
         st.show_volume = !finger;
+        st.touch_controls = finger;
         st.episodes = season_list.read().clone().unwrap_or_default();
         let scope_s = if kind == MediaKind::Tv { season } else { 0 };
         if let Some((qs, qlist)) = quality_cache() {
@@ -2923,7 +2985,9 @@ pub fn Player(
                         ui.with_mut(|s| s.menu = None);
                         show_controls();
                     } else if finger {
-                        if ui.peek().controls {
+                        if ui.peek().paused {
+                            show_controls();
+                        } else if ui.peek().controls {
                             ui.with_mut(|s| s.controls = false);
                         } else {
                             show_controls();

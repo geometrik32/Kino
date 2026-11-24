@@ -1104,7 +1104,9 @@ html.native-video .player.native-video * { visibility: visible; }
   display: grid; place-items: center; box-shadow: 0 10px 30px rgba(0,0,0,.5);
   transition: opacity .25s, background .15s, color .15s, border-color .15s;
 }
-.p-big:hover { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+@media (hover: hover) and (pointer: fine) {
+  .p-big:hover { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+}
 .p-error { background: rgba(14,22,33,.92); border: 1px solid var(--line); padding: 22px; border-radius: 16px; max-width: 440px; }
 .p-err-acts { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin-top: 6px; }
 .p-wait { display: grid; justify-items: center; gap: 10px; padding: 16px 22px; border-radius: 16px; background: rgba(14,22,33,.82); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,.12); }
@@ -1220,11 +1222,13 @@ html.native-video .player.native-video * { visibility: visible; }
 .p-seen.done { color: var(--accent); }
 
 .p-next-card {
-  position: absolute; right: calc(24px + var(--sar)); bottom: calc(134px + var(--sab)); z-index: 5;
+  position: absolute; right: calc(24px + var(--sar)); bottom: calc(24px + var(--sab)); z-index: 5;
   display: flex; align-items: center; gap: 12px; padding: 10px 12px 10px 14px; border-radius: 14px;
   background: rgba(14, 22, 33, .86); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
   border: 1px solid rgba(255,255,255,.15); box-shadow: 0 12px 32px rgba(0,0,0,.5);
+  transition: bottom .25s;
 }
+.player.show .p-next-card { bottom: calc(134px + var(--sab)); }
 .p-next-sub { font-size: 11.5px; color: var(--muted); }
 .p-next-title { font-weight: 700; font-size: 14px; margin-top: 1px; }
 .p-next-close { width: 32px !important; height: 32px !important; }
@@ -1356,7 +1360,8 @@ html.native-video .player.native-video * { visibility: visible; }
   .p-ctrl-row { gap: 5px; }
   .p-popover { left: 12px; right: 12px; width: auto; bottom: calc(130px + var(--sab)); }
   .p-popover.sync { top: calc(58px + var(--sat)); bottom: auto; left: 12px; right: 12px; width: auto; }
-  .p-next-card { left: 12px; right: 12px; bottom: calc(130px + var(--sab)); justify-content: space-between; }
+  .p-next-card { left: 12px; right: 12px; bottom: calc(16px + var(--sab)); justify-content: space-between; }
+  .player.show .p-next-card { bottom: calc(130px + var(--sab)); }
 }
 
 @media (max-width: 480px) {
@@ -1380,7 +1385,8 @@ html.native-video .player.native-video * { visibility: visible; }
   .p-popover { left: auto; right: calc(18px + var(--sar)); width: 300px; bottom: calc(104px + var(--sab)); max-height: calc(100vh - 124px); padding: 10px; }
   .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
   .p-opt { padding: 8px 10px; font-size: 13.5px; }
-  .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(104px + var(--sab)); }
+  .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
+  .player.show .p-next-card { bottom: calc(104px + var(--sab)); }
   .player.show .p-unmute-btn { bottom: calc(104px + var(--sab)); }
 }
 
@@ -1416,7 +1422,8 @@ html.native-video .player.native-video * { visibility: visible; }
   html.tg.tg-player-rot .player .p-popover { left: auto; right: calc(18px + var(--sar)); width: 300px; bottom: calc(96px + var(--sab)); max-height: calc(100% - 116px); padding: 10px; }
   html.tg.tg-player-rot .player .p-popover.sync { top: calc(54px + var(--sat)); bottom: auto; left: auto; right: calc(18px + var(--sar)); width: 300px; }
   html.tg.tg-player-rot .player .p-opt { padding: 8px 10px; font-size: 13.5px; }
-  html.tg.tg-player-rot .player .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(96px + var(--sab)); }
+  html.tg.tg-player-rot .player .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
+  html.tg.tg-player-rot .player.show .p-next-card { bottom: calc(96px + var(--sab)); }
   html.tg.tg-player-rot .player.show .p-unmute-btn { bottom: calc(96px + var(--sab)); }
 }
 

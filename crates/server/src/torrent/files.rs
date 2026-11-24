@@ -42,7 +42,7 @@ pub fn episode_of(path: &str) -> (Option<i32>, Option<i32>) {
 }
 
 /// A file of a torrent: its 1-based index (as TorrServer counts), path and size.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FileEntry {
     pub index: i32,
     pub path: String,

@@ -32,6 +32,9 @@ services:
     environment:
       DATABASE_URL: postgres://kino:${POSTGRES_PASSWORD}@kino-db/kino
       IMAGE_CACHE_DIR: /var/cache/kino-img
+      PAUSE_CACHE_DIR: /var/cache/kino-pause
+      PAUSE_CACHE_MAX_MB: "${PAUSE_CACHE_MAX_MB:-5120}"
+      PAUSE_CACHE_TTL_HOURS: "${PAUSE_CACHE_TTL_HOURS:-72}"
       JACKETT_WAKE_URL: http://sablier:10000
       JACKETT_WAKE_GROUP: jackett
       JACKETT_WAKE_DURATION: 10m
@@ -50,6 +53,8 @@ services:
       - ${DOWNLOADS_DIR:-/mnt/HDD_Data/orel-kino}:/downloads:ro
       # Disk cache for TMDB posters/backdrops (keeps image cache out of RAM).
       - ./data/image-cache:/var/cache/kino-img
+      # SSD pause-resume cache for torrent streams (5 GiB budget, 72h TTL).
+      - ./data/pause-cache:/var/cache/kino-pause
     networks: [kino, proxy, vpn]
     labels:
       traefik.enable: "true"
@@ -58,6 +63,12 @@ services:
       traefik.http.routers.orel-kino.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
       traefik.http.routers.orel-kino.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
       traefik.http.routers.orel-kino.middlewares: orel-kino-compress
+      traefik.http.routers.orel-kino.service: orel-kino
+      traefik.http.routers.orel-kino-live.rule: "Host(`${KINO_HOST:?set KINO_HOST in .env}`) && (PathPrefix(`/api/sync/ws`) || PathPrefix(`/api/stream`))"
+      traefik.http.routers.orel-kino-live.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.orel-kino-live.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-le-resolver}
+      traefik.http.routers.orel-kino-live.priority: "200"
+      traefik.http.routers.orel-kino-live.service: orel-kino
       traefik.http.middlewares.orel-kino-compress.compress: "true"
       traefik.http.services.orel-kino.loadbalancer.server.port: "8080"
 

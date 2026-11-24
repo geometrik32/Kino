@@ -98,6 +98,8 @@ pub struct PlayerState {
     pub muted: bool,
     /// Whether to show the inline desktop volume slider.
     pub show_volume: bool,
+    /// Touch device mode: tapping reveals controls with a center Pause/Play button.
+    pub touch_controls: bool,
     /// Season being watched and its episodes (series only); `episode` is the current one.
     pub season: i32,
     pub episode: i32,
@@ -159,6 +161,7 @@ impl Default for PlayerState {
             volume: 1.0,
             muted: false,
             show_volume: true,
+            touch_controls: false,
             season: 0,
             episode: 0,
             episodes: Vec::new(),
@@ -221,7 +224,7 @@ pub fn ConnectProgress(progress: StreamProgress) -> Element {
 
 /// Whether player controls (bars, dock, center play) should be visible.
 pub fn controls_shown(locked: bool, state: &PlayerState, scrubbing: bool) -> bool {
-    !locked && (state.controls || state.menu.is_some() || scrubbing)
+    !locked && (state.controls || state.paused || state.menu.is_some() || scrubbing)
 }
 
 /// Filters zero-pixel synthetic `pointermove` events emitted on layout/cursor changes.
@@ -569,13 +572,16 @@ pub fn PlayerView(
                             }
                         }
                     }
-                } else if s.paused && s.menu.is_none() && s.error.is_none() {
-                    // Unobstructed center during playback; big Play appears ONLY while paused.
+                } else if (s.paused || s.touch_controls) && s.menu.is_none() && s.error.is_none() {
+                    // On touch devices, tapping reveals the center Pause/Play button alongside the controls
+                    // (hidden via CSS when controls fade out); desktop shows it only while paused.
                     button {
                         class: "p-center p-big",
-                        "aria-label": "Продолжить воспроизведение",
+                        title: if s.paused { "Продолжить воспроизведение" } else { "Пауза" },
+                        "aria-label": if s.paused { "Продолжить воспроизведение" } else { "Пауза" },
+                        onpointerdown: move |_| ping_activity(),
                         onclick: move |_| on_toggle.call(()),
-                        Icon { svg: icons::PLAY, class: "ic xl" }
+                        Icon { svg: if s.paused { icons::PLAY } else { icons::PAUSE }, class: "ic xl" }
                     }
                 }
 
@@ -808,12 +814,12 @@ pub fn PlayerView(
                             Icon { svg: icons::AUDIO_CC, class: "ic sm" }
                             span { class: "long", "Наушники" }
                         }
-                        // Button 2: Settings (Quality + Speed + Scale).
+                        // Button 2: Settings (Speed + Scale + Quality).
                         button {
                             class: if settings_open { "p-glass-btn settings-btn active" } else { "p-glass-btn settings-btn" },
-                            title: "Настройки: качество, скорость и масштаб",
+                            title: "Настройки: скорость, масштаб и качество",
                             "aria-label": "Настройки",
-                            onclick: move |_| on_menu.call(if settings_open { None } else { Some(PlayerMenu::Quality) }),
+                            onclick: move |_| on_menu.call(if settings_open { None } else { Some(PlayerMenu::Speed) }),
                             Icon { svg: icons::SETTINGS, class: "ic sm" }
                             span { class: "long", "Настройки" }
                         }
@@ -903,13 +909,6 @@ pub fn PlayerView(
                             p { class: "muted small p-pop-note", "Выбор дорожки и субтитров запоминается для этого тайтла." }
                         } else if matches!(menu, PlayerMenu::Quality | PlayerMenu::Speed | PlayerMenu::Scale) {
                             div { class: "p-pop-tabs",
-                                if on_pick_quality.is_some() {
-                                    button {
-                                        class: if menu == PlayerMenu::Quality { "active" } else { "" },
-                                        onclick: move |_| on_menu.call(Some(PlayerMenu::Quality)),
-                                        "Качество"
-                                    }
-                                }
                                 button {
                                     class: if menu == PlayerMenu::Speed { "active" } else { "" },
                                     onclick: move |_| on_menu.call(Some(PlayerMenu::Speed)),
@@ -919,6 +918,13 @@ pub fn PlayerView(
                                     class: if menu == PlayerMenu::Scale { "active" } else { "" },
                                     onclick: move |_| on_menu.call(Some(PlayerMenu::Scale)),
                                     "Масштаб"
+                                }
+                                if on_pick_quality.is_some() {
+                                    button {
+                                        class: if menu == PlayerMenu::Quality { "active" } else { "" },
+                                        onclick: move |_| on_menu.call(Some(PlayerMenu::Quality)),
+                                        "Качество"
+                                    }
                                 }
                             }
                             if menu == PlayerMenu::Quality {
@@ -1128,15 +1134,16 @@ mod tests {
     use super::{controls_shown, pointer_moved, PlayerMenu, PlayerState, VideoScale};
 
     #[test]
-    fn paused_hides_controls_when_inactive() {
+    fn paused_keeps_controls_visible() {
         let mut s = PlayerState {
             paused: true,
-            controls: true,
+            controls: false,
             ..PlayerState::default()
         };
         assert!(controls_shown(false, &s, false));
+        assert!(!controls_shown(true, &s, false));
 
-        s.controls = false;
+        s.paused = false;
         assert!(!controls_shown(false, &s, false));
         assert!(controls_shown(false, &s, true));
 
