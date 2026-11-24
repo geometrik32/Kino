@@ -582,7 +582,7 @@ pub fn Player(
             ui.with_mut(|s| s.auto_muted = false);
         }
         v.play_checked(move |outcome| {
-            if closing() || play_gen() != expected_gen || desired_paused() {
+            if closing.try_peek().ok().is_none_or(|c| *c) || play_gen() != expected_gen || desired_paused() {
                 return;
             }
             if outcome == PlayOutcome::NotAllowed {

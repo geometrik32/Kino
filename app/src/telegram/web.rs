@@ -311,6 +311,19 @@ pub fn reset_history() {
     }
 }
 
+fn wrap_in_runtime(mut f: impl FnMut() + 'static) -> Rc<RefCell<dyn FnMut()>> {
+    let rt = dioxus::core::Runtime::try_current();
+    let scope = rt.as_ref().and_then(|r| r.try_current_scope_id());
+    Rc::new(RefCell::new(move || match (&rt, scope) {
+        (Some(rt), Some(id)) => rt.in_scope(id, &mut f),
+        (Some(rt), None) => {
+            let _guard = dioxus::core::RuntimeGuard::new(rt.clone());
+            f();
+        }
+        (None, _) => f(),
+    }))
+}
+
 /// Takes over the native Back button until [`pop_back`]. Returns the id to give back.
 /// Outside Telegram it only records the handler.
 pub fn push_back(handler: impl FnMut() + 'static) -> u64 {
@@ -319,7 +332,7 @@ pub fn push_back(handler: impl FnMut() + 'static) -> u64 {
         n.set(id + 1);
         id
     });
-    BACKS.with(|b| b.borrow_mut().push((id, Rc::new(RefCell::new(handler)))));
+    BACKS.with(|b| b.borrow_mut().push((id, wrap_in_runtime(handler))));
     sync_back();
     id
 }
@@ -352,7 +365,8 @@ fn sync_back() {
 pub fn show_main_button(text: &str, on_click: impl FnMut() + 'static) {
     let Some(button) = node(&["MainButton"]) else { return };
     hide_main_button();
-    let closure = Closure::<dyn FnMut()>::new(on_click);
+    let wrapped = wrap_in_runtime(on_click);
+    let closure = Closure::<dyn FnMut()>::new(move || (wrapped.borrow_mut())());
     call(&["MainButton"], "onClick", &[closure.as_ref().clone()]);
     MAIN.with(|m| *m.borrow_mut() = Some(closure));
     let (accent, fg) = if is_light_now() { LIGHT_ACCENT } else { DARK_ACCENT };

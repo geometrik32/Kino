@@ -64,16 +64,32 @@ mod imp {
             self.0.set_current_time(t);
         }
         pub fn play_checked(&self, on_done: impl FnOnce(PlayOutcome) + 'static) {
+            let rt = dioxus::core::Runtime::try_current();
+            let scope = rt.as_ref().and_then(|r| r.try_current_scope_id());
+            let done = std::rc::Rc::new(std::cell::RefCell::new(Some(
+                Box::new(on_done) as Box<dyn FnOnce(PlayOutcome)>
+            )));
+            let dispatch = move |outcome: PlayOutcome| {
+                let Some(cb) = done.borrow_mut().take() else {
+                    return;
+                };
+                match (&rt, scope) {
+                    (Some(rt), Some(id)) => rt.in_scope(id, || cb(outcome)),
+                    (Some(rt), None) => {
+                        let _guard = dioxus::core::RuntimeGuard::new(rt.clone());
+                        cb(outcome);
+                    }
+                    (None, _) => cb(outcome),
+                }
+            };
             let Ok(promise) = self.0.play() else {
-                on_done(PlayOutcome::Error);
+                dispatch(PlayOutcome::Error);
                 return;
             };
-            let done = std::rc::Rc::new(std::cell::RefCell::new(Some(on_done)));
-            let done_err = done.clone();
+            let dispatch = std::rc::Rc::new(dispatch);
+            let dispatch_err = dispatch.clone();
             let on_ok = wasm_bindgen::closure::Closure::once(move |_: wasm_bindgen::JsValue| {
-                if let Some(cb) = done.borrow_mut().take() {
-                    cb(PlayOutcome::Ok);
-                }
+                dispatch(PlayOutcome::Ok);
             });
             let on_err = wasm_bindgen::closure::Closure::once(move |err: wasm_bindgen::JsValue| {
                 let name = js_sys::Reflect::get(&err, &"name".into())
@@ -85,9 +101,7 @@ mod imp {
                     "AbortError" => PlayOutcome::Aborted,
                     _ => PlayOutcome::Error,
                 };
-                if let Some(cb) = done_err.borrow_mut().take() {
-                    cb(outcome);
-                }
+                dispatch_err(outcome);
             });
             let _ = promise.then2(&on_ok, &on_err);
             on_ok.forget();
