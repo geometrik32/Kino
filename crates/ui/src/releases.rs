@@ -279,6 +279,7 @@ pub fn ReleasePicker(
         .filter(|r| filter.matches(r))
         .cloned();
     shown.retain(|r| Some(&r.infohash) != chosen.as_ref());
+    let (preloaded_top, rest): (Vec<ReleaseOption>, Vec<ReleaseOption>) = shown.into_iter().partition(|r| r.preloaded);
     let n_active = filter.active();
     let filter_label = if n_active > 0 {
         format!("Фильтры · {n_active}")
@@ -292,7 +293,8 @@ pub fn ReleasePicker(
             on_panel.call(Some(p))
         }
     };
-    let shown_count = shown.len() + usize::from(pinned.is_some());
+    let shown_count = preloaded_top.len() + rest.len() + usize::from(pinned.is_some());
+    let has_preloaded_q = |q: &str| releases.iter().any(|r| r.preloaded && r.quality == q);
     let f_all = filter.clone();
     let f_dp = filter.clone();
     rsx! {
@@ -341,6 +343,7 @@ pub fn ReleasePicker(
                                 let active = filter.quality.as_deref() == Some(q.as_str());
                                 let f_q = filter.clone();
                                 let q_val = q.clone();
+                                let q_has_srv = has_preloaded_q(&q);
                                 rsx! {
                                     button {
                                         key: "q-{q}",
@@ -349,6 +352,9 @@ pub fn ReleasePicker(
                                             let next = if active { None } else { Some(q_val.clone()) };
                                             on_filter.call(ReleaseFilter { quality: next, ..f_q.clone() });
                                         },
+                                        if q_has_srv {
+                                            span { class: "hot-dot", title: "Есть скачанный файл на сервере" }
+                                        }
                                         "{quality_short(&q)}"
                                     }
                                 }
@@ -397,10 +403,38 @@ pub fn ReleasePicker(
                     None => rsx! {},
                 }
                 div { class: "rel-list",
-                    if let Some(r) = pinned {
-                        ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, on_pick, on_preload }
+                    if pinned.as_ref().is_some_and(|r| r.preloaded) {
+                        if let Some(r) = &pinned {
+                            ReleaseRow { key: "pinned-{r.infohash}", release: r.clone(), chosen: true, watched: true, native_player, on_pick, on_preload }
+                        }
+                        for r in preloaded_top {
+                            ReleaseRow {
+                                key: "{r.infohash}",
+                                watched: watched.contains(&r.infohash),
+                                release: r,
+                                chosen: false,
+                                native_player,
+                                on_pick,
+                                on_preload,
+                            }
+                        }
+                    } else {
+                        for r in preloaded_top {
+                            ReleaseRow {
+                                key: "{r.infohash}",
+                                watched: watched.contains(&r.infohash),
+                                release: r,
+                                chosen: false,
+                                native_player,
+                                on_pick,
+                                on_preload,
+                            }
+                        }
+                        if let Some(r) = pinned {
+                            ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, on_pick, on_preload }
+                        }
                     }
-                    for r in shown {
+                    for r in rest {
                         ReleaseRow {
                             key: "{r.infohash}",
                             watched: watched.contains(&r.infohash),
@@ -609,7 +643,7 @@ fn ReleaseRow(
                 div { class: "rel-voice",
                     strong { "{release.voice}" }
                     if release.preloaded {
-                        span { class: "tag ok", title: "Файл уже скачан на сервер и запускается мгновенно",
+                        span { class: "tag srv", title: "Файл уже скачан на сервер и запускается мгновенно",
                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
                             "На сервере"
                         }
@@ -795,5 +829,18 @@ mod tests {
             .all(|s| ReleaseSort::from_key(Some(s.key())) == *s));
         assert_eq!(human_size(28_400_000_000), "28.4 ГБ");
         assert_eq!(ru_short_date("2024-03-08"), "08.03.24");
+    }
+
+    #[test]
+    fn preloaded_releases_sort_above_others() {
+        let mut all = mock_releases(&title(), None);
+        // Mark an item near the bottom as preloaded and confirm partitioning places it first.
+        let last_idx = all.len() - 1;
+        all[last_idx].preloaded = true;
+        let pre_hash = all[last_idx].infohash.clone();
+        let (pre, rest): (Vec<_>, Vec<_>) = all.into_iter().partition(|r| r.preloaded);
+        assert_eq!(pre.len(), 1);
+        assert_eq!(pre[0].infohash, pre_hash);
+        assert!(!rest.is_empty());
     }
 }

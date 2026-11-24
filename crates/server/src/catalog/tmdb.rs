@@ -672,6 +672,54 @@ const MAX_CAST: usize = 20;
 const MAX_TITLES: usize = 20;
 const MAX_CREDITS: usize = 60;
 
+#[derive(Deserialize)]
+struct RawCollectionRef {
+    id: i64,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct RawCollectionDetails {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    parts: Vec<ListItem>,
+}
+
+/// Converts a TMDB `/collection/{id}` response into chronologically ordered movie summaries.
+pub(crate) fn collection_from(
+    mut raw: RawCollectionDetails,
+    fallback_name: String,
+    own_id: i64,
+) -> (Option<String>, Vec<TitleSummary>) {
+    raw.parts.sort_by(|a, b| {
+        let da = a.release_date.as_deref().filter(|d| !d.is_empty());
+        let db = b.release_date.as_deref().filter(|d| !d.is_empty());
+        match (da, db) {
+            (Some(a_d), Some(b_d)) => a_d.cmp(b_d).then_with(|| a.id.cmp(&b.id)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.id.cmp(&b.id),
+        }
+    });
+    let items: Vec<TitleSummary> = raw
+        .parts
+        .into_iter()
+        .filter_map(|p| p.into_summary(Some(MediaKind::Movie)))
+        .filter(|t| t.poster_path.is_some() && t.tmdb_id != own_id)
+        .take(MAX_TITLES)
+        .collect();
+    let name = if !raw.name.trim().is_empty() {
+        Some(raw.name.trim().to_owned())
+    } else if !fallback_name.trim().is_empty() {
+        Some(fallback_name.trim().to_owned())
+    } else {
+        None
+    };
+    (name, items)
+}
+
 pub(crate) fn extras_from(raw: serde_json::Value, kind: MediaKind, own_id: i64) -> Result<TitleExtras, CatalogError> {
     let r: RawExtras = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
     let mut cast = r.credits.map(|c| c.cast).unwrap_or_default();
@@ -703,6 +751,8 @@ pub(crate) fn extras_from(raw: serde_json::Value, kind: MediaKind, own_id: i64) 
         .collect();
     Ok(TitleExtras {
         cast,
+        collection_name: None,
+        collection: Vec::new(),
         recommendations,
         similar,
     })
@@ -1510,7 +1560,25 @@ impl Catalog for TmdbCatalog {
         let raw: serde_json::Value = self
             .get(&path, &[("append_to_response", "credits,recommendations,similar")])
             .await?;
-        extras_from(raw, kind, tmdb_id)
+        let mut ext = extras_from(raw.clone(), kind, tmdb_id)?;
+        if kind == MediaKind::Movie {
+            if let Some(col_ref) = raw
+                .get("belongs_to_collection")
+                .and_then(|v| serde_json::from_value::<RawCollectionRef>(v.clone()).ok())
+            {
+                if let Ok(col) = self
+                    .get::<RawCollectionDetails>(&format!("/collection/{}", col_ref.id), &[])
+                    .await
+                {
+                    let (name, items) = collection_from(col, col_ref.name, tmdb_id);
+                    if !items.is_empty() {
+                        ext.collection_name = name;
+                        ext.collection = items;
+                    }
+                }
+            }
+        }
+        Ok(ext)
     }
 
     async fn person(&self, id: i64) -> Result<PersonDetails, CatalogError> {
@@ -1839,5 +1907,27 @@ mod tests {
         assert_eq!(list.len(), 2);
         assert_eq!(list[0].tmdb_id, 2);
         assert_eq!(list[0].title, "Зелёная линия");
+    }
+
+    #[test]
+    fn parses_a_collection_in_chronological_order() {
+        let raw: RawCollectionDetails = serde_json::from_value(json!({
+            "name": "Трилогия",
+            "parts": [
+                { "id": 30, "title": "Часть 3", "release_date": "2012-07-19", "poster_path": "/3.jpg" },
+                { "id": 10, "title": "Часть 1", "release_date": "2005-06-15", "poster_path": "/1.jpg" },
+                { "id": 20, "title": "Текущий фильм", "release_date": "2008-07-18", "poster_path": "/2.jpg" },
+                { "id": 40, "title": "Без даты", "release_date": "", "poster_path": "/4.jpg" },
+                { "id": 50, "title": "Без постера", "release_date": "2001-01-01", "poster_path": null }
+            ]
+        }))
+        .unwrap();
+        let (name, items) = collection_from(raw, String::new(), 20);
+        assert_eq!(name.as_deref(), Some("Трилогия"));
+        assert_eq!(
+            items.iter().map(|i| i.tmdb_id).collect::<Vec<_>>(),
+            vec![10, 30, 40],
+            "self and posterless items are excluded; dated items sort chronologically before undated"
+        );
     }
 }

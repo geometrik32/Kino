@@ -275,7 +275,10 @@ button.tg-avatar:hover, .tg-avatar.active { border-color: var(--accent); box-sha
 
 .tag { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 6px; background: var(--tint2); color: var(--soft); font-size: 11.5px; font-weight: 600; }
 .tag.q, .tag.acc { background: var(--accent-bg); color: var(--accent-text); }
+.tag.srv { background: var(--accent-bg); color: var(--accent-text); border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent); }
 .tag.ok { background: var(--ok-bg); color: var(--ok); }
+.hot-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 6px var(--accent); flex-shrink: 0; }
+.chip.active .hot-dot { background: #071918; box-shadow: 0 0 0 1.5px rgba(255,255,255,.55); }
 .tag.warn { background: var(--warn-bg); color: var(--warn); }
 .tag.wait { background: rgba(246, 185, 102, .16); color: #F6B966; }
 .tag.err { background: var(--err-bg); color: var(--err); }
@@ -1142,7 +1145,7 @@ html.native-video .player.native-video * { visibility: visible; }
 .p-seek-row { display: flex; align-items: center; gap: 14px; }
 .p-time { font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; color: rgba(242,236,225,.88); min-width: 48px; }
 .p-time.r { text-align: right; }
-.p-track { position: relative; flex: 1; height: 6px; border-radius: 999px; background: rgba(255,255,255,.20); touch-action: none; }
+.p-track { position: relative; flex: 1; height: 6px; border-radius: 999px; background: rgba(255,255,255,.20); touch-action: none; cursor: pointer; }
 .p-track::before { content: ""; position: absolute; inset: -14px 0; }
 .p-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--accent); }
 .p-fill::after { content: ""; position: absolute; right: -7px; top: -4px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 4px rgba(56,198,189,.32); }
@@ -1152,7 +1155,7 @@ html.native-video .player.native-video * { visibility: visible; }
   background: rgba(14,22,33,.94); border: 1px solid rgba(255,255,255,.18);
   font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.p-track input { position: absolute; inset: -12px 0; width: 100%; opacity: 0; cursor: pointer; margin: 0; }
+.p-track input { position: absolute; inset: -12px 0; width: 100%; opacity: 0; pointer-events: none; margin: 0; }
 
 .p-ctrl-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; }
 .p-play-btn { width: 44px; height: 44px; border-radius: 50%; background: #F2ECE1; color: #0B141B; display: grid; place-items: center; flex: none; }

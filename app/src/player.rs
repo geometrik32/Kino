@@ -1544,28 +1544,35 @@ pub fn Player(
             };
             let mut begin_async = begin_playback.clone();
             spawn(async move {
-                match api::resolve_release(&tok, kind, id, &req).await {
-                    Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
-                        choices.with_mut(|v| {
-                            v.retain(|c| {
-                                !(c.season == choice.season
-                                    && c.episode == choice.episode
-                                    && c.quality_key == choice.quality_key)
-                            });
-                            v.insert(0, choice.clone());
+                let resolved = match api::resolve_release(&tok, kind, id, &req).await {
+                    Ok(ResolveReleaseResponse::Ready { choice, .. }) => Some(choice),
+                    Ok(ResolveReleaseResponse::PreloadQualityMismatch {
+                        preloaded, fallback, ..
+                    }) => match *fallback {
+                        ResolveReleaseResponse::Ready { choice, .. } => Some(choice),
+                        _ => Some(preloaded),
+                    },
+                    _ => None,
+                };
+                if let Some(choice) = resolved {
+                    choices.with_mut(|v| {
+                        v.retain(|c| {
+                            !(c.season == choice.season
+                                && c.episode == choice.episode
+                                && c.quality_key == choice.quality_key)
                         });
-                        release.set(choice.clone());
-                        target.set((ns, ne));
-                        sync::send(&SyncClientMsg::Episode {
-                            season: ns,
-                            episode: ne,
-                            release: Some(choice),
-                        });
-                        begin_async(false);
-                    }
-                    _ => {
-                        on_need_release.call((ns, ne));
-                    }
+                        v.insert(0, choice.clone());
+                    });
+                    release.set(choice.clone());
+                    target.set((ns, ne));
+                    sync::send(&SyncClientMsg::Episode {
+                        season: ns,
+                        episode: ne,
+                        release: Some(choice),
+                    });
+                    begin_async(false);
+                } else {
+                    on_need_release.call((ns, ne));
                 }
             });
         }

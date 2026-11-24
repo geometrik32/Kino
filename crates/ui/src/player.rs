@@ -269,10 +269,11 @@ pub fn PlayerView(
     let mut lock_hint = use_signal(|| false);
     let mut scrub = use_signal(|| None::<f64>);
     let mut track_el = use_signal(|| None::<Rc<MountedData>>);
-    let mut drag_rect = use_signal(|| None::<(f64, f64)>);
+    // `(is_vertical, start_coord, length)` so both horizontal and rotated vertical tracks share one drag path.
+    let mut drag_rect = use_signal(|| None::<(bool, f64, f64)>);
     let mut drag_gen = use_signal(|| 0u64);
     let mut drag_active = use_signal(|| false);
-    let mut drag_end_y = use_signal(|| None::<f64>);
+    let mut drag_end_pos = use_signal(|| None::<(f64, f64)>);
     let mut dismissed_next = use_signal(|| None::<String>);
     let mut last_mouse = use_signal(|| None::<(f64, f64)>);
     let mut tap_gen = use_signal(|| 0u64);
@@ -334,8 +335,10 @@ pub fn PlayerView(
         div {
             class: "{player_cls}",
             onpointermove: move |e| {
-                if let Some((top, h)) = *drag_rect.peek() {
-                    let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                if let Some((vert, start, len)) = *drag_rect.peek() {
+                    let c = e.client_coordinates();
+                    let coord = if vert { c.y } else { c.x };
+                    let frac = ((coord - start) / len).clamp(0.0, 1.0);
                     scrub.set(Some(frac * dur.max(1.0)));
                     ping_activity();
                     return;
@@ -352,14 +355,16 @@ pub fn PlayerView(
             onpointerup: move |e| {
                 if *drag_active.peek() {
                     drag_active.set(false);
-                    if let Some((top, h)) = drag_rect.take() {
-                        let frac = ((e.client_coordinates().y - top) / h).clamp(0.0, 1.0);
+                    let c = e.client_coordinates();
+                    if let Some((vert, start, len)) = drag_rect.take() {
+                        let coord = if vert { c.y } else { c.x };
+                        let frac = ((coord - start) / len).clamp(0.0, 1.0);
                         let v = frac * dur.max(1.0);
                         scrub.set(None);
                         on_seek.call(v);
                     } else {
                         // `get_client_rect().await` is still resolving; finish the tap once it returns.
-                        drag_end_y.set(Some(e.client_coordinates().y));
+                        drag_end_pos.set(Some((c.x, c.y)));
                     }
                 }
             },
@@ -367,7 +372,7 @@ pub fn PlayerView(
                 if *drag_active.peek() || drag_rect.peek().is_some() {
                     drag_gen.set(drag_gen() + 1);
                     drag_active.set(false);
-                    drag_end_y.set(None);
+                    drag_end_pos.set(None);
                     drag_rect.set(None);
                     scrub.set(None);
                 }
@@ -506,20 +511,12 @@ pub fn PlayerView(
                                 if let Some(sub) = &s.subtitle { span { "{sub} · " } }
                                 span { "{s.release}" }
                                 if let Some(rw) = &s.rewatch_label { span { class: "tag acc", "{rw}" } }
-                                if s.preloaded { span { class: "tag ok", "с диска" } }
+                                if s.preloaded { span { class: "tag srv", "На сервере" } }
                                 if s.transcoded { span { class: "tag warn", "перекодируется" } }
                             }
                         }
                     }
                     div { class: "p-top-r",
-                        button {
-                            class: "p-glass-btn",
-                            title: "Выбрать другую раздачу",
-                            onclick: move |_| on_pick_release.call(()),
-                            Icon { svg: icons::SWAP, class: "ic sm" }
-                            span { class: "long", "Сменить раздачу" }
-                            span { class: "short", "Раздача" }
-                        }
                         button {
                             class: "p-glass-btn icon",
                             title: "Заблокировать экран от случайных нажатий",
@@ -648,11 +645,12 @@ pub fn PlayerView(
                                     return;
                                 }
                                 let Some(el) = track_el() else { return };
-                                let cy = e.client_coordinates().y;
+                                let c = e.client_coordinates();
+                                let (cx, cy) = (c.x, c.y);
                                 let my_gen = *drag_gen.peek() + 1;
                                 drag_gen.set(my_gen);
                                 drag_active.set(true);
-                                drag_end_y.set(None);
+                                drag_end_pos.set(None);
                                 drag_rect.set(None);
                                 let seek_dur = dur;
                                 spawn(async move {
@@ -660,22 +658,28 @@ pub fn PlayerView(
                                         if *drag_gen.peek() != my_gen {
                                             return;
                                         }
-                                        if rect.height() > rect.width() && rect.height() > 1.0 {
-                                            let top = rect.min_y();
-                                            let h = rect.height();
+                                        let vert = rect.height() > rect.width();
+                                        let (start, len) = if vert {
+                                            (rect.min_y(), rect.height())
+                                        } else {
+                                            (rect.min_x(), rect.width())
+                                        };
+                                        if len > 1.0 {
                                             if *drag_active.peek() {
-                                                drag_rect.set(Some((top, h)));
-                                                let frac = ((cy - top) / h).clamp(0.0, 1.0);
+                                                drag_rect.set(Some((vert, start, len)));
+                                                let coord = if vert { cy } else { cx };
+                                                let frac = ((coord - start) / len).clamp(0.0, 1.0);
                                                 scrub.set(Some(frac * seek_dur));
-                                            } else if let Some(end_y) = drag_end_y.take() {
-                                                let frac = ((end_y - top) / h).clamp(0.0, 1.0);
+                                            } else if let Some((end_x, end_y)) = drag_end_pos.take() {
+                                                let coord = if vert { end_y } else { end_x };
+                                                let frac = ((coord - start) / len).clamp(0.0, 1.0);
                                                 scrub.set(None);
                                                 on_seek.call(frac * seek_dur);
                                             }
                                         } else {
                                             let was_released = !*drag_active.peek();
                                             drag_active.set(false);
-                                            drag_end_y.set(None);
+                                            drag_end_pos.set(None);
                                             if was_released {
                                                 scrub.set(None);
                                             }
@@ -683,7 +687,7 @@ pub fn PlayerView(
                                     } else if *drag_gen.peek() == my_gen {
                                         let was_released = !*drag_active.peek();
                                         drag_active.set(false);
-                                        drag_end_y.set(None);
+                                        drag_end_pos.set(None);
                                         if was_released {
                                             scrub.set(None);
                                         }
@@ -712,11 +716,6 @@ pub fn PlayerView(
                                     scrub.set(None);
                                     if let Ok(v) = e.value().parse::<f64>() {
                                         on_seek.call(v);
-                                    }
-                                },
-                                onpointerup: move |_| {
-                                    if drag_rect.peek().is_none() {
-                                        scrub.set(None);
                                     }
                                 },
                                 onpointercancel: move |_| {
@@ -959,8 +958,10 @@ pub fn PlayerView(
                                                     strong { "{qk}" }
                                                     span { class: "muted small", "{info}" }
                                                     if rel.preloaded {
-                                                        span { class: "tag ok", "На сервере" }
-                                                    } else if pick_cnt > 0 {
+                                                        span { class: "hot-dot", title: "Файл уже скачан на сервер" }
+                                                        span { class: "tag srv", "На сервере" }
+                                                    }
+                                                    if pick_cnt > 0 {
                                                         span { class: "tag acc", "👥 {pick_cnt}" }
                                                     }
                                                 }

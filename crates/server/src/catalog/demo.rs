@@ -451,6 +451,8 @@ impl Catalog for DemoCatalog {
         };
         Ok(TitleExtras {
             cast,
+            collection_name: None,
+            collection: Vec::new(),
             recommendations: others(true),
             similar: others(false),
         })

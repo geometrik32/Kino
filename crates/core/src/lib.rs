@@ -363,6 +363,22 @@ impl TitleDetails {
                 ))
     }
 
+    /// True when a series has not started airing yet relative to `today_ymd` (`YYYY-MM-DD`).
+    pub fn is_unreleased_series(&self, today_ymd: &str) -> bool {
+        self.summary.kind == MediaKind::Tv
+            && self.last_episode.is_none()
+            && (self.release_date.as_deref().is_some_and(|d| d > today_ymd)
+                || matches!(
+                    self.series_status.as_deref(),
+                    Some("Rumored" | "Planned" | "In Production" | "Pilot")
+                ))
+    }
+
+    /// True when a movie or series has not come out yet relative to `today_ymd` (`YYYY-MM-DD`).
+    pub fn is_unreleased(&self, today_ymd: &str) -> bool {
+        self.is_unreleased_movie(today_ymd) || self.is_unreleased_series(today_ymd)
+    }
+
     /// Human-readable Russian label for TMDB project status (`Продолжается`, `Завершён`, `Закрыт`, ...).
     pub fn localized_status(&self) -> Option<&'static str> {
         localized_project_status(self.summary.kind, self.series_status.as_deref())
@@ -467,6 +483,12 @@ pub struct PersonDetails {
 pub struct TitleExtras {
     /// Billing order, the first ones are the leads.
     pub cast: Vec<CastMember>,
+    /// TMDB franchise / collection name, when the film belongs to a collection.
+    #[serde(default)]
+    pub collection_name: Option<String>,
+    /// Other parts of the same TMDB collection, sorted chronologically.
+    #[serde(default)]
+    pub collection: Vec<TitleSummary>,
     /// "Рекомендации": what TMDB suggests to those who liked the title.
     pub recommendations: Vec<TitleSummary>,
     /// "Похожие": alike by genre and keywords.
@@ -629,30 +651,34 @@ pub enum TitleStatus {
 
 impl TitleStatus {
     pub const ALL: [TitleStatus; 6] = [
-        TitleStatus::Watching,
-        TitleStatus::WaitingEpisode,
         TitleStatus::Want,
+        TitleStatus::Watching,
         TitleStatus::WaitingRelease,
+        TitleStatus::WaitingEpisode,
         TitleStatus::Watched,
         TitleStatus::Dropped,
     ];
 
-    /// Statuses selectable in UI for a given title.
-    pub fn selectable_for(kind: MediaKind, unreleased_movie: bool) -> &'static [TitleStatus] {
+    /// True when this status is normally set explicitly by the user (vs automatically tracked).
+    pub fn is_manual(self) -> bool {
+        matches!(self, TitleStatus::Want)
+    }
+
+    /// Statuses selectable in UI for a given title, with manual statuses first and automatic ones after.
+    pub fn selectable_for(kind: MediaKind, unreleased: bool) -> &'static [TitleStatus] {
         match kind {
-            MediaKind::Movie if unreleased_movie => {
-                &[TitleStatus::WaitingRelease, TitleStatus::Want, TitleStatus::Dropped]
-            }
+            MediaKind::Movie if unreleased => &[TitleStatus::Want, TitleStatus::WaitingRelease, TitleStatus::Dropped],
             MediaKind::Movie => &[
-                TitleStatus::Watching,
                 TitleStatus::Want,
+                TitleStatus::Watching,
                 TitleStatus::Watched,
                 TitleStatus::Dropped,
             ],
+            MediaKind::Tv if unreleased => &[TitleStatus::Want, TitleStatus::WaitingRelease, TitleStatus::Dropped],
             MediaKind::Tv => &[
+                TitleStatus::Want,
                 TitleStatus::Watching,
                 TitleStatus::WaitingEpisode,
-                TitleStatus::Want,
                 TitleStatus::Watched,
                 TitleStatus::Dropped,
             ],
@@ -843,6 +869,9 @@ pub struct TitleState {
     /// Other users' activity on this title.
     #[serde(default)]
     pub peers: Vec<PeerBadge>,
+    /// Timestamp of the newest finished server download (`preload.state = 'ready'`), if any.
+    #[serde(default)]
+    pub preloaded_ready_at: Option<DateTime<Utc>>,
 }
 
 /// Body of `PUT /api/title/{kind}/{id}/status`; `null` clears it.
@@ -1119,5 +1148,55 @@ mod catalog_tests {
             format_episode_ranges(&[(1, 1), (1, 2), (1, 4), (1, 5), (2, 1)]),
             "S01E01–E02, S01E04–E05, S02E01"
         );
+    }
+
+    #[test]
+    fn status_grouping_and_unreleased_series() {
+        assert!(TitleStatus::Want.is_manual());
+        assert!(!TitleStatus::WaitingRelease.is_manual());
+        assert!(!TitleStatus::Dropped.is_manual());
+
+        let m_unrel = TitleStatus::selectable_for(MediaKind::Movie, true);
+        assert_eq!(m_unrel[0], TitleStatus::Want);
+        assert!(m_unrel.contains(&TitleStatus::WaitingRelease));
+
+        let tv_unrel = TitleStatus::selectable_for(MediaKind::Tv, true);
+        assert_eq!(tv_unrel[0], TitleStatus::Want);
+        assert!(tv_unrel.contains(&TitleStatus::WaitingRelease));
+
+        let tv_rel = TitleStatus::selectable_for(MediaKind::Tv, false);
+        assert_eq!(tv_rel[0], TitleStatus::Want);
+        assert!(tv_rel.contains(&TitleStatus::WaitingEpisode));
+
+        let future_tv = TitleDetails {
+            summary: TitleSummary {
+                kind: MediaKind::Tv,
+                tmdb_id: 99,
+                title: "Будущий сериал".into(),
+                original_title: None,
+                year: Some(2027),
+                poster_path: None,
+                backdrop_path: None,
+                rating: None,
+                overview: None,
+                user_rating: None,
+                user_status: None,
+                peers: Vec::new(),
+                preloaded: false,
+            },
+            genres: Vec::new(),
+            runtime_min: None,
+            tagline: None,
+            seasons: Vec::new(),
+            imdb_id: None,
+            last_episode: None,
+            series_status: Some("In Production".into()),
+            release_date: Some("2027-01-01".into()),
+            next_episode: None,
+        };
+        assert!(future_tv.is_unreleased("2026-11-24"));
+        let mut released_tv = future_tv;
+        released_tv.last_episode = Some((1, 1));
+        assert!(!released_tv.is_unreleased("2026-11-24"));
     }
 }

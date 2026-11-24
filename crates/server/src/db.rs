@@ -436,8 +436,35 @@ pub async fn title_progress(
     rows.iter().map(progress_from_row).collect()
 }
 
-/// A title not touched for this long is offered to be marked "Брошено".
+/// After 60 days without progress, "Continue watching" marks the card as stale.
 pub const STALE_AFTER: chrono::Duration = chrono::Duration::days(60);
+/// After another 60 days (120 days total without activity), `watching` titles automatically become "Брошено".
+pub const AUTO_DROP_AFTER: chrono::Duration = chrono::Duration::days(120);
+
+/// Moves stale `watching` titles (no activity for 120 days) to `dropped` ("Брошено").
+pub async fn auto_drop_stale_titles(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let days = AUTO_DROP_AFTER.num_days() as i32;
+    let res = sqlx::query(
+        "UPDATE title_state ts
+         SET status = 'dropped', updated_at = now()
+         WHERE ts.status = 'watching'
+           AND GREATEST(
+               ts.updated_at,
+               COALESCE(
+                   (SELECT MAX(wp.updated_at)
+                    FROM watch_progress wp
+                    WHERE wp.user_id = ts.user_id
+                      AND wp.media_kind = ts.media_kind
+                      AND wp.tmdb_id = ts.tmdb_id),
+                   ts.updated_at
+               )
+           ) < now() - make_interval(days => $1)",
+    )
+    .bind(days)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
 
 /// "Continue watching": the latest position per title, newest first.
 /// Finished films drop out; a finished episode points at the next one.

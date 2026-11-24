@@ -462,6 +462,10 @@ async fn title_state(
         tmdb_id,
     )
     .await;
+    st.preloaded_ready_at = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id)
+        .await
+        .ok()
+        .and_then(|v| v.first().map(|p| p.ready_at));
     Ok(Json(st))
 }
 
@@ -475,27 +479,30 @@ async fn put_status(
         return Err(AppError::bad_request("tmdb_id must be positive"));
     }
     let kind = parse_kind(&kind)?;
-    if u.status == Some(TitleStatus::WaitingRelease) {
-        if kind != MediaKind::Movie {
-            return Err(AppError::bad_request("Статус «Жду» доступен только для фильмов"));
-        }
+    let mut effective_status = u.status;
+    if matches!(u.status, Some(TitleStatus::Want | TitleStatus::WaitingRelease)) {
         let msk = FixedOffset::east_opt(3 * 3600).expect("UTC+3");
         let today = Utc::now().with_timezone(&msk).format("%Y-%m-%d").to_string();
         let details = state.catalog.details(kind, tmdb_id).await?;
-        if !details.is_unreleased_movie(&today) {
+        let unreleased = details.is_unreleased(&today);
+        if u.status == Some(TitleStatus::WaitingRelease) && !unreleased {
             return Err(AppError::bad_request(
-                "Статус «Жду» доступен только для невышедших фильмов",
+                "Статус «Жду» доступен только для ещё не вышедших фильмов и сериалов",
             ));
         }
+        // Adding an unreleased title to "Хочу посмотреть" automatically sets "Жду" until release.
+        if u.status == Some(TitleStatus::Want) && unreleased {
+            effective_status = Some(TitleStatus::WaitingRelease);
+        }
     }
-    if u.status == Some(TitleStatus::WaitingEpisode) && kind != MediaKind::Tv {
+    if effective_status == Some(TitleStatus::WaitingEpisode) && kind != MediaKind::Tv {
         return Err(AppError::bad_request(
             "Статус «Жду следующей серии» доступен только для сериалов",
         ));
     }
-    let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, u.status).await?;
+    let mut st = userdata::set_status(&state.pool, user.0, kind, tmdb_id, effective_status).await?;
     // Marking a film "Просмотрено" by hand also marks it watched for "Continue watching".
-    if u.status == Some(TitleStatus::Watched) && kind == MediaKind::Movie {
+    if effective_status == Some(TitleStatus::Watched) && kind == MediaKind::Movie {
         let m = MarkWatched {
             kind,
             tmdb_id,
@@ -516,6 +523,10 @@ async fn put_status(
         tmdb_id,
     )
     .await;
+    st.preloaded_ready_at = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id)
+        .await
+        .ok()
+        .and_then(|v| v.first().map(|p| p.ready_at));
     Ok(Json(st))
 }
 
@@ -673,6 +684,10 @@ async fn put_rating(
         tmdb_id,
     )
     .await;
+    st.preloaded_ready_at = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id)
+        .await
+        .ok()
+        .and_then(|v| v.first().map(|p| p.ready_at));
     Ok(Json(st))
 }
 
@@ -1550,13 +1565,18 @@ async fn catalog_extras(
     Path((kind, tmdb_id)): Path<(String, i64)>,
 ) -> Result<Json<TitleExtras>, AppError> {
     let mut extras = state.catalog.extras(parse_kind(&kind)?, tmdb_id).await?;
+    let col_len = extras.collection.len();
     let rec_len = extras.recommendations.len();
-    let mut all = Vec::with_capacity(rec_len + extras.similar.len());
+    let mut all = Vec::with_capacity(col_len + rec_len + extras.similar.len());
+    all.append(&mut extras.collection);
     all.append(&mut extras.recommendations);
     all.append(&mut extras.similar);
     social::enrich_summaries(&state.pool, &state.config.session_secret, &state.sync, user.0, &mut all).await;
-    extras.similar = all.split_off(rec_len);
-    extras.recommendations = all;
+    let rest = all.split_off(col_len);
+    extras.collection = all;
+    let mut rec = rest;
+    extras.similar = rec.split_off(rec_len);
+    extras.recommendations = rec;
     Ok(Json(extras))
 }
 

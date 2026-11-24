@@ -59,7 +59,7 @@ where
     Ok(sent)
 }
 
-/// Checks "Жду" movies and transitions released ones to "Хочу посмотреть", notifying the user.
+/// Checks "Жду" titles (movies and unreleased series) and transitions released ones to "Хочу посмотреть", notifying the user.
 pub async fn check_released_movies<F, Fut>(state: &AppState, send: F) -> anyhow::Result<usize>
 where
     F: Fn(i64, String, String) -> Fut,
@@ -68,9 +68,9 @@ where
     let msk = FixedOffset::east_opt(3 * 3600).expect("UTC+3");
     let today = Utc::now().with_timezone(&msk).format("%Y-%m-%d").to_string();
     let rows = sqlx::query(
-        "SELECT s.user_id, u.telegram_id, s.tmdb_id
+        "SELECT s.user_id, u.telegram_id, s.media_kind, s.tmdb_id
          FROM title_state s JOIN users u ON u.id = s.user_id
-         WHERE s.media_kind = 'movie' AND s.status = 'waiting_release'",
+         WHERE s.status = 'waiting_release'",
     )
     .fetch_all(&state.pool)
     .await?;
@@ -79,16 +79,24 @@ where
     for r in rows {
         let user_id: i64 = r.try_get("user_id")?;
         let telegram_id: i64 = r.try_get("telegram_id")?;
-        let tmdb_id: i64 = r.try_get("tmdb_id")?;
-        let Ok(d) = state.catalog.details(MediaKind::Movie, tmdb_id).await else {
+        let kind_raw: String = r.try_get("media_kind")?;
+        let Some(kind) = MediaKind::parse(&kind_raw) else {
             continue;
         };
-        if !d.is_unreleased_movie(&today) {
-            userdata::set_status(&state.pool, user_id, MediaKind::Movie, tmdb_id, Some(TitleStatus::Want)).await?;
-            let text = format!("Вышел фильм «{}», который вы ждали.", d.summary.title);
-            let open_url = format!("{}/?open=movie_{tmdb_id}", state.config.public_url);
+        let tmdb_id: i64 = r.try_get("tmdb_id")?;
+        let Ok(d) = state.catalog.details(kind, tmdb_id).await else {
+            continue;
+        };
+        if !d.is_unreleased(&today) {
+            userdata::set_status(&state.pool, user_id, kind, tmdb_id, Some(TitleStatus::Want)).await?;
+            let noun = match kind {
+                MediaKind::Movie => "фильм",
+                MediaKind::Tv => "сериал",
+            };
+            let text = format!("Вышел {noun} «{}», который вы ждали.", d.summary.title);
+            let open_url = format!("{}/?open={}_{tmdb_id}", state.config.public_url, kind.as_str());
             if let Err(e) = send(telegram_id, text, open_url).await {
-                tracing::warn!(error = %e, user = user_id, "movie release message failed");
+                tracing::warn!(error = %e, user = user_id, "release notification failed");
             } else {
                 sent += 1;
             }
@@ -239,6 +247,11 @@ pub fn spawn(state: AppState, every: Duration) {
                 Ok(n) if n > 0 => tracing::info!(removed = n, "old releases forgotten"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "pruning old releases failed"),
+            }
+            match crate::db::auto_drop_stale_titles(&state.pool).await {
+                Ok(n) if n > 0 => tracing::info!(dropped = n, "stale watching titles auto-dropped"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "auto-dropping stale titles failed"),
             }
             since_check += Duration::from_secs(3600);
             if since_check >= every {

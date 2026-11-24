@@ -47,6 +47,7 @@ fn state_from_row(row: &PgRow) -> Result<TitleState, sqlx::Error> {
         updated_at: row.try_get("updated_at")?,
         title: None,
         peers: Vec::new(),
+        preloaded_ready_at: None,
     })
 }
 
@@ -125,6 +126,7 @@ pub async fn get_state(pool: &PgPool, user_id: i64, kind: MediaKind, tmdb_id: i6
             updated_at: Utc::now(),
             title: None,
             peers: Vec::new(),
+            preloaded_ready_at: None,
         },
     };
     if kind == MediaKind::Tv {

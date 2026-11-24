@@ -1538,6 +1538,17 @@ fn Title(
     let mut exit_on_close = use_signal(|| autoplay);
     let mut overlay_pushed = use_signal(|| false);
     let mut notice_pushed = use_signal(|| false);
+    let mut mismatch_prompt = use_signal(|| {
+        None::<(
+            PlayTarget,
+            RewatchMode,
+            ReleaseChoiceUpdate,
+            String,
+            String,
+            ResolveReleaseResponse,
+        )>
+    });
+    let mut mismatch_pushed = use_signal(|| false);
     let t0 = token.clone();
     // Releases for the open picker, loaded from the indexer (or demo data).
     let releases = use_resource(move || {
@@ -1681,7 +1692,18 @@ fn Title(
     let latest = manual_choices.first().or_else(|| peer_choices.first()).cloned();
     let (target, play_label) = play_target(&details, &progress);
     let default_target = target.clone();
-    let release_label = if details.summary.preloaded && picked_now().is_empty() {
+    let manual_after_preload = st.preloaded_ready_at.is_some_and(|rt| {
+        loaded.iter().any(|c| {
+            c.picked_by.is_none()
+                && c.manual
+                && c.chosen_at > rt
+                && (kind == MediaKind::Movie
+                    || (c.release.season == target.season
+                        && (c.release.episode == target.episode || c.release.episode == 0))
+                    || (c.release.season == 0 && c.release.episode == 0))
+        })
+    });
+    let release_label = if details.summary.preloaded && picked_now().is_empty() && !manual_after_preload {
         Some("На сервере · готово".to_owned())
     } else {
         display_choice_for(target.season, target.episode).map(|c| choice_label(&c))
@@ -1763,6 +1785,13 @@ fn Title(
             telegram::pop_history();
         }
     });
+    let close_mismatch = Callback::new(move |_: ()| {
+        mismatch_prompt.set(None);
+        if *mismatch_pushed.peek() {
+            mismatch_pushed.set(false);
+            telegram::pop_history();
+        }
+    });
     let open_picker_scope = Callback::new(move |(t, ep_scoped)| open_picker_with_scope(t, ep_scoped));
     let start_playback = Callback::new(
         move |(t, c, mode, explicit_rel): (PlayTarget, ReleaseChoiceUpdate, RewatchMode, bool)| {
@@ -1794,6 +1823,18 @@ fn Title(
                 match res {
                     Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
                         start_playback.call((t, choice, mode, false));
+                    }
+                    Ok(ResolveReleaseResponse::PreloadQualityMismatch {
+                        preloaded,
+                        preloaded_quality,
+                        target_quality,
+                        fallback,
+                    }) => {
+                        if !auto() && !*mismatch_pushed.peek() {
+                            mismatch_pushed.set(true);
+                            telegram::push_history(None);
+                        }
+                        mismatch_prompt.set(Some((t, mode, preloaded, preloaded_quality, target_quality, *fallback)));
                     }
                     Ok(ResolveReleaseResponse::NeedsPicker { releases, .. }) => {
                         let sk = if kind == MediaKind::Tv { t.season } else { 0 };
@@ -1836,7 +1877,7 @@ fn Title(
     let main_target = target.clone();
     rsx! {
         // Inside Telegram: the native big button plays, the native Back closes what is open.
-        if !auto() && playing().is_none() && picker().is_none() && notice().is_none() {
+        if !auto() && playing().is_none() && picker().is_none() && notice().is_none() && mismatch_prompt().is_none() {
             native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
         }
         if picker().is_some() {
@@ -1890,7 +1931,9 @@ fn Title(
                     status_now.set(Some(s));
                     let t = token.clone();
                     spawn(async move {
-                        if api::set_status(&t, kind, id, s).await.is_ok() {
+                        if let Ok(saved) = api::set_status(&t, kind, id, s).await {
+                            // Reflect automatic server adjustments (e.g. "Want" -> "WaitingRelease" on unreleased titles).
+                            status_now.set(Some(saved.status));
                             // A film marked "Просмотрено" also changes its progress.
                             data.restart();
                             status_now.set(None);
@@ -2116,6 +2159,66 @@ fn Title(
                 div { class: "sheet", onclick: move |e| e.stop_propagation(),
                     p { "{text}" }
                     button { class: "btn ghost", onclick: move |_| close_notice.call(()), "Хорошо" }
+                }
+            }
+        }
+        if let Some((t_m, mode_m, preloaded_m, pre_q, tgt_q, fallback_m)) = mismatch_prompt() {
+            div { class: "sheet-bg", onclick: move |_| close_mismatch.call(()),
+                div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                    div { class: "sheet-head",
+                        h3 { "Есть скачанный файл ({pre_q})" }
+                        button {
+                            class: "sheet-close",
+                            title: "Закрыть",
+                            "aria-label": "Закрыть",
+                            onclick: move |_| close_mismatch.call(()),
+                            Icon { svg: icons::CLOSE, class: "ic sm" }
+                        }
+                    }
+                    p { class: "muted",
+                        "На сервере уже скачана раздача в качестве {pre_q}, а для этого устройства настроено {tgt_q}. Запустить скачанную без ожидания?"
+                    }
+                    div { style: "display:flex; gap:10px; flex-wrap:wrap; margin-top:14px;",
+                        button {
+                            class: "btn primary",
+                            onclick: {
+                                let t_m = t_m.clone();
+                                let preloaded_m = preloaded_m.clone();
+                                move |_| {
+                                    close_mismatch.call(());
+                                    start_playback.call((t_m.clone(), preloaded_m.clone(), mode_m, false));
+                                }
+                            },
+                            "Смотреть скачанную ({pre_q})"
+                        }
+                        button {
+                            class: "btn ghost",
+                            onclick: {
+                                let t_m = t_m.clone();
+                                let fallback_m = fallback_m.clone();
+                                move |_| {
+                                    close_mismatch.call(());
+                                    match fallback_m.clone() {
+                                        ResolveReleaseResponse::Ready { choice, .. } => {
+                                            start_playback.call((t_m.clone(), choice, mode_m, false));
+                                        }
+                                        ResolveReleaseResponse::NeedsPicker { releases, .. } => {
+                                            let sk = if kind == MediaKind::Tv { t_m.season } else { 0 };
+                                            picker_preloaded.set(Some((sk, releases)));
+                                            open_picker_scope.call((t_m.clone(), false));
+                                        }
+                                        ResolveReleaseResponse::PreloadQualityMismatch { preloaded, .. } => {
+                                            start_playback.call((t_m.clone(), preloaded, mode_m, false));
+                                        }
+                                    }
+                                }
+                            },
+                            match &fallback_m {
+                                ResolveReleaseResponse::Ready { .. } => format!("Смотреть {tgt_q} онлайн"),
+                                _ => "Выбрать другую раздачу".to_owned(),
+                            }
+                        }
+                    }
                 }
             }
         }

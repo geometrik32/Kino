@@ -171,6 +171,12 @@ pub enum ResolveReleaseResponse {
         target_quality: String,
         releases: ReleaseList,
     },
+    PreloadQualityMismatch {
+        preloaded: ReleaseChoiceUpdate,
+        preloaded_quality: String,
+        target_quality: String,
+        fallback: Box<ResolveReleaseResponse>,
+    },
 }
 
 /// Sample releases, used when no indexer is configured and for screenshots.

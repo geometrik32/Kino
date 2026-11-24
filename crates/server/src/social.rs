@@ -499,7 +499,10 @@ pub async fn calendar_entries(
                 (st.kind, status),
                 (
                     MediaKind::Tv,
-                    TitleStatus::Watching | TitleStatus::WaitingEpisode | TitleStatus::Want
+                    TitleStatus::Watching
+                        | TitleStatus::WaitingEpisode
+                        | TitleStatus::WaitingRelease
+                        | TitleStatus::Want
                 ) | (MediaKind::Movie, TitleStatus::WaitingRelease | TitleStatus::Want)
             );
             keep.then_some((st.kind, st.tmdb_id, status))
@@ -532,6 +535,22 @@ pub async fn calendar_entries(
                                 season: Some(next.season),
                                 episode: Some(next.episode),
                                 episode_name: next.name.clone(),
+                                title: Some(d.summary),
+                                status,
+                            });
+                        }
+                    }
+                } else if status == TitleStatus::WaitingRelease || status == TitleStatus::Want {
+                    if let Some(date) = &d.release_date {
+                        if date.as_str() >= today_ymd {
+                            summaries.push(d.summary.clone());
+                            entries.push(CalendarEntry {
+                                date: date.clone(),
+                                kind,
+                                tmdb_id: id,
+                                season: None,
+                                episode: None,
+                                episode_name: None,
                                 title: Some(d.summary),
                                 status,
                             });

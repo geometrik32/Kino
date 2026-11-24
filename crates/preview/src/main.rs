@@ -366,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
             updated_at: Utc::now(),
             title: title_of(k, id).await,
             peers: Vec::new(),
+            preloaded_ready_at: None,
         });
     }
     let hist = |k, id, s, e, from: f64, to: f64, ago_h: i64, dev: &str| HistoryEntry {

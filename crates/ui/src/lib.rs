@@ -1158,8 +1158,8 @@ pub fn TitleView(
         .iter()
         .max_by_key(|p| p.updated_at)
         .map(|p| (p.season, p.episode));
-    let is_unreleased_movie = !today_ymd.is_empty() && details.is_unreleased_movie(&today_ymd);
-    let selectable_statuses = TitleStatus::selectable_for(s.kind, is_unreleased_movie);
+    let is_unreleased = !today_ymd.is_empty() && details.is_unreleased(&today_ymd);
+    let selectable_statuses = TitleStatus::selectable_for(s.kind, is_unreleased);
     let fav5 = rewatch_targets(&episode_ratings, RewatchMode::Only5);
     let fav4 = rewatch_targets(&episode_ratings, RewatchMode::FourPlus);
     let has_rewatch_modes = s.kind == MediaKind::Tv && !fav4.is_empty() && on_play_rewatch.is_some();
@@ -1186,7 +1186,7 @@ pub fn TitleView(
         }
         _ => {}
     }
-    if is_unreleased_movie {
+    if is_unreleased {
         if let Some(d) = details.release_date.as_deref().filter(|d| !d.is_empty()) {
             meta.push(format!("Премьера {}", ru_date(d)));
         }
@@ -1623,6 +1623,14 @@ pub fn TitleExtrasView(
                 }
             }
         }
+        if !extras.collection.is_empty() {
+            PosterRow {
+                title: "Франшиза",
+                subtitle: extras.collection_name,
+                items: extras.collection,
+                on_open,
+            }
+        }
         if !extras.recommendations.is_empty() {
             PosterRow { title: "Рекомендации", items: extras.recommendations, on_open }
         }
@@ -1844,18 +1852,7 @@ fn status_dot_class(st: Option<TitleStatus>) -> &'static str {
     }
 }
 
-fn status_auto_hint(st: TitleStatus) -> &'static str {
-    match st {
-        TitleStatus::Watching => "авто",
-        TitleStatus::WaitingEpisode => "авто",
-        TitleStatus::Want => "вручную",
-        TitleStatus::WaitingRelease => "до выхода",
-        TitleStatus::Watched => "≥ 90%",
-        TitleStatus::Dropped => "авто",
-    }
-}
-
-/// Compact mutually-exclusive status dropdown with automatic-status hints.
+/// Compact mutually-exclusive status dropdown grouped into manual and automatic choices.
 #[component]
 pub fn StatusDropdown(
     status: Option<TitleStatus>,
@@ -1864,15 +1861,13 @@ pub fn StatusDropdown(
 ) -> Element {
     let mut open = use_signal(|| false);
     let label = status.map_or("Статус просмотра", TitleStatus::label);
-    let show_auto = matches!(
-        status,
-        Some(TitleStatus::Watching | TitleStatus::WaitingEpisode | TitleStatus::Watched | TitleStatus::Dropped)
-    );
     let options: &[TitleStatus] = if selectable.is_empty() {
         &TitleStatus::ALL
     } else {
         &selectable
     };
+    let (manual, automatic): (Vec<TitleStatus>, Vec<TitleStatus>) =
+        options.iter().copied().partition(|st| st.is_manual());
     rsx! {
         div { class: "status-dd-wrap",
             if open() {
@@ -1885,15 +1880,12 @@ pub fn StatusDropdown(
                 span { class: "status-dd-left",
                     span { class: "{status_dot_class(status)}" }
                     span { "{label}" }
-                    if show_auto {
-                        span { class: "st-auto", "авто" }
-                    }
                 }
                 Icon { svg: icons::CHEV_D, class: "ic sm muted" }
             }
             if open() {
                 div { class: "status-menu",
-                    for st in options.iter().copied() {
+                    for st in manual.iter().copied() {
                         button {
                             class: if status == Some(st) { "st-item on" } else { "st-item" },
                             onclick: move |_| {
@@ -1904,7 +1896,22 @@ pub fn StatusDropdown(
                                 span { class: "{status_dot_class(Some(st))}" }
                                 span { "{st.label()}" }
                             }
-                            span { class: "st-auto", "{status_auto_hint(st)}" }
+                        }
+                    }
+                    if !manual.is_empty() && !automatic.is_empty() {
+                        div { class: "st-div" }
+                    }
+                    for st in automatic.iter().copied() {
+                        button {
+                            class: if status == Some(st) { "st-item on" } else { "st-item" },
+                            onclick: move |_| {
+                                open.set(false);
+                                on_status.call(Some(st));
+                            },
+                            span { class: "st-item-l",
+                                span { class: "{status_dot_class(Some(st))}" }
+                                span { "{st.label()}" }
+                            }
                         }
                     }
                     if status.is_some() {
