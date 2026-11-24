@@ -1451,10 +1451,8 @@ pub fn Player(
                                                 {
                                                     show_controls();
                                                 }
-                                                if hold {
-                                                    if paused_since_ms().is_none() {
-                                                        paused_since_ms.set(Some(now_ms));
-                                                    }
+                                                if hold && paused_since_ms().is_none() {
+                                                    paused_since_ms.set(Some(now_ms));
                                                 }
 
                                                 if let Some(v) = video() {

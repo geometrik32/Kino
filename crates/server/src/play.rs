@@ -1267,8 +1267,7 @@ async fn stream(
     Ok(media
         .pause_cache
         .serve_stream(ts, c.uid, &c.h, c.i, req.method(), req.headers())
-        .await
-        .unwrap_or_else(|r| r))
+        .await)
 }
 
 /// Where the file is: on disk for a preload, else pause-cache loopback or TorrServer's stream.

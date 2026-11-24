@@ -1091,7 +1091,7 @@ impl PauseCache {
         file_index: i32,
         method: &Method,
         headers: &HeaderMap,
-    ) -> Result<Response, Response> {
+    ) -> Response {
         let key = CacheKey::new(user_id, hash, file_index);
         let upstream_url = ts.stream_url(&key.infohash, file_index);
 
@@ -1115,7 +1115,7 @@ impl PauseCache {
                 resp = resp
                     .header(header::ACCEPT_RANGES, "bytes")
                     .header(header::CONTENT_LENGTH, meta.file.length.to_string());
-                return Ok(resp.body(Body::empty()).map_err(|_| bad_gateway())?);
+                return resp.body(Body::empty()).unwrap_or_else(|_| bad_gateway());
             }
         }
 
@@ -1128,11 +1128,11 @@ impl PauseCache {
                 let (has_range, start, end) = match parse_range(range_hdr, meta.file.length) {
                     Ok(v) => v,
                     Err(()) => {
-                        return Ok((
+                        return (
                             StatusCode::RANGE_NOT_SATISFIABLE,
                             [(header::CONTENT_RANGE, format!("bytes */{}", meta.file.length))],
                         )
-                            .into_response());
+                            .into_response();
                     }
                 };
                 if let Some(slice) = meta
@@ -1250,7 +1250,9 @@ impl PauseCache {
                                 let body_stream = futures_util::stream::unfold(rx, |mut rx| async move {
                                     rx.recv().await.map(|item| (item, rx))
                                 });
-                                return resp.body(Body::from_stream(body_stream)).map_err(|_| bad_gateway());
+                                return resp
+                                    .body(Body::from_stream(body_stream))
+                                    .unwrap_or_else(|_| bad_gateway());
                             }
                         }
                     }
@@ -1270,10 +1272,10 @@ impl PauseCache {
         if let Some(range) = headers.get(header::RANGE) {
             r = r.header(header::RANGE, range.as_bytes());
         }
-        let upstream = tokio::time::timeout(STREAM_TIMEOUT, r.send())
-            .await
-            .map_err(|_| bad_gateway())?
-            .map_err(|_| bad_gateway())?;
+        let upstream = match tokio::time::timeout(STREAM_TIMEOUT, r.send()).await {
+            Ok(Ok(u)) => u,
+            _ => return bad_gateway(),
+        };
         let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         let mut resp = Response::builder().status(status);
         for name in [
@@ -1291,7 +1293,7 @@ impl PauseCache {
         if !is_get {
             return resp
                 .body(Body::from_stream(upstream.bytes_stream()))
-                .map_err(|_| bad_gateway());
+                .unwrap_or_else(|_| bad_gateway());
         }
         let start_offset = upstream
             .headers()
@@ -1336,7 +1338,8 @@ impl PauseCache {
         });
         let body_stream =
             futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
-        resp.body(Body::from_stream(body_stream)).map_err(|_| bad_gateway())
+        resp.body(Body::from_stream(body_stream))
+            .unwrap_or_else(|_| bad_gateway())
     }
 }
 
@@ -1372,13 +1375,9 @@ async fn internal_stream(
     if secret != st.cache.inner.secret {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match st
-        .cache
+    st.cache
         .serve_stream(&st.ts, uid, &hash, index, req.method(), req.headers())
         .await
-    {
-        Ok(r) | Err(r) => r,
-    }
 }
 
 async fn probe_stream(
@@ -1819,7 +1818,7 @@ mod tests {
         // Open-ended range starting at 25: 25..50 from SSD + 50..100 from TorrServer!
         let mut hdrs = HeaderMap::new();
         hdrs.insert(header::RANGE, HeaderValue::from_static("bytes=25-"));
-        let resp = cache.serve_stream(&ts, 1, &hash, 1, &Method::GET, &hdrs).await.unwrap();
+        let resp = cache.serve_stream(&ts, 1, &hash, 1, &Method::GET, &hdrs).await;
         assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
         let body = resp.into_body().collect().await.unwrap().to_bytes().to_vec();
         assert_eq!(body, full_data[25..100]);
