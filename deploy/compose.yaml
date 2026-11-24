@@ -35,12 +35,12 @@ services:
       JACKETT_WAKE_URL: http://sablier:10000
       JACKETT_WAKE_GROUP: jackett
       JACKETT_WAKE_DURATION: 10m
-      MAX_TRANSCODES: "${MAX_TRANSCODES:-2}"
+      MAX_TRANSCODES: "${MAX_TRANSCODES:-4}"
     depends_on:
       kino-db:
         condition: service_healthy
-    # Compact cache + up to 2 concurrent transcodes fit comfortably in 640m.
-    mem_limit: 640m
+    # Compact cache + up to 4 concurrent transcodes (3 active users + headroom) fit in 1280m.
+    mem_limit: 1280m
     devices:
       - /dev/dri:/dev/dri
     group_add:
@@ -91,14 +91,14 @@ services:
       TS_DONTKILL: "1"
       TS_CONF_PATH: /opt/ts/config
       TS_TORR_DIR: /opt/ts/torrents
-      GOMEMLIMIT: "576MiB"
+      GOMEMLIMIT: "960MiB"
     volumes:
       - ./data/torrserver:/opt/ts
     ports:
       # BitTorrent peers.
       - "32000:32000"
       - "32000:32000/udp"
-    mem_limit: 768m
+    mem_limit: 1280m
     networks: [kino]
 
   # Wakes Jackett on demand when someone browses for a new title, and stops it after 10m idle.

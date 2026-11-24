@@ -7,7 +7,7 @@
     "RemoveCacheOnDrop": false,
     "ForceEncrypt": false,
     "RetrackersMode": 1,
-    "TorrentDisconnectTimeout": 30,
+    "TorrentDisconnectTimeout": 90,
     "EnableDebug": false,
     "EnableDLNA": false,
     "EnableRutorSearch": false,

@@ -103,7 +103,7 @@ impl TorrentConfig {
             hwaccel: opt("TRANSCODE_HWACCEL").unwrap_or_else(|| "none".into()),
             max_transcodes: opt("MAX_TRANSCODES")
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(2)
+                .unwrap_or(4)
                 .clamp(1, 8),
         }
     }

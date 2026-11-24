@@ -58,7 +58,7 @@ pub struct Media {
 }
 
 /// Default maximum videos re-encoded concurrently (configurable via `MAX_TRANSCODES`).
-const DEFAULT_MAX_TRANSCODES: usize = 2;
+const DEFAULT_MAX_TRANSCODES: usize = 4;
 /// How many subtitle extractions run concurrently.
 const MAX_SUBTITLES: usize = 2;
 /// Drops a paused/stalled transcode if the client stops reading for this long.

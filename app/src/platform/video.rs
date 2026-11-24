@@ -48,6 +48,18 @@ mod imp {
         pub fn ready_state(&self) -> u16 {
             self.0.ready_state()
         }
+        pub fn buffered_ahead(&self) -> Option<f64> {
+            let cur = self.0.current_time();
+            let ranges = self.0.buffered();
+            for i in 0..ranges.length() {
+                let Ok(start) = ranges.start(i) else { continue };
+                let Ok(end) = ranges.end(i) else { continue };
+                if start <= cur + 0.5 && end >= cur {
+                    return Some((end - cur).max(0.0));
+                }
+            }
+            Some(0.0)
+        }
         pub fn set_current_time(&self, t: f64) {
             self.0.set_current_time(t);
         }
@@ -148,6 +160,7 @@ mod imp {
         duration: f64,
         paused: bool,
         ready_state: u16,
+        buffered_ahead: f64,
     }
 
     static SNAPSHOT: Mutex<Snapshot> = Mutex::new(Snapshot {
@@ -155,6 +168,7 @@ mod imp {
         duration: f64::NAN,
         paused: true,
         ready_state: 0,
+        buffered_ahead: f64::NAN,
     });
 
     static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -228,6 +242,7 @@ mod imp {
             duration: f64::NAN,
             paused: !autoplay,
             ready_state: 0,
+            buffered_ahead: f64::NAN,
         };
         NATIVE_SCALE_MODE.store(if scale_mode == 2 { 2 } else { 1 }, Ordering::Relaxed);
         let seq = super::super::android::native_open(url, start, rate as f32, audio, subtitle, autoplay, scale_mode);
@@ -321,6 +336,14 @@ mod imp {
         }
         pub fn ready_state(&self) -> u16 {
             snapshot().ready_state
+        }
+        pub fn buffered_ahead(&self) -> Option<f64> {
+            #[cfg(target_os = "android")]
+            if is_native_active() {
+                return None;
+            }
+            let buf = snapshot().buffered_ahead;
+            buf.is_finite().then_some(buf.max(0.0))
         }
         pub fn set_current_time(&self, t: f64) {
             if !t.is_finite() {
@@ -447,16 +470,31 @@ mod imp {
                     "if (window.__kinoVideoBridgeTimer) {{ clearInterval(window.__kinoVideoBridgeTimer); }} \
                      window.__kinoVideoBridgeTimer = setInterval(function () {{ \
                        var v = document.getElementById('{VIDEO_ID}'); \
-                       if (v && typeof v.play === 'function') dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState]); \
+                       if (v && typeof v.play === 'function') {{ \
+                         var buf = -1; \
+                         if (v.buffered && v.buffered.length) {{ \
+                           var t = v.currentTime || 0; \
+                           for (var i = 0; i < v.buffered.length; i++) {{ \
+                             if (v.buffered.start(i) <= t + 0.5 && v.buffered.end(i) >= t) {{ \
+                               buf = v.buffered.end(i) - t; \
+                               break; \
+                             }} \
+                           }} \
+                         }} \
+                         dioxus.send([v.currentTime, isFinite(v.duration) ? v.duration : -1, v.paused, v.readyState, buf]); \
+                       }} \
                      }}, 250);"
                 ));
-                while let Ok((time, duration, paused, ready_state)) = bridge.recv::<(f64, f64, bool, u16)>().await {
+                while let Ok((time, duration, paused, ready_state, buffered_ahead)) =
+                    bridge.recv::<(f64, f64, bool, u16, f64)>().await
+                {
                     if !is_native_active() {
                         *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
                             time,
                             duration: if duration < 0.0 { f64::NAN } else { duration },
                             paused,
                             ready_state,
+                            buffered_ahead: if buffered_ahead < 0.0 { f64::NAN } else { buffered_ahead },
                         };
                     }
                 }

@@ -9,7 +9,7 @@ use kino_core::{
     StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState,
     TracksUpdate,
 };
-use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale};
+use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale, NEXT_PROMPT_SEC};
 
 use crate::{
     api, native, platform,
@@ -59,6 +59,112 @@ fn next_target_episode(
         .collect();
     matching.sort_unstable();
     matching.into_iter().next()
+}
+
+/// How long a background-prepared stream for the next episode stays warm in TorrServer.
+const PREFETCH_TORR_TTL_MS: i64 = 75_000;
+/// Refresh background-prepared live streams if older than this when reaching the prompt window again.
+const PREFETCH_REFRESH_MS: i64 = 60_000;
+/// Wait until the current HTML `<video>` has at least this many seconds buffered ahead (unless near the very end).
+const PREFETCH_MIN_BUFFER_SEC: f64 = 5.0;
+const PREFETCH_FORCE_REMAINING_SEC: f64 = 20.0;
+
+#[derive(Debug, Clone, PartialEq)]
+enum NextPrefetchStatus {
+    InFlight,
+    Ready { info: PlayInfo, prepared_at_ms: i64 },
+    NeedsPicker,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct NextPrefetch {
+    gen: u32,
+    from_season: i32,
+    from_episode: i32,
+    from_infohash: String,
+    next_season: i32,
+    next_episode: i32,
+    resolved_choice: Option<ReleaseChoiceUpdate>,
+    status: NextPrefetchStatus,
+}
+
+impl NextPrefetch {
+    fn matches_source(&self, season: i32, episode: i32, infohash: &str, ns: i32, ne: i32) -> bool {
+        self.from_season == season
+            && self.from_episode == episode
+            && self.from_infohash.eq_ignore_ascii_case(infohash)
+            && self.next_season == ns
+            && self.next_episode == ne
+    }
+
+    fn matches_play(&self, season: i32, episode: i32, infohash: &str) -> bool {
+        self.next_season == season
+            && self.next_episode == episode
+            && self
+                .resolved_choice
+                .as_ref()
+                .is_some_and(|c| c.infohash.eq_ignore_ascii_case(infohash))
+    }
+}
+
+fn resolve_response_to_choice(res: ResolveReleaseResponse) -> Option<ReleaseChoiceUpdate> {
+    match res {
+        ResolveReleaseResponse::Ready { choice, .. } => Some(choice),
+        ResolveReleaseResponse::PreloadQualityMismatch {
+            preloaded, fallback, ..
+        } => match *fallback {
+            ResolveReleaseResponse::Ready { choice, .. } => Some(choice),
+            _ => Some(preloaded),
+        },
+        ResolveReleaseResponse::NeedsPicker { .. } => None,
+    }
+}
+
+fn upsert_choice(choices: &mut Vec<ReleaseChoiceUpdate>, choice: ReleaseChoiceUpdate) {
+    choices
+        .retain(|c| !(c.season == choice.season && c.episode == choice.episode && c.quality_key == choice.quality_key));
+    choices.insert(0, choice);
+}
+
+fn prefetch_is_fresh(info: &PlayInfo, prepared_at_ms: i64, now_ms: i64, ttl_ms: i64) -> bool {
+    info.preloaded || now_ms.saturating_sub(prepared_at_ms) <= ttl_ms
+}
+
+fn can_prefetch_next(pos: f64, dur: f64, buffered_ahead: Option<f64>) -> bool {
+    if !pos.is_finite() || !dur.is_finite() || dur <= 20.0 || pos < 5.0 {
+        return false;
+    }
+    let remaining = dur - pos;
+    if remaining >= NEXT_PROMPT_SEC {
+        return false;
+    }
+    match buffered_ahead {
+        Some(buf) if remaining > PREFETCH_FORCE_REMAINING_SEC => {
+            buf >= PREFETCH_MIN_BUFFER_SEC || pos + buf >= dur - 2.0
+        }
+        _ => true,
+    }
+}
+
+fn needs_prefetch_refresh(
+    existing: Option<&NextPrefetch>,
+    season: i32,
+    ep: i32,
+    infohash: &str,
+    ns: i32,
+    ne: i32,
+    now_ms: i64,
+) -> bool {
+    let Some(p) = existing.filter(|p| p.matches_source(season, ep, infohash, ns, ne)) else {
+        return true;
+    };
+    match &p.status {
+        NextPrefetchStatus::InFlight | NextPrefetchStatus::NeedsPicker | NextPrefetchStatus::Failed => false,
+        NextPrefetchStatus::Ready { info, prepared_at_ms } => {
+            !prefetch_is_fresh(info, *prepared_at_ms, now_ms, PREFETCH_REFRESH_MS)
+        }
+    }
 }
 
 fn best_per_quality(
@@ -367,6 +473,14 @@ pub fn Player(
     let mut last_prog_pause_ms = use_signal(|| 0_i64);
     let mut last_sound_cmd_ms = use_signal(|| 0_i64);
     let mut last_sync_unmute_ms = use_signal(|| 0_i64);
+    let mut prefetch_gen = use_signal(|| 0u32);
+    let mut next_prefetch = use_signal(|| None::<NextPrefetch>);
+    let mut invalidate_prefetch = move || {
+        prefetch_gen.set(prefetch_gen() + 1);
+        if next_prefetch.peek().is_some() {
+            next_prefetch.set(None);
+        }
+    };
     let mut paused_since_ms = use_signal(|| None::<i64>);
     let mut last_advance = use_signal(|| (0.0_f64, 0_i64));
     let mut auto_reloads = use_signal(|| 0_u32);
@@ -605,12 +719,17 @@ pub fn Player(
             }
             return;
         }
-        let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+        let (cur_s, cur_e) = *target.peek();
+        let scoped_sync = sync_state
+            .peek()
+            .as_ref()
+            .filter(|st| kind != MediaKind::Tv || (st.season == cur_s && st.episode == cur_e))
+            .cloned();
+        let waiting_peer = scoped_sync.as_ref().is_some_and(|st| st.waiting);
         let hold = if force_reload {
             *desired_paused.peek() || waiting_peer
         } else {
-            sync_state
-                .peek()
+            scoped_sync
                 .as_ref()
                 .map_or(*desired_paused.peek(), |st| st.paused || st.waiting)
         };
@@ -717,7 +836,12 @@ pub fn Player(
         awaiting_ready.set(false);
         stall_secs.set(0);
         waiting_gen.set(waiting_gen() + 1);
-        let st_opt = sync_state.peek().clone();
+        let (cur_s, cur_e) = *target.peek();
+        let st_opt = sync_state
+            .peek()
+            .as_ref()
+            .filter(|st| kind != MediaKind::Tv || (st.season == cur_s && st.episode == cur_e))
+            .cloned();
         let paused_by_user = st_opt.as_ref().map_or(*desired_paused.peek(), |st| st.paused);
         let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
         let hold = paused_by_user || waiting_peer;
@@ -764,15 +888,236 @@ pub fn Player(
         });
     };
 
-    // Fetches `/api/play` for `(season, episode, rel)` and loads the resulting stream.
-    let start_play_fetch = {
-        let token = token.clone();
+    // Applies a resolved `PlayInfo` (fresh or background-prefetched) to the player.
+    let apply_play_result = {
         let save = save.clone();
         let ep_ratings_ctx = start.episode_ratings.clone();
+        move |season: i32, episode: i32, my_gen: u32, t: String, res: Result<PlayInfo, api::Failure>| {
+            let mut save_after_probe = save.clone();
+            let ep_ratings_fetch = ep_ratings_ctx.clone();
+            connecting.set(false);
+            match res {
+                Ok(i) => {
+                    let synced_audio = sync_audio_index(&sync_state.peek(), &i.audio, i.audio_track);
+                    let should_probe = i.duration.is_none();
+                    let probe_stream = i.stream.clone();
+                    let probe_native = i.native;
+                    let computed_next = next_target_episode(season, episode, i.next, rewatch_mode, &ep_ratings_fetch);
+                    ui.with_mut(|s| {
+                        s.duration = i.duration;
+                        s.audio = i.audio.clone();
+                        s.subtitle_tracks = i.subtitles.clone();
+                        s.audio_track = synced_audio;
+                        s.subtitle_track = if i.preloaded || i.native {
+                            i.subtitle_track
+                        } else {
+                            None
+                        };
+                        s.next = computed_next.map(|(s, e)| episode_code(s, e));
+                        s.preloaded = i.preloaded;
+                    });
+                    let at = override_seek
+                        .with_mut(|o| o.take())
+                        .or_else(|| {
+                            sync_state
+                                .peek()
+                                .as_ref()
+                                .filter(|st| kind != MediaKind::Tv || (st.season == season && st.episode == episode))
+                                .map(|st| clock.peek().expected_position(st, platform::now_ms()))
+                        })
+                        .unwrap_or_else(|| f64::from(i.start_at));
+                    last_saved.set(at);
+                    info.set(Some(i));
+                    load_source(at);
+
+                    if should_probe {
+                        let probe_token = t;
+                        spawn(async move {
+                            for delay in [5_000_u32, 8_000, 12_000, 15_000, 20_000, 30_000] {
+                                platform::sleep(delay).await;
+                                if play_gen() != my_gen || closing() || ui.peek().duration.is_some() {
+                                    break;
+                                }
+                                let probe_req = PlayProbeRequest {
+                                    kind,
+                                    tmdb_id: id,
+                                    stream: probe_stream.clone(),
+                                    native: probe_native,
+                                };
+                                let Ok(p) = api::play_probe(&probe_token, &probe_req).await else {
+                                    continue;
+                                };
+                                if play_gen() != my_gen || closing() {
+                                    break;
+                                }
+                                if p.duration.is_none() && p.audio.is_empty() && p.subtitles.is_empty() {
+                                    continue;
+                                }
+                                // Playback already started with track 0 (or default when direct),
+                                // so display the active track in the menu without jarring mid-stream reloads.
+                                let fallback_audio = if ui.peek().transcoded {
+                                    p.audio
+                                        .iter()
+                                        .find(|a| a.index == 0)
+                                        .or(p.audio.first())
+                                        .map(|a| a.index)
+                                } else {
+                                    p.audio.iter().find(|a| a.default).or(p.audio.first()).map(|a| a.index)
+                                };
+                                let synced_audio = sync_audio_index(&sync_state.peek(), &p.audio, fallback_audio);
+                                info.with_mut(|cur| {
+                                    if let Some(cur) = cur.as_mut() {
+                                        if cur.duration.is_none() {
+                                            cur.duration = p.duration;
+                                        }
+                                        cur.direct = p.direct;
+                                        if let Some(s) = p.stream.clone() {
+                                            cur.stream = s;
+                                        }
+                                        if cur.audio.is_empty() && !p.audio.is_empty() {
+                                            cur.audio = p.audio.clone();
+                                        }
+                                        if cur.subtitles.is_empty() && !p.subtitles.is_empty() {
+                                            cur.subtitles = p.subtitles.clone();
+                                        }
+                                    }
+                                });
+                                ui.with_mut(|s| {
+                                    if s.duration.is_none() {
+                                        s.duration = p.duration;
+                                    }
+                                    if s.audio.is_empty() && !p.audio.is_empty() {
+                                        s.audio = p.audio.clone();
+                                        if s.audio_track.is_none() {
+                                            s.audio_track = synced_audio;
+                                        }
+                                    }
+                                    if s.subtitle_tracks.is_empty() && !p.subtitles.is_empty() {
+                                        s.subtitle_tracks = p.subtitles.clone();
+                                        if (probe_native || s.preloaded) && s.subtitle_track.is_none() {
+                                            s.subtitle_track = p.subtitle_track;
+                                        }
+                                    }
+                                });
+                                if ui.peek().duration.is_some() {
+                                    let s = ui.peek().clone();
+                                    if sync_connected() && played() && !awaiting_ready() {
+                                        sync::send(&SyncClientMsg::Report {
+                                            position_sec: s.position,
+                                            duration_sec: s.duration,
+                                            paused: desired_paused(),
+                                            rate: rate(),
+                                        });
+                                    }
+                                    if s.position >= 1.0 {
+                                        save_after_probe(false);
+                                    }
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(e) => {
+                    // Do not keep another peer blocked if this device failed to load the stream.
+                    sync::send(&SyncClientMsg::Ready {
+                        position_sec: 0.0,
+                        duration_sec: None,
+                        file_index: None,
+                    });
+                    let next_avail = if e.code == "no_file" && !e.available_episodes.is_empty() {
+                        e.available_episodes
+                            .iter()
+                            .copied()
+                            .find(|&(s, ep)| s == season && ep > episode)
+                            .or_else(|| {
+                                e.available_episodes
+                                    .iter()
+                                    .copied()
+                                    .find(|&(s, ep)| (s, ep) > (season, episode))
+                            })
+                    } else {
+                        None
+                    };
+                    ui.with_mut(|s| {
+                        s.status = None;
+                        s.progress = None;
+                        s.next_available = next_avail;
+                        s.error = Some(e.message);
+                    });
+                }
+            }
+        }
+    };
+
+    // Fetches `/api/play` for `(season, episode, rel)` (or uses a warm background prefetch) and loads the stream.
+    let start_play_fetch = {
+        let token = token.clone();
+        let mut apply_play_result = apply_play_result.clone();
         move |season: i32, episode: i32, rel: ReleaseChoiceUpdate, initial_pos: f64, my_gen: u32| {
             let t = token.clone();
-            let save_for_probe = save.clone();
-            let ep_ratings_fetch = ep_ratings_ctx.clone();
+            let now_ms = platform::now_ms();
+            enum PrefetchHit {
+                Ready(PlayInfo),
+                InFlight(u32),
+                Miss,
+            }
+            let hit = match next_prefetch
+                .peek()
+                .as_ref()
+                .filter(|p| p.matches_play(season, episode, &rel.infohash))
+            {
+                Some(p) => match &p.status {
+                    NextPrefetchStatus::Ready { info, prepared_at_ms }
+                        if prefetch_is_fresh(info, *prepared_at_ms, now_ms, PREFETCH_TORR_TTL_MS) =>
+                    {
+                        PrefetchHit::Ready(info.clone())
+                    }
+                    NextPrefetchStatus::InFlight => PrefetchHit::InFlight(p.gen),
+                    _ => PrefetchHit::Miss,
+                },
+                None => PrefetchHit::Miss,
+            };
+
+            if let PrefetchHit::Ready(prefetched) = hit {
+                invalidate_prefetch();
+                stall_secs.set(0);
+                auto_reloads.set(0);
+                last_advance.set((0.0, now_ms));
+                connecting.set(false);
+                played.set(false);
+                awaiting_ready.set(true);
+                canplay_seen.set(false);
+                pending_seek.set(None);
+                seeking_target.set(None);
+                info.set(None);
+                force_transcode.set(false);
+                ui.with_mut(|s| {
+                    s.subtitles_src = None;
+                    s.error = None;
+                    s.next_available = None;
+                    s.menu = None;
+                    s.position = initial_pos;
+                    s.duration = None;
+                    s.waiting = false;
+                    s.release = release_label(&rel);
+                    s.active_infohash = Some(rel.infohash.clone());
+                    s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
+                    s.status = None;
+                    s.progress = None;
+                });
+                apply_play_result(season, episode, my_gen, t, Ok(prefetched));
+                return;
+            }
+
+            let wait_pf_gen = match hit {
+                PrefetchHit::InFlight(g) => Some(g),
+                _ => {
+                    invalidate_prefetch();
+                    None
+                }
+            };
+
             spawn(async move {
                 platform::sleep(95_000).await;
                 if play_gen() != my_gen || closing() {
@@ -793,7 +1138,7 @@ pub fn Player(
 
             stall_secs.set(0);
             auto_reloads.set(0);
-            last_advance.set((0.0, platform::now_ms()));
+            last_advance.set((0.0, now_ms));
             connecting.set(true);
             played.set(false);
             awaiting_ready.set(true);
@@ -819,7 +1164,41 @@ pub fn Player(
             });
             stop_video_element();
 
+            let mut apply_async = apply_play_result.clone();
             spawn(async move {
+                if let Some(pf_gen) = wait_pf_gen {
+                    loop {
+                        if play_gen() != my_gen || closing() {
+                            return;
+                        }
+                        let state = next_prefetch
+                            .peek()
+                            .as_ref()
+                            .filter(|p| p.gen == pf_gen)
+                            .map(|p| p.status.clone());
+                        match state {
+                            Some(NextPrefetchStatus::InFlight) => {
+                                platform::sleep(100).await;
+                            }
+                            Some(NextPrefetchStatus::Ready { info, prepared_at_ms })
+                                if prefetch_is_fresh(
+                                    &info,
+                                    prepared_at_ms,
+                                    platform::now_ms(),
+                                    PREFETCH_TORR_TTL_MS,
+                                ) =>
+                            {
+                                invalidate_prefetch();
+                                apply_async(season, episode, my_gen, t, Ok(info));
+                                return;
+                            }
+                            _ => {
+                                invalidate_prefetch();
+                                break;
+                            }
+                        }
+                    }
+                }
                 let req = PlayRequest {
                     kind,
                     tmdb_id: id,
@@ -832,162 +1211,7 @@ pub fn Player(
                 if play_gen() != my_gen || closing() {
                     return;
                 }
-                connecting.set(false);
-                match res {
-                    Ok(i) => {
-                        let synced_audio = sync_audio_index(&sync_state.peek(), &i.audio, i.audio_track);
-                        let should_probe = i.duration.is_none();
-                        let probe_stream = i.stream.clone();
-                        let probe_native = i.native;
-                        let computed_next =
-                            next_target_episode(season, episode, i.next, rewatch_mode, &ep_ratings_fetch);
-                        ui.with_mut(|s| {
-                            s.duration = i.duration;
-                            s.audio = i.audio.clone();
-                            s.subtitle_tracks = i.subtitles.clone();
-                            s.audio_track = synced_audio;
-                            s.subtitle_track = if i.preloaded || i.native {
-                                i.subtitle_track
-                            } else {
-                                None
-                            };
-                            s.next = computed_next.map(|(s, e)| episode_code(s, e));
-                            s.preloaded = i.preloaded;
-                        });
-                        let at = override_seek
-                            .with_mut(|o| o.take())
-                            .or_else(|| {
-                                sync_state
-                                    .peek()
-                                    .as_ref()
-                                    .filter(|st| {
-                                        kind != MediaKind::Tv || (st.season == season && st.episode == episode)
-                                    })
-                                    .map(|st| clock.peek().expected_position(st, platform::now_ms()))
-                            })
-                            .unwrap_or_else(|| f64::from(i.start_at));
-                        last_saved.set(at);
-                        info.set(Some(i));
-                        load_source(at);
-
-                        if should_probe {
-                            let probe_token = t.clone();
-                            let mut save_after_probe = save_for_probe;
-                            spawn(async move {
-                                for delay in [5_000_u32, 8_000, 12_000, 15_000, 20_000, 30_000] {
-                                    platform::sleep(delay).await;
-                                    if play_gen() != my_gen || closing() || ui.peek().duration.is_some() {
-                                        break;
-                                    }
-                                    let probe_req = PlayProbeRequest {
-                                        kind,
-                                        tmdb_id: id,
-                                        stream: probe_stream.clone(),
-                                        native: probe_native,
-                                    };
-                                    let Ok(p) = api::play_probe(&probe_token, &probe_req).await else {
-                                        continue;
-                                    };
-                                    if play_gen() != my_gen || closing() {
-                                        break;
-                                    }
-                                    if p.duration.is_none() && p.audio.is_empty() && p.subtitles.is_empty() {
-                                        continue;
-                                    }
-                                    // Playback already started with track 0 (or default when direct),
-                                    // so display the active track in the menu without jarring mid-stream reloads.
-                                    let fallback_audio = if ui.peek().transcoded {
-                                        p.audio
-                                            .iter()
-                                            .find(|a| a.index == 0)
-                                            .or(p.audio.first())
-                                            .map(|a| a.index)
-                                    } else {
-                                        p.audio.iter().find(|a| a.default).or(p.audio.first()).map(|a| a.index)
-                                    };
-                                    let synced_audio = sync_audio_index(&sync_state.peek(), &p.audio, fallback_audio);
-                                    info.with_mut(|cur| {
-                                        if let Some(cur) = cur.as_mut() {
-                                            if cur.duration.is_none() {
-                                                cur.duration = p.duration;
-                                            }
-                                            cur.direct = p.direct;
-                                            if let Some(s) = p.stream.clone() {
-                                                cur.stream = s;
-                                            }
-                                            if cur.audio.is_empty() && !p.audio.is_empty() {
-                                                cur.audio = p.audio.clone();
-                                            }
-                                            if cur.subtitles.is_empty() && !p.subtitles.is_empty() {
-                                                cur.subtitles = p.subtitles.clone();
-                                            }
-                                        }
-                                    });
-                                    ui.with_mut(|s| {
-                                        if s.duration.is_none() {
-                                            s.duration = p.duration;
-                                        }
-                                        if s.audio.is_empty() && !p.audio.is_empty() {
-                                            s.audio = p.audio.clone();
-                                            if s.audio_track.is_none() {
-                                                s.audio_track = synced_audio;
-                                            }
-                                        }
-                                        if s.subtitle_tracks.is_empty() && !p.subtitles.is_empty() {
-                                            s.subtitle_tracks = p.subtitles.clone();
-                                            if (probe_native || s.preloaded) && s.subtitle_track.is_none() {
-                                                s.subtitle_track = p.subtitle_track;
-                                            }
-                                        }
-                                    });
-                                    if ui.peek().duration.is_some() {
-                                        let s = ui.peek().clone();
-                                        if sync_connected() && played() && !awaiting_ready() {
-                                            sync::send(&SyncClientMsg::Report {
-                                                position_sec: s.position,
-                                                duration_sec: s.duration,
-                                                paused: desired_paused(),
-                                                rate: rate(),
-                                            });
-                                        }
-                                        if s.position >= 1.0 {
-                                            save_after_probe(false);
-                                        }
-                                        break;
-                                    }
-                                }
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        // Do not keep another peer blocked if this device failed to load the stream.
-                        sync::send(&SyncClientMsg::Ready {
-                            position_sec: 0.0,
-                            duration_sec: None,
-                            file_index: None,
-                        });
-                        let next_avail = if e.code == "no_file" && !e.available_episodes.is_empty() {
-                            e.available_episodes
-                                .iter()
-                                .copied()
-                                .find(|&(s, ep)| s == season && ep > episode)
-                                .or_else(|| {
-                                    e.available_episodes
-                                        .iter()
-                                        .copied()
-                                        .find(|&(s, ep)| (s, ep) > (season, episode))
-                                })
-                        } else {
-                            None
-                        };
-                        ui.with_mut(|s| {
-                            s.status = None;
-                            s.progress = None;
-                            s.next_available = next_avail;
-                            s.error = Some(e.message);
-                        });
-                    }
-                }
+                apply_async(season, episode, my_gen, t, res);
             });
         }
     };
@@ -1261,6 +1485,7 @@ pub fn Player(
                                                         if target_idx.is_some() && target_idx != ui.peek().audio_track {
                                                             let at =
                                                                 clock.peek().expected_position(&st, platform::now_ms());
+                                                            invalidate_prefetch();
                                                             ui.with_mut(|s| s.audio_track = target_idx);
                                                             load_source(at);
                                                             continue;
@@ -1612,20 +1837,147 @@ pub fn Player(
         }
     });
 
+    let maybe_prefetch_next = {
+        let prefetch_token = token.clone();
+        let ep_ratings_pf = ep_ratings.clone();
+        move |pos: f64, dur: f64, buffered_ahead: Option<f64>| {
+            if closing() || kind != MediaKind::Tv || connecting() || awaiting_ready() || !played() || desired_paused() {
+                return;
+            }
+            {
+                let s = ui.peek();
+                if s.paused || s.waiting || s.error.is_some() {
+                    return;
+                }
+            }
+            if !can_prefetch_next(pos, dur, buffered_ahead) {
+                return;
+            }
+            let (season, cur_ep) = *target.peek();
+            let server_next = info.peek().as_ref().and_then(|i| i.next);
+            let Some((ns, ne)) = next_target_episode(season, cur_ep, server_next, rewatch_mode, &ep_ratings_pf) else {
+                return;
+            };
+            let cur_rel = release.peek().clone();
+            let now_ms = platform::now_ms();
+            if !needs_prefetch_refresh(
+                next_prefetch.peek().as_ref(),
+                season,
+                cur_ep,
+                &cur_rel.infohash,
+                ns,
+                ne,
+                now_ms,
+            ) {
+                return;
+            }
+
+            let need_switch = ns != season || cur_rel.episode > 0;
+            let pf_gen = *prefetch_gen.peek() + 1;
+            prefetch_gen.set(pf_gen);
+            let initial_choice = (!need_switch).then(|| cur_rel.clone());
+            next_prefetch.set(Some(NextPrefetch {
+                gen: pf_gen,
+                from_season: season,
+                from_episode: cur_ep,
+                from_infohash: cur_rel.infohash,
+                next_season: ns,
+                next_episode: ne,
+                resolved_choice: initial_choice.clone(),
+                status: NextPrefetchStatus::InFlight,
+            }));
+
+            let tok = prefetch_token.clone();
+            let is_mobile = telegram::is_mobile();
+            let native = platform::video::supports_native();
+            spawn(async move {
+                let target_choice = match initial_choice {
+                    Some(c) => c,
+                    None => {
+                        let req = ResolveReleaseRequest {
+                            season: ns,
+                            episode: ne,
+                            is_mobile,
+                        };
+                        let Ok(res) = api::resolve_release(&tok, kind, id, &req).await else {
+                            if !closing() && *prefetch_gen.peek() == pf_gen {
+                                next_prefetch.with_mut(|p| {
+                                    if let Some(p) = p.as_mut().filter(|p| p.gen == pf_gen) {
+                                        p.status = NextPrefetchStatus::Failed;
+                                    }
+                                });
+                            }
+                            return;
+                        };
+                        if closing() || *prefetch_gen.peek() != pf_gen {
+                            return;
+                        }
+                        match resolve_response_to_choice(res) {
+                            Some(c) => {
+                                next_prefetch.with_mut(|p| {
+                                    if let Some(p) = p.as_mut().filter(|p| p.gen == pf_gen) {
+                                        p.resolved_choice = Some(c.clone());
+                                    }
+                                });
+                                c
+                            }
+                            None => {
+                                next_prefetch.with_mut(|p| {
+                                    if let Some(p) = p.as_mut().filter(|p| p.gen == pf_gen) {
+                                        p.status = NextPrefetchStatus::NeedsPicker;
+                                    }
+                                });
+                                return;
+                            }
+                        }
+                    }
+                };
+                let req = PlayRequest {
+                    kind,
+                    tmdb_id: id,
+                    season: ns,
+                    episode: ne,
+                    release: target_choice.infohash.clone(),
+                    native,
+                };
+                let res = api::play(&tok, &req).await;
+                if closing() || *prefetch_gen.peek() != pf_gen {
+                    return;
+                }
+                next_prefetch.with_mut(|p| {
+                    if let Some(p) = p.as_mut().filter(|p| p.gen == pf_gen) {
+                        p.status = match res {
+                            Ok(play_info) => NextPrefetchStatus::Ready {
+                                info: play_info,
+                                prepared_at_ms: platform::now_ms(),
+                            },
+                            Err(_) => NextPrefetchStatus::Failed,
+                        };
+                    }
+                });
+            });
+        }
+    };
+
     let mut go_next = {
         let mut save = save.clone();
         let mut begin_playback = begin_playback.clone();
+        let start_fetch_next = start_play_fetch.clone();
         let tok_next = token.clone();
         let ep_ratings_next = ep_ratings.clone();
         move || {
-            let (season, cur_ep) = target();
+            let (season, cur_ep) = *target.peek();
             let server_next = info.peek().as_ref().and_then(|i| i.next);
             let Some((ns, ne)) = next_target_episode(season, cur_ep, server_next, rewatch_mode, &ep_ratings_next)
             else {
                 return;
             };
             save(true);
-            let need_switch = ns != season || release.peek().episode > 0;
+            desired_paused.set(false);
+            paused_since_ms.set(None);
+            ui.with_mut(|s| s.paused = false);
+            let cur_rel = release.peek().clone();
+            let need_switch = ns != season || cur_rel.episode > 0;
             if !need_switch {
                 target.set((ns, ne));
                 sync::send(&SyncClientMsg::Episode {
@@ -1636,33 +1988,15 @@ pub fn Player(
                 begin_playback(false);
                 return;
             }
-            let tok = tok_next.clone();
-            let req = ResolveReleaseRequest {
-                season: ns,
-                episode: ne,
-                is_mobile: telegram::is_mobile(),
-            };
-            let mut begin_async = begin_playback.clone();
-            spawn(async move {
-                let resolved = match api::resolve_release(&tok, kind, id, &req).await {
-                    Ok(ResolveReleaseResponse::Ready { choice, .. }) => Some(choice),
-                    Ok(ResolveReleaseResponse::PreloadQualityMismatch {
-                        preloaded, fallback, ..
-                    }) => match *fallback {
-                        ResolveReleaseResponse::Ready { choice, .. } => Some(choice),
-                        _ => Some(preloaded),
-                    },
-                    _ => None,
-                };
-                if let Some(choice) = resolved {
-                    choices.with_mut(|v| {
-                        v.retain(|c| {
-                            !(c.season == choice.season
-                                && c.episode == choice.episode
-                                && c.quality_key == choice.quality_key)
-                        });
-                        v.insert(0, choice.clone());
-                    });
+
+            let pf_hit = next_prefetch
+                .peek()
+                .as_ref()
+                .filter(|p| p.matches_source(season, cur_ep, &cur_rel.infohash, ns, ne))
+                .cloned();
+            if let Some(pf) = &pf_hit {
+                if let Some(choice) = pf.resolved_choice.clone() {
+                    choices.with_mut(|v| upsert_choice(v, choice.clone()));
                     release.set(choice.clone());
                     target.set((ns, ne));
                     sync::send(&SyncClientMsg::Episode {
@@ -1670,8 +2004,88 @@ pub fn Player(
                         episode: ne,
                         release: Some(choice),
                     });
-                    begin_async(false);
+                    begin_playback(false);
+                    return;
+                }
+                if pf.status == NextPrefetchStatus::NeedsPicker {
+                    invalidate_prefetch();
+                    on_need_release.call((ns, ne));
+                    return;
+                }
+            }
+
+            let wait_pf_gen = pf_hit
+                .filter(|p| p.status == NextPrefetchStatus::InFlight)
+                .map(|p| p.gen);
+            let my_gen = play_gen() + 1;
+            play_gen.set(my_gen);
+            connecting.set(true);
+            ui.with_mut(|s| {
+                s.src.clear();
+                s.subtitles_src = None;
+                s.error = None;
+                s.next_available = None;
+                s.menu = None;
+                s.waiting = false;
+                s.progress = None;
+                s.status = Some("Подключаемся к раздаче…".into());
+            });
+            stop_video_element();
+
+            let tok = tok_next.clone();
+            let req = ResolveReleaseRequest {
+                season: ns,
+                episode: ne,
+                is_mobile: telegram::is_mobile(),
+            };
+            let mut start_async = start_fetch_next.clone();
+            spawn(async move {
+                let mut pre_resolved: Option<Option<ReleaseChoiceUpdate>> = None;
+                if let Some(pf_gen) = wait_pf_gen {
+                    loop {
+                        if play_gen() != my_gen || closing() {
+                            return;
+                        }
+                        let snap = next_prefetch.peek().as_ref().filter(|p| p.gen == pf_gen).cloned();
+                        match snap {
+                            Some(p) if p.resolved_choice.is_some() => {
+                                pre_resolved = Some(p.resolved_choice);
+                                break;
+                            }
+                            Some(p) if p.status == NextPrefetchStatus::NeedsPicker => {
+                                pre_resolved = Some(None);
+                                break;
+                            }
+                            Some(p) if p.status == NextPrefetchStatus::InFlight => {
+                                platform::sleep(100).await;
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                let resolved = match pre_resolved {
+                    Some(v) => v,
+                    None => api::resolve_release(&tok, kind, id, &req)
+                        .await
+                        .ok()
+                        .and_then(resolve_response_to_choice),
+                };
+                if play_gen() != my_gen || closing() {
+                    return;
+                }
+                if let Some(choice) = resolved {
+                    choices.with_mut(|v| upsert_choice(v, choice.clone()));
+                    release.set(choice.clone());
+                    target.set((ns, ne));
+                    sync::send(&SyncClientMsg::Episode {
+                        season: ns,
+                        episode: ne,
+                        release: Some(choice.clone()),
+                    });
+                    start_async(ns, ne, choice, 0.0, my_gen);
                 } else {
+                    connecting.set(false);
+                    ui.with_mut(|s| s.status = None);
                     on_need_release.call((ns, ne));
                 }
             });
@@ -1699,7 +2113,12 @@ pub fn Player(
         move || {
             let Some(v) = video() else { return };
             let cur_pos = ui.peek().position;
-            let st_opt = sync_state.peek().clone();
+            let (cur_s, cur_e) = *target.peek();
+            let st_opt = sync_state
+                .peek()
+                .as_ref()
+                .filter(|st| kind != MediaKind::Tv || (st.season == cur_s && st.episode == cur_e))
+                .cloned();
             let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
             let is_paused_now = ui.peek().paused || (!waiting_peer && (desired_paused() || v.paused()));
             if is_paused_now {
@@ -1787,6 +2206,7 @@ pub fn Player(
     let on_video = {
         let mut save = save.clone();
         let mut go_next = go_next.clone();
+        let mut maybe_prefetch_next = maybe_prefetch_next.clone();
         let err_token = token.clone();
         let mut mark_media_ready = mark_media_ready;
         let ep_ratings_ev = ep_ratings.clone();
@@ -1813,6 +2233,9 @@ pub fn Player(
                     sync::set_playback_state(pos, eff_dur, played());
                     if (pos - last_saved()).abs() >= SAVE_EVERY {
                         save(false);
+                    }
+                    if let Some(dur) = eff_dur {
+                        maybe_prefetch_next(pos, dur, v.buffered_ahead());
                     }
                 }
                 "metadata" => {
@@ -2079,6 +2502,7 @@ pub fn Player(
             }
             let from_pop = !to_title && telegram::in_popstate();
             closing.set(true);
+            invalidate_prefetch();
             ws_gen.set(ws_gen() + 1);
             let s = ui.peek().clone();
             if !sync_connected() {
@@ -2438,6 +2862,7 @@ pub fn Player(
                 return;
             }
             save(false);
+            invalidate_prefetch();
             target.set((season, n));
             sync::send(&SyncClientMsg::Episode {
                 season,
@@ -2587,6 +3012,7 @@ pub fn Player(
                     voice: (!rel.voice.is_empty()).then(|| rel.voice.clone()),
                 };
                 release.set(new_choice.clone());
+                invalidate_prefetch();
                 let my_gen = play_gen() + 1;
                 play_gen.set(my_gen);
                 ui.with_mut(|s| {
@@ -2616,6 +3042,7 @@ pub fn Player(
                 let mut jump_fetch = start_play_fetch.clone();
                 move |(ns, ne): (i32, i32)| {
                     let rel = release.peek().clone();
+                    invalidate_prefetch();
                     let my_gen = play_gen() + 1;
                     play_gen.set(my_gen);
                     target.set((ns, ne));
@@ -2646,6 +3073,7 @@ pub fn Player(
                         s.audio_track = Some(a);
                         s.menu = None;
                     });
+                    invalidate_prefetch();
                     show_controls();
                     sync::send(&SyncClientMsg::Audio {
                         audio_track: label,
@@ -2676,6 +3104,7 @@ pub fn Player(
                         s.subtitles_src = url;
                         s.menu = None;
                     });
+                    invalidate_prefetch();
                     show_controls();
                     save_tracks();
                 }
@@ -2761,5 +3190,137 @@ mod tests {
             "/api/stream/tok?audio=0&start=15&r=202"
         );
         assert_eq!(bust_cache_url("/api/stream/tok?r=101", 303), "/api/stream/tok?r=303");
+    }
+
+    fn sample_play_info(preloaded: bool) -> PlayInfo {
+        PlayInfo {
+            infohash: "a".repeat(40),
+            file_index: 2,
+            file_name: "ep2.mkv".into(),
+            stream: "/api/stream/tok".into(),
+            direct: true,
+            duration: Some(1200.0),
+            audio: Vec::new(),
+            subtitles: Vec::new(),
+            audio_track: Some(0),
+            subtitle_track: None,
+            start_at: 0,
+            next: Some((1, 3)),
+            preloaded,
+            native: false,
+        }
+    }
+
+    fn sample_choice(hash_char: char, season: i32) -> ReleaseChoiceUpdate {
+        ReleaseChoiceUpdate {
+            kind: MediaKind::Tv,
+            tmdb_id: 1396,
+            season,
+            episode: 0,
+            infohash: hash_char.to_string().repeat(40),
+            title: Some("Release".into()),
+            quality: Some("1080p".into()),
+            quality_key: Some("1080p".into()),
+            voice: Some("LostFilm".into()),
+        }
+    }
+
+    #[test]
+    fn next_prefetch_timing_and_buffer_guards() {
+        // Too early or invalid durations never prefetch.
+        assert!(!can_prefetch_next(100.0, 200.0, Some(30.0)));
+        assert!(!can_prefetch_next(3.0, 35.0, Some(30.0)));
+        assert!(!can_prefetch_next(10.0, 15.0, Some(15.0)));
+
+        // Inside the prompt window: require >= 5s buffered ahead unless at EOF or <= 20s remaining.
+        assert!(!can_prefetch_next(965.0, 1000.0, Some(2.0)));
+        assert!(can_prefetch_next(965.0, 1000.0, Some(6.0)));
+        assert!(can_prefetch_next(981.0, 1000.0, Some(1.0)));
+        assert!(can_prefetch_next(998.5, 1000.0, Some(1.5)));
+        // Native player without JS buffer telemetry triggers right in the prompt window.
+        assert!(can_prefetch_next(965.0, 1000.0, None));
+    }
+
+    #[test]
+    fn next_prefetch_freshness_and_refresh_rules() {
+        let hash_a = "a".repeat(40);
+        let live_info = sample_play_info(false);
+        assert!(prefetch_is_fresh(
+            &live_info,
+            1_000,
+            1_000 + PREFETCH_TORR_TTL_MS,
+            PREFETCH_TORR_TTL_MS
+        ));
+        assert!(!prefetch_is_fresh(
+            &live_info,
+            1_000,
+            1_000 + PREFETCH_TORR_TTL_MS + 1,
+            PREFETCH_TORR_TTL_MS
+        ));
+        let disk_info = sample_play_info(true);
+        assert!(prefetch_is_fresh(&disk_info, 1_000, 10_000_000, PREFETCH_TORR_TTL_MS));
+
+        let pf = NextPrefetch {
+            gen: 1,
+            from_season: 1,
+            from_episode: 1,
+            from_infohash: hash_a.clone(),
+            next_season: 1,
+            next_episode: 2,
+            resolved_choice: Some(sample_choice('a', 1)),
+            status: NextPrefetchStatus::Ready {
+                info: live_info,
+                prepared_at_ms: 10_000,
+            },
+        };
+        assert!(!needs_prefetch_refresh(Some(&pf), 1, 1, &hash_a, 1, 2, 10_000 + 30_000));
+        assert!(needs_prefetch_refresh(
+            Some(&pf),
+            1,
+            1,
+            &hash_a,
+            1,
+            2,
+            10_000 + PREFETCH_REFRESH_MS + 1
+        ));
+        assert!(needs_prefetch_refresh(Some(&pf), 1, 2, &hash_a, 1, 3, 10_000));
+    }
+
+    #[test]
+    fn resolves_and_upserts_next_season_choices() {
+        let c1 = sample_choice('a', 1);
+        let c2 = sample_choice('b', 2);
+        let c2_new = sample_choice('c', 2);
+        let mut list = vec![c1.clone(), c2.clone()];
+        upsert_choice(&mut list, c2_new.clone());
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0], c2_new);
+        assert_eq!(list[1], c1);
+
+        let ready = ResolveReleaseResponse::Ready {
+            choice: c2.clone(),
+            from_peer: None,
+        };
+        assert_eq!(resolve_response_to_choice(ready), Some(c2.clone()));
+
+        let mismatch = ResolveReleaseResponse::PreloadQualityMismatch {
+            preloaded: c1.clone(),
+            preloaded_quality: "720p".into(),
+            target_quality: "1080p".into(),
+            fallback: Box::new(ResolveReleaseResponse::Ready {
+                choice: c2.clone(),
+                from_peer: None,
+            }),
+        };
+        assert_eq!(resolve_response_to_choice(mismatch), Some(c2));
+
+        let picker = ResolveReleaseResponse::NeedsPicker {
+            target_quality: "1080p".into(),
+            releases: kino_core::ReleaseList {
+                releases: Vec::new(),
+                configured: true,
+            },
+        };
+        assert_eq!(resolve_response_to_choice(picker), None);
     }
 }
