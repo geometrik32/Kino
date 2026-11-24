@@ -651,10 +651,10 @@ pub enum TitleStatus {
 
 impl TitleStatus {
     pub const ALL: [TitleStatus; 6] = [
-        TitleStatus::Want,
         TitleStatus::Watching,
-        TitleStatus::WaitingRelease,
         TitleStatus::WaitingEpisode,
+        TitleStatus::Want,
+        TitleStatus::WaitingRelease,
         TitleStatus::Watched,
         TitleStatus::Dropped,
     ];
