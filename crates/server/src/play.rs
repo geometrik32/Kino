@@ -62,7 +62,7 @@ const DEFAULT_MAX_TRANSCODES: usize = 2;
 /// How many subtitle extractions run concurrently.
 const MAX_SUBTITLES: usize = 2;
 /// Drops a paused/stalled transcode if the client stops reading for this long.
-const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 impl Media {
     pub fn new(c: &TorrentConfig) -> Self {

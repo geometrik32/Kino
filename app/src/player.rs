@@ -204,6 +204,16 @@ fn waiting_label(st: &SyncState) -> String {
     }
 }
 
+/// Replaces or appends the cache-busting `r=` query parameter so `<video>` reloads cleanly.
+fn bust_cache_url(src: &str, nonce: i64) -> String {
+    let base = src
+        .split_once("&r=")
+        .or_else(|| src.split_once("?r="))
+        .map_or(src, |(head, _)| head);
+    let sep = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{sep}r={nonce}")
+}
+
 /// Aborts the `<video>` element's open network fetch and stops any active native player immediately.
 fn stop_video_element() {
     platform::video::native_close();
@@ -357,6 +367,9 @@ pub fn Player(
     let mut last_prog_pause_ms = use_signal(|| 0_i64);
     let mut last_sound_cmd_ms = use_signal(|| 0_i64);
     let mut last_sync_unmute_ms = use_signal(|| 0_i64);
+    let mut paused_since_ms = use_signal(|| None::<i64>);
+    let mut last_advance = use_signal(|| (0.0_f64, 0_i64));
+    let mut auto_reloads = use_signal(|| 0_u32);
 
     let mut pause_video = move || {
         last_prog_pause_ms.set(platform::now_ms());
@@ -457,6 +470,7 @@ pub fn Player(
                 let alone = sync_state.peek().as_ref().is_none_or(|st| st.members.len() <= 1);
                 if alone {
                     desired_paused.set(true);
+                    paused_since_ms.set(Some(platform::now_ms()));
                     sync::send(&SyncClientMsg::Pause {
                         position_sec: ui.peek().position,
                     });
@@ -509,7 +523,7 @@ pub fn Player(
     };
 
     // Points the video at the right source for the given audio track and second.
-    let mut load_source = move |at: f64| {
+    let mut open_source = move |at: f64, force_reload: bool| {
         let Some(i) = info() else { return };
         let audio = ui.peek().audio_track;
         let native = platform::video::supports_native() && !force_transcode();
@@ -524,7 +538,14 @@ pub fn Player(
             seeking_target.set(None);
             (i.stream.clone(), 0.0)
         };
-        if transcode && ui.peek().src == src {
+        if force_reload {
+            if !native {
+                src = bust_cache_url(&src, platform::now_ms());
+            }
+            if transcode {
+                last_reload_ms.set(platform::now_ms());
+            }
+        } else if transcode && ui.peek().src == src {
             if (ui.peek().position - at).abs() <= 1.5 {
                 offset.set(off);
                 sync::set_stream_offset(off);
@@ -540,10 +561,8 @@ pub fn Player(
                 return;
             }
             // Seeking back to the same start second (e.g. 0:00): bust identical URL so `<video>` actually reloads.
-            let sep = if src.contains('?') { '&' } else { '?' };
-            src.push_str(&format!("{sep}r={}", platform::now_ms()));
-        }
-        if !native && !transcode && ui.peek().src == src {
+            src = bust_cache_url(&src, platform::now_ms());
+        } else if !native && !transcode && ui.peek().src == src {
             if (ui.peek().position - at).abs() > 1.5 {
                 if let Some(v) = video() {
                     if v.ready_state() >= 1 {
@@ -567,7 +586,7 @@ pub fn Player(
             }
             return;
         }
-        if native && ui.peek().native_video && ui.peek().src == src {
+        if !force_reload && native && ui.peek().native_video && ui.peek().src == src {
             platform::video::native_set_audio(audio);
             if (ui.peek().position - at).abs() > 1.5 {
                 if let Some(v) = video() {
@@ -586,11 +605,22 @@ pub fn Player(
             }
             return;
         }
-        let hold = sync_state
-            .peek()
-            .as_ref()
-            .map_or(*desired_paused.peek(), |st| st.paused || st.waiting);
+        let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+        let hold = if force_reload {
+            *desired_paused.peek() || waiting_peer
+        } else {
+            sync_state
+                .peek()
+                .as_ref()
+                .map_or(*desired_paused.peek(), |st| st.paused || st.waiting)
+        };
         desired_paused.set(hold);
+        if hold {
+            paused_since_ms.set(Some(platform::now_ms()));
+        } else {
+            paused_since_ms.set(None);
+        }
+        last_advance.set((at, platform::now_ms()));
         awaiting_ready.set(true);
         canplay_seen.set(false);
         let status = if transcode {
@@ -642,6 +672,7 @@ pub fn Player(
             };
         });
     };
+    let mut load_source = move |at: f64| open_source(at, false);
 
     let save = {
         let token = token.clone();
@@ -691,6 +722,12 @@ pub fn Player(
         let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
         let hold = paused_by_user || waiting_peer;
         desired_paused.set(hold);
+        if hold {
+            paused_since_ms.set(Some(platform::now_ms()));
+        } else {
+            paused_since_ms.set(None);
+            last_advance.set((ui.peek().position, platform::now_ms()));
+        }
         if hold {
             pause_video();
             let msg = if waiting_peer {
@@ -755,6 +792,8 @@ pub fn Player(
             });
 
             stall_secs.set(0);
+            auto_reloads.set(0);
+            last_advance.set((0.0, platform::now_ms()));
             connecting.set(true);
             played.set(false);
             awaiting_ready.set(true);
@@ -973,6 +1012,8 @@ pub fn Player(
             }
 
             stall_secs.set(0);
+            auto_reloads.set(0);
+            last_advance.set((0.0, platform::now_ms()));
             connecting.set(true);
             played.set(false);
             awaiting_ready.set(true);
@@ -1366,7 +1407,8 @@ pub fn Player(
         move || begin_playback(true)
     });
 
-    // While connecting or buffering, shows how far the torrent has got instead of a bare spinner.
+    // While connecting or buffering, shows how far the torrent has got instead of a bare spinner;
+    // also detects silent `<video>` stalls (e.g. a closed chunked transcode stream) and auto-reloads from the current second.
     {
         let token = token.clone();
         use_future(move || {
@@ -1377,7 +1419,7 @@ pub fn Player(
                     if closing() {
                         break;
                     }
-                    let (busy, preloaded) = {
+                    let (busy, preloaded, is_transcoded, is_native, is_paused, has_err, has_info) = {
                         let s = ui.peek();
                         let waiting_for_peer = sync_state
                             .peek()
@@ -1386,8 +1428,66 @@ pub fn Player(
                         (
                             s.error.is_none() && (connecting() || (s.waiting && !waiting_for_peer)),
                             s.preloaded,
+                            s.transcoded,
+                            s.native_video,
+                            s.paused || desired_paused() || waiting_for_peer,
+                            s.error.is_some(),
+                            info.peek().is_some(),
                         )
                     };
+                    if has_info
+                        && !has_err
+                        && !connecting()
+                        && !is_paused
+                        && !is_native
+                        && seeking_target.peek().is_none()
+                        && pending_seek.peek().is_none()
+                    {
+                        if let Some(v) = video() {
+                            let cur_t = offset() + v.current_time();
+                            let now_ms = platform::now_ms();
+                            let (prev_t, prev_ms) = last_advance();
+                            let dur = ui.peek().duration;
+                            let premature_eof = v.ended() && dur.is_some_and(|d| d > 30.0 && cur_t + 12.0 < d);
+                            if !premature_eof && (cur_t - prev_t).abs() > 0.15 {
+                                last_advance.set((cur_t, now_ms));
+                                if auto_reloads() > 0 && now_ms - last_reload_ms() > 3_500 {
+                                    auto_reloads.set(0);
+                                }
+                            } else {
+                                let stuck_ms = now_ms - prev_ms;
+                                let silent_freeze = !awaiting_ready()
+                                    && !ui.peek().waiting
+                                    && ((is_transcoded && stuck_ms >= 4_500)
+                                        || (!is_transcoded && preloaded && stuck_ms >= 6_000));
+                                let waiting_stuck = (awaiting_ready() || ui.peek().waiting)
+                                    && (is_transcoded || preloaded)
+                                    && stuck_ms >= 15_000;
+                                if premature_eof || silent_freeze || waiting_stuck {
+                                    if auto_reloads() < 2 {
+                                        auto_reloads.set(auto_reloads() + 1);
+                                        last_advance.set((cur_t, now_ms));
+                                        open_source(cur_t, true);
+                                        continue;
+                                    } else {
+                                        ui.with_mut(|s| {
+                                            s.src.clear();
+                                            s.subtitles_src = None;
+                                            s.status = None;
+                                            s.waiting = false;
+                                            s.progress = None;
+                                            s.error = Some(
+                                                "Поток завис или оборвался. Попробуйте перезапустить или выбрать другую раздачу."
+                                                    .into(),
+                                            );
+                                        });
+                                        stop_video_element();
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if !busy || preloaded {
                         stall_secs.set(0);
                         if ui.peek().progress.is_some() {
@@ -1603,24 +1703,40 @@ pub fn Player(
             let waiting_peer = st_opt.as_ref().is_some_and(|st| st.waiting);
             let is_paused_now = ui.peek().paused || (!waiting_peer && (desired_paused() || v.paused()));
             if is_paused_now {
+                let now_ms = platform::now_ms();
+                let paused_ms = paused_since_ms().map_or(0, |t| now_ms - t);
                 desired_paused.set(false);
+                paused_since_ms.set(None);
+                last_advance.set((cur_pos, now_ms));
+                auto_reloads.set(0);
+                sync_state.with_mut(|st| {
+                    if let Some(s) = st.as_mut() {
+                        s.paused = false;
+                    }
+                });
                 if st_opt.as_ref().is_none_or(|st| st.paused || st.waiting) {
                     sync::send(&SyncClientMsg::Play { position_sec: cur_pos });
                 }
                 if !waiting_peer {
-                    if let Some(st) = st_opt.as_ref().filter(|st| !st.paused && !st.waiting) {
-                        let expected = clock.peek().expected_position(st, platform::now_ms());
-                        if (cur_pos - expected).abs() > 1.5 && !ui.peek().transcoded {
-                            v.set_current_time(expected);
-                            ui.with_mut(|s| s.position = expected);
+                    if ui.peek().transcoded && (v.ended() || paused_ms >= 45_000) {
+                        ui.with_mut(|s| s.paused = false);
+                        open_source(cur_pos, true);
+                    } else {
+                        if let Some(st) = st_opt.as_ref().filter(|st| !st.paused && !st.waiting) {
+                            let expected = clock.peek().expected_position(st, now_ms);
+                            if (cur_pos - expected).abs() > 1.5 && !ui.peek().transcoded {
+                                v.set_current_time(expected);
+                                ui.with_mut(|s| s.position = expected);
+                            }
                         }
+                        ui.with_mut(|s| s.paused = false);
+                        attempt_play(play_gen(), true);
                     }
-                    ui.with_mut(|s| s.paused = false);
-                    attempt_play(play_gen(), true);
                 }
                 show_controls();
             } else {
                 desired_paused.set(true);
+                paused_since_ms.set(Some(platform::now_ms()));
                 pause_video();
                 ui.with_mut(|s| s.paused = true);
                 show_controls();
@@ -1639,6 +1755,8 @@ pub fn Player(
             Some(d) => at.clamp(0.0, (d - 1.0).max(0.0)),
             None => at.max(0.0),
         };
+        auto_reloads.set(0);
+        last_advance.set((at, platform::now_ms()));
         last_seek_cmd_ms.set(platform::now_ms());
         sync::send(&SyncClientMsg::Seek { position_sec: at });
         if s.transcoded {
@@ -1680,6 +1798,9 @@ pub fn Player(
                         return;
                     }
                     let pos = offset() + v.current_time();
+                    if (pos - last_advance.peek().0).abs() > 0.12 {
+                        last_advance.set((pos, platform::now_ms()));
+                    }
                     let direct_len = (!ui.peek().transcoded && v.duration().is_finite()).then(|| v.duration());
                     let mut eff_dur = ui.peek().duration;
                     ui.with_mut(|s| {
@@ -1747,6 +1868,16 @@ pub fn Player(
                         mark_media_ready();
                     }
                 }
+                "stalled" => {
+                    if !desired_paused() && !closing() && !awaiting_ready() {
+                        ui.with_mut(|s| {
+                            s.waiting = true;
+                            if s.status.is_none() {
+                                s.status = Some("Буферизация видео…".into());
+                            }
+                        });
+                    }
+                }
                 "waiting" => {
                     let already_played = played();
                     ui.with_mut(|s| {
@@ -1788,6 +1919,7 @@ pub fn Player(
                     if !ui.peek().native_video {
                         apply_web_scale(*saved_scale.peek());
                     }
+                    last_advance.set((offset() + v.current_time(), platform::now_ms()));
                     played.set(true);
                     canplay_seen.set(true);
                     seeking_target.set(None);
@@ -1848,12 +1980,23 @@ pub fn Player(
                     }
                     // External pause trigger (e.g. MediaSession / headphone disconnect).
                     desired_paused.set(true);
+                    paused_since_ms.set(Some(platform::now_ms()));
                     ui.with_mut(|s| s.paused = true);
                     show_controls();
                     sync::send(&SyncClientMsg::Pause { position_sec: pos });
                     save(false);
                 }
                 "ended" => {
+                    let pos = offset() + v.current_time();
+                    if ui.peek().transcoded
+                        && ui.peek().duration.is_some_and(|d| d > 30.0 && pos + 12.0 < d)
+                        && auto_reloads() < 2
+                    {
+                        auto_reloads.set(auto_reloads() + 1);
+                        last_advance.set((pos, platform::now_ms()));
+                        open_source(pos, true);
+                        return;
+                    }
                     save(true);
                     let (cur_s, cur_e) = *target.peek();
                     let s_next = info.peek().as_ref().and_then(|i| i.next);
@@ -2609,5 +2752,14 @@ mod tests {
             serde_json::from_str::<VideoScale>("\"width\"").unwrap(),
             VideoScale::FitWidth
         );
+        assert_eq!(
+            bust_cache_url("/api/stream/tok?audio=0&start=15", 101),
+            "/api/stream/tok?audio=0&start=15&r=101"
+        );
+        assert_eq!(
+            bust_cache_url("/api/stream/tok?audio=0&start=15&r=101", 202),
+            "/api/stream/tok?audio=0&start=15&r=202"
+        );
+        assert_eq!(bust_cache_url("/api/stream/tok?r=101", 303), "/api/stream/tok?r=303");
     }
 }

@@ -42,6 +42,9 @@ mod imp {
         pub fn paused(&self) -> bool {
             self.0.paused()
         }
+        pub fn ended(&self) -> bool {
+            self.0.ended()
+        }
         pub fn ready_state(&self) -> u16 {
             self.0.ready_state()
         }
@@ -312,6 +315,9 @@ mod imp {
         }
         pub fn paused(&self) -> bool {
             snapshot().paused
+        }
+        pub fn ended(&self) -> bool {
+            false
         }
         pub fn ready_state(&self) -> u16 {
             snapshot().ready_state

@@ -396,6 +396,7 @@ pub fn PlayerView(
                     oncanplay: move |_| on_video.call("canplay"),
                     onseeked: move |_| on_video.call("seeked"),
                     onwaiting: move |_| on_video.call("waiting"),
+                    onstalled: move |_| on_video.call("stalled"),
                     onplaying: move |_| on_video.call("playing"),
                     onpause: move |_| on_video.call("pause"),
                     onplay: move |_| on_video.call("play"),
