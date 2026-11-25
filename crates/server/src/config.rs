@@ -45,9 +45,24 @@ pub struct Config {
     pub torrents: TorrentConfig,
 }
 
-/// Where the torrent services live. Without Jackett the release list is demo
-/// data; without TorrServer nothing can be played; without qBittorrent there is
-/// no preloading.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExtraTorznabConfig {
+    pub url: String,
+    pub api_key: Option<String>,
+}
+
+impl std::fmt::Debug for ExtraTorznabConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtraTorznabConfig")
+            .field("url", &self.url)
+            .field("has_api_key", &self.api_key.is_some())
+            .finish()
+    }
+}
+
+/// Where the torrent services live. Without any indexer the release list is
+/// demo data; without TorrServer nothing can be played; without qBittorrent
+/// there is no preloading.
 #[derive(Clone, Default)]
 pub struct TorrentConfig {
     pub jackett_url: Option<String>,
@@ -58,6 +73,9 @@ pub struct TorrentConfig {
     pub jackett_wake_group: String,
     /// How long Jackett stays awake after activity (default `10m`).
     pub jackett_wake_duration: String,
+    /// Optional additional Torznab endpoints (e.g. public JacRed mirror)
+    /// queried in parallel with Jackett.
+    pub extra_torznab: Vec<ExtraTorznabConfig>,
     pub torrserver_url: Option<String>,
     pub torrserver_user: Option<String>,
     pub torrserver_password: Option<String>,
@@ -96,6 +114,7 @@ impl TorrentConfig {
             jackett_wake_url: opt("JACKETT_WAKE_URL"),
             jackett_wake_group: opt("JACKETT_WAKE_GROUP").unwrap_or_else(|| "jackett".into()),
             jackett_wake_duration: opt("JACKETT_WAKE_DURATION").unwrap_or_else(|| "10m".into()),
+            extra_torznab: parse_extra_torznab(opt("EXTRA_TORZNAB_URLS")),
             torrserver_url: opt("TORRSERVER_URL"),
             torrserver_user: opt("TORRSERVER_USER"),
             torrserver_password: opt("TORRSERVER_PASSWORD"),
@@ -141,6 +160,7 @@ impl std::fmt::Debug for Config {
             .field("image_cache_dir", &self.image_cache_dir)
             .field("jackett", &self.torrents.jackett_url)
             .field("jackett_wake", &self.torrents.jackett_wake_url)
+            .field("extra_torznab", &self.torrents.extra_torznab)
             .field("torrserver", &self.torrents.torrserver_url)
             .field("qbittorrent", &self.torrents.qbittorrent_url)
             .field("hwaccel", &self.torrents.hwaccel)
@@ -262,9 +282,27 @@ pub fn parse_ids(s: &str) -> Result<Vec<i64>, std::num::ParseIntError> {
         .collect()
 }
 
+fn parse_extra_torznab(raw: Option<String>) -> Vec<ExtraTorznabConfig> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|entry| {
+            let (url, key) = match entry.split_once('|') {
+                Some((u, k)) => (u.trim(), Some(k.trim()).filter(|k| !k.is_empty())),
+                None => (entry, None),
+            };
+            (!url.is_empty()).then(|| ExtraTorznabConfig {
+                url: url.trim_end_matches('/').to_owned(),
+                api_key: key.map(str::to_owned),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{clean_value, parse_ids, redact_proxy};
+    use super::{clean_value, parse_extra_torznab, parse_ids, redact_proxy, ExtraTorznabConfig};
 
     #[test]
     fn values() {
@@ -281,5 +319,23 @@ mod tests {
         assert_eq!(parse_ids("").unwrap(), Vec::<i64>::new());
         assert_eq!(parse_ids(" 1, 22 ,").unwrap(), vec![1, 22]);
         assert!(parse_ids("1,x").is_err());
+    }
+
+    #[test]
+    fn extra_torznab_parsing() {
+        assert_eq!(parse_extra_torznab(None), vec![]);
+        assert_eq!(
+            parse_extra_torznab(Some(" https://jac-red.ru/ , https://other.example|secret , ".into())),
+            vec![
+                ExtraTorznabConfig {
+                    url: "https://jac-red.ru".into(),
+                    api_key: None,
+                },
+                ExtraTorznabConfig {
+                    url: "https://other.example".into(),
+                    api_key: Some("secret".into()),
+                },
+            ]
+        );
     }
 }

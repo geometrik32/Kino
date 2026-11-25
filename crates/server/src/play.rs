@@ -42,7 +42,7 @@ use crate::{
 /// Clients of the torrent services that are configured.
 pub struct Media {
     pub http: reqwest::Client,
-    pub jackett: Option<Jackett>,
+    pub indexers: Vec<Jackett>,
     pub torrserver: Option<TorrServer>,
     pub qbit: Option<QBittorrent>,
     /// Recent indexer results; see [`torrent::search_cache`].
@@ -75,33 +75,37 @@ impl Media {
         } else {
             DEFAULT_MAX_TRANSCODES
         };
-        let jackett = match (&c.jackett_url, &c.jackett_api_key) {
-            (Some(url), Some(key)) => {
-                let mut j = Jackett::new(http.clone(), url, key);
-                if let Some(wake_url) = &c.jackett_wake_url {
-                    let group = if c.jackett_wake_group.is_empty() {
-                        "jackett".to_owned()
-                    } else {
-                        c.jackett_wake_group.clone()
-                    };
-                    let duration = if c.jackett_wake_duration.is_empty() {
-                        "10m".to_owned()
-                    } else {
-                        c.jackett_wake_duration.clone()
-                    };
-                    j = j.with_wake(torrent::torznab::JackettWake::new(
-                        http.clone(),
-                        wake_url,
-                        group,
-                        duration,
-                    ));
-                }
-                Some(j)
+        let mut indexers = Vec::new();
+        if let (Some(url), Some(key)) = (&c.jackett_url, &c.jackett_api_key) {
+            let mut j = Jackett::new(http.clone(), url, key);
+            if let Some(wake_url) = &c.jackett_wake_url {
+                let group = if c.jackett_wake_group.is_empty() {
+                    "jackett".to_owned()
+                } else {
+                    c.jackett_wake_group.clone()
+                };
+                let duration = if c.jackett_wake_duration.is_empty() {
+                    "10m".to_owned()
+                } else {
+                    c.jackett_wake_duration.clone()
+                };
+                j = j.with_wake(torrent::torznab::JackettWake::new(
+                    http.clone(),
+                    wake_url,
+                    group,
+                    duration,
+                ));
             }
-            _ => None,
-        };
+            indexers.push(j);
+        }
+        for extra in &c.extra_torznab {
+            indexers.push(
+                Jackett::new(http.clone(), &extra.url, extra.api_key.as_deref().unwrap_or(""))
+                    .with_timeout(std::time::Duration::from_secs(15)),
+            );
+        }
         Self {
-            jackett,
+            indexers,
             torrserver: c.torrserver_url.as_ref().map(|url| {
                 let auth = c.torrserver_user.clone().zip(c.torrserver_password.clone());
                 TorrServer::new(url, auth)
@@ -132,8 +136,8 @@ impl Media {
 
     /// Proactively wakes a sleeping Jackett container in the background when a user starts browsing.
     pub fn wake_jackett(&self) {
-        if let Some(j) = &self.jackett {
-            j.wake_in_background();
+        for idx in &self.indexers {
+            idx.wake_in_background();
         }
     }
 }
@@ -222,7 +226,7 @@ async fn fetch_release_list(
     let kind = details.summary.kind;
     let tmdb_id = details.summary.tmdb_id;
     let season_val = if kind == MediaKind::Tv { season.unwrap_or(0) } else { 0 };
-    let Some(jackett) = &state.media.jackett else {
+    if state.media.indexers.is_empty() {
         let s = (kind == MediaKind::Tv).then(|| season.unwrap_or(1));
         let mut releases = demo_releases(&details.summary, s);
         enrich_release_meta(&state.pool, kind, tmdb_id, season_val, &mut releases).await?;
@@ -230,8 +234,8 @@ async fn fetch_release_list(
             releases,
             configured: false,
         });
-    };
-    let items = torrent::search_cached(&state.media.searches, &state.pool, jackett, details).await?;
+    }
+    let items = torrent::search_cached(&state.media.searches, &state.pool, &state.media.indexers, details).await?;
     let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, details)).collect();
     // Releases downloaded before are shown by their real info-hash, so the
     // remembered choice and "По просмотренным" find them.
@@ -691,7 +695,7 @@ async fn resolve_online_tiers(
 /// by the time someone presses "Смотреть". Skips titles where the user already has
 /// a saved release choice (so "Продолжить просмотр" does not wake a sleeping indexer).
 pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) {
-    if state.media.jackett.is_none() {
+    if state.media.indexers.is_empty() {
         return;
     }
     let state = state.clone();
@@ -715,10 +719,10 @@ pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) 
         if has_saved {
             return;
         }
-        if let Some(jackett) = &state.media.jackett {
-            if let Err(e) = torrent::search_cached(&state.media.searches, &state.pool, jackett, &details).await {
-                tracing::debug!(error = %e, "background release search failed");
-            }
+        if let Err(e) =
+            torrent::search_cached(&state.media.searches, &state.pool, &state.media.indexers, &details).await
+        {
+            tracing::debug!(error = %e, "background release search failed");
         }
     });
 }
@@ -743,7 +747,7 @@ async fn play(
         ));
     }
     let media = &state.media;
-    let src = torrent::resolve(&state.pool, &media.http, &key, media.jackett.as_ref()).await?;
+    let src = torrent::resolve(&state.pool, &media.http, &key, &media.indexers).await?;
     let hash = src.infohash.clone().ok_or(TorrentError::Unknown)?;
     let episode = (req.kind == MediaKind::Tv).then_some((req.season.max(1), req.episode.max(1)));
     let (season, ep) = episode.unwrap_or((0, 0));

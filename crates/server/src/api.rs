@@ -1111,7 +1111,7 @@ async fn add_preload(
         // Without a downloader the request is only recorded (demo mode).
         return Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?));
     };
-    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, media.jackett.as_ref()).await?;
+    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, &media.indexers).await?;
     r.infohash = src.infohash.clone().unwrap_or(r.infohash);
     if r.title.is_none() && !src.title.is_empty() {
         r.title = Some(src.title.clone());

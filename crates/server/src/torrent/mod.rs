@@ -556,46 +556,68 @@ fn search_plan(details: &TitleDetails) -> (&'static str, Vec<String>, Option<Vec
 }
 
 async fn run_queries(
-    jackett: &Jackett,
+    indexers: &[Jackett],
     queries: &[String],
     cats: &str,
     details: &TitleDetails,
-) -> (HashMap<String, TorznabItem>, Option<torznab::TorznabError>) {
-    let results = futures_util::future::join_all(queries.iter().map(|q| jackett.search(q, cats))).await;
-    let mut seen = HashMap::new();
+) -> (HashMap<String, TorznabItem>, bool, Option<torznab::TorznabError>) {
+    let tasks = indexers
+        .iter()
+        .flat_map(|idx| queries.iter().map(move |q| idx.search(q, cats)));
+    let results = futures_util::future::join_all(tasks).await;
+    let mut seen: HashMap<String, TorznabItem> = HashMap::new();
+    let mut any_ok = false;
     let mut first_err = None;
     for r in results {
         match r {
             Ok(items) => {
+                any_ok = true;
                 for it in items
                     .into_iter()
                     .filter(|it| category_ok(it, details) && is_about(&it.title, details))
                 {
-                    seen.entry(release_key(&it)).or_insert(it);
+                    seen.entry(release_key(&it))
+                        .and_modify(|existing| {
+                            existing.seeders = existing.seeders.max(it.seeders);
+                            if existing.link.is_none() {
+                                existing.link = it.link.clone();
+                            }
+                            if existing.magnet.is_none() {
+                                existing.magnet = it.magnet.clone();
+                            }
+                        })
+                        .or_insert(it);
                 }
             }
-            Err(e) => first_err = first_err.or(Some(e)),
+            Err(e) => {
+                tracing::warn!(error = %e, "indexer search failed");
+                first_err = first_err.or(Some(e));
+            }
         }
     }
-    (seen, first_err)
+    (seen, any_ok, first_err)
 }
 
-/// Searches every tracker for the title, by its Russian and original names.
-pub async fn search(jackett: &Jackett, details: &TitleDetails) -> Result<Vec<TorznabItem>, TorrentError> {
+/// Searches every configured indexer for the title, by its Russian and original names.
+pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<TorznabItem>, TorrentError> {
+    if indexers.is_empty() {
+        return Ok(Vec::new());
+    }
     let (cats, queries, fallback) = search_plan(details);
-    let (mut seen, mut first_err) = run_queries(jackett, &queries, cats, details).await;
+    let (mut seen, mut any_ok, mut first_err) = run_queries(indexers, &queries, cats, details).await;
 
     // For TV shows: if a single-season query with year found nothing (e.g. releases omit year),
     // or a multi-season yearless query was crowded out by a namesake film, retry the fallback queries.
-    if seen.is_empty() && first_err.is_none() {
+    if seen.is_empty() && any_ok {
         if let Some(fb_queries) = fallback {
-            let (fb_seen, fb_err) = run_queries(jackett, &fb_queries, cats, details).await;
+            let (fb_seen, fb_ok, fb_err) = run_queries(indexers, &fb_queries, cats, details).await;
             seen = fb_seen;
-            first_err = fb_err;
+            any_ok |= fb_ok;
+            first_err = first_err.or(fb_err);
         }
     }
 
-    if seen.is_empty() {
+    if seen.is_empty() && !any_ok {
         if let Some(e) = first_err {
             return Err(e.into());
         }
@@ -610,13 +632,13 @@ pub async fn search(jackett: &Jackett, details: &TitleDetails) -> Result<Vec<Tor
 pub async fn search_cached(
     cache: &search_cache::SearchCache,
     pool: &PgPool,
-    jackett: &Jackett,
+    indexers: &[Jackett],
     details: &TitleDetails,
 ) -> Result<std::sync::Arc<Vec<TorznabItem>>, TorrentError> {
     let key = (details.summary.kind, details.summary.tmdb_id);
     cache
         .get_or_search(key, || async {
-            let items = search(jackett, details).await?;
+            let items = search(indexers, details).await?;
             save_sources(pool, &items).await?;
             Ok(std::sync::Arc::new(items))
         })
@@ -694,7 +716,7 @@ pub async fn resolve(
     pool: &PgPool,
     http: &reqwest::Client,
     key: &str,
-    jackett: Option<&Jackett>,
+    indexers: &[Jackett],
 ) -> Result<Source, TorrentError> {
     let src = source(pool, key).await?;
     if let Some(s) = src.as_ref().filter(|s| s.infohash.is_some() && s.torrent.is_some()) {
@@ -716,7 +738,7 @@ pub async fn resolve(
         };
     };
     if let Some(link) = src.link.clone() {
-        if let Some(j) = jackett.filter(|j| j.owns_link(&link)) {
+        if let Some(j) = indexers.iter().find(|j| j.owns_link(&link)) {
             j.ensure_ready().await;
         }
         match fetch(http, &link).await {

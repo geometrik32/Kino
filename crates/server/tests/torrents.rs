@@ -1005,3 +1005,88 @@ async fn missing_episode_reports_available_episodes(pool: PgPool) {
         err.available_episodes
     );
 }
+
+#[sqlx::test(migrations = "./migrations")]
+async fn extra_torznab_merges_and_tolerates_failure(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let extra_feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+  <item>
+    <title>Во все тяжкие / Breaking Bad S02 (2009) WEB-DL 1080p Дубляж</title>
+    <jackettindexer id="all">rutracker, bitru, rutor</jackettindexer>
+    <link>magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</link>
+    <category>5000</category>
+    <size>24000000000</size>
+    <torznab:attr name="seeders" value="320" />
+    <torznab:attr name="infohash" value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />
+  </item>
+  <item>
+    <title>Во все тяжкие / Breaking Bad (Сезон 2) (2009) BDRip 1080p MVO</title>
+    <jackettindexer id="all">kinozal, rutor</jackettindexer>
+    <link>magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a</link>
+    <category>5000</category>
+    <size>18400000000</size>
+    <torznab:attr name="seeders" value="150" />
+    <torznab:attr name="infohash" value="c12fe1c06bba254a9dc9f519b335aa7c1367a88a" />
+  </item>
+</channel></rss>"#;
+
+    let extra_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let extra_url = format!("http://{}", extra_listener.local_addr().unwrap());
+    let extra_router = Router::new().route(
+        "/api/v2.0/indexers/all/results/torznab/api",
+        get(move |Query(q): Query<Vec<(String, String)>>| async move {
+            assert!(!q.iter().any(|(k, _)| k == "apikey"));
+            extra_feed
+        }),
+    );
+    tokio::spawn(async move { axum::serve(extra_listener, extra_router).await.unwrap() });
+
+    let broken_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let broken_url = format!("http://{}", broken_listener.local_addr().unwrap());
+    let broken_router = Router::new().route(
+        "/api/v2.0/indexers/all/results/torznab/api",
+        get(|| async { StatusCode::BAD_GATEWAY }),
+    );
+    tokio::spawn(async move { axum::serve(broken_listener, broken_router).await.unwrap() });
+
+    let app = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            extra_torznab: vec![
+                kino_server::config::ExtraTorznabConfig {
+                    url: extra_url,
+                    api_key: None,
+                },
+                kino_server::config::ExtraTorznabConfig {
+                    url: broken_url,
+                    api_key: None,
+                },
+            ],
+            ..Default::default()
+        },
+    ));
+    let t = login_ok(&app, ADMIN_TG, None).await.token;
+    let (code, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&t), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert!(list.configured);
+    // 3 from Jackett + 1 new RuTracker release from extra_torznab (Kinozal hash deduplicated).
+    assert_eq!(list.releases.len(), 4);
+    let extra = list
+        .releases
+        .iter()
+        .find(|r| r.infohash == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        .expect("extra RuTracker release present");
+    assert_eq!(extra.tracker, "RuTracker");
+    assert_eq!(extra.seeders, 320);
+
+    let kinozal = list
+        .releases
+        .iter()
+        .find(|r| r.infohash == "c12fe1c06bba254a9dc9f519b335aa7c1367a88a")
+        .expect("deduplicated Kinozal release present");
+    assert_eq!(kinozal.seeders, 150);
+}

@@ -117,6 +117,7 @@ pub struct Jackett {
     base: String,
     api_key: String,
     wake: Option<JackettWake>,
+    timeout: std::time::Duration,
 }
 
 /// Torznab categories: movies (2000) and TV (5000) with sub-categories, plus
@@ -132,11 +133,17 @@ impl Jackett {
             base: base.trim_end_matches('/').to_owned(),
             api_key: api_key.to_owned(),
             wake: None,
+            timeout: std::time::Duration::from_secs(40),
         }
     }
 
     pub fn with_wake(mut self, wake: JackettWake) -> Self {
         self.wake = Some(wake);
+        self
+    }
+
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
         self
     }
 
@@ -159,16 +166,15 @@ impl Jackett {
     pub async fn search(&self, query: &str, cats: &str) -> Result<Vec<TorznabItem>, TorznabError> {
         self.ensure_ready().await;
         let url = format!("{}/api/v2.0/indexers/all/results/torznab/api", self.base);
+        let mut params = vec![("t", "search"), ("q", query), ("cat", cats)];
+        if !self.api_key.is_empty() {
+            params.push(("apikey", self.api_key.as_str()));
+        }
         let body = self
             .http
             .get(url)
-            .query(&[
-                ("apikey", self.api_key.as_str()),
-                ("t", "search"),
-                ("q", query),
-                ("cat", cats),
-            ])
-            .timeout(std::time::Duration::from_secs(40))
+            .query(&params)
+            .timeout(self.timeout)
             .send()
             .await?
             .error_for_status()?
@@ -241,15 +247,35 @@ pub fn parse_feed(xml: &str) -> Result<Vec<TorznabItem>, TorznabError> {
     Ok(items)
 }
 
-/// "RuTracker.org" → "RuTracker".
+/// `"RuTracker.org"` → `"RuTracker"`; `"rutracker, bitru, rutor"` → `"RuTracker"`.
 fn tracker_name(s: &str) -> String {
-    let s = s.trim();
+    let first = s.split(',').next().unwrap_or(s).trim();
+    let mut base = first;
     for tld in [".org", ".net", ".tv", ".guru", ".me", ".ru", ".com", ".to"] {
-        if let Some(base) = s.strip_suffix(tld) {
-            return base.to_owned();
+        if let Some(stripped) = first.strip_suffix(tld) {
+            base = stripped;
+            break;
         }
     }
-    s.to_owned()
+    const CANONICAL: &[(&str, &str)] = &[
+        ("rutracker", "RuTracker"),
+        ("rutor", "RuTor"),
+        ("kinozal", "Kinozal"),
+        ("megapeer", "MegaPeer"),
+        ("nnmclub", "NNM-Club"),
+        ("nnm-club", "NNM-Club"),
+        ("selezen", "Selezen"),
+        ("bitru", "BitRu"),
+        ("anilibria", "AniLibria"),
+        ("anidub", "AniDUB"),
+        ("lostfilm", "LostFilm"),
+    ];
+    for &(needle, canonical) in CANONICAL {
+        if base.eq_ignore_ascii_case(needle) {
+            return canonical.to_owned();
+        }
+    }
+    base.to_owned()
 }
 
 #[cfg(test)]
@@ -295,5 +321,14 @@ mod tests {
         let items = parse_feed(xml).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].categories, vec![8000, 100003]);
+    }
+
+    #[test]
+    fn normalizes_multi_tracker_names() {
+        assert_eq!(tracker_name("RuTracker.org"), "RuTracker");
+        assert_eq!(tracker_name("rutracker, bitru, rutor"), "RuTracker");
+        assert_eq!(tracker_name("kinozal, megapeer, rutor"), "Kinozal");
+        assert_eq!(tracker_name("nnmclub, bitru"), "NNM-Club");
+        assert_eq!(tracker_name("korsars"), "korsars");
     }
 }
