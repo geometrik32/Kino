@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use dioxus::html::{geometry::PixelsVector2D, input_data::MouseButton, MountedData, ScrollBehavior};
+use dioxus::html::{geometry::PixelsVector2D, MountedData, ScrollBehavior};
 use dioxus::prelude::*;
 use kino_core::{
     clock, episode_code, format_rating_short, image_url, rating_description, CastMember, ContinueItem, EpisodeRating,
@@ -145,7 +145,9 @@ pub(crate) fn shelf_href(id: &str) -> String {
 pub(crate) fn is_plain_primary_click(e: &Event<MouseData>) -> bool {
     let m = e.modifiers();
     let no_mods = !m.ctrl() && !m.meta() && !m.shift() && !m.alt();
-    let primary = e.trigger_button().is_none_or(|b| b == MouseButton::Primary);
+    let primary = e
+        .trigger_button()
+        .is_none_or(|b| b == dioxus::html::input_data::MouseButton::Primary);
     no_mods && primary
 }
 

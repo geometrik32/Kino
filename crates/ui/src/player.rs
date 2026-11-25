@@ -1323,7 +1323,7 @@ pub fn PlayerView(
 
 #[cfg(test)]
 mod tests {
-    use super::{controls_shown, pointer_moved, PlayerMenu, PlayerState, VideoScale};
+    use super::{controls_shown, pointer_moved, PlayerMenu, PlayerState, PreloadState, VideoScale};
 
     #[test]
     fn paused_keeps_controls_visible() {

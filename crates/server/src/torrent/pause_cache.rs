@@ -1189,7 +1189,7 @@ impl PauseCache {
                 return None;
             }
         }
-        let Ok(_gen_permit) = tokio::time::timeout(
+        let Some(_gen_permit) = tokio::time::timeout(
             Duration::from_secs(3),
             Arc::clone(&self.inner.ready_gen_sem).acquire_owned(),
         )
