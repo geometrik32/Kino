@@ -1189,15 +1189,13 @@ impl PauseCache {
                 return None;
             }
         }
-        let Some(_gen_permit) = tokio::time::timeout(
+        let _gen_permit = tokio::time::timeout(
             Duration::from_secs(3),
             Arc::clone(&self.inner.ready_gen_sem).acquire_owned(),
         )
         .await
         .ok()
-        .and_then(Result::ok) else {
-            return None;
-        };
+        .and_then(Result::ok)?;
 
         let port = self.loopback_port(ctx.torrserver.clone()).await.ok()?;
         let staging_id = self.inner.probe_seq.fetch_add(1, Ordering::Relaxed).to_string();

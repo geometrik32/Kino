@@ -574,7 +574,7 @@ impl AppCache {
     }
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct HomeSessionSnapshot {
     category: String,
