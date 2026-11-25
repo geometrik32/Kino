@@ -383,6 +383,7 @@ struct ScrollRequest {
 }
 
 const MAX_CACHED_ENTRIES: usize = 20;
+#[cfg(target_arch = "wasm32")]
 const HOME_SNAPSHOT_KEY: &str = "kino.home_snapshot.v1";
 
 #[derive(Clone, Default)]

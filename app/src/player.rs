@@ -1131,7 +1131,7 @@ pub fn Player(
     };
 
     let apply_preloads_list = {
-        let mut maybe_trigger = maybe_trigger_disk_ready_prompt.clone();
+        let mut maybe_trigger = maybe_trigger_disk_ready_prompt;
         move |items: Vec<PreloadItem>, check_prompt: bool| {
             player_preloads.set(items.clone());
             sync_preloads_ui();
@@ -1153,9 +1153,9 @@ pub fn Player(
     };
 
     let refresh_preloads = {
-        let apply_list = apply_preloads_list.clone();
+        let apply_list = apply_preloads_list;
         move |tok: String, check_prompt: bool| {
-            let mut apply_list = apply_list.clone();
+            let mut apply_list = apply_list;
             spawn(async move {
                 let Ok(items) = api::preloads(&tok).await else {
                     return;
@@ -1169,11 +1169,11 @@ pub fn Player(
     };
 
     let start_download_poll = {
-        let apply_list = apply_preloads_list.clone();
+        let apply_list = apply_preloads_list;
         move |tok: String| {
             let my_poll = *poll_dl_gen.peek() + 1;
             poll_dl_gen.set(my_poll);
-            let mut apply_list = apply_list.clone();
+            let mut apply_list = apply_list;
             spawn(async move {
                 loop {
                     platform::sleep(4_000).await;
@@ -1376,8 +1376,8 @@ pub fn Player(
         let explicit_ep_initial = start.explicit_episode;
         let explicit_rel_initial = start.explicit_release;
         let mut start_play_fetch = start_play_fetch.clone();
-        let refresh_preloads = refresh_preloads.clone();
-        let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt.clone();
+        let refresh_preloads = refresh_preloads;
+        let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt;
         move |join_sync: bool| {
             let (season, episode) = *target.peek();
             let rel = release.peek().clone();
@@ -1420,8 +1420,8 @@ pub fn Player(
             let cid = client_id.clone();
             let dev = device.clone();
             let mut start_play_fetch = start_play_fetch.clone();
-            let refresh_preloads = refresh_preloads.clone();
-            let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt.clone();
+            let refresh_preloads = refresh_preloads;
+            let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt;
             spawn(async move {
                 let mut cur_season = season;
                 let mut cur_episode = episode;
@@ -1478,8 +1478,8 @@ pub fn Player(
                     let ws_dev = dev.clone();
                     let initial_ticket = resp.ticket;
                     let mut ws_start_fetch = start_play_fetch.clone();
-                    let ws_refresh_preloads = refresh_preloads.clone();
-                    let mut ws_trigger_ready = maybe_trigger_disk_ready_prompt.clone();
+                    let ws_refresh_preloads = refresh_preloads;
+                    let mut ws_trigger_ready = maybe_trigger_disk_ready_prompt;
                     spawn(async move {
                         let mut ticket = initial_ticket;
                         let mut backoff_ms: u32 = 1_500;
@@ -1870,7 +1870,7 @@ pub fn Player(
     };
     use_hook({
         let mut begin_playback = begin_playback.clone();
-        let refresh_init = refresh_preloads.clone();
+        let refresh_init = refresh_preloads;
         let init_token = token.clone();
         move || {
             begin_playback(true);
@@ -3160,11 +3160,11 @@ pub fn Player(
     };
 
     let menu_token = token.clone();
-    let menu_refresh_preloads = refresh_preloads.clone();
-    let mut menu_start_poll = start_download_poll.clone();
+    let menu_refresh_preloads = refresh_preloads;
+    let mut menu_start_poll = start_download_poll;
     let dl_token = token.clone();
-    let dl_start_poll = start_download_poll.clone();
-    let dl_trigger_ready = maybe_trigger_disk_ready_prompt.clone();
+    let dl_start_poll = start_download_poll;
+    let dl_trigger_ready = maybe_trigger_disk_ready_prompt;
     let dl_on_changed = on_preloads_changed;
     let mut switch_save = save.clone();
     let mut switch_fetch = start_play_fetch.clone();
@@ -3276,8 +3276,8 @@ pub fn Player(
                 ui.with_mut(|s| s.download_note = None);
                 let tok = dl_token.clone();
                 let changed_cb = dl_on_changed;
-                let mut start_poll = dl_start_poll.clone();
-                let mut trigger_ready = dl_trigger_ready.clone();
+                let mut start_poll = dl_start_poll;
+                let mut trigger_ready = dl_trigger_ready;
                 spawn(async move {
                     match api::add_preload(&tok, &req).await {
                         Ok(item) => {
