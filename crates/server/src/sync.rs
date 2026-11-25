@@ -302,10 +302,13 @@ impl SyncHub {
 
     /// True when at least one live player room actively loaded a file from `hash` (`file_index` set).
     pub fn has_playing_hash(&self, hash: &str) -> bool {
+        self.has_playing_hash_at(hash, Self::now_ms())
+    }
+
+    fn has_playing_hash_at(&self, hash: &str, now_ms: i64) -> bool {
         if hash.is_empty() {
             return false;
         }
-        let now = Self::now_ms();
         let room_list: Vec<Arc<Mutex<Room>>> = {
             let rooms = self.rooms.lock().expect("sync rooms lock");
             rooms.values().cloned().collect()
@@ -317,7 +320,7 @@ impl SyncHub {
                 && room
                     .members
                     .iter()
-                    .any(|m| now - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS)
+                    .any(|m| now_ms - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS)
         })
     }
 
@@ -330,10 +333,21 @@ impl SyncHub {
         season: i32,
         infohash: &str,
     ) {
+        self.notify_preload_ready_at(ready_users, kind, tmdb_id, season, infohash, Self::now_ms());
+    }
+
+    fn notify_preload_ready_at(
+        &self,
+        ready_users: &[i64],
+        kind: MediaKind,
+        tmdb_id: i64,
+        season: i32,
+        infohash: &str,
+        now_ms: i64,
+    ) {
         if infohash.is_empty() {
             return;
         }
-        let now = Self::now_ms();
         let room_list: Vec<(RoomKey, Arc<Mutex<Room>>)> = {
             let rooms = self.rooms.lock().expect("sync rooms lock");
             rooms
@@ -353,7 +367,7 @@ impl SyncHub {
             let has_live = room
                 .members
                 .iter()
-                .any(|m| now - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS);
+                .any(|m| now_ms - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS);
             if !has_live {
                 continue;
             }
@@ -1808,7 +1822,7 @@ mod tests {
             exp: 9_999_999_999,
         };
         let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
-        assert!(!hub.has_playing_hash(&hash_a));
+        assert!(!hub.has_playing_hash_at(&hash_a, t));
         hub.handle_ws_msg(
             key,
             "a",
@@ -1821,10 +1835,10 @@ mod tests {
             None,
             t + 100,
         );
-        assert!(hub.has_playing_hash(&hash_a));
+        assert!(hub.has_playing_hash_at(&hash_a, t + 100));
         while rx_a.try_recv().is_ok() {}
 
-        hub.notify_preload_ready(&[1], MediaKind::Movie, 603, 0, &hash_a);
+        hub.notify_preload_ready_at(&[1], MediaKind::Movie, 603, 0, &hash_a, t + 100);
         match rx_a.try_recv().unwrap() {
             SyncServerMsg::PreloadReady {
                 kind,
