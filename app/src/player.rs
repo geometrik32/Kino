@@ -1376,8 +1376,6 @@ pub fn Player(
         let explicit_ep_initial = start.explicit_episode;
         let explicit_rel_initial = start.explicit_release;
         let mut start_play_fetch = start_play_fetch.clone();
-        let refresh_preloads = refresh_preloads;
-        let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt;
         move |join_sync: bool| {
             let (season, episode) = *target.peek();
             let rel = release.peek().clone();
@@ -1420,8 +1418,6 @@ pub fn Player(
             let cid = client_id.clone();
             let dev = device.clone();
             let mut start_play_fetch = start_play_fetch.clone();
-            let refresh_preloads = refresh_preloads;
-            let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt;
             spawn(async move {
                 let mut cur_season = season;
                 let mut cur_episode = episode;
