@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use dioxus::html::{geometry::PixelsVector2D, MountedData, ScrollBehavior};
+use dioxus::html::{geometry::PixelsVector2D, input_data::MouseButton, MountedData, ScrollBehavior};
 use dioxus::prelude::*;
 use kino_core::{
     clock, episode_code, format_rating_short, image_url, rating_description, CastMember, ContinueItem, EpisodeRating,
@@ -115,6 +115,53 @@ fn is_valid_imdb_id(id: &str) -> bool {
     id.starts_with("tt") && id.len() >= 4 && id.len() <= 16 && id[2..].bytes().all(|b| b.is_ascii_digit())
 }
 
+pub(crate) fn title_href(kind: MediaKind, tmdb_id: i64) -> String {
+    format!("/?open={}_{tmdb_id}", kind.as_str())
+}
+
+pub(crate) fn person_href(id: i64) -> String {
+    format!("/?person={id}")
+}
+
+fn encode_query_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+pub(crate) fn shelf_href(id: &str) -> String {
+    format!("/?shelf={}", encode_query_component(id))
+}
+
+/// True only for an unmodified primary click, allowing middle-click and Ctrl/Cmd-click to open links in new tabs on web.
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn is_plain_primary_click(e: &Event<MouseData>) -> bool {
+    let m = e.modifiers();
+    let no_mods = !m.ctrl() && !m.meta() && !m.shift() && !m.alt();
+    let primary = e.trigger_button().is_none_or(|b| b == MouseButton::Primary);
+    no_mods && primary
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn is_plain_primary_click(_e: &Event<MouseData>) -> bool {
+    true
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn handle_aux_click(_e: Event<PointerData>) {}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn handle_aux_click(e: Event<PointerData>) {
+    e.prevent_default();
+}
+
 fn backdrop_style(t: &TitleSummary) -> String {
     match &t.backdrop_path {
         Some(p) if is_safe_tmdb_path(p) => {
@@ -207,20 +254,22 @@ pub fn Shell(
     let header_cls = if is_search_tab { "topbar is-search" } else { "topbar" };
     rsx! {
         header { class: "{header_cls}",
-            div { class: "top-brand-slot",
-                BrandPlaque { on_click: move |_| on_tab.call(Tab::Home) }
-            }
-            nav { class: "nav-pills",
-                for t in DESKTOP_TABS {
-                    button {
-                        class: if tab == Some(t) { "active" } else { "" },
-                        onclick: move |_| on_tab.call(t),
-                        Icon { svg: t.icon_svg(), class: "ic sm" }
-                        "{t.label()}"
+            div { class: "top-left",
+                div { class: "top-brand-slot",
+                    BrandPlaque { on_click: move |_| on_tab.call(Tab::Home) }
+                }
+                nav { class: "nav-pills",
+                    for t in DESKTOP_TABS {
+                        button {
+                            class: if tab == Some(t) { "active" } else { "" },
+                            onclick: move |_| on_tab.call(t),
+                            Icon { svg: t.icon_svg(), class: "ic sm" }
+                            "{t.label()}"
+                        }
                     }
                 }
             }
-            div { class: "top-right",
+            div { class: "top-center",
                 div { class: "search-box",
                     span { class: "muted", "aria-hidden": "true", Icon { svg: icons::SEARCH, class: "ic sm" } }
                     input {
@@ -248,6 +297,8 @@ pub fn Shell(
                         span { class: "kbd", "Ctrl K" }
                     }
                 }
+            }
+            div { class: "top-right",
                 if let Some(pct) = dl_percent {
                     button {
                         class: "dl-pill",
@@ -331,9 +382,19 @@ pub fn PosterCard(
     };
     let any_live = item.peers.iter().any(|p| p.watching_now);
     let peer_count = item.peers.len();
+    let href = title_href(item.kind, item.tmdb_id);
     let it = item.clone();
     rsx! {
-        button { class: "poster", onclick: move |_| on_open.call(it.clone()),
+        a {
+            class: "poster",
+            href: "{href}",
+            onclick: move |e: Event<MouseData>| {
+                if is_plain_primary_click(&e) {
+                    e.prevent_default();
+                    on_open.call(it.clone());
+                }
+            },
+            onauxclick: handle_aux_click,
             div { class: "img",
                 if let Some(p) = &item.poster_path {
                     img { src: image_url(p, ImageSize::Poster), alt: "{item.title}", loading: "lazy" }
@@ -423,32 +484,56 @@ pub fn ContinueCard(
     };
     let release = p.release.as_ref().and_then(|r| r.title.clone());
     let (kind, tmdb_id) = (p.kind, p.tmdb_id);
+    let href = title_href(kind, tmdb_id);
     let it_play = item.clone();
     let it_drop = item.clone();
     let it_drop_menu = item.clone();
     rsx! {
         div { class: "cw-card",
             div { class: "cw-thumb",
-                onclick: move |_| {
-                    if menu_open() {
-                        menu_open.set(false);
-                    } else {
-                        on_play.call(it_play.clone());
+                a {
+                    class: "cw-thumb-link",
+                    href: "{href}",
+                    onclick: move |e: Event<MouseData>| {
+                        if menu_open() {
+                            e.prevent_default();
+                            menu_open.set(false);
+                        } else if is_plain_primary_click(&e) {
+                            e.prevent_default();
+                            on_play.call(it_play.clone());
+                        }
+                    },
+                    onauxclick: handle_aux_click,
+                    div { class: "cw-bg", style: "{bg}" }
+                    div { class: "cw-scrim" }
+                    div { class: if pct > 0.0 { "cw-overlay-meta has-bar" } else { "cw-overlay-meta" },
+                        span { class: "cw-time-pill", "{pill_text}" }
+                        if item.stale {
+                            span { class: "cw-stale-pill", "Давно не смотрели" }
+                        }
                     }
-                },
-                div { class: "cw-bg", style: "{bg}" }
-                div { class: "cw-scrim" }
+                    if pct > 0.0 {
+                        div { class: "cw-inset-bar",
+                            div { style: "width: {pct:.1}%" }
+                        }
+                    }
+                }
                 div { class: "cw-top-acts",
                     if let Some(open_cb) = on_open {
-                        button {
+                        a {
                             class: "glass-circle",
+                            href: "{href}",
                             title: "Открыть страницу",
                             "aria-label": "Открыть страницу",
-                            onclick: move |e| {
+                            onclick: move |e: Event<MouseData>| {
                                 e.stop_propagation();
-                                menu_open.set(false);
-                                open_cb.call((kind, tmdb_id));
+                                if is_plain_primary_click(&e) {
+                                    e.prevent_default();
+                                    menu_open.set(false);
+                                    open_cb.call((kind, tmdb_id));
+                                }
                             },
+                            onauxclick: handle_aux_click,
                             Icon { svg: icons::INFO, class: "ic sm" }
                         }
                     }
@@ -468,12 +553,17 @@ pub fn ContinueCard(
                         class: "cw-pop",
                         onclick: move |e| e.stop_propagation(),
                         if let Some(open_cb) = on_open {
-                            button {
+                            a {
                                 class: "cw-pop-item",
-                                onclick: move |_| {
-                                    menu_open.set(false);
-                                    open_cb.call((kind, tmdb_id));
+                                href: "{href}",
+                                onclick: move |e: Event<MouseData>| {
+                                    if is_plain_primary_click(&e) {
+                                        e.prevent_default();
+                                        menu_open.set(false);
+                                        open_cb.call((kind, tmdb_id));
+                                    }
                                 },
+                                onauxclick: handle_aux_click,
                                 Icon { svg: icons::INFO, class: "ic sm" }
                                 "Страница тайтла"
                             }
@@ -489,28 +579,22 @@ pub fn ContinueCard(
                         }
                     }
                 }
-                div { class: if pct > 0.0 { "cw-overlay-meta has-bar" } else { "cw-overlay-meta" },
-                    span { class: "cw-time-pill", "{pill_text}" }
-                    if item.stale {
-                        span { class: "cw-stale-pill", "Давно не смотрели" }
-                    }
-                }
-                if pct > 0.0 {
-                    div { class: "cw-inset-bar",
-                        div { style: "width: {pct:.1}%" }
-                    }
-                }
             }
             div { class: "cw-foot",
-                button {
+                a {
                     class: "cw-title",
-                    onclick: move |_| {
-                        if let Some(open_cb) = on_open {
-                            open_cb.call((kind, tmdb_id));
-                        } else {
-                            on_play.call(item.clone());
+                    href: "{href}",
+                    onclick: move |e: Event<MouseData>| {
+                        if is_plain_primary_click(&e) {
+                            e.prevent_default();
+                            if let Some(open_cb) = on_open {
+                                open_cb.call((kind, tmdb_id));
+                            } else {
+                                on_play.call(item.clone());
+                            }
                         }
                     },
+                    onauxclick: handle_aux_click,
                     "{name}"
                 }
                 if item.stale {
@@ -535,11 +619,14 @@ pub fn ScrollRow(
     items_len: usize,
     #[props(default)] has_more: bool,
     #[props(default)] on_near_end: Option<EventHandler<()>>,
+    #[props(default)] initial_scroll_left: f64,
+    #[props(default)] on_scroll_left: Option<EventHandler<f64>>,
     children: Element,
 ) -> Element {
     let mut mounted = use_signal(|| None::<Rc<MountedData>>);
     let mut can_prev = use_signal(|| false);
     let mut can_next = use_signal(|| false);
+    let mut restored = use_signal(|| false);
 
     // Re-measure overflow whenever items change (e.g. after appending page 2).
     use_effect(use_reactive((&items_len,), move |_| {
@@ -600,9 +687,33 @@ pub fn ScrollRow(
             }
             div {
                 class: "{row_class}",
-                onmounted: move |e| mounted.set(Some(e.data())),
+                onmounted: move |e| {
+                    let data = e.data();
+                    mounted.set(Some(data.clone()));
+                    if !*restored.peek() && initial_scroll_left > 1.0 {
+                        restored.set(true);
+                        let target_x = initial_scroll_left;
+                        spawn(async move {
+                            let _ = data
+                                .scroll(PixelsVector2D::new(target_x, 0.0), ScrollBehavior::Instant)
+                                .await;
+                            if let (Ok(offset), Ok(size), Ok(rect)) = (
+                                data.get_scroll_offset().await,
+                                data.get_scroll_size().await,
+                                data.get_client_rect().await,
+                            ) {
+                                let w = rect.width();
+                                can_prev.set(offset.x > 8.0);
+                                can_next.set(offset.x + w < size.width - 8.0);
+                            }
+                        });
+                    }
+                },
                 onscroll: move |e| {
                     let left = e.scroll_left();
+                    if let Some(cb) = on_scroll_left {
+                        cb.call(left);
+                    }
                     let width = f64::from(e.scroll_width());
                     let client = f64::from(e.client_width());
                     let next_prev = left > 8.0;
@@ -647,6 +758,8 @@ pub fn PosterRow(
     #[props(default)] on_open_all: Option<EventHandler<()>>,
     #[props(default)] on_load_more_shelf: Option<EventHandler<String>>,
     #[props(default)] on_open_shelf: Option<EventHandler<(String, String, Option<String>)>>,
+    #[props(default)] initial_scroll_left: f64,
+    #[props(default)] on_scroll_left: Option<EventHandler<f64>>,
 ) -> Element {
     let items_len = items.len();
     let has_open_all = on_open_all.is_some() || (on_open_shelf.is_some() && !shelf_id.is_empty());
@@ -662,9 +775,10 @@ pub fn PosterRow(
     let sid_btn = shelf_id.clone();
     let title_btn = title.clone();
     let sub_btn = subtitle.clone();
-    let sid_card = shelf_id;
+    let sid_card = shelf_id.clone();
     let title_card = title.clone();
     let sub_card = subtitle.clone();
+    let shelf_link = (!shelf_id.is_empty()).then(|| shelf_href(&shelf_id));
     rsx! {
         section { class: "section",
             div { class: "row-head",
@@ -675,17 +789,35 @@ pub fn PosterRow(
                     }
                 }
                 if has_open_all {
-                    button {
-                        class: "row-all",
-                        onclick: move |_| {
-                            if let Some(open_all) = on_open_all {
-                                open_all.call(());
-                            } else if let Some(cb) = on_open_shelf {
-                                cb.call((sid_btn.clone(), title_btn.clone(), sub_btn.clone()));
-                            }
-                        },
-                        "Все"
-                        Icon { svg: icons::CHEV_R, class: "ic sm" }
+                    if let Some(href) = &shelf_link {
+                        a {
+                            class: "row-all",
+                            href: "{href}",
+                            onclick: move |e: Event<MouseData>| {
+                                if is_plain_primary_click(&e) {
+                                    e.prevent_default();
+                                    if let Some(open_all) = on_open_all {
+                                        open_all.call(());
+                                    } else if let Some(cb) = on_open_shelf {
+                                        cb.call((sid_btn.clone(), title_btn.clone(), sub_btn.clone()));
+                                    }
+                                }
+                            },
+                            onauxclick: handle_aux_click,
+                            "Все"
+                            Icon { svg: icons::CHEV_R, class: "ic sm" }
+                        }
+                    } else {
+                        button {
+                            class: "row-all",
+                            onclick: move |_| {
+                                if let Some(open_all) = on_open_all {
+                                    open_all.call(());
+                                }
+                            },
+                            "Все"
+                            Icon { svg: icons::CHEV_R, class: "ic sm" }
+                        }
                     }
                 }
             }
@@ -694,6 +826,8 @@ pub fn PosterRow(
                 items_len,
                 has_more,
                 on_near_end: near_end_opt,
+                initial_scroll_left,
+                on_scroll_left,
                 for item in items {
                     PosterCard { key: "{item.kind.as_str()}{item.tmdb_id}", item, on_open }
                 }
@@ -707,23 +841,47 @@ pub fn PosterRow(
                     }
                 }
                 if has_open_all {
-                    button {
-                        class: "poster poster-all",
-                        onclick: move |_| {
-                            if let Some(open_all) = on_open_all {
-                                open_all.call(());
-                            } else if let Some(cb) = on_open_shelf {
-                                cb.call((sid_card.clone(), title_card.clone(), sub_card.clone()));
+                    if let Some(href) = &shelf_link {
+                        a {
+                            class: "poster poster-all",
+                            href: "{href}",
+                            onclick: move |e: Event<MouseData>| {
+                                if is_plain_primary_click(&e) {
+                                    e.prevent_default();
+                                    if let Some(open_all) = on_open_all {
+                                        open_all.call(());
+                                    } else if let Some(cb) = on_open_shelf {
+                                        cb.call((sid_card.clone(), title_card.clone(), sub_card.clone()));
+                                    }
+                                }
+                            },
+                            onauxclick: handle_aux_click,
+                            div { class: "img",
+                                div { class: "all-box",
+                                    span { class: "all-arrow", Icon { svg: icons::CHEV_R, class: "ic lg" } }
+                                    span { class: "all-label", "Все" }
+                                }
                             }
-                        },
-                        div { class: "img",
-                            div { class: "all-box",
-                                span { class: "all-arrow", Icon { svg: icons::CHEV_R, class: "ic lg" } }
-                                span { class: "all-label", "Все" }
-                            }
+                            div { class: "name", "Смотреть все" }
+                            div { class: "sub", if has_more { "Открыть каталог" } else { "Показать списком" } }
                         }
-                        div { class: "name", "Смотреть все" }
-                        div { class: "sub", if has_more { "Открыть каталог" } else { "Показать списком" } }
+                    } else {
+                        button {
+                            class: "poster poster-all",
+                            onclick: move |_| {
+                                if let Some(open_all) = on_open_all {
+                                    open_all.call(());
+                                }
+                            },
+                            div { class: "img",
+                                div { class: "all-box",
+                                    span { class: "all-arrow", Icon { svg: icons::CHEV_R, class: "ic lg" } }
+                                    span { class: "all-label", "Все" }
+                                }
+                            }
+                            div { class: "name", "Смотреть все" }
+                            div { class: "sub", if has_more { "Открыть каталог" } else { "Показать списком" } }
+                        }
                     }
                 }
             }
@@ -769,8 +927,19 @@ pub fn HomeView(
     #[props(default)] on_load_more_items: Option<EventHandler<String>>,
     #[props(default)] on_open_shelf: Option<EventHandler<(String, String, Option<String>)>>,
     #[props(default)] on_load_more_rows: Option<EventHandler<()>>,
+    #[props(default)] row_scrolls: std::collections::HashMap<String, f64>,
+    #[props(default)] on_row_scroll: Option<EventHandler<(String, f64)>>,
+    #[props(default)] initial_cats_scroll: f64,
+    #[props(default)] on_cats_scroll: Option<EventHandler<f64>>,
 ) -> Element {
     let cont_len = continue_items.len();
+    let mut cats_restored = use_signal(|| false);
+    let cont_scroll = row_scrolls.get("__continue__").copied().unwrap_or(0.0);
+    let on_cont_scroll = on_row_scroll.map(|cb| {
+        Callback::new(move |left: f64| {
+            cb.call(("__continue__".to_owned(), left));
+        })
+    });
     rsx! {
         if feed.as_ref().is_some_and(|f| f.demo) {
             p { class: "demo-note", "Демо-каталог: без ключа TMDB показываются встроенные примеры без постеров." }
@@ -780,7 +949,11 @@ pub fn HomeView(
                 div { class: "sec-head",
                     h2 { "Продолжить просмотр" }
                 }
-                ScrollRow { row_class: "row".to_owned(), items_len: cont_len,
+                ScrollRow {
+                    row_class: "row".to_owned(),
+                    items_len: cont_len,
+                    initial_scroll_left: cont_scroll,
+                    on_scroll_left: on_cont_scroll,
                     for item in continue_items {
                         ContinueCard {
                             key: "{item.last.kind.as_str()}{item.last.tmdb_id}",
@@ -824,7 +997,23 @@ pub fn HomeView(
                 };
                 rsx! {
                     if feed.categories.len() > 1 {
-                        div { class: "chips home-cats",
+                        div {
+                            class: "chips home-cats",
+                            onmounted: move |e| {
+                                if !*cats_restored.peek() && initial_cats_scroll > 1.0 {
+                                    cats_restored.set(true);
+                                    let data = e.data();
+                                    let x = initial_cats_scroll;
+                                    spawn(async move {
+                                        let _ = data.scroll(PixelsVector2D::new(x, 0.0), ScrollBehavior::Instant).await;
+                                    });
+                                }
+                            },
+                            onscroll: move |e| {
+                                if let Some(cb) = on_cats_scroll {
+                                    cb.call(e.scroll_left());
+                                }
+                            },
                             for cat in feed.categories {
                                 {
                                     let cid = cat.id.clone();
@@ -851,6 +1040,13 @@ pub fn HomeView(
                     for row in loaded_rows {
                         {
                             let row_loading = loading_row_pages.iter().any(|id| id == &row.id);
+                            let row_init_scroll = row_scrolls.get(&row.id).copied().unwrap_or(0.0);
+                            let sid_scroll = row.id.clone();
+                            let on_scroll_row = on_row_scroll.map(|cb| {
+                                Callback::new(move |left: f64| {
+                                    cb.call((sid_scroll.clone(), left));
+                                })
+                            });
                             rsx! {
                                 PosterRow {
                                     key: "{row.id}-{row.title}",
@@ -863,6 +1059,8 @@ pub fn HomeView(
                                     on_open,
                                     on_load_more_shelf: on_load_more_items,
                                     on_open_shelf,
+                                    initial_scroll_left: row_init_scroll,
+                                    on_scroll_left: on_scroll_row,
                                 }
                             }
                         }
@@ -945,8 +1143,19 @@ pub fn ShelfView(
 }
 
 #[component]
-pub fn SearchView(results: Option<SearchResults>, on_open: EventHandler<TitleSummary>) -> Element {
-    let mut kind = use_signal(|| MyKindFilter::All);
+pub fn SearchView(
+    results: Option<SearchResults>,
+    on_open: EventHandler<TitleSummary>,
+    #[props(default)] initial_kind: MyKindFilter,
+    #[props(default)] on_kind_change: Option<EventHandler<MyKindFilter>>,
+) -> Element {
+    let mut kind = use_signal(|| initial_kind);
+    let mut set_kind = move |next: MyKindFilter| {
+        kind.set(next);
+        if let Some(cb) = on_kind_change {
+            cb.call(next);
+        }
+    };
     rsx! {
         section { class: "section search-section",
             match results {
@@ -973,20 +1182,20 @@ pub fn SearchView(results: Option<SearchResults>, on_open: EventHandler<TitleSum
                         div { class: "chips search-filters",
                             button {
                                 class: if active == MyKindFilter::All { "chip active" } else { "chip" },
-                                onclick: move |_| kind.set(MyKindFilter::All),
+                                onclick: move |_| set_kind(MyKindFilter::All),
                                 "Все · {total}"
                             }
                             if movies > 0 {
                                 button {
                                     class: if active == MyKindFilter::Movie { "chip active" } else { "chip" },
-                                    onclick: move |_| kind.set(MyKindFilter::Movie),
+                                    onclick: move |_| set_kind(MyKindFilter::Movie),
                                     "Фильмы · {movies}"
                                 }
                             }
                             if tv > 0 {
                                 button {
                                     class: if active == MyKindFilter::Tv { "chip active" } else { "chip" },
-                                    onclick: move |_| kind.set(MyKindFilter::Tv),
+                                    onclick: move |_| set_kind(MyKindFilter::Tv),
                                     "Сериалы · {tv}"
                                 }
                             }
@@ -1643,8 +1852,18 @@ pub fn TitleExtrasView(
 #[component]
 fn CastCard(person: CastMember, on_person: EventHandler<i64>) -> Element {
     let id = person.id;
+    let href = person_href(id);
     rsx! {
-        button { class: "cast-card", onclick: move |_| on_person.call(id),
+        a {
+            class: "cast-card",
+            href: "{href}",
+            onclick: move |e: Event<MouseData>| {
+                if is_plain_primary_click(&e) {
+                    e.prevent_default();
+                    on_person.call(id);
+                }
+            },
+            onauxclick: handle_aux_click,
             div { class: "avatar",
                 if let Some(p) = &person.profile_path {
                     img { src: image_url(p, ImageSize::Profile), alt: "{person.name}", loading: "lazy" }

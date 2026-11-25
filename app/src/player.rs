@@ -5,9 +5,9 @@
 use dioxus::prelude::*;
 use kino_core::{
     episode_code, normalize_quality_key, EpisodeRating, MediaKind, MediaTrack, PlayInfo, PlayProbeRequest, PlayRequest,
-    ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode,
-    StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState,
-    TracksUpdate,
+    PreloadItem, PreloadRequest, PreloadState, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef, ResolveReleaseRequest,
+    ResolveReleaseResponse, RewatchMode, StreamPhase, SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest,
+    SyncServerMsg, SyncState, TracksUpdate,
 };
 use kino_ui::{PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale, NEXT_PROMPT_SEC};
 
@@ -16,6 +16,9 @@ use crate::{
     platform::video::{video, PlayOutcome},
     sync, telegram,
 };
+
+/// Keep paused transcoded streams alive up to 8 minutes before forcing a clean reload.
+const TRANSCODE_PAUSE_RELOAD_MS: i64 = 480_000;
 
 /// What to play.
 #[derive(Debug, Clone, PartialEq)]
@@ -400,6 +403,7 @@ pub fn Player(
     on_title: EventHandler<()>,
     /// The next season has no remembered release: pick one for `(season, episode)`.
     on_need_release: EventHandler<(i32, i32)>,
+    #[props(default)] on_preloads_changed: Option<EventHandler<()>>,
 ) -> Element {
     let kind = start.kind;
     let id = start.tmdb_id;
@@ -484,6 +488,9 @@ pub fn Player(
     let mut paused_since_ms = use_signal(|| None::<i64>);
     let mut last_advance = use_signal(|| (0.0_f64, 0_i64));
     let mut auto_reloads = use_signal(|| 0_u32);
+    let mut player_preloads = use_signal(Vec::<PreloadItem>::new);
+    let mut prompted_hashes = use_signal(Vec::<String>::new);
+    let mut poll_dl_gen = use_signal(|| 0_u32);
 
     let mut pause_video = move || {
         last_prog_pause_ms.set(platform::now_ms());
@@ -1061,6 +1068,138 @@ pub fn Player(
         }
     };
 
+    // Syncs `player_preloads` download states into `ui.release_downloads` and `quality_cache`.
+    let mut sync_preloads_ui = move || {
+        let items = player_preloads.peek().clone();
+        let cur_season = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
+        let mapped: Vec<(String, PreloadState, f32)> = items
+            .iter()
+            .filter(|p| {
+                p.kind == kind
+                    && p.tmdb_id == id
+                    && (kind == MediaKind::Movie || p.season == 0 || p.season == cur_season)
+            })
+            .map(|p| (p.infohash.clone(), p.state, p.progress))
+            .collect();
+        ui.with_mut(|s| s.release_downloads = mapped.clone());
+        quality_cache.with_mut(|qc| {
+            if let Some((_, ref mut list)) = qc.as_mut() {
+                for r in list.iter_mut() {
+                    if mapped
+                        .iter()
+                        .any(|(h, st, _)| *st == PreloadState::Ready && h.eq_ignore_ascii_case(&r.infohash))
+                    {
+                        r.preloaded = true;
+                    }
+                }
+            }
+        });
+    };
+
+    let mut clear_disk_ready_prompt = move || {
+        if ui.peek().disk_ready_prompt {
+            ui.with_mut(|s| s.disk_ready_prompt = false);
+        }
+    };
+
+    let maybe_trigger_disk_ready_prompt = move |ready_hash: &str, ready_season: i32| {
+        if closing()
+            || ui.peek().preloaded
+            || ui.peek().error.is_some()
+            || info.peek().is_none()
+            || ui.peek().disk_ready_prompt
+        {
+            return;
+        }
+        if kind == MediaKind::Tv && ready_season != 0 && ready_season != target.peek().0 {
+            return;
+        }
+        if !ui
+            .peek()
+            .active_infohash
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(ready_hash))
+        {
+            return;
+        }
+        let lc = ready_hash.to_ascii_lowercase();
+        if prompted_hashes.peek().iter().any(|h| h == &lc) {
+            return;
+        }
+        prompted_hashes.with_mut(|v| v.push(lc));
+        ui.with_mut(|s| s.disk_ready_prompt = true);
+    };
+
+    let apply_preloads_list = {
+        let mut maybe_trigger = maybe_trigger_disk_ready_prompt.clone();
+        move |items: Vec<PreloadItem>, check_prompt: bool| {
+            player_preloads.set(items.clone());
+            sync_preloads_ui();
+            if check_prompt {
+                if let Some(cur_hash) = ui.peek().active_infohash.clone() {
+                    let cur_s = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
+                    if let Some(hit) = items.iter().find(|p| {
+                        p.kind == kind
+                            && p.tmdb_id == id
+                            && p.state == PreloadState::Ready
+                            && p.infohash.eq_ignore_ascii_case(&cur_hash)
+                            && (kind == MediaKind::Movie || p.season == 0 || p.season == cur_s)
+                    }) {
+                        maybe_trigger(&hit.infohash, hit.season);
+                    }
+                }
+            }
+        }
+    };
+
+    let refresh_preloads = {
+        let apply_list = apply_preloads_list.clone();
+        move |tok: String, check_prompt: bool| {
+            let mut apply_list = apply_list.clone();
+            spawn(async move {
+                let Ok(items) = api::preloads(&tok).await else {
+                    return;
+                };
+                if closing() {
+                    return;
+                }
+                apply_list(items, check_prompt);
+            });
+        }
+    };
+
+    let start_download_poll = {
+        let apply_list = apply_preloads_list.clone();
+        move |tok: String| {
+            let my_poll = *poll_dl_gen.peek() + 1;
+            poll_dl_gen.set(my_poll);
+            let mut apply_list = apply_list.clone();
+            spawn(async move {
+                loop {
+                    platform::sleep(4_000).await;
+                    if closing() || *poll_dl_gen.peek() != my_poll || ui.peek().menu != Some(PlayerMenu::Quality) {
+                        break;
+                    }
+                    let has_active = player_preloads.peek().iter().any(|p| {
+                        p.kind == kind
+                            && p.tmdb_id == id
+                            && matches!(p.state, PreloadState::Queued | PreloadState::Downloading)
+                    });
+                    if !has_active {
+                        break;
+                    }
+                    let Ok(items) = api::preloads(&tok).await else {
+                        continue;
+                    };
+                    if closing() || *poll_dl_gen.peek() != my_poll {
+                        break;
+                    }
+                    apply_list(items, true);
+                }
+            });
+        }
+    };
+
     // Fetches `/api/play` for `(season, episode, rel)` (or uses a warm background prefetch) and loads the stream.
     let start_play_fetch = {
         let token = token.clone();
@@ -1147,6 +1286,7 @@ pub fn Player(
                 }
             });
 
+            clear_disk_ready_prompt();
             stall_secs.set(0);
             auto_reloads.set(0);
             last_advance.set((0.0, now_ms));
@@ -1163,6 +1303,7 @@ pub fn Player(
                 s.subtitles_src = None;
                 s.error = None;
                 s.next_available = None;
+                s.download_note = None;
                 s.menu = None;
                 s.position = initial_pos;
                 s.duration = None;
@@ -1235,6 +1376,8 @@ pub fn Player(
         let explicit_ep_initial = start.explicit_episode;
         let explicit_rel_initial = start.explicit_release;
         let mut start_play_fetch = start_play_fetch.clone();
+        let refresh_preloads = refresh_preloads.clone();
+        let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt.clone();
         move |join_sync: bool| {
             let (season, episode) = *target.peek();
             let rel = release.peek().clone();
@@ -1277,6 +1420,8 @@ pub fn Player(
             let cid = client_id.clone();
             let dev = device.clone();
             let mut start_play_fetch = start_play_fetch.clone();
+            let refresh_preloads = refresh_preloads.clone();
+            let maybe_trigger_disk_ready_prompt = maybe_trigger_disk_ready_prompt.clone();
             spawn(async move {
                 let mut cur_season = season;
                 let mut cur_episode = episode;
@@ -1333,6 +1478,8 @@ pub fn Player(
                     let ws_dev = dev.clone();
                     let initial_ticket = resp.ticket;
                     let mut ws_start_fetch = start_play_fetch.clone();
+                    let ws_refresh_preloads = refresh_preloads.clone();
+                    let mut ws_trigger_ready = maybe_trigger_disk_ready_prompt.clone();
                     spawn(async move {
                         let mut ticket = initial_ticket;
                         let mut backoff_ms: u32 = 1_500;
@@ -1364,6 +1511,10 @@ pub fn Player(
                                                 file_index: fi,
                                             });
                                         }
+                                        ws_refresh_preloads(
+                                            ws_token.clone(),
+                                            !awaiting_ready() && info.peek().is_some(),
+                                        );
                                     }
                                     sync::WsBridgeEvent::Msg { data } => {
                                         let Some(msg) = sync::parse_server_msg(&data) else {
@@ -1461,7 +1612,9 @@ pub fn Player(
                                                     } else if !awaiting_ready() && info.peek().is_some() && v.paused() {
                                                         let paused_ms = paused_since_ms().map_or(0, |t| now_ms - t);
                                                         paused_since_ms.set(None);
-                                                        if ui.peek().transcoded && (v.ended() || paused_ms >= 45_000) {
+                                                        if ui.peek().transcoded
+                                                            && (v.ended() || paused_ms >= TRANSCODE_PAUSE_RELOAD_MS)
+                                                        {
                                                             let expected = clock.peek().expected_position(&st, now_ms);
                                                             open_source(expected, true);
                                                         } else {
@@ -1580,6 +1733,46 @@ pub fn Player(
                                                     }
                                                 }
                                             }
+                                            SyncServerMsg::PreloadReady {
+                                                kind: pk,
+                                                tmdb_id: pid,
+                                                season: pseason,
+                                                infohash,
+                                            } => {
+                                                if pk == kind && pid == id {
+                                                    let cur_title = ui.peek().title.clone();
+                                                    player_preloads.with_mut(|list| {
+                                                        if let Some(existing) = list
+                                                            .iter_mut()
+                                                            .find(|p| p.infohash.eq_ignore_ascii_case(&infohash))
+                                                        {
+                                                            existing.state = PreloadState::Ready;
+                                                            existing.progress = 1.0;
+                                                        } else {
+                                                            list.insert(
+                                                                0,
+                                                                PreloadItem {
+                                                                    id: 0,
+                                                                    kind,
+                                                                    tmdb_id: id,
+                                                                    season: pseason,
+                                                                    infohash: infohash.clone(),
+                                                                    title: Some(cur_title),
+                                                                    state: PreloadState::Ready,
+                                                                    progress: 1.0,
+                                                                    size_bytes: None,
+                                                                    requested_at: chrono::Utc::now(),
+                                                                    ready_at: Some(chrono::Utc::now()),
+                                                                    delete_after: None,
+                                                                    poster_path: None,
+                                                                },
+                                                            );
+                                                        }
+                                                    });
+                                                    sync_preloads_ui();
+                                                    ws_trigger_ready(&infohash, pseason);
+                                                }
+                                            }
                                             SyncServerMsg::Error { .. } => {}
                                         }
                                     }
@@ -1677,7 +1870,12 @@ pub fn Player(
     };
     use_hook({
         let mut begin_playback = begin_playback.clone();
-        move || begin_playback(true)
+        let refresh_init = refresh_preloads.clone();
+        let init_token = token.clone();
+        move || {
+            begin_playback(true);
+            refresh_init(init_token.clone(), false);
+        }
     });
 
     // While connecting or buffering, shows how far the torrent has got instead of a bare spinner;
@@ -2195,7 +2393,7 @@ pub fn Player(
                         .map(|st| clock.peek().expected_position(st, now_ms));
                     let need_transcode_reload = ui.peek().transcoded
                         && (v.ended()
-                            || paused_ms >= 45_000
+                            || paused_ms >= TRANSCODE_PAUSE_RELOAD_MS
                             || sync_expected.is_some_and(|exp| (cur_pos - exp).abs() > 2.0));
                     if need_transcode_reload {
                         ui.with_mut(|s| s.paused = false);
@@ -2561,6 +2759,7 @@ pub fn Player(
             }
             let from_pop = !to_title && telegram::in_popstate();
             closing.set(true);
+            clear_disk_ready_prompt();
             invalidate_prefetch();
             ws_gen.set(ws_gen() + 1);
             let s = ui.peek().clone();
@@ -2961,6 +3160,15 @@ pub fn Player(
     };
 
     let menu_token = token.clone();
+    let menu_refresh_preloads = refresh_preloads.clone();
+    let mut menu_start_poll = start_download_poll.clone();
+    let dl_token = token.clone();
+    let dl_start_poll = start_download_poll.clone();
+    let dl_trigger_ready = maybe_trigger_disk_ready_prompt.clone();
+    let dl_on_changed = on_preloads_changed;
+    let mut switch_save = save.clone();
+    let mut switch_fetch = start_play_fetch.clone();
+    let switch_save_tracks = save_tracks.clone();
     let qual_token = token.clone();
     let mut start_fetch_qual = start_play_fetch.clone();
     let mut save_qual = save.clone();
@@ -3021,7 +3229,10 @@ pub fn Player(
             on_toggle: move |_| toggle_play(),
             on_seek: move |at: f64| seek_to(at),
             on_menu: move |m: Option<PlayerMenu>| {
-                ui.with_mut(|s| s.menu = m);
+                ui.with_mut(|s| {
+                    s.menu = m;
+                    s.download_note = None;
+                });
                 show_controls();
                 if m == Some(PlayerMenu::Episodes) {
                     // The list is long: bring the current episode into view.
@@ -3032,6 +3243,8 @@ pub fn Player(
                         );
                     });
                 } else if m == Some(PlayerMenu::Quality) {
+                    menu_refresh_preloads(menu_token.clone(), !awaiting_ready() && info.peek().is_some());
+                    menu_start_poll(menu_token.clone());
                     let scope_s = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
                     if quality_cache.peek().as_ref().map(|(s, _)| *s) != Some(scope_s) && !*quality_loading.peek() {
                         quality_loading.set(true);
@@ -3045,10 +3258,93 @@ pub fn Player(
                                 .map(|l| best_per_quality(&l.releases, &cur_choices, &cur_rel, scope_s))
                                 .unwrap_or_default();
                             quality_cache.set(Some((scope_s, items)));
+                            sync_preloads_ui();
                         });
                     }
                 }
             },
+            on_download_release: Some(Callback::new(move |rel: ReleaseOption| {
+                let orig_key = rel.infohash.clone();
+                let dl_season = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
+                let req = PreloadRequest {
+                    kind,
+                    tmdb_id: id,
+                    season: dl_season,
+                    infohash: orig_key.clone(),
+                    title: (!rel.title.is_empty()).then(|| rel.title.clone()),
+                };
+                ui.with_mut(|s| s.download_note = None);
+                let tok = dl_token.clone();
+                let changed_cb = dl_on_changed;
+                let mut start_poll = dl_start_poll.clone();
+                let mut trigger_ready = dl_trigger_ready.clone();
+                spawn(async move {
+                    match api::add_preload(&tok, &req).await {
+                        Ok(item) => {
+                            if let Some(cb) = changed_cb {
+                                cb.call(());
+                            }
+                            let resolved_hash = item.infohash.clone();
+                            if resolved_hash != orig_key {
+                                quality_cache.with_mut(|qc| {
+                                    if let Some((_, ref mut list)) = qc.as_mut() {
+                                        for r in list.iter_mut() {
+                                            if r.infohash == orig_key {
+                                                r.infohash = resolved_hash.clone();
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            player_preloads.with_mut(|list| {
+                                list.retain(|p| !p.infohash.eq_ignore_ascii_case(&item.infohash));
+                                list.insert(0, item.clone());
+                            });
+                            sync_preloads_ui();
+                            if item.state == PreloadState::Ready {
+                                trigger_ready(&item.infohash, item.season);
+                            } else {
+                                start_poll(tok);
+                            }
+                        }
+                        Err(e) => {
+                            ui.with_mut(|s| {
+                                s.download_note = Some(format!("Не удалось скачать: {}", e.message));
+                            });
+                        }
+                    }
+                });
+            })),
+            on_switch_to_disk: Some(Callback::new(move |_| {
+                clear_disk_ready_prompt();
+                let cur_pos = ui.peek().position;
+                let rewind_at = (cur_pos - 1.0).max(0.0);
+                switch_save(false);
+                switch_save_tracks();
+                invalidate_prefetch();
+                override_seek.set(Some(rewind_at));
+                desired_paused.set(false);
+                paused_since_ms.set(None);
+                sync_state.with_mut(|st| {
+                    if let Some(s) = st.as_mut() {
+                        s.paused = false;
+                    }
+                });
+                ui.with_mut(|s| {
+                    s.paused = false;
+                    s.menu = None;
+                });
+                sync::send(&SyncClientMsg::Seek { position_sec: rewind_at });
+                sync::send(&SyncClientMsg::Play { position_sec: rewind_at });
+                let (cur_s, cur_e) = *target.peek();
+                let cur_rel = release.peek().clone();
+                let my_gen = play_gen() + 1;
+                play_gen.set(my_gen);
+                switch_fetch(cur_s, cur_e, cur_rel, rewind_at, my_gen);
+            })),
+            on_dismiss_disk_prompt: Some(Callback::new(move |_| {
+                clear_disk_ready_prompt();
+            })),
             on_pick_quality: Some(Callback::new(move |rel: ReleaseOption| {
                 let cur_pos = ui.peek().position;
                 save_qual(false);

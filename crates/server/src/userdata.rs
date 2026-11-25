@@ -992,6 +992,7 @@ pub async fn preloads_active(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> 
 }
 
 /// Progress from the torrent client, for every user who asked for this release.
+/// Returns the `(user_id, media_kind, tmdb_id, season)` rows updated from `queued`/`downloading`.
 /// Finished downloads are kept on disk for at most 7 days unless watched earlier.
 pub async fn preload_progress(
     pool: &PgPool,
@@ -999,23 +1000,33 @@ pub async fn preload_progress(
     state: PreloadState,
     progress: f32,
     size_bytes: Option<i64>,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
+) -> Result<Vec<(i64, MediaKind, i64, i32)>, sqlx::Error> {
+    let rows = sqlx::query(
         "UPDATE preload SET state = $2, progress = $3, size_bytes = COALESCE($4, size_bytes),
              ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END,
              delete_after = CASE
                  WHEN $2 = 'ready' THEN LEAST(COALESCE(delete_after, now() + interval '7 days'), now() + interval '7 days')
                  ELSE delete_after
              END
-         WHERE infohash = $1 AND state IN ('queued', 'downloading')",
+         WHERE infohash = $1 AND state IN ('queued', 'downloading')
+         RETURNING user_id, media_kind, tmdb_id, season",
     )
     .bind(infohash)
     .bind(state.as_str())
     .bind(progress)
     .bind(size_bytes)
-    .execute(pool)
+    .fetch_all(pool)
     .await?;
-    Ok(())
+    rows.iter()
+        .map(|row| {
+            Ok((
+                row.try_get("user_id")?,
+                kind_of(row)?,
+                row.try_get("tmdb_id")?,
+                row.try_get("season")?,
+            ))
+        })
+        .collect()
 }
 
 /// Ready-to-play server download metadata.

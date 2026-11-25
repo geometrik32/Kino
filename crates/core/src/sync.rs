@@ -188,6 +188,18 @@ pub enum SyncClientMsg {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncServerMsg {
     State(Box<SyncState>),
-    Pong { client_ms: i64, server_ms: i64 },
-    Error { message: String },
+    Pong {
+        client_ms: i64,
+        server_ms: i64,
+    },
+    Error {
+        message: String,
+    },
+    /// A requested download finished on server disk while a matching player is open.
+    PreloadReady {
+        kind: MediaKind,
+        tmdb_id: i64,
+        season: i32,
+        infohash: String,
+    },
 }

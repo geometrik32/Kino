@@ -60,11 +60,13 @@ pub struct Media {
 }
 
 /// Default maximum videos re-encoded concurrently (configurable via `MAX_TRANSCODES`).
-const DEFAULT_MAX_TRANSCODES: usize = 4;
+const DEFAULT_MAX_TRANSCODES: usize = 6;
 /// How many subtitle extractions run concurrently.
 const MAX_SUBTITLES: usize = 2;
+/// Capture a pause-cache snapshot after client reading pauses for this long.
+const TRANSCODE_STALL_CAPTURE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Drops a paused/stalled transcode if the client stops reading for this long.
-const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(540);
 
 impl Media {
     pub fn new(c: &TorrentConfig) -> Self {
@@ -104,6 +106,13 @@ impl Media {
                     .with_timeout(std::time::Duration::from_secs(15)),
             );
         }
+        let transcodes_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(transcodes));
+        let pause_cache = torrent::pause_cache::PauseCache::new(
+            c.pause_cache_dir.clone(),
+            c.pause_cache_max_mb,
+            c.pause_cache_ttl_hours,
+        );
+        pause_cache.set_live_transcodes(std::sync::Arc::clone(&transcodes_sem));
         Self {
             indexers,
             torrserver: c.torrserver_url.as_ref().map(|url| {
@@ -123,13 +132,9 @@ impl Media {
             ffmpeg: or(&c.ffmpeg, "ffmpeg"),
             ffprobe: or(&c.ffprobe, "ffprobe"),
             hw: HwAccel::parse(&c.hwaccel),
-            transcodes: std::sync::Arc::new(tokio::sync::Semaphore::new(transcodes)),
+            transcodes: transcodes_sem,
             subtitles: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SUBTITLES)),
-            pause_cache: torrent::pause_cache::PauseCache::new(
-                c.pause_cache_dir.clone(),
-                c.pause_cache_max_mb,
-                c.pause_cache_ttl_hours,
-            ),
+            pause_cache,
             http,
         }
     }
@@ -734,6 +739,67 @@ fn unavailable(msg: &str) -> AppError {
     AppError::new(StatusCode::SERVICE_UNAVAILABLE, "player_unavailable", msg)
 }
 
+fn is_hash_in_use(state: &AppState, hash: &str) -> bool {
+    state.sync.has_playing_hash(hash) || state.media.pause_cache.has_active_stream_for_hash(hash)
+}
+
+async fn drop_torrserver_if_idle(state: &AppState, ts: &TorrServer, hash: &str, only_if_zero_progress: bool) {
+    if is_hash_in_use(state, hash) {
+        return;
+    }
+    if only_if_zero_progress {
+        let dead = match ts.progress(hash).await {
+            Ok(p) => p.loaded_bytes == 0 && p.speed_bps == 0,
+            Err(_) => true,
+        };
+        if !dead {
+            return;
+        }
+    }
+    ts.drop_torrent(hash).await;
+}
+
+fn spawn_warm_up(state: &AppState, ts: &TorrServer, hash: &str, index: i32) {
+    let st = state.clone();
+    let ts = ts.clone();
+    let hash = hash.to_owned();
+    tokio::spawn(async move {
+        let completed = ts.preload_once(&hash, index, std::time::Duration::from_secs(90)).await;
+        if !completed {
+            drop_torrserver_if_idle(&st, &ts, &hash, true).await;
+        }
+    });
+}
+
+/// Cleans up a dead/zero-byte torrent from TorrServer if the caller cancels `/api/play` mid-connect.
+struct DeadPlayGuard {
+    armed: bool,
+    state: AppState,
+    ts: TorrServer,
+    hash: String,
+}
+
+impl DeadPlayGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeadPlayGuard {
+    fn drop(&mut self) {
+        if !self.armed || self.hash.is_empty() {
+            return;
+        }
+        let state = self.state.clone();
+        let ts = self.ts.clone();
+        let hash = std::mem::take(&mut self.hash);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            drop_torrserver_if_idle(&state, &ts, &hash, true).await;
+        });
+    }
+}
+
 /// Prepares playback: finds the file, looks inside it and hands out a stream link.
 async fn play(
     State(state): State<AppState>,
@@ -760,7 +826,7 @@ async fn play(
 
     // A release downloaded in advance is played from disk; otherwise through pause-cache / TorrServer.
     let local = preloaded_files(&state, &hash).await;
-    let (file, probe, preloaded) = match local {
+    let ((file, probe, preloaded), torrent_ts) = match local {
         Some((list, dir)) => {
             let f = files::pick(&list, episode)
                 .cloned()
@@ -773,7 +839,7 @@ async fn play(
                 tracing::warn!(error = %e, "ffprobe failed, playing the file as it is");
                 Probe::default()
             });
-            (f, probe, true)
+            ((f, probe, true), None)
         }
         None => {
             let ts = media
@@ -789,41 +855,45 @@ async fn play(
                     hit.file.length,
                 );
                 media.pause_cache.remember_probe(&hash, hit.file.index, &hit.probe);
-                media.pause_cache.register_play(
-                    user.0,
-                    req.kind,
-                    req.tmdb_id,
-                    season,
-                    ep,
-                    src,
-                    hit.file.clone(),
-                    hit.probe.clone(),
-                    f64::from(start_at),
-                    ts.clone(),
-                    media.ffmpeg.clone(),
-                );
-                (hit.file, hit.probe, false)
+                ((hit.file, hit.probe, false), Some(ts.clone()))
             } else {
-                let list = ts.add(&src).await.map_err(|e| {
-                    tracing::warn!(error = %e, "TorrServer failed");
-                    unavailable("Потоковый сервер не отвечает")
-                })?;
+                let mut dead_guard = DeadPlayGuard {
+                    armed: true,
+                    state: state.clone(),
+                    ts: ts.clone(),
+                    hash: hash.clone(),
+                };
+                let list = match ts.add(&src).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        dead_guard.disarm();
+                        tracing::warn!(error = %e, "TorrServer failed");
+                        return Err(unavailable("Потоковый сервер не отвечает"));
+                    }
+                };
                 if list.is_empty() {
+                    dead_guard.disarm();
+                    drop_torrserver_if_idle(&state, ts, &hash, false).await;
                     return Err(unavailable(
                         "Нет раздающих: не удалось получить список файлов. Попробуйте «Скачать заранее».",
                     ));
                 }
-                let f = files::pick(&list, episode)
-                    .cloned()
-                    .ok_or_else(|| missing_file(&list, episode))?;
+                let f = match files::pick(&list, episode).cloned() {
+                    Some(f) => f,
+                    None => {
+                        dead_guard.disarm();
+                        drop_torrserver_if_idle(&state, ts, &hash, true).await;
+                        return Err(missing_file(&list, episode));
+                    }
+                };
                 let probe = if let Some(cached) = media.pause_cache.lookup_probe(&hash, f.index) {
                     if start_at <= 15 {
-                        ts.warm_up(&hash, f.index);
+                        spawn_warm_up(&state, ts, &hash, f.index);
                     }
                     cached
                 } else {
                     // Load the start of the file now, so the player can show how far it got.
-                    ts.warm_up(&hash, f.index);
+                    spawn_warm_up(&state, ts, &hash, f.index);
                     let input = ts.stream_url_for_ffmpeg(&hash, f.index);
                     let probed = match ffmpeg::probe(&media.ffprobe, &input).await {
                         Ok(p) => p,
@@ -833,6 +903,8 @@ async fn play(
                                 Err(_) => true,
                             };
                             if stalled {
+                                dead_guard.disarm();
+                                drop_torrserver_if_idle(&state, ts, &hash, true).await;
                                 return Err(unavailable(
                                     "Нет раздающих: не удалось начать загрузку. Попробуйте другую раздачу или «Скачать заранее».",
                                 ));
@@ -844,20 +916,8 @@ async fn play(
                     media.pause_cache.remember_probe(&hash, f.index, &probed);
                     probed
                 };
-                media.pause_cache.register_play(
-                    user.0,
-                    req.kind,
-                    req.tmdb_id,
-                    season,
-                    ep,
-                    src,
-                    f.clone(),
-                    probe.clone(),
-                    f64::from(start_at),
-                    ts.clone(),
-                    media.ffmpeg.clone(),
-                );
-                (f, probe, false)
+                dead_guard.disarm();
+                ((f, probe, false), Some(ts.clone()))
             }
         }
     };
@@ -877,6 +937,23 @@ async fn play(
 
     let (audio_track, subtitle_track) =
         preferred_tracks(&state, user.0, req.kind, req.tmdb_id, &probe, preloaded, req.native).await?;
+    if let Some(ts) = torrent_ts {
+        media.pause_cache.register_play(
+            user.0,
+            req.kind,
+            req.tmdb_id,
+            season,
+            ep,
+            src,
+            file.clone(),
+            probe.clone(),
+            f64::from(start_at),
+            audio_track.unwrap_or(0),
+            media.hw,
+            ts,
+            media.ffmpeg.clone(),
+        );
+    }
     let next = match episode {
         Some(e) => next_episode(&state.catalog.details(MediaKind::Tv, req.tmdb_id).await?, e),
         None => None,
@@ -1163,6 +1240,11 @@ async fn stream(
         if audio < 0 {
             return Err(AppError::bad_request("audio track index must be >= 0"));
         }
+        let start = q.start.unwrap_or(0);
+        let pause_cache = media.pause_cache.clone();
+        let cache_key = torrent::pause_cache::CacheKey::new(c.uid, &c.h, c.i);
+        pause_cache.on_stream_audio(&cache_key, audio);
+
         // A seek drops the previous request (and its ffmpeg) first, so wait a moment for its slot.
         let permit = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -1172,7 +1254,25 @@ async fn stream(
         .ok()
         .and_then(Result::ok)
         .ok_or_else(|| unavailable("Сервер уже перекодирует другие видео, попробуйте позже"))?;
-        let args = ffmpeg::transcode_args(&input, q.start.unwrap_or(0), audio, c.v, media.hw);
+
+        if c.p.is_none() {
+            if let Some(ready) = pause_cache
+                .lookup_ready_transcode(c.uid, &c.h, c.i, audio, start, c.v, media.hw)
+                .await
+            {
+                return Ok(stream_ready_with_spliced_continuation(
+                    &media.ffmpeg,
+                    input,
+                    audio,
+                    ready,
+                    pause_cache,
+                    cache_key,
+                    permit,
+                ));
+            }
+        }
+
+        let args = ffmpeg::transcode_args(&input, start, audio, c.v, media.hw);
         let mut child = ffmpeg::spawn(&media.ffmpeg, &args).map_err(|e| {
             tracing::error!(error = %e, "ffmpeg did not start");
             unavailable("Перекодирование недоступно")
@@ -1213,12 +1313,9 @@ async fn stream(
         // Feed ffmpeg stdout through a bounded channel so client disconnects stop ffmpeg
         // immediately (even while blocked on upstream) and idle clients release their slot.
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
-        let pause_cache = media.pause_cache.clone();
-        let cache_key = torrent::pause_cache::CacheKey::new(c.uid, &c.h, c.i);
-        let stall_capture_after = std::time::Duration::from_secs(25);
         tokio::spawn(async move {
             let _keep = (child, permit);
-            if tx.send(Ok(first)).await.is_err() {
+            if !send_with_idle_capture(&tx, Ok(first), &pause_cache, &cache_key).await {
                 return;
             }
             loop {
@@ -1228,23 +1325,8 @@ async fn stream(
                     chunk = reader.next() => chunk,
                 };
                 let Some(chunk) = next_chunk else { break };
-                let send_fut = tx.send(chunk);
-                tokio::pin!(send_fut);
-                match tokio::time::timeout(stall_capture_after, &mut send_fut).await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(_)) => break,
-                    Err(_) => {
-                        pause_cache.on_transcode_stalled(&cache_key);
-                        let rem = TRANSCODE_IDLE_TIMEOUT.saturating_sub(stall_capture_after);
-                        match tokio::time::timeout(rem, send_fut).await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(_)) => break,
-                            Err(_) => {
-                                tracing::info!("stopping idle ffmpeg transcode after client stall");
-                                break;
-                            }
-                        }
-                    }
+                if !send_with_idle_capture(&tx, chunk, &pause_cache, &cache_key).await {
+                    break;
                 }
             }
             drop(stderr_handle);
@@ -1272,6 +1354,203 @@ async fn stream(
         .pause_cache
         .serve_stream(ts, c.uid, &c.h, c.i, req.method(), req.headers())
         .await)
+}
+
+/// Sends a streamed chunk to the HTTP response channel, triggering SSD pause-cache capture
+/// if client reading stalls briefly and closing the stream cleanly after `TRANSCODE_IDLE_TIMEOUT`.
+async fn send_with_idle_capture(
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    item: Result<axum::body::Bytes, std::io::Error>,
+    pause_cache: &torrent::pause_cache::PauseCache,
+    cache_key: &torrent::pause_cache::CacheKey,
+) -> bool {
+    let send_fut = tx.send(item);
+    tokio::pin!(send_fut);
+    match tokio::time::timeout(TRANSCODE_STALL_CAPTURE, &mut send_fut).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            pause_cache.on_transcode_stalled(cache_key);
+            let rem = TRANSCODE_IDLE_TIMEOUT.saturating_sub(TRANSCODE_STALL_CAPTURE);
+            match tokio::time::timeout(rem, send_fut).await {
+                Ok(Ok(())) => true,
+                Ok(Err(_)) => false,
+                Err(_) => {
+                    tracing::info!("stopping idle ffmpeg transcode after client stall");
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Streams a cached pre-transcoded `ready.mp4` prefix immediately from SSD while launching
+/// the live continuation `ffmpeg` process in parallel and splicing its `moof`/`mdat` boxes seamlessly.
+fn stream_ready_with_spliced_continuation(
+    ffmpeg_bin: &str,
+    input: String,
+    audio: i32,
+    ready: torrent::pause_cache::ReadyTranscodeHit,
+    pause_cache: torrent::pause_cache::PauseCache,
+    cache_key: torrent::pause_cache::CacheKey,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    let args = ffmpeg::transcode_args_seek(&input, Some(&ready.cont_seek_str), audio, ready.copy_video, ready.hw);
+    let child_res = ffmpeg::spawn(ffmpeg_bin, &args);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(8);
+    tokio::spawn(async move {
+        let _permit = permit;
+        let mut child = match child_res {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "ready continuation ffmpeg spawn failed");
+                let _ = stream_ready_file(&ready.ready_path, &tx, &pause_cache, &cache_key).await;
+                return;
+            }
+        };
+        let out = child.stdout.take();
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                let mut limited = (&mut err).take(4096);
+                let _ = limited.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).trim().to_owned()
+            })
+        });
+
+        if !stream_ready_file(&ready.ready_path, &tx, &pause_cache, &cache_key).await {
+            return;
+        }
+        let Some(out) = out else { return };
+        let mut reader = tokio_util::io::ReaderStream::new(out);
+        let mut boxes = torrent::fmp4::BoxStreamReader::default();
+        let mut moov_checked = false;
+        let mut matched = ready.split_idr_hash.is_none();
+        let mut skipped_frags = 0usize;
+        let mut pending_moof: Option<Vec<u8>> = None;
+        let mut next_seq = ready.last_seq;
+        let mut dts_deltas: std::collections::HashMap<u32, i128> = std::collections::HashMap::new();
+
+        'outer: loop {
+            let next_chunk = tokio::select! {
+                biased;
+                _ = tx.closed() => break 'outer,
+                chunk = reader.next() => chunk,
+            };
+            let Some(Ok(chunk)) = next_chunk else { break 'outer };
+            boxes.push(&chunk);
+            loop {
+                let (typ, bx) = match boxes.next_box() {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(_) => break 'outer,
+                };
+                match &typ {
+                    b"moov" => {
+                        let tracks = torrent::fmp4::extract_tracks(&bx);
+                        if tracks != ready.tracks {
+                            tracing::debug!("ready splice moov mismatch; letting client cleanly reload");
+                            break 'outer;
+                        }
+                        moov_checked = true;
+                    }
+                    b"moof" => {
+                        if !moov_checked {
+                            break 'outer;
+                        }
+                        pending_moof = Some(bx);
+                    }
+                    b"mdat" => {
+                        let Some(mut moof) = pending_moof.take() else { continue };
+                        if !matched {
+                            if let Some(ref target_hash) = ready.split_idr_hash {
+                                if torrent::fmp4::first_sample_sha256(&moof, &bx, 1).as_ref() == Some(target_hash) {
+                                    matched = true;
+                                } else {
+                                    skipped_frags += 1;
+                                    if skipped_frags > 24 {
+                                        tracing::debug!("ready splice IDR marker not found; letting client reload");
+                                        break 'outer;
+                                    }
+                                    continue;
+                                }
+                            } else {
+                                matched = true;
+                            }
+                        }
+                        let Ok(info) = torrent::fmp4::parse_moof(&moof) else {
+                            break 'outer;
+                        };
+                        for t in &info.tracks {
+                            dts_deltas.entry(t.track_id).or_insert_with(|| {
+                                let target_end = ready.track_ends.get(&t.track_id).copied().unwrap_or(0);
+                                i128::from(target_end) - i128::from(t.base_dts)
+                            });
+                        }
+                        next_seq = next_seq.saturating_add(1);
+                        if torrent::fmp4::patch_moof(&mut moof, next_seq, &dts_deltas).is_err() {
+                            break 'outer;
+                        }
+                        if !send_with_idle_capture(&tx, Ok(axum::body::Bytes::from(moof)), &pause_cache, &cache_key)
+                            .await
+                        {
+                            break 'outer;
+                        }
+                        if !send_with_idle_capture(&tx, Ok(axum::body::Bytes::from(bx)), &pause_cache, &cache_key).await
+                        {
+                            break 'outer;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        drop(child);
+        if !matched || !moov_checked {
+            if let Some(h) = stderr_handle {
+                if let Ok(Ok(err)) = tokio::time::timeout(std::time::Duration::from_secs(1), h).await {
+                    if !err.is_empty() {
+                        tracing::debug!(stderr = %err, "continuation ffmpeg stderr before splice match");
+                    }
+                }
+            }
+        }
+    });
+    let body = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    (
+        [(header::CONTENT_TYPE, "video/mp4"), (header::CACHE_CONTROL, "no-store")],
+        Body::from_stream(body),
+    )
+        .into_response()
+}
+
+async fn stream_ready_file(
+    path: &std::path::Path,
+    tx: &tokio::sync::mpsc::Sender<Result<axum::body::Bytes, std::io::Error>>,
+    pause_cache: &torrent::pause_cache::PauseCache,
+    cache_key: &torrent::pause_cache::CacheKey,
+) -> bool {
+    use tokio::io::AsyncReadExt;
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return false;
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if tx.is_closed() {
+            return false;
+        }
+        match file.read(&mut buf).await {
+            Ok(0) => return true,
+            Ok(n) => {
+                let chunk = axum::body::Bytes::copy_from_slice(&buf[..n]);
+                if !send_with_idle_capture(tx, Ok(chunk), pause_cache, cache_key).await {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// Where the file is: on disk for a preload, else pause-cache loopback or TorrServer's stream.

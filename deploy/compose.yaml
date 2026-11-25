@@ -38,11 +38,11 @@ services:
       JACKETT_WAKE_URL: http://sablier:10000
       JACKETT_WAKE_GROUP: jackett
       JACKETT_WAKE_DURATION: 10m
-      MAX_TRANSCODES: "${MAX_TRANSCODES:-4}"
+      MAX_TRANSCODES: "${MAX_TRANSCODES:-6}"
     depends_on:
       kino-db:
         condition: service_healthy
-    # Compact cache + up to 4 concurrent transcodes (3 active users + headroom) fit in 1280m.
+    # Compact cache + up to 6 concurrent/paused transcodes fit easily in 1280m.
     mem_limit: 1280m
     devices:
       - /dev/dri:/dev/dri

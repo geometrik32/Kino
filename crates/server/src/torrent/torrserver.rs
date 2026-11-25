@@ -189,15 +189,24 @@ impl TorrServer {
         Ok(resp.json::<Stats>().await?.progress())
     }
 
-    /// Asks TorrServer to load the beginning of a file ahead of the player, so
-    /// [`TorrServer::progress`] has a percentage to show. The answer is not
-    /// needed: only the start of the response is waited for, then it is dropped.
-    pub fn warm_up(&self, hash: &str, index: i32) {
+    /// Requests TorrServer to preload the start of a file and returns whether
+    /// it finished answering before `timeout`.
+    pub async fn preload_once(&self, hash: &str, index: i32, timeout: std::time::Duration) -> bool {
         let url = format!("{}/stream/video?link={hash}&index={index}&preload", self.base);
-        let req = self.get(&url).timeout(std::time::Duration::from_secs(120));
-        tokio::spawn(async move {
-            let _ = req.send().await;
-        });
+        self.get(&url).timeout(timeout).send().await.is_ok()
+    }
+
+    /// Stops and unloads an active torrent session from TorrServer RAM without touching saved entries.
+    pub async fn drop_torrent(&self, hash: &str) {
+        if hash.is_empty() {
+            return;
+        }
+        let _ = self
+            .req(self.http.post(format!("{}/torrents", self.base)))
+            .json(&json!({ "action": "drop", "hash": hash }))
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
     }
 
     /// Preloads a specific byte window (`[start .. start + len)`) in TorrServer so

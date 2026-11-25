@@ -212,6 +212,9 @@ pub fn init_history(has_initial_trail: bool, initial_url: Option<&str>) {
     if is_telegram() || HISTORY_WIRED.with(|w| w.replace(true)) {
         return;
     }
+    let _ = dioxus::document::eval(
+        "try { if ('scrollRestoration' in history) history.scrollRestoration = 'manual'; } catch (e) {}",
+    );
     let Some(w) = web_sys::window() else { return };
     if let Ok(h) = w.history() {
         if has_initial_trail {

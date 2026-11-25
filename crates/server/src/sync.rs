@@ -300,6 +300,73 @@ impl SyncHub {
         Utc::now().timestamp_millis()
     }
 
+    /// True when at least one live player room actively loaded a file from `hash` (`file_index` set).
+    pub fn has_playing_hash(&self, hash: &str) -> bool {
+        if hash.is_empty() {
+            return false;
+        }
+        let now = Self::now_ms();
+        let room_list: Vec<Arc<Mutex<Room>>> = {
+            let rooms = self.rooms.lock().expect("sync rooms lock");
+            rooms.values().cloned().collect()
+        };
+        room_list.into_iter().any(|room_arc| {
+            let room = room_arc.lock().expect("sync room lock");
+            room.file_index.is_some()
+                && room.release.infohash.eq_ignore_ascii_case(hash)
+                && room
+                    .members
+                    .iter()
+                    .any(|m| now - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS)
+        })
+    }
+
+    /// Broadcasts `PreloadReady` to active players watching `(kind, tmdb_id)` when their download finishes.
+    pub fn notify_preload_ready(
+        &self,
+        ready_users: &[i64],
+        kind: MediaKind,
+        tmdb_id: i64,
+        season: i32,
+        infohash: &str,
+    ) {
+        if infohash.is_empty() {
+            return;
+        }
+        let now = Self::now_ms();
+        let room_list: Vec<(RoomKey, Arc<Mutex<Room>>)> = {
+            let rooms = self.rooms.lock().expect("sync rooms lock");
+            rooms
+                .iter()
+                .filter(|(k, _)| k.kind == kind && k.tmdb_id == tmdb_id)
+                .map(|(k, v)| (*k, v.clone()))
+                .collect()
+        };
+        let msg = SyncServerMsg::PreloadReady {
+            kind,
+            tmdb_id,
+            season,
+            infohash: infohash.to_ascii_lowercase(),
+        };
+        for (key, room_arc) in room_list {
+            let room = room_arc.lock().expect("sync room lock");
+            let has_live = room
+                .members
+                .iter()
+                .any(|m| now - m.last_seen_ms <= HEARTBEAT_TIMEOUT_MS);
+            if !has_live {
+                continue;
+            }
+            if ready_users.contains(&key.user_id) || room.release.infohash.eq_ignore_ascii_case(infohash) {
+                for m in &room.members {
+                    if let Some(tx) = &m.tx {
+                        let _ = tx.try_send(msg.clone());
+                    }
+                }
+            }
+        }
+    }
+
     /// Checks whether an incoming HTTP `PUT /api/progress` is compatible with
     /// any currently active sync room (preventing stale devices from overwriting
     /// the room's live timecode).
@@ -1082,6 +1149,10 @@ pub async fn leave(
     if let Some(job) = state.sync.leave_http(user.0, &req, SyncHub::now_ms()) {
         persist_progress(&state, job.user_id, job.update).await?;
     }
+    state
+        .media
+        .pause_cache
+        .on_player_leave(user.0, req.kind, req.tmdb_id, req.position_sec);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1265,6 +1336,18 @@ mod tests {
             let json = serde_json::to_string(&m).expect("serialize client msg");
             let decoded: SyncClientMsg = serde_json::from_str(&json).expect("deserialize client msg");
             assert_eq!(m, decoded);
+        }
+
+        let server_msgs = vec![SyncServerMsg::PreloadReady {
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            season: 0,
+            infohash: "a".repeat(40),
+        }];
+        for m in &server_msgs {
+            let json = serde_json::to_string(m).expect("serialize server msg");
+            let decoded: SyncServerMsg = serde_json::from_str(&json).expect("deserialize server msg");
+            assert_eq!(&decoded, m);
         }
 
         let server_msg = SyncServerMsg::State(Box::new(SyncState {
@@ -1707,6 +1790,54 @@ mod tests {
                 assert_eq!(st.sound_client_id.as_deref(), Some("a"));
             }
             _ => panic!("expected sweep handoff"),
+        }
+    }
+
+    #[test]
+    fn notifies_matching_players_when_preload_finishes() {
+        let hub = SyncHub::new();
+        let t = 5_000_000_i64;
+        let hash_a = "a".repeat(40);
+        hub.join_in_memory(1, &join_req("a", "ПК"), &[], None, t);
+        let (tx_a, mut rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_a = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
+        assert!(!hub.has_playing_hash(&hash_a));
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Ready {
+                position_sec: 10.0,
+                duration_sec: Some(5000.0),
+                file_index: Some(1),
+            },
+            None,
+            t + 100,
+        );
+        assert!(hub.has_playing_hash(&hash_a));
+        while rx_a.try_recv().is_ok() {}
+
+        hub.notify_preload_ready(&[1], MediaKind::Movie, 603, 0, &hash_a);
+        match rx_a.try_recv().unwrap() {
+            SyncServerMsg::PreloadReady {
+                kind,
+                tmdb_id,
+                season,
+                infohash,
+            } => {
+                assert_eq!(kind, MediaKind::Movie);
+                assert_eq!(tmdb_id, 603);
+                assert_eq!(season, 0);
+                assert_eq!(infohash, hash_a);
+            }
+            other => panic!("expected PreloadReady, got {other:?}"),
         }
     }
 

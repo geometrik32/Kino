@@ -180,7 +180,7 @@ pub async fn probe_with_timeout(ffprobe: &str, input: &str, timeout: std::time::
 }
 
 /// Hardware for encoding video.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HwAccel {
     None,
     /// Intel Quick Sync (needs `/dev/dri` in the container).
@@ -200,6 +200,69 @@ impl HwAccel {
 
 /// ffmpeg arguments for a browser-friendly fragmented MP4 to stdout.
 pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw: HwAccel) -> Vec<String> {
+    let seek = (start > 0).then(|| start.to_string());
+    transcode_args_seek(input, seek.as_deref(), audio, copy_video, hw)
+}
+
+/// ffmpeg arguments seeking to an arbitrary timestamp string (`"120"` or `"120.500000"`).
+pub fn transcode_args_seek(
+    input: &str,
+    seek_ss: Option<&str>,
+    audio: i32,
+    copy_video: bool,
+    hw: HwAccel,
+) -> Vec<String> {
+    let mut a = transcode_args_base(input, seek_ss, audio, copy_video, hw);
+    a.push("pipe:1".into());
+    a
+}
+
+/// ffmpeg arguments to pre-transcode a bounded `duration_secs` fMP4 prefix onto disk.
+pub fn transcode_prefix_to_file_args(
+    input: &str,
+    start: u64,
+    audio: i32,
+    copy_video: bool,
+    hw: HwAccel,
+    duration_secs: u64,
+    out_path: &str,
+) -> Vec<String> {
+    let seek = (start > 0).then(|| start.to_string());
+    let mut a = transcode_args_base(input, seek.as_deref(), audio, copy_video, hw);
+    a.extend(["-t".into(), duration_secs.to_string(), "-y".into(), out_path.into()]);
+    a
+}
+
+/// Fast single-frame copy probe outputting the exact snapped source start timestamp in milliseconds.
+pub fn probe_start_pts_args(input: &str, start: u64) -> Vec<String> {
+    let mut a: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
+    if is_http(input) {
+        a.extend(["-rw_timeout".into(), "10000000".into()]);
+    }
+    if start > 0 {
+        a.extend(["-noaccurate_seek".into(), "-ss".into(), start.to_string()]);
+    }
+    a.extend(
+        [
+            "-copyts",
+            "-i",
+            input,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-frames:v",
+            "1",
+            "-f",
+            "mkvtimestamp_v2",
+            "pipe:1",
+        ]
+        .map(String::from),
+    );
+    a
+}
+
+fn transcode_args_base(input: &str, seek_ss: Option<&str>, audio: i32, copy_video: bool, hw: HwAccel) -> Vec<String> {
     let mut a: Vec<String> = vec!["-hide_banner".into(), "-loglevel".into(), "error".into()];
     if is_http(input) {
         a.extend(["-rw_timeout".into(), "30000000".into()]);
@@ -221,12 +284,12 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
             HwAccel::None => {}
         }
     }
-    if start > 0 {
+    if let Some(ss) = seek_ss {
         if copy_video {
             // Keep audio in sync with copied video when `-ss` snaps back to a preceding keyframe.
             a.push("-noaccurate_seek".into());
         }
-        a.extend(["-ss".into(), start.to_string()]);
+        a.extend(["-ss".into(), ss.to_owned()]);
     }
     a.extend(["-i".into(), input.into()]);
     a.extend(["-map".into(), "0:v:0".into(), "-map".into(), format!("0:a:{audio}?")]);
@@ -258,6 +321,7 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
                 .map(String::from),
             ),
         }
+        a.extend(["-g", "48"].map(String::from));
     }
     a.extend(
         [
@@ -273,7 +337,6 @@ pub fn transcode_args(input: &str, start: u64, audio: i32, copy_video: bool, hw:
             "mp4",
             "-movflags",
             "frag_keyframe+empty_moov+default_base_moof",
-            "pipe:1",
         ]
         .map(String::from),
     );
@@ -359,6 +422,15 @@ mod tests {
         let s = subtitle_args("http://ts/stream", 0, 90).join(" ");
         assert!(s.contains("-rw_timeout 30000000") && s.contains("-ss 90 -i http://ts/stream"));
         assert!(s.contains("-vn -an -dn"));
+
+        let f = transcode_prefix_to_file_args("http://127.0.0.1/s", 120, 1, true, HwAccel::None, 30, "/tmp/r.mp4")
+            .join(" ");
+        assert!(f.contains("-noaccurate_seek -ss 120 -i http://127.0.0.1/s"));
+        assert!(f.contains("-t 30 -y /tmp/r.mp4"));
+
+        let p = probe_start_pts_args("http://127.0.0.1/s", 120).join(" ");
+        assert!(p.contains("-noaccurate_seek -ss 120 -copyts -i http://127.0.0.1/s"));
+        assert!(p.contains("-f mkvtimestamp_v2 pipe:1"));
     }
 
     #[test]

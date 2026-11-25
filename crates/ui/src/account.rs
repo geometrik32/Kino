@@ -9,7 +9,7 @@ use kino_core::{
 
 use crate::icons::{self, Icon};
 use crate::releases::{ReleaseSort, CODECS, SEEDER_STEPS, SIZE_STEPS};
-use crate::{fallback_bg, ru_date, AvatarContent, PosterCard};
+use crate::{fallback_bg, handle_aux_click, is_plain_primary_click, ru_date, title_href, AvatarContent, PosterCard};
 
 /// Sub-section inside "Мои".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -162,13 +162,37 @@ pub fn MyView(
     #[props(default)] today_ymd: String,
     #[props(default)] on_section: Option<EventHandler<MySection>>,
     #[props(default)] on_select_user: Option<EventHandler<i64>>,
+    #[props(default)] initial_peer_status: Option<TitleStatus>,
+    #[props(default)] on_peer_status: Option<EventHandler<Option<TitleStatus>>>,
+    #[props(default)] initial_cal_month: Option<(i32, u32)>,
+    #[props(default)] on_cal_month: Option<EventHandler<Option<(i32, u32)>>>,
+    #[props(default)] initial_cal_day: Option<String>,
+    #[props(default)] on_cal_day: Option<EventHandler<Option<String>>>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
     let mut open_dd = use_signal(|| None::<MyDropdown>);
-    let mut peer_status_filter = use_signal(|| None::<TitleStatus>);
-    let mut cal_month = use_signal(|| None::<(i32, u32)>);
-    let mut cal_day = use_signal(|| None::<String>);
+    let mut peer_status_filter = use_signal(|| initial_peer_status);
+    let mut cal_month = use_signal(|| initial_cal_month);
+    let mut cal_day = use_signal(|| initial_cal_day);
+    let mut set_peer_status = move |next: Option<TitleStatus>| {
+        peer_status_filter.set(next);
+        if let Some(cb) = on_peer_status {
+            cb.call(next);
+        }
+    };
+    let mut set_cal_month = move |next: Option<(i32, u32)>| {
+        cal_month.set(next);
+        if let Some(cb) = on_cal_month {
+            cb.call(next);
+        }
+    };
+    let mut set_cal_day = move |next: Option<String>| {
+        cal_day.set(next.clone());
+        if let Some(cb) = on_cal_day {
+            cb.call(next);
+        }
+    };
 
     let by_kind: Vec<&TitleState> = items.iter().filter(|i| filters.kind.matches(i.kind)).collect();
     let total_kind = by_kind.len();
@@ -368,7 +392,7 @@ pub fn MyView(
                                                 key: "{uid}",
                                                 class: if is_sel { "user-card active" } else { "user-card" },
                                                 onclick: move |_| {
-                                                    peer_status_filter.set(None);
+                                                    set_peer_status(None);
                                                     if let Some(cb) = on_select_user {
                                                         cb.call(uid);
                                                     }
@@ -424,11 +448,19 @@ pub fn MyView(
                                             if let Some(wn) = lib.profile.watching_now.as_ref().and_then(|w| w.title.clone().map(|t| (w.clone(), t))) {
                                                 {
                                                     let (w_meta, w_title) = wn;
+                                                    let href = title_href(w_meta.kind, w_title.tmdb_id);
                                                     let wt_open = w_title.clone();
                                                     rsx! {
-                                                        button {
+                                                        a {
                                                             class: "pill-btn accent",
-                                                            onclick: move |_| on_open.call(wt_open.clone()),
+                                                            href: "{href}",
+                                                            onclick: move |e: Event<MouseData>| {
+                                                                if is_plain_primary_click(&e) {
+                                                                    e.prevent_default();
+                                                                    on_open.call(wt_open.clone());
+                                                                }
+                                                            },
+                                                            onauxclick: handle_aux_click,
                                                             Icon { svg: icons::PLAY, class: "ic xs" }
                                                             if w_meta.kind == MediaKind::Tv && w_meta.season > 0 {
                                                                 "Смотрит: {w_title.title} · {episode_code(w_meta.season, w_meta.episode)}"
@@ -443,7 +475,7 @@ pub fn MyView(
                                         div { class: "pill-group status-pills",
                                             button {
                                                 class: if pfilter.is_none() { "pill-btn active" } else { "pill-btn" },
-                                                onclick: move |_| peer_status_filter.set(None),
+                                                onclick: move |_| set_peer_status(None),
                                                 "Все · {lib.items.len()}"
                                             }
                                             for st in TitleStatus::ALL {
@@ -453,7 +485,7 @@ pub fn MyView(
                                                         rsx! {
                                                             button {
                                                                 class: if pfilter == Some(st) { "pill-btn active" } else { "pill-btn" },
-                                                                onclick: move |_| peer_status_filter.set(Some(st)),
+                                                                onclick: move |_| set_peer_status(Some(st)),
                                                                 "{st.label()} · {cnt}"
                                                             }
                                                         }
@@ -538,8 +570,8 @@ pub fn MyView(
                                         title: "Предыдущий месяц",
                                         "aria-label": "Предыдущий месяц",
                                         onclick: move |_| {
-                                            cal_day.set(None);
-                                            cal_month.set(Some(shift_ym((yr, mo), -1)));
+                                            set_cal_day(None);
+                                            set_cal_month(Some(shift_ym((yr, mo), -1)));
                                         },
                                         Icon { svg: icons::CHEV_L, class: "ic sm" }
                                     }
@@ -549,15 +581,15 @@ pub fn MyView(
                                         title: "Следующий месяц",
                                         "aria-label": "Следующий месяц",
                                         onclick: move |_| {
-                                            cal_day.set(None);
-                                            cal_month.set(Some(shift_ym((yr, mo), 1)));
+                                            set_cal_day(None);
+                                            set_cal_month(Some(shift_ym((yr, mo), 1)));
                                         },
                                         Icon { svg: icons::CHEV_R, class: "ic sm" }
                                     }
                                     if sel_day.is_some() {
                                         button {
                                             class: "chip sm",
-                                            onclick: move |_| cal_day.set(None),
+                                            onclick: move |_| set_cal_day(None),
                                             "Весь месяц"
                                         }
                                     }
@@ -599,9 +631,9 @@ pub fn MyView(
                                                     title: if titles_preview.is_empty() { String::new() } else { titles_preview.clone() },
                                                     onclick: move |_| {
                                                         if is_sel {
-                                                            cal_day.set(None);
+                                                            set_cal_day(None);
                                                         } else {
-                                                            cal_day.set(Some(ymd.clone()));
+                                                            set_cal_day(Some(ymd.clone()));
                                                         }
                                                     },
                                                     span { class: "cal-day-num", "{day}" }
@@ -648,15 +680,21 @@ pub fn MyView(
                                         };
                                         let st = entry.status;
                                         let id = entry.tmdb_id;
+                                        let href = title_href(entry.kind, id);
                                         rsx! {
-                                            button {
+                                            a {
                                                 key: "cal-{entry.date}-{entry.kind.as_str()}-{id}",
                                                 class: "cal-row",
-                                                onclick: move |_| {
-                                                    if let Some(t) = t_opt.clone() {
-                                                        on_open.call(t);
+                                                href: "{href}",
+                                                onclick: move |e: Event<MouseData>| {
+                                                    if is_plain_primary_click(&e) {
+                                                        e.prevent_default();
+                                                        if let Some(t) = t_opt.clone() {
+                                                            on_open.call(t);
+                                                        }
                                                     }
                                                 },
+                                                onauxclick: handle_aux_click,
                                                 div { class: "cal-date", "{date_lbl}" }
                                                 div { class: "cal-poster",
                                                     if let Some(p) = poster {
@@ -858,11 +896,29 @@ pub fn ProfileView(
     on_prefs: EventHandler<UserPrefs>,
     on_delete_preload: EventHandler<i64>,
     #[props(default)] on_refresh: Option<EventHandler<()>>,
+    #[props(default)] initial_prefs_open: bool,
+    #[props(default)] on_prefs_open: Option<EventHandler<bool>>,
+    #[props(default)] initial_hist_limit: Option<usize>,
+    #[props(default)] on_hist_limit: Option<EventHandler<usize>>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
-    let mut prefs_open = use_signal(|| false);
-    let mut hist_limit = use_signal(|| 10usize);
+    let mut prefs_open = use_signal(|| initial_prefs_open);
+    let mut hist_limit = use_signal(|| initial_hist_limit.unwrap_or(10));
+    let mut toggle_prefs = move || {
+        let next = !*prefs_open.peek();
+        prefs_open.set(next);
+        if let Some(cb) = on_prefs_open {
+            cb.call(next);
+        }
+    };
+    let mut bump_hist_limit = move || {
+        let next = *hist_limit.peek() + 10;
+        hist_limit.set(next);
+        if let Some(cb) = on_hist_limit {
+            cb.call(next);
+        }
+    };
     let tz = FixedOffset::east_opt(utc_offset_min * 60).unwrap_or(FixedOffset::east_opt(0).expect("UTC"));
     let p = prefs.clone();
     let summary_tags = prefs_summary(&p);
@@ -955,7 +1011,7 @@ pub fn ProfileView(
                     h2 { "Раздачи и плеер по умолчанию" }
                 }
                 div { class: if prefs_open() { "acc-card open" } else { "acc-card" },
-                    onclick: move |_| prefs_open.toggle(),
+                    onclick: move |_| toggle_prefs(),
                     div { class: "acc-info",
                         div { class: "acc-title", "Фильтры выбора раздач" }
                         div { class: "acc-tags",
@@ -972,7 +1028,7 @@ pub fn ProfileView(
                         class: "btn glass sm",
                         onclick: move |e| {
                             e.stop_propagation();
-                            prefs_open.toggle();
+                            toggle_prefs();
                         },
                         if prefs_open() { "Свернуть" } else { "Настроить" }
                         Icon { svg: icons::CHEV_D, class: chev_cls }
@@ -1055,8 +1111,19 @@ pub fn ProfileView(
                                 let span = format!("{} → {}", clock(h.position_from), clock(h.position_to));
                                 let (kind, id) = (h.kind, h.tmdb_id);
                                 let dev = h.device.clone();
+                                let href = title_href(kind, id);
                                 rsx! {
-                                    button { key: "{i}-{id}", class: "hist-row", onclick: move |_| on_open.call((kind, id)),
+                                    a {
+                                        key: "{i}-{id}",
+                                        class: "hist-row",
+                                        href: "{href}",
+                                        onclick: move |e: Event<MouseData>| {
+                                            if is_plain_primary_click(&e) {
+                                                e.prevent_default();
+                                                on_open.call((kind, id));
+                                            }
+                                        },
+                                        onauxclick: handle_aux_click,
                                         div { class: "hist-thumb",
                                             if let Some(path) = poster {
                                                 img { src: image_url(&path, ImageSize::Poster), alt: "{name}", loading: "lazy" }
@@ -1086,7 +1153,7 @@ pub fn ProfileView(
                         div { class: "hist-more",
                             button {
                                 class: "chip sm",
-                                onclick: move |_| hist_limit.set(hist_limit() + 10),
+                                onclick: move |_| bump_hist_limit(),
                                 "Показать ещё ({remaining_history})"
                             }
                         }
@@ -1179,31 +1246,43 @@ fn PreloadRow(
         "HD".to_owned()
     };
     let title = item.title.clone().unwrap_or_else(|| item.infohash.clone());
+    let href = title_href(kind, tmdb_id);
     rsx! {
-        div { class: "dl-row", onclick: move |_| on_open.call((kind, tmdb_id)),
-            div { class: "dl-poster", style: "background: {fallback_bg(tmdb_id)}",
-                if let Some(p) = &item.poster_path {
-                    img { src: image_url(p, ImageSize::Poster), alt: "{title}", loading: "lazy" }
-                    span { class: "dl-poster-tag over", "{badge_lbl}" }
-                } else {
-                    span { class: "dl-poster-tag", "{badge_lbl}" }
-                }
-            }
-            div { class: "dl-body",
-                div { class: "dl-title", "{title}" }
-                div { class: "dl-tags",
-                    span { class: "{cls}", "{status_text}" }
-                    if let Some(s) = size { span { class: "tag", "{s}" } }
-                    if let Some((txt, tcls)) = delete_tag {
-                        span { class: "{tcls}",
-                            Icon { svg: icons::CLOCK, class: "ic xs" }
-                            "{txt}"
-                        }
+        div { class: "dl-row",
+            a {
+                class: "dl-main",
+                href: "{href}",
+                onclick: move |e: Event<MouseData>| {
+                    if is_plain_primary_click(&e) {
+                        e.prevent_default();
+                        on_open.call((kind, tmdb_id));
+                    }
+                },
+                onauxclick: handle_aux_click,
+                div { class: "dl-poster", style: "background: {fallback_bg(tmdb_id)}",
+                    if let Some(p) = &item.poster_path {
+                        img { src: image_url(p, ImageSize::Poster), alt: "{title}", loading: "lazy" }
+                        span { class: "dl-poster-tag over", "{badge_lbl}" }
+                    } else {
+                        span { class: "dl-poster-tag", "{badge_lbl}" }
                     }
                 }
-                if item.state == PreloadState::Downloading {
-                    div { class: "dl-bar",
-                        div { style: "width: {pct:.0}%" }
+                div { class: "dl-body",
+                    div { class: "dl-title", "{title}" }
+                    div { class: "dl-tags",
+                        span { class: "{cls}", "{status_text}" }
+                        if let Some(s) = size { span { class: "tag", "{s}" } }
+                        if let Some((txt, tcls)) = delete_tag {
+                            span { class: "{tcls}",
+                                Icon { svg: icons::CLOCK, class: "ic xs" }
+                                "{txt}"
+                            }
+                        }
+                    }
+                    if item.state == PreloadState::Downloading {
+                        div { class: "dl-bar",
+                            div { style: "width: {pct:.0}%" }
+                        }
                     }
                 }
             }

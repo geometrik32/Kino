@@ -1,7 +1,7 @@
 //! Background jobs: new-episode notifications through the Telegram bot and
 //! removal of preloads after they were watched.
 
-use std::{future::Future, sync::Arc, time::Duration};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 
 use chrono::{FixedOffset, Utc};
 use kino_core::{episode_code, MediaKind, PreloadState, TitleStatus};
@@ -181,7 +181,16 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
             Some(i) if i.done() => (PreloadState::Ready, 1.0, Some(i.size)),
             Some(i) => (PreloadState::Downloading, i.progress, Some(i.size)),
         };
-        userdata::preload_progress(&state.pool, hash, st, progress, size).await?;
+        let transitioned = userdata::preload_progress(&state.pool, hash, st, progress, size).await?;
+        if st == PreloadState::Ready && !transitioned.is_empty() {
+            let mut by_title: HashMap<(MediaKind, i64, i32), Vec<i64>> = HashMap::new();
+            for (uid, kind, tmdb_id, season) in transitioned {
+                by_title.entry((kind, tmdb_id, season)).or_default().push(uid);
+            }
+            for ((kind, tmdb_id, season), users) in by_title {
+                state.sync.notify_preload_ready(&users, kind, tmdb_id, season, hash);
+            }
+        }
     }
     Ok(())
 }
@@ -227,7 +236,7 @@ pub fn spawn(state: AppState, every: Duration) {
     );
     let sync_state = state.clone();
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(30));
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
             if let Err(e) = sync_preloads(&sync_state).await {

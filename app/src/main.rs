@@ -12,16 +12,20 @@ mod telegram;
 
 use player::{PlayStart, Player};
 
+use std::collections::{HashMap, VecDeque};
+
 use dioxus::prelude::*;
 use kino_core::{
-    image_url, normalize_quality_key, AuthResponse, HomeFeed, ImageSize, MarkWatched, MediaKind, PreloadRequest,
-    PreloadState, ReleaseChoiceUpdate, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, TitleStatus,
-    TitleSummary, UserPrefs, VideoScale, WidgetAuthRequest,
+    image_url, normalize_quality_key, AuthResponse, CalendarEntry, ContinueItem, HistoryEntry, HomeFeed, ImageSize,
+    MarkWatched, MediaKind, PersonDetails, PreloadItem, PreloadRequest, PreloadState, Progress, ReleaseChoice,
+    ReleaseChoiceUpdate, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, SearchResults, Season,
+    TitleDetails, TitleExtras, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
+    VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
-    icons, play_target, HomeView, Icon, LoginView, MyFilters, MySection, MyView, PersonView, PickerPanel, PlayTarget,
-    ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell, Tab, Theme,
-    TitleExtrasView, TitleView, FAVICON_URI, STYLE,
+    icons, play_target, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection, MyView, PersonView, PickerPanel,
+    PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell,
+    Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
@@ -180,6 +184,7 @@ fn App() -> Element {
                     on_theme,
                     on_logout: move |_| {
                         api::forget_token();
+                        clear_home_snapshot();
                         session.set(Session::LoggedOut { error: None });
                     },
                 }
@@ -365,6 +370,304 @@ enum View {
     },
 }
 
+#[derive(Clone, PartialEq)]
+struct TrailEntry {
+    view: View,
+    scroll_y: f64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ScrollRequest {
+    seq: u64,
+    y: f64,
+}
+
+const MAX_CACHED_ENTRIES: usize = 20;
+const HOME_SNAPSHOT_KEY: &str = "kino.home_snapshot.v1";
+
+#[derive(Clone, Default)]
+struct HomeCache {
+    feed: Option<HomeFeed>,
+    continue_items: Vec<ContinueItem>,
+    row_scrolls: HashMap<String, f64>,
+    cats_scroll: f64,
+}
+
+#[derive(Clone)]
+struct ShelfCache {
+    title: String,
+    subtitle: Option<String>,
+    items: Vec<TitleSummary>,
+    page: u32,
+    has_more: bool,
+}
+
+#[derive(Clone)]
+struct SearchCache {
+    query: String,
+    results: Option<SearchResults>,
+    kind: MyKindFilter,
+}
+
+#[derive(Clone, Default)]
+struct MineCache {
+    items: Option<Vec<TitleState>>,
+    users: Option<Vec<UserPublicProfile>>,
+    calendar: Option<Vec<CalendarEntry>>,
+    selected_user_id: Option<i64>,
+    peer_libraries: HashMap<i64, UserSocialLibrary>,
+    peer_status_filter: Option<TitleStatus>,
+    cal_month: Option<(i32, u32)>,
+    cal_day: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct ProfileCache {
+    history: Option<Vec<HistoryEntry>>,
+    preloads: Option<Vec<PreloadItem>>,
+    prefs: Option<UserPrefs>,
+    prefs_open: bool,
+    hist_limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct TitleCache {
+    details: TitleDetails,
+    progress: Vec<Progress>,
+    state: TitleState,
+    choices: Vec<ReleaseChoice>,
+    extras: Option<TitleExtras>,
+    chosen_season: Option<i32>,
+    seasons: HashMap<i32, Season>,
+}
+
+#[derive(Clone, Default)]
+struct AppCache {
+    home: Option<HomeCache>,
+    shelves: HashMap<String, ShelfCache>,
+    shelf_order: VecDeque<String>,
+    search: Option<SearchCache>,
+    mine: Option<MineCache>,
+    profile: Option<ProfileCache>,
+    persons: HashMap<i64, PersonDetails>,
+    person_order: VecDeque<i64>,
+    titles: HashMap<(MediaKind, i64), TitleCache>,
+    title_order: VecDeque<(MediaKind, i64)>,
+}
+
+fn push_bounded<K: Eq + std::hash::Hash + Clone, V>(map: &mut HashMap<K, V>, order: &mut VecDeque<K>, key: K, val: V) {
+    if !map.contains_key(&key) {
+        if order.len() >= MAX_CACHED_ENTRIES {
+            if let Some(old) = order.pop_front() {
+                map.remove(&old);
+            }
+        }
+        order.push_back(key.clone());
+    }
+    map.insert(key, val);
+}
+
+impl AppCache {
+    fn insert_shelf(&mut self, id: String, shelf: ShelfCache) {
+        push_bounded(&mut self.shelves, &mut self.shelf_order, id, shelf);
+    }
+
+    fn insert_person(&mut self, id: i64, person: PersonDetails) {
+        push_bounded(&mut self.persons, &mut self.person_order, id, person);
+    }
+
+    fn upsert_title(&mut self, key: (MediaKind, i64), entry: TitleCache) {
+        push_bounded(&mut self.titles, &mut self.title_order, key, entry);
+    }
+
+    fn patch_title(
+        &mut self,
+        kind: MediaKind,
+        tmdb_id: i64,
+        user_status: Option<TitleStatus>,
+        user_rating: Option<f32>,
+        preloaded: Option<bool>,
+    ) {
+        let patch_summary = |s: &mut TitleSummary| {
+            if s.kind == kind && s.tmdb_id == tmdb_id {
+                s.user_status = user_status;
+                s.user_rating = user_rating;
+                if let Some(pre) = preloaded {
+                    s.preloaded = pre;
+                }
+            }
+        };
+        if let Some(home) = &mut self.home {
+            if let Some(feed) = &mut home.feed {
+                for row in &mut feed.rows {
+                    for item in &mut row.items {
+                        patch_summary(item);
+                    }
+                }
+            }
+            for cont in &mut home.continue_items {
+                if let Some(t) = &mut cont.title {
+                    patch_summary(t);
+                }
+            }
+        }
+        for shelf in self.shelves.values_mut() {
+            for item in &mut shelf.items {
+                patch_summary(item);
+            }
+        }
+        if let Some(search) = &mut self.search {
+            if let Some(res) = &mut search.results {
+                for item in &mut res.items {
+                    patch_summary(item);
+                }
+            }
+        }
+        for person in self.persons.values_mut() {
+            for item in &mut person.credits {
+                patch_summary(item);
+            }
+        }
+        for entry in self.titles.values_mut() {
+            patch_summary(&mut entry.details.summary);
+            if let Some(ex) = &mut entry.extras {
+                for item in &mut ex.collection {
+                    patch_summary(item);
+                }
+                for item in &mut ex.recommendations {
+                    patch_summary(item);
+                }
+                for item in &mut ex.similar {
+                    patch_summary(item);
+                }
+            }
+        }
+        if let Some(mine) = &mut self.mine {
+            if let Some(items) = &mut mine.items {
+                for st in items {
+                    if st.kind == kind && st.tmdb_id == tmdb_id {
+                        st.status = user_status;
+                        st.effective_rating = user_rating;
+                    }
+                    if let Some(t) = &mut st.title {
+                        patch_summary(t);
+                    }
+                }
+            }
+            for lib in mine.peer_libraries.values_mut() {
+                for st in &mut lib.items {
+                    if let Some(t) = &mut st.title {
+                        patch_summary(t);
+                    }
+                }
+            }
+        }
+        if let Some(profile) = &mut self.profile {
+            if let Some(history) = &mut profile.history {
+                for h in history {
+                    if let Some(t) = &mut h.title {
+                        patch_summary(t);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct HomeSessionSnapshot {
+    category: String,
+    scroll_y: f64,
+    cats_scroll: f64,
+    row_scrolls: HashMap<String, f64>,
+    feed: Option<HomeFeed>,
+    continue_items: Vec<ContinueItem>,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn save_home_snapshot(category: &str, scroll_y: f64, home: &HomeCache) {
+    let snap = HomeSessionSnapshot {
+        category: category.to_owned(),
+        scroll_y,
+        cats_scroll: home.cats_scroll,
+        row_scrolls: home.row_scrolls.clone(),
+        feed: home.feed.clone(),
+        continue_items: home.continue_items.clone(),
+    };
+    if let Ok(json) = serde_json::to_string(&snap) {
+        if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+            let _ = storage.set_item(HOME_SNAPSHOT_KEY, &json);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn save_home_snapshot(_category: &str, _scroll_y: f64, _home: &HomeCache) {}
+
+#[cfg(target_arch = "wasm32")]
+fn load_home_snapshot() -> Option<HomeSessionSnapshot> {
+    let storage = web_sys::window()?.session_storage().ok().flatten()?;
+    let raw = storage.get_item(HOME_SNAPSHOT_KEY).ok().flatten()?;
+    serde_json::from_str(&raw).ok()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn load_home_snapshot() -> Option<HomeSessionSnapshot> {
+    None
+}
+
+#[cfg(target_arch = "wasm32")]
+fn clear_home_snapshot() {
+    if let Some(storage) = web_sys::window().and_then(|w| w.session_storage().ok().flatten()) {
+        let _ = storage.remove_item(HOME_SNAPSHOT_KEY);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn clear_home_snapshot() {}
+
+#[cfg(target_arch = "wasm32")]
+fn is_back_forward_nav() -> bool {
+    let Some(w) = web_sys::window() else { return false };
+    let Ok(perf) = js_sys::Reflect::get(&w, &wasm_bindgen::JsValue::from_str("performance")) else {
+        return false;
+    };
+    let Ok(func) = js_sys::Reflect::get(&perf, &wasm_bindgen::JsValue::from_str("getEntriesByType")) else {
+        return false;
+    };
+    let Ok(f) = wasm_bindgen::JsCast::dyn_into::<js_sys::Function>(func) else {
+        return false;
+    };
+    let Ok(entries) = f.call1(&perf, &wasm_bindgen::JsValue::from_str("navigation")) else {
+        return false;
+    };
+    let arr: js_sys::Array = entries.into();
+    if arr.length() == 0 {
+        return false;
+    }
+    let first = arr.get(0);
+    js_sys::Reflect::get(&first, &wasm_bindgen::JsValue::from_str("type"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .is_some_and(|t| t == "back_forward")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn is_back_forward_nav() -> bool {
+    false
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_scroll_y(_fallback: f64) -> f64 {
+    web_sys::window().and_then(|w| w.scroll_y().ok()).unwrap_or(0.0)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_scroll_y(fallback: f64) -> f64 {
+    fallback
+}
+
 fn view_url(view: &View, my_section: MySection, query: &str) -> String {
     match view {
         View::Tab(Tab::Home) => "/".to_owned(),
@@ -385,6 +688,69 @@ fn view_url(view: &View, my_section: MySection, query: &str) -> String {
         View::Title(kind, id, _) => format!("/?open={}_{id}", kind.as_str()),
         View::Person(id) => format!("/?person={id}"),
         View::Shelf { id, .. } => format!("/?shelf={}", urlencoding::encode(id)),
+    }
+}
+
+fn normalize_prev_view(v: View) -> View {
+    match v {
+        View::Title(k, i, _) => View::Title(k, i, false),
+        other => other,
+    }
+}
+
+fn schedule_scroll(mut scroll_req: Signal<ScrollRequest>, y: f64) {
+    let next = scroll_req.peek().seq + 1;
+    scroll_req.set(ScrollRequest { seq: next, y });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_view(
+    mut view: Signal<View>,
+    mut trail: Signal<Vec<TrailEntry>>,
+    home_category: Signal<String>,
+    cache: Signal<AppCache>,
+    scroll_req: Signal<ScrollRequest>,
+    live_scroll_y: Signal<f64>,
+    next_view: View,
+    url: Option<&str>,
+    push_hist: bool,
+) {
+    let sy = current_scroll_y(*live_scroll_y.peek());
+    let prev = normalize_prev_view(view.peek().clone());
+    if matches!(prev, View::Tab(Tab::Home)) {
+        if let Some(home) = cache.peek().home.as_ref() {
+            save_home_snapshot(&home_category.peek(), sy, home);
+        }
+    }
+    trail.with_mut(|t| {
+        t.push(TrailEntry {
+            view: prev,
+            scroll_y: sy,
+        })
+    });
+    view.set(next_view);
+    schedule_scroll(scroll_req, 0.0);
+    if push_hist {
+        telegram::push_history(url);
+    }
+}
+
+fn step_back(
+    mut view: Signal<View>,
+    mut trail: Signal<Vec<TrailEntry>>,
+    mut query: Signal<String>,
+    scroll_req: Signal<ScrollRequest>,
+    from_pop: bool,
+) {
+    if let Some(prev) = trail.with_mut(|t| t.pop()) {
+        if matches!(prev.view, View::Tab(Tab::Home)) && trail.peek().is_empty() {
+            query.set(String::new());
+        }
+        view.set(prev.view);
+        schedule_scroll(scroll_req, prev.scroll_y);
+        if !from_pop {
+            telegram::pop_history();
+        }
     }
 }
 
@@ -421,10 +787,38 @@ fn Main(
         },
     };
     let has_initial_trail = !matches!(initial_route, telegram::InitialRoute::Home);
+    let restored_snap = use_hook(|| {
+        let allow = has_initial_trail || is_back_forward_nav();
+        if !allow {
+            clear_home_snapshot();
+            return None;
+        }
+        load_home_snapshot()
+    });
+    let init_category = restored_snap
+        .as_ref()
+        .map(|s| s.category.clone())
+        .unwrap_or_else(|| "for_you".to_owned());
+    let init_home_scroll = restored_snap.as_ref().map(|s| s.scroll_y).unwrap_or(0.0);
+    let mut cache = use_signal(|| {
+        let mut c = AppCache::default();
+        if let Some(snap) = &restored_snap {
+            c.home = Some(HomeCache {
+                feed: snap.feed.clone(),
+                continue_items: snap.continue_items.clone(),
+                row_scrolls: snap.row_scrolls.clone(),
+                cats_scroll: snap.cats_scroll,
+            });
+        }
+        c
+    });
     let mut view = use_signal(|| initial_view.clone());
     let mut trail = use_signal(|| {
         if has_initial_trail {
-            vec![View::Tab(Tab::Home)]
+            vec![TrailEntry {
+                view: View::Tab(Tab::Home),
+                scroll_y: init_home_scroll,
+            }]
         } else {
             Vec::new()
         }
@@ -435,8 +829,64 @@ fn Main(
         let init_url = view_url(&initial_view, initial_my_sec, &initial_query);
         telegram::init_history(has_initial_trail, (init_url != "/").then_some(init_url.as_str()));
     });
-    let mut home_category = use_signal(|| "for_you".to_owned());
+    let mut home_category = use_signal(|| init_category);
+    let mut home_epoch = use_signal(|| 0u64);
     let mut my_filters = use_signal(MyFilters::default);
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut live_scroll_y = use_signal(|| 0.0f64);
+    let scroll_req = use_signal(|| ScrollRequest {
+        seq: u64::from(!has_initial_trail && init_home_scroll > 0.0),
+        y: if !has_initial_trail { init_home_scroll } else { 0.0 },
+    });
+    let mut applied_scroll_seq = use_signal(|| 0u64);
+    use_effect(move || {
+        let req = scroll_req();
+        if req.seq == 0 || *applied_scroll_seq.peek() == req.seq {
+            return;
+        }
+        applied_scroll_seq.set(req.seq);
+        let y = req.y.max(0.0);
+        let js = format!(
+            "(function(y) {{ \
+               window.scrollTo({{ top: y, left: 0, behavior: 'instant' }}); \
+               if (y > 0 && Math.abs((window.scrollY || 0) - y) > 2) {{ \
+                 requestAnimationFrame(function() {{ \
+                   window.scrollTo({{ top: y, left: 0, behavior: 'instant' }}); \
+                   if (Math.abs((window.scrollY || 0) - y) > 2) {{ \
+                     requestAnimationFrame(function() {{ \
+                       window.scrollTo({{ top: y, left: 0, behavior: 'instant' }}); \
+                     }}); \
+                   }} \
+                 }}); \
+               }} \
+             }})({y});"
+        );
+        let _ = dioxus::document::eval(&js);
+    });
+    #[cfg(not(target_arch = "wasm32"))]
+    use_hook(move || {
+        spawn(async move {
+            let mut bridge = dioxus::document::eval(
+                "if (!window.__kinoScrollTrack) {
+                   window.__kinoScrollTrack = true;
+                   var lastT = 0, lastY = -1, timer = null;
+                   var send = function() {
+                     var y = window.scrollY || 0;
+                     if (y !== lastY) { lastY = y; dioxus.send(y); }
+                   };
+                   window.addEventListener('scroll', function() {
+                     var now = Date.now();
+                     if (now - lastT > 80) { lastT = now; send(); }
+                     clearTimeout(timer);
+                     timer = setTimeout(send, 120);
+                   }, { passive: true });
+                 }",
+            );
+            while let Ok(y) = bridge.recv::<f64>().await {
+                live_scroll_y.set(y);
+            }
+        });
+    });
     // Restore saved "Мои" filters on startup.
     use_effect(move || {
         spawn(async move {
@@ -510,51 +960,57 @@ fn Main(
         View::Tab(t) => Some(t),
         View::Title(..) | View::Person(_) | View::Shelf { .. } => None,
     };
-    let mut open_title = move |kind: MediaKind, id: i64, play: bool| {
-        // Coming back to a title must not start it again.
-        trail.with_mut(|t| {
-            t.push(match view() {
-                View::Title(k, i, _) => View::Title(k, i, false),
-                v => v,
-            })
-        });
-        view.set(View::Title(kind, id, play));
+    let open_title = move |kind: MediaKind, id: i64, play: bool| {
         let url = format!("/?open={}_{id}", kind.as_str());
-        telegram::push_history(Some(&url));
+        push_view(
+            view,
+            trail,
+            home_category,
+            cache,
+            scroll_req,
+            live_scroll_y,
+            View::Title(kind, id, play),
+            Some(&url),
+            true,
+        );
     };
     let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id, false);
     let open_person = move |id: i64| {
         telegram::haptic(telegram::Haptic::Tap);
-        trail.with_mut(|t| {
-            t.push(match view() {
-                View::Title(k, i, _) => View::Title(k, i, false),
-                v => v,
-            })
-        });
-        view.set(View::Person(id));
-        telegram::push_history(Some(&format!("/?person={id}")));
+        let url = format!("/?person={id}");
+        push_view(
+            view,
+            trail,
+            home_category,
+            cache,
+            scroll_req,
+            live_scroll_y,
+            View::Person(id),
+            Some(&url),
+            true,
+        );
     };
     let open_shelf = move |(id, title, subtitle): (String, String, Option<String>)| {
         telegram::haptic(telegram::Haptic::Tap);
-        trail.with_mut(|t| {
-            t.push(match view() {
-                View::Title(k, i, _) => View::Title(k, i, false),
-                v => v,
-            })
+        cache.with_mut(|c| {
+            c.shelves.remove(&id);
         });
         let url = format!("/?shelf={}", urlencoding::encode(&id));
-        view.set(View::Shelf { id, title, subtitle });
-        telegram::push_history(Some(&url));
+        push_view(
+            view,
+            trail,
+            home_category,
+            cache,
+            scroll_req,
+            live_scroll_y,
+            View::Shelf { id, title, subtitle },
+            Some(&url),
+            true,
+        );
     };
     let go_back = move |_: ()| {
         telegram::haptic(telegram::Haptic::Tap);
-        if let Some(prev) = trail.with_mut(|t| t.pop()) {
-            if matches!(prev, View::Tab(Tab::Home)) && trail.peek().is_empty() {
-                query.set(String::new());
-            }
-            view.set(prev);
-            telegram::pop_history();
-        }
+        step_back(view, trail, query, scroll_req, false);
     };
     let can_back = !trail().is_empty();
     rsx! {
@@ -574,31 +1030,46 @@ fn Main(
                 }
                 if t == Tab::Home {
                     home_category.set("for_you".to_owned());
+                    cache.with_mut(|c| c.home = None);
+                    clear_home_snapshot();
+                    let next = *home_epoch.peek() + 1;
+                    home_epoch.set(next);
+                    trail.set(Vec::new());
+                    view.set(View::Tab(Tab::Home));
+                    schedule_scroll(scroll_req, 0.0);
+                    if !telegram::is_telegram() {
+                        telegram::reset_history();
+                    }
+                    return;
                 }
-                if view() == View::Tab(t) && (t != Tab::Home || trail.peek().is_empty()) {
+                if view() == View::Tab(t) {
                     if t == Tab::Search {
                         let _ = dioxus::document::eval(
                             "var el = document.getElementById('kino-search-input'); if (el) el.focus();",
                         );
+                    } else {
+                        schedule_scroll(scroll_req, 0.0);
                     }
                     return;
                 }
-                if t == Tab::Home || telegram::is_telegram() {
+                if telegram::is_telegram() {
                     trail.set(Vec::new());
                     view.set(View::Tab(t));
-                    if !telegram::is_telegram() {
-                        telegram::reset_history();
-                    }
+                    schedule_scroll(scroll_req, 0.0);
                 } else {
-                    let prev = match view() {
-                        View::Title(k, i, _) => View::Title(k, i, false),
-                        v => v,
-                    };
                     let next = View::Tab(t);
                     let url = view_url(&next, *my_section.peek(), &query.peek());
-                    trail.with_mut(|tr| tr.push(prev));
-                    view.set(next);
-                    telegram::push_history(Some(&url));
+                    push_view(
+                        view,
+                        trail,
+                        home_category,
+                        cache,
+                        scroll_req,
+                        live_scroll_y,
+                        next,
+                        Some(&url),
+                        true,
+                    );
                 }
                 if t == Tab::Profile {
                     active_preloads.restart();
@@ -618,26 +1089,32 @@ fn Main(
                     // On phones Search is a dedicated tab: clearing the box keeps you on Search.
                     // On desktop, clearing the topbar search box returns to the previous screen.
                     if matches!(view(), View::Tab(Tab::Search)) && !telegram::is_mobile() {
-                        if let Some(prev) = trail.with_mut(|tr| tr.pop()) {
-                            view.set(prev);
-                            telegram::pop_history();
-                        } else {
+                        if trail.peek().is_empty() {
                             view.set(View::Tab(Tab::Home));
+                            schedule_scroll(scroll_req, 0.0);
+                        } else {
+                            step_back(view, trail, query, scroll_req, false);
                         }
                     }
                 } else if !matches!(view(), View::Tab(Tab::Search)) {
                     if !telegram::is_telegram() {
-                        let prev = match view() {
-                            View::Title(k, i, _) => View::Title(k, i, false),
-                            v => v,
-                        };
                         let url = view_url(&View::Tab(Tab::Search), *my_section.peek(), &q);
-                        trail.with_mut(|tr| tr.push(prev));
-                        telegram::push_history(Some(&url));
+                        push_view(
+                            view,
+                            trail,
+                            home_category,
+                            cache,
+                            scroll_req,
+                            live_scroll_y,
+                            View::Tab(Tab::Search),
+                            Some(&url),
+                            true,
+                        );
                     } else {
                         trail.set(Vec::new());
+                        view.set(View::Tab(Tab::Search));
+                        schedule_scroll(scroll_req, 0.0);
                     }
-                    view.set(View::Tab(Tab::Search));
                 } else {
                     telegram::replace_history(&view_url(&View::Tab(Tab::Search), *my_section.peek(), &q));
                 }
@@ -646,20 +1123,23 @@ fn Main(
             match view() {
                 View::Tab(Tab::Home) => rsx! {
                     Home {
+                        key: "home-{home_epoch()}",
                         token: token.clone(),
                         active_category: home_category,
+                        cache,
                         on_open: open,
                         on_open_title: move |(k, id)| open_title(k, id, false),
                         on_play: move |(k, id)| open_title(k, id, true),
                         on_open_shelf: open_shelf,
                     }
                 },
-                View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, on_open: open } },
+                View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, cache, on_open: open } },
                 View::Tab(Tab::Mine) => rsx! {
                     Mine {
                         token: token.clone(),
                         section: my_section,
                         filters: my_filters,
+                        cache,
                         on_section: move |s: MySection| {
                             my_section.set(s);
                             telegram::replace_history(&view_url(&View::Tab(Tab::Mine), s, &query.peek()));
@@ -678,6 +1158,7 @@ fn Main(
                         name: name.clone(),
                         avatar_url: avatar_url.clone(),
                         theme,
+                        cache,
                         on_theme,
                         on_preloads_changed: move |_| active_preloads.restart(),
                         on_open: move |(k, id)| open_title(k, id, false),
@@ -691,24 +1172,17 @@ fn Main(
                         kind,
                         id,
                         autoplay: play,
+                        cache,
                         on_preloads_changed: move |_| active_preloads.restart(),
                         on_open: open,
                         on_person: open_person,
                         // Closing a player started directly from Home / deep-link returns to the previous screen.
                         on_exit: move |from_pop: bool| {
-                            if let Some(prev) = trail.with_mut(|t| t.pop()) {
-                                if matches!(prev, View::Tab(Tab::Home)) && trail.peek().is_empty() {
-                                    query.set(String::new());
-                                }
-                                view.set(prev);
-                                if !from_pop {
-                                    telegram::pop_history();
-                                }
-                            }
+                            step_back(view, trail, query, scroll_req, from_pop);
                         },
                     }
                 },
-                View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, on_open: open } },
+                View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, cache, on_open: open } },
                 View::Shelf { id, title, subtitle } => rsx! {
                     Shelf {
                         key: "shelf-{id}",
@@ -716,6 +1190,7 @@ fn Main(
                         id,
                         title,
                         subtitle,
+                        cache,
                         on_open: open,
                     }
                 },
@@ -740,11 +1215,22 @@ fn loading() -> Element {
 }
 
 #[component]
-fn Person(token: String, id: i64, on_open: EventHandler<TitleSummary>) -> Element {
+fn Person(token: String, id: i64, cache: Signal<AppCache>, on_open: EventHandler<TitleSummary>) -> Element {
+    let cached = use_hook(|| cache.peek().persons.get(&id).cloned());
+    let mut person_state = use_signal(|| cached);
     let data = use_resource(move || {
         let t = token.clone();
         async move { api::person(&t, id).await }
     });
+    use_effect(move || {
+        if let Some(Ok(p)) = &*data.read() {
+            person_state.set(Some(p.clone()));
+            cache.with_mut(|c| c.insert_person(id, p.clone()));
+        }
+    });
+    if let Some(person) = person_state() {
+        return rsx! { PersonView { person, on_open } };
+    }
     let state = data.read().clone();
     match state {
         None => loading(),
@@ -760,11 +1246,32 @@ const MAX_ROW_AUTO_PAGES: u32 = 4;
 fn Home(
     token: String,
     active_category: Signal<String>,
+    cache: Signal<AppCache>,
     on_open: EventHandler<TitleSummary>,
     on_open_title: EventHandler<(MediaKind, i64)>,
     on_play: EventHandler<(MediaKind, i64)>,
     on_open_shelf: EventHandler<(String, String, Option<String>)>,
 ) -> Element {
+    let cached_home = use_hook(|| cache.peek().home.clone());
+    let has_cached_feed = cached_home.as_ref().and_then(|c| c.feed.as_ref()).is_some();
+    let initial_cont = cached_home
+        .as_ref()
+        .map(|c| c.continue_items.clone())
+        .unwrap_or_default();
+    let initial_row_scrolls = use_hook(|| cached_home.as_ref().map(|c| c.row_scrolls.clone()).unwrap_or_default());
+    let initial_cats_scroll = cached_home.as_ref().map(|c| c.cats_scroll).unwrap_or(0.0);
+    let cat_already_has_rows = cached_home.as_ref().and_then(|c| c.feed.as_ref()).is_some_and(|f| {
+        let cat = active_category.peek();
+        *cat == "for_you"
+            || f.rows
+                .iter()
+                .any(|r| r.loaded && r.categories.iter().any(|c| c == &*cat))
+    });
+
+    let mut cont_items_state = use_signal(|| initial_cont);
+    let mut feed_state = use_signal(|| cached_home.as_ref().and_then(|c| c.feed.clone()));
+    let mut need_feed_fetch = use_signal(|| !has_cached_feed);
+
     let token_cont = token.clone();
     let mut cont_res = use_resource(move || {
         let t = token_cont.clone();
@@ -773,25 +1280,43 @@ fn Home(
     let token_feed = token.clone();
     let mut feed_res = use_resource(move || {
         let t = token_feed.clone();
-        async move { api::home(&t).await }
+        let should_fetch = need_feed_fetch();
+        async move {
+            if !should_fetch {
+                return Ok(None);
+            }
+            api::home(&t).await.map(Some)
+        }
     });
 
-    let mut feed_state = use_signal(|| None::<HomeFeed>);
     let mut loading_shelves = use_signal(Vec::<String>::new);
     let mut loading_row_pages = use_signal(Vec::<String>::new);
     let mut loading_more_rows = use_signal(|| false);
 
     use_effect(move || {
-        if let Some(Ok(f)) = &*feed_res.read() {
+        if let Some(Ok(items)) = &*cont_res.read() {
+            cont_items_state.set(items.clone());
+            cache.with_mut(|ca| {
+                ca.home.get_or_insert_with(HomeCache::default).continue_items = items.clone();
+            });
+        }
+    });
+
+    use_effect(move || {
+        if let Some(Ok(Some(f))) = &*feed_res.read() {
+            need_feed_fetch.set(false);
             feed_state.set(Some(f.clone()));
             loading_shelves.set(Vec::new());
             loading_row_pages.set(Vec::new());
             loading_more_rows.set(false);
+            cache.with_mut(|ca| {
+                ca.home.get_or_insert_with(HomeCache::default).feed = Some(f.clone());
+            });
         }
     });
 
     let mut lazy_backoff_until_ms = use_signal(|| 0i64);
-    let mut init_cat_loaded = use_signal(|| false);
+    let mut init_cat_loaded = use_signal(|| cat_already_has_rows);
 
     let load_batch = {
         let token = token.clone();
@@ -838,6 +1363,9 @@ fn Home(
                                 }
                             }
                             feed.rows.retain(|r| !r.loaded || !r.items.is_empty());
+                        });
+                        cache.with_mut(|ca| {
+                            ca.home.get_or_insert_with(HomeCache::default).feed = feed_state.peek().clone();
                         });
                     }
                     Err(_) => {
@@ -959,16 +1487,16 @@ fn Home(
                         row.page = page.page;
                         row.has_more = page.has_more;
                     });
+                    cache.with_mut(|ca| {
+                        ca.home.get_or_insert_with(HomeCache::default).feed = feed_state.peek().clone();
+                    });
                 }
                 loading_row_pages.with_mut(|v| v.retain(|id| id != &sid));
             });
         }
     };
 
-    let cont_items = match &*cont_res.read() {
-        Some(Ok(items)) => items.clone(),
-        _ => Vec::new(),
-    };
+    let cont_items = cont_items_state();
     let feed_err = match &*feed_res.read() {
         Some(Err(e)) => Some(e.message.clone()),
         _ => None,
@@ -1005,12 +1533,16 @@ fn Home(
             on_play: move |c: kino_core::ContinueItem| on_play.call((c.last.kind, c.last.tmdb_id)),
             on_drop: move |c: kino_core::ContinueItem| {
                 let t = t_drop.clone();
+                cache.with_mut(|ca| {
+                    ca.patch_title(c.last.kind, c.last.tmdb_id, Some(TitleStatus::Dropped), None, None);
+                });
                 spawn(async move {
                     if api::set_status(&t, c.last.kind, c.last.tmdb_id, Some(TitleStatus::Dropped))
                         .await
                         .is_ok()
                     {
                         cont_res.restart();
+                        need_feed_fetch.set(true);
                         feed_res.restart();
                     }
                 });
@@ -1026,6 +1558,21 @@ fn Home(
                 if !*loading_more_rows.peek() {
                     lb_more(HOME_LAZY_BATCH, active_category.peek().clone());
                 }
+            },
+            row_scrolls: initial_row_scrolls.clone(),
+            on_row_scroll: move |(row_id, left): (String, f64)| {
+                cache.with_mut(|ca| {
+                    ca.home
+                        .get_or_insert_with(HomeCache::default)
+                        .row_scrolls
+                        .insert(row_id, left);
+                });
+            },
+            initial_cats_scroll,
+            on_cats_scroll: move |left: f64| {
+                cache.with_mut(|ca| {
+                    ca.home.get_or_insert_with(HomeCache::default).cats_scroll = left;
+                });
             },
         }
         if let Some(err) = feed_err {
@@ -1043,15 +1590,24 @@ fn Shelf(
     id: String,
     title: String,
     subtitle: Option<String>,
+    cache: Signal<AppCache>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
-    let mut items = use_signal(Vec::<TitleSummary>::new);
-    let mut page = use_signal(|| 0u32);
-    let mut has_more = use_signal(|| true);
-    let mut loading = use_signal(|| true);
+    let cached = use_hook(|| cache.peek().shelves.get(&id).cloned());
+    let has_cached = cached.is_some();
+    let mut items = use_signal(|| cached.as_ref().map(|c| c.items.clone()).unwrap_or_default());
+    let mut page = use_signal(|| cached.as_ref().map(|c| c.page).unwrap_or(0));
+    let mut has_more = use_signal(|| cached.as_ref().map(|c| c.has_more).unwrap_or(true));
+    let mut loading = use_signal(|| !has_cached);
     let mut err = use_signal(|| None::<String>);
-    let mut shelf_title = use_signal(|| title);
-    let mut shelf_sub = use_signal(|| subtitle);
+    let mut shelf_title = use_signal(|| {
+        cached
+            .as_ref()
+            .filter(|c| !c.title.is_empty())
+            .map(|c| c.title.clone())
+            .unwrap_or(title)
+    });
+    let mut shelf_sub = use_signal(|| cached.as_ref().and_then(|c| c.subtitle.clone()).or(subtitle));
 
     let mut fetch_page = {
         let token = token.clone();
@@ -1079,6 +1635,14 @@ fn Shelf(
                         });
                         page.set(res.page);
                         has_more.set(res.has_more);
+                        let snapshot = ShelfCache {
+                            title: shelf_title.peek().clone(),
+                            subtitle: shelf_sub.peek().clone(),
+                            items: items.peek().clone(),
+                            page: res.page,
+                            has_more: res.has_more,
+                        };
+                        cache.with_mut(|ca| ca.insert_shelf(sid, snapshot));
                     }
                     Err(e) => err.set(Some(e.message)),
                 }
@@ -1089,7 +1653,11 @@ fn Shelf(
 
     {
         let mut fp = fetch_page.clone();
-        use_hook(move || fp(1));
+        use_hook(move || {
+            if !has_cached {
+                fp(1);
+            }
+        });
     }
 
     if let Some(message) = err() {
@@ -1116,8 +1684,24 @@ fn Shelf(
 }
 
 #[component]
-fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSummary>) -> Element {
-    let mut debounced = use_signal(|| query.peek().clone());
+fn Search(
+    token: String,
+    query: Signal<String>,
+    cache: Signal<AppCache>,
+    on_open: EventHandler<TitleSummary>,
+) -> Element {
+    let initial_q = use_hook(|| query.peek().clone());
+    let cached = use_hook(|| {
+        cache
+            .peek()
+            .search
+            .as_ref()
+            .filter(|c| c.query == initial_q.trim())
+            .cloned()
+    });
+    let initial_kind = cached.as_ref().map(|c| c.kind).unwrap_or_default();
+    let mut shown_state = use_signal(|| cached.as_ref().and_then(|c| c.results.clone()));
+    let mut debounced = use_signal(|| initial_q);
     let mut gen = use_signal(|| 0u64);
     use_effect(move || {
         let q = query();
@@ -1125,6 +1709,8 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
         gen.set(next);
         if q.trim().is_empty() {
             debounced.set(q);
+            shown_state.set(None);
+            cache.with_mut(|c| c.search = None);
             return;
         }
         spawn(async move {
@@ -1144,16 +1730,50 @@ fn Search(token: String, query: Signal<String>, on_open: EventHandler<TitleSumma
             api::search(&t, &q).await.map(Some)
         }
     });
-    let shown = match &*results.read() {
-        Some(Ok(r)) => r.clone(),
-        _ => None,
-    };
+    use_effect(move || {
+        if let Some(Ok(Some(res))) = &*results.read() {
+            shown_state.set(Some(res.clone()));
+            let q_trimmed = debounced.peek().trim().to_owned();
+            cache.with_mut(|c| {
+                let kind = c
+                    .search
+                    .as_ref()
+                    .filter(|prev| prev.query == q_trimmed)
+                    .map(|prev| prev.kind)
+                    .unwrap_or(initial_kind);
+                c.search = Some(SearchCache {
+                    query: q_trimmed,
+                    results: Some(res.clone()),
+                    kind,
+                });
+            });
+        }
+    });
+    let shown = shown_state();
     let err = match &*results.read() {
-        Some(Err(e)) => Some(e.message.clone()),
+        Some(Err(e)) if shown.is_none() => Some(e.message.clone()),
         _ => None,
     };
     rsx! {
-        SearchView { results: shown, on_open }
+        SearchView {
+            results: shown,
+            on_open,
+            initial_kind,
+            on_kind_change: move |next_kind| {
+                let q_trimmed = query.peek().trim().to_owned();
+                cache.with_mut(|c| {
+                    if let Some(s) = c.search.as_mut() {
+                        s.kind = next_kind;
+                    } else if !q_trimmed.is_empty() {
+                        c.search = Some(SearchCache {
+                            query: q_trimmed,
+                            results: shown_state.peek().clone(),
+                            kind: next_kind,
+                        });
+                    }
+                });
+            },
+        }
         if let Some(e) = err { {error_text(&e)} }
     }
 }
@@ -1163,13 +1783,20 @@ fn Mine(
     token: String,
     section: Signal<MySection>,
     filters: Signal<MyFilters>,
+    cache: Signal<AppCache>,
     on_section: EventHandler<MySection>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
-    let mut selected_user_id = use_signal(|| None::<i64>);
+    let cached = use_hook(|| cache.peek().mine.clone().unwrap_or_default());
+    let mut selected_user_id = use_signal(|| cached.selected_user_id);
+    let mut items_state = use_signal(|| cached.items.clone());
+    let mut users_state = use_signal(|| cached.users.clone().unwrap_or_default());
+    let mut calendar_state = use_signal(|| cached.calendar.clone().unwrap_or_default());
+    let mut peer_libs = use_signal(|| cached.peer_libraries.clone());
+
     let t_items = token.clone();
-    let items = use_resource(move || {
+    let items_res = use_resource(move || {
         let t = t_items.clone();
         async move { api::my(&t).await }
     });
@@ -1186,7 +1813,7 @@ fn Mine(
     let t_peer = token.clone();
     let peer_res = use_resource(move || {
         let t = t_peer.clone();
-        let uid = selected_user_id().or_else(|| users_res.read().as_ref().and_then(|v| v.first().map(|u| u.id)));
+        let uid = selected_user_id().or_else(|| users_state().first().map(|u| u.id));
         async move {
             match uid {
                 Some(id) => api::user_titles(&t, id).await.ok(),
@@ -1194,37 +1821,95 @@ fn Mine(
             }
         }
     });
-    let state = items.read().clone();
-    match state {
-        None => loading(),
-        Some(Err(e)) => error_text(&e.message),
-        Some(Ok(items)) => {
-            let users = users_res.read().clone().unwrap_or_default();
-            let active_uid = selected_user_id().or_else(|| users.first().map(|u| u.id));
-            let peer_library = peer_res
-                .read()
-                .clone()
-                .flatten()
-                .filter(|l| Some(l.profile.id) == active_uid);
-            let peer_loading = active_uid.is_some() && peer_library.is_none() && !users.is_empty();
-            let calendar = calendar_res.read().clone().unwrap_or_default();
-            rsx! {
-                MyView {
-                    items,
-                    filters: filters(),
-                    section: section(),
-                    users,
-                    selected_user_id: active_uid,
-                    peer_library,
-                    peer_loading,
-                    calendar,
-                    today_ymd: today_ymd(),
-                    on_section,
-                    on_select_user: move |id| selected_user_id.set(Some(id)),
-                    on_filters,
-                    on_open,
-                }
-            }
+
+    use_effect(move || {
+        if let Some(Ok(list)) = &*items_res.read() {
+            items_state.set(Some(list.clone()));
+            cache.with_mut(|c| c.mine.get_or_insert_with(MineCache::default).items = Some(list.clone()));
+        }
+    });
+    use_effect(move || {
+        if let Some(list) = &*users_res.read() {
+            users_state.set(list.clone());
+            cache.with_mut(|c| c.mine.get_or_insert_with(MineCache::default).users = Some(list.clone()));
+        }
+    });
+    use_effect(move || {
+        if let Some(list) = &*calendar_res.read() {
+            calendar_state.set(list.clone());
+            cache.with_mut(|c| c.mine.get_or_insert_with(MineCache::default).calendar = Some(list.clone()));
+        }
+    });
+    use_effect(move || {
+        if let Some(Some(lib)) = &*peer_res.read() {
+            let uid = lib.profile.id;
+            peer_libs.with_mut(|m| {
+                m.insert(uid, lib.clone());
+            });
+            cache.with_mut(|c| {
+                c.mine
+                    .get_or_insert_with(MineCache::default)
+                    .peer_libraries
+                    .insert(uid, lib.clone());
+            });
+        }
+    });
+
+    let items_err = match &*items_res.read() {
+        Some(Err(e)) => Some(e.message.clone()),
+        _ => None,
+    };
+    let Some(items) = items_state() else {
+        return match items_err {
+            Some(msg) => error_text(&msg),
+            None => loading(),
+        };
+    };
+    let users = users_state();
+    let active_uid = selected_user_id().or_else(|| users.first().map(|u| u.id));
+    let peer_library = active_uid.and_then(|uid| peer_libs().get(&uid).cloned());
+    let peer_loading = active_uid.is_some() && peer_library.is_none() && !users.is_empty();
+    let calendar = calendar_state();
+    rsx! {
+        MyView {
+            items,
+            filters: filters(),
+            section: section(),
+            users,
+            selected_user_id: active_uid,
+            peer_library,
+            peer_loading,
+            calendar,
+            today_ymd: today_ymd(),
+            on_section,
+            on_select_user: move |id| {
+                selected_user_id.set(Some(id));
+                cache.with_mut(|c| {
+                    let m = c.mine.get_or_insert_with(MineCache::default);
+                    m.selected_user_id = Some(id);
+                    m.peer_status_filter = None;
+                });
+            },
+            initial_peer_status: cached.peer_status_filter,
+            on_peer_status: move |st| {
+                cache.with_mut(|c| {
+                    c.mine.get_or_insert_with(MineCache::default).peer_status_filter = st;
+                });
+            },
+            initial_cal_month: cached.cal_month,
+            on_cal_month: move |ym| {
+                cache.with_mut(|c| {
+                    c.mine.get_or_insert_with(MineCache::default).cal_month = ym;
+                });
+            },
+            initial_cal_day: cached.cal_day.clone(),
+            on_cal_day: move |day| {
+                cache.with_mut(|c| {
+                    c.mine.get_or_insert_with(MineCache::default).cal_day = day;
+                });
+            },
+            on_filters,
+            on_open,
         }
     }
 }
@@ -1317,11 +2002,16 @@ fn Profile(
     name: String,
     avatar_url: Option<String>,
     theme: Theme,
+    cache: Signal<AppCache>,
     on_theme: EventHandler<Theme>,
     on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
+    let cached = use_hook(|| cache.peek().profile.clone().unwrap_or_default());
+    let mut history_state = use_signal(|| cached.history.clone());
+    let mut preloads_state = use_signal(|| cached.preloads.clone());
+    let mut prefs_state = use_signal(|| cached.prefs.clone());
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -1330,12 +2020,26 @@ fn Profile(
             Ok::<_, api::Failure>((history?, preloads?, prefs?))
         }
     });
+    use_effect(move || {
+        if let Some(Ok((h, pl, pr))) = &*data.read() {
+            history_state.set(Some(h.clone()));
+            preloads_state.set(Some(pl.clone()));
+            prefs_state.set(Some(pr.clone()));
+            cache.with_mut(|c| {
+                let p = c.profile.get_or_insert_with(ProfileCache::default);
+                p.history = Some(h.clone());
+                p.preloads = Some(pl.clone());
+                p.prefs = Some(pr.clone());
+            });
+        }
+    });
     let mut prefs_now = use_signal(|| None::<UserPrefs>);
     let state = data.read().clone();
-    let has_active_dl = matches!(
-        &state,
-        Some(Ok((_, pl, _))) if pl.iter().any(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
-    );
+    let active_preloads_list = preloads_state();
+    let has_active_dl = active_preloads_list.as_ref().is_some_and(|pl| {
+        pl.iter()
+            .any(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
+    });
     let mut poll_gen = use_signal(|| 0u64);
     use_effect(use_reactive!(|has_active_dl| {
         let gen = *poll_gen.peek() + 1;
@@ -1357,10 +2061,11 @@ fn Profile(
         let next = *poll_gen.peek() + 1;
         poll_gen.set(next);
     });
-    let (history, preloads, prefs) = match state {
-        None => return loading(),
-        Some(Err(e)) => return error_text(&e.message),
-        Some(Ok(v)) => v,
+    let (Some(history), Some(preloads), Some(prefs)) = (history_state(), active_preloads_list, prefs_state()) else {
+        return match state {
+            Some(Err(e)) => error_text(&e.message),
+            _ => loading(),
+        };
     };
     let (now, utc_offset_min) = platform::now();
     let t2 = token.clone();
@@ -1380,6 +2085,10 @@ fn Profile(
                 // The studio is no longer chosen here, so an old one must not linger unseen.
                 let p = UserPrefs { voice: None, ..p };
                 prefs_now.set(Some(p.clone()));
+                prefs_state.set(Some(p.clone()));
+                cache.with_mut(|c| {
+                    c.profile.get_or_insert_with(ProfileCache::default).prefs = Some(p.clone());
+                });
                 let t = token.clone();
                 spawn(async move {
                     let _ = api::save_prefs(&t, &p).await;
@@ -1397,6 +2106,18 @@ fn Profile(
             on_refresh: move |_| {
                 data.restart();
                 on_preloads_changed.call(());
+            },
+            initial_prefs_open: cached.prefs_open,
+            on_prefs_open: move |open| {
+                cache.with_mut(|c| {
+                    c.profile.get_or_insert_with(ProfileCache::default).prefs_open = open;
+                });
+            },
+            initial_hist_limit: cached.hist_limit,
+            on_hist_limit: move |limit| {
+                cache.with_mut(|c| {
+                    c.profile.get_or_insert_with(ProfileCache::default).hist_limit = Some(limit);
+                });
             },
             on_open,
             on_logout,
@@ -1463,11 +2184,32 @@ fn Title(
     kind: MediaKind,
     id: i64,
     autoplay: bool,
+    cache: Signal<AppCache>,
     on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<TitleSummary>,
     on_person: EventHandler<i64>,
     on_exit: EventHandler<bool>,
 ) -> Element {
+    let cached_title = use_hook(|| cache.peek().titles.get(&(kind, id)).cloned());
+    let mut data_state = use_signal(|| {
+        cached_title.as_ref().map(|c| {
+            (
+                c.details.clone(),
+                c.progress.clone(),
+                c.state.clone(),
+                c.choices.clone(),
+            )
+        })
+    });
+    let mut extras_state = use_signal(|| cached_title.as_ref().and_then(|c| c.extras.clone()));
+    let mut chosen_season = use_signal(|| cached_title.as_ref().and_then(|c| c.chosen_season));
+    let mut season_state = use_signal(|| {
+        cached_title.as_ref().and_then(|c| {
+            let last = c.progress.iter().max_by_key(|p| p.updated_at).map(|p| p.season);
+            let default_n = last.or_else(|| c.details.seasons.iter().map(|s| s.number).find(|n| *n > 0));
+            c.chosen_season.or(default_n).and_then(|n| c.seasons.get(&n).cloned())
+        })
+    });
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
@@ -1484,18 +2226,17 @@ fn Title(
     });
     // Cast and suggestions come apart from the title: if TMDB is slow or fails, the page still works.
     let t_extras = token.clone();
-    let extras = use_resource(move || {
+    let extras_res = use_resource(move || {
         let t = t_extras.clone();
         async move { api::extras(&t, kind, id).await.ok() }
     });
-    let mut chosen_season = use_signal(|| None::<i32>);
     let t2 = token.clone();
-    let season = use_resource(move || {
+    let season_res = use_resource(move || {
         let t = t2.clone();
         let picked = chosen_season();
         // Default: the season of the last watched episode, else the first one.
-        let default = match &*data.read() {
-            Some(Ok((d, p, _, _))) if kind == MediaKind::Tv => {
+        let default = match data_state() {
+            Some((d, p, _, _)) if kind == MediaKind::Tv => {
                 let last = p.iter().max_by_key(|p| p.updated_at).map(|p| p.season);
                 last.or_else(|| d.seasons.iter().map(|s| s.number).find(|n| *n > 0))
             }
@@ -1506,6 +2247,52 @@ fn Title(
                 Some(n) => api::season(&t, id, n).await.ok(),
                 None => None,
             }
+        }
+    });
+    use_effect(move || {
+        if let Some(Ok(v)) = &*data.read() {
+            data_state.set(Some(v.clone()));
+            let user_r = v.2.effective_rating.or_else(|| v.2.rating.map(f32::from));
+            let is_pre = v.0.summary.preloaded || v.2.preloaded_ready_at.is_some();
+            cache.with_mut(|c| {
+                let prev = c.titles.get(&(kind, id)).cloned();
+                c.upsert_title(
+                    (kind, id),
+                    TitleCache {
+                        details: v.0.clone(),
+                        progress: v.1.clone(),
+                        state: v.2.clone(),
+                        choices: v.3.clone(),
+                        extras: extras_state
+                            .peek()
+                            .clone()
+                            .or_else(|| prev.as_ref().and_then(|p| p.extras.clone())),
+                        chosen_season: *chosen_season.peek(),
+                        seasons: prev.map(|p| p.seasons).unwrap_or_default(),
+                    },
+                );
+                c.patch_title(kind, id, v.2.status, user_r, Some(is_pre));
+            });
+        }
+    });
+    use_effect(move || {
+        if let Some(Some(ex)) = &*extras_res.read() {
+            extras_state.set(Some(ex.clone()));
+            cache.with_mut(|c| {
+                if let Some(entry) = c.titles.get_mut(&(kind, id)) {
+                    entry.extras = Some(ex.clone());
+                }
+            });
+        }
+    });
+    use_effect(move || {
+        if let Some(Some(s)) = &*season_res.read() {
+            season_state.set(Some(s.clone()));
+            cache.with_mut(|c| {
+                if let Some(entry) = c.titles.get_mut(&(kind, id)) {
+                    entry.seasons.insert(s.number, s.clone());
+                }
+            });
         }
     });
     // Optimistic edits; cleared when the data reloads.
@@ -1636,11 +2423,13 @@ fn Title(
         defaults_relaxed.set(true);
     });
 
-    let state = data.read().clone();
-    let (details, progress, st, loaded) = match state {
-        None => return loading(),
-        Some(Err(e)) => return error_text(&e.message),
-        Some(Ok(v)) => v,
+    let (details, progress, st, loaded) = match data_state() {
+        Some(v) => v,
+        None => match data.read().clone() {
+            None => return loading(),
+            Some(Err(e)) => return error_text(&e.message),
+            Some(Ok(v)) => v,
+        },
     };
     let status = status_now().unwrap_or(st.status);
     let my_rating = rating_now().unwrap_or(st.rating);
@@ -1708,7 +2497,7 @@ fn Title(
     } else {
         display_choice_for(target.season, target.episode).map(|c| choice_label(&c))
     };
-    let cur_season_data = season.read().clone().flatten();
+    let cur_season_data = season_state();
     let season_release_label = cur_season_data.as_ref().and_then(|sd| {
         manual_choices
             .iter()
@@ -1934,6 +2723,10 @@ fn Title(
                         if let Ok(saved) = api::set_status(&t, kind, id, s).await {
                             // Reflect automatic server adjustments (e.g. "Want" -> "WaitingRelease" on unreleased titles).
                             status_now.set(Some(saved.status));
+                            let user_r = saved.effective_rating.or_else(|| saved.rating.map(f32::from));
+                            cache.with_mut(|c| {
+                                c.patch_title(kind, id, saved.status, user_r, None);
+                            });
                             // A film marked "Просмотрено" also changes its progress.
                             data.restart();
                             status_now.set(None);
@@ -1951,7 +2744,7 @@ fn Title(
                     if r.is_some() {
                         status_now.set(Some(Some(TitleStatus::Watched)));
                         if kind == MediaKind::Tv && chosen_season.peek().is_none() {
-                            if let Some(Some(s)) = season.peek().as_ref() {
+                            if let Some(s) = season_state.peek().as_ref() {
                                 chosen_season.set(Some(s.number));
                             }
                         }
@@ -1964,6 +2757,10 @@ fn Title(
                                 if r.is_some() && *status_now.peek() == Some(Some(TitleStatus::Watched)) {
                                     status_now.set(Some(updated.status));
                                 }
+                                let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
+                                cache.with_mut(|c| {
+                                    c.patch_title(kind, id, updated.status, user_r, None);
+                                });
                                 data.restart();
                             }
                             Err(_) if *rate_seq.peek() == seq => {
@@ -1983,8 +2780,12 @@ fn Title(
                     telegram::haptic(telegram::Haptic::Select);
                     let t = token.clone();
                     spawn(async move {
-                        if api::set_season_rating(&t, id, s_num, r).await.is_ok() {
+                        if let Ok(updated) = api::set_season_rating(&t, id, s_num, r).await {
                             status_now.set(None);
+                            let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
+                            cache.with_mut(|c| {
+                                c.patch_title(kind, id, updated.status, user_r, None);
+                            });
                             data.restart();
                         }
                     });
@@ -1996,8 +2797,12 @@ fn Title(
                     telegram::haptic(telegram::Haptic::Select);
                     let t = token.clone();
                     spawn(async move {
-                        if api::set_episode_rating(&t, id, s_num, ep_num, r).await.is_ok() {
+                        if let Ok(updated) = api::set_episode_rating(&t, id, s_num, ep_num, r).await {
                             status_now.set(None);
+                            let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
+                            cache.with_mut(|c| {
+                                c.patch_title(kind, id, updated.status, user_r, None);
+                            });
                             data.restart();
                         }
                     });
@@ -2017,9 +2822,19 @@ fn Title(
                     });
                 }
             },
-            on_season: move |n| chosen_season.set(Some(n)),
+            on_season: move |n| {
+                chosen_season.set(Some(n));
+                cache.with_mut(|c| {
+                    if let Some(entry) = c.titles.get_mut(&(kind, id)) {
+                        entry.chosen_season = Some(n);
+                        if let Some(s) = entry.seasons.get(&n) {
+                            season_state.set(Some(s.clone()));
+                        }
+                    }
+                });
+            },
         }
-        if let Some(Some(extras)) = extras.read().clone() {
+        if let Some(extras) = extras_state() {
             TitleExtrasView { extras, on_open, on_person }
         }
         if let (Some(heading), Some(target)) = (heading, picker()) {
@@ -2282,6 +3097,9 @@ fn Title(
                         open_picker(PlayTarget { season, episode, position_sec: 0.0 });
                     }
                 },
+                on_preloads_changed: Some(Callback::new(move |_| {
+                    on_preloads_changed.call(());
+                })),
             }
         }
     }
