@@ -81,6 +81,7 @@ fn is_light_now() -> bool {
 /// scrolling, native bars in the page colour, and CSS classes (`tg`, `tg-dark`/`tg-light`,
 /// `tg-<platform>`) that the stylesheet uses. Does nothing in a normal browser.
 pub fn init() {
+    cover_notch();
     if !is_telegram() {
         return;
     }
@@ -101,7 +102,6 @@ pub fn init() {
     if !platform.is_empty() {
         let _ = classes.add_1(&format!("tg-{platform}"));
     }
-    cover_notch();
     call(&[], "ready", &[]);
     call(&[], "expand", &[]);
     call(&[], "disableVerticalSwipes", &[]);

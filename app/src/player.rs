@@ -254,6 +254,28 @@ fn scale_from_code(code: u8) -> VideoScale {
     }
 }
 
+/// Only treat HTML5 `stalled` as buffering when `<video>` actually lacks buffered frames to play.
+fn should_show_stalled_overlay(paused: bool, ready_state: u16, buffered_ahead: Option<f64>) -> bool {
+    !paused && ready_state < 3 && buffered_ahead.is_none_or(|b| b <= 0.5)
+}
+
+/// Only poll/display TorrServer's 0..32 MB start-preload card during initial startup, not mid-episode buffering.
+fn should_poll_stream_progress(connecting: bool, played: bool, position_sec: f64, preloaded: bool) -> bool {
+    !preloaded && (connecting || (!played && position_sec < 5.0))
+}
+
+/// Clear a stale local buffering overlay once active playback advances again.
+fn should_clear_buffering_on_time(
+    paused: bool,
+    desired_paused: bool,
+    waiting_for_peer: bool,
+    ui_waiting: bool,
+    has_status: bool,
+    has_progress: bool,
+) -> bool {
+    !paused && !desired_paused && !waiting_for_peer && (ui_waiting || has_status || has_progress)
+}
+
 fn decode_saved_scales(raw: &str) -> Vec<(String, String)> {
     serde_json::from_str::<Vec<(String, String)>>(raw).unwrap_or_default()
 }
@@ -375,6 +397,17 @@ impl Drop for ScaleGuard {
     }
 }
 
+/// Removes the player's page-visibility listener when the player unmounts.
+struct VisibilityGuard;
+
+impl Drop for VisibilityGuard {
+    fn drop(&mut self) {
+        let _ = dioxus::document::eval(
+            "if (window.__kinoPlayerVisibilityStop) { try { window.__kinoPlayerVisibilityStop(); } catch (e) {} }",
+        );
+    }
+}
+
 /// Ensures the sync WebSocket closes cleanly if `Player` is unmounted directly.
 struct SyncGuard;
 
@@ -487,6 +520,7 @@ pub fn Player(
     };
     let mut paused_since_ms = use_signal(|| None::<i64>);
     let mut last_advance = use_signal(|| (0.0_f64, 0_i64));
+    let mut tab_hidden = use_signal(|| false);
     let mut auto_reloads = use_signal(|| 0_u32);
     let mut player_preloads = use_signal(Vec::<PreloadItem>::new);
     let mut prompted_hashes = use_signal(Vec::<String>::new);
@@ -1886,7 +1920,10 @@ pub fn Player(
                     if closing() {
                         break;
                     }
-                    let (busy, preloaded, is_transcoded, is_native, is_paused, has_err, has_info) = {
+                    if tab_hidden() {
+                        continue;
+                    }
+                    let (busy, preloaded, is_transcoded, is_native, is_paused, has_err, has_info, cur_pos) = {
                         let s = ui.peek();
                         let waiting_for_peer = sync_state
                             .peek()
@@ -1900,6 +1937,7 @@ pub fn Player(
                             s.paused || desired_paused() || waiting_for_peer,
                             s.error.is_some(),
                             info.peek().is_some(),
+                            s.position,
                         )
                     };
                     if has_info
@@ -1920,6 +1958,24 @@ pub fn Player(
                                 last_advance.set((cur_t, now_ms));
                                 if auto_reloads() > 0 && now_ms - last_reload_ms() > 3_500 {
                                     auto_reloads.set(0);
+                                }
+                                let s = ui.peek();
+                                let waiting_for_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                                if !awaiting_ready()
+                                    && !v.paused()
+                                    && should_clear_buffering_on_time(
+                                        s.paused,
+                                        desired_paused(),
+                                        waiting_for_peer,
+                                        s.waiting,
+                                        s.status.is_some(),
+                                        s.progress.is_some(),
+                                    )
+                                {
+                                    drop(s);
+                                    played.set(true);
+                                    canplay_seen.set(true);
+                                    mark_media_ready();
                                 }
                             } else {
                                 let stuck_ms = now_ms - prev_ms;
@@ -1955,7 +2011,7 @@ pub fn Player(
                             }
                         }
                     }
-                    if !busy || preloaded {
+                    if !busy || !should_poll_stream_progress(connecting(), played(), cur_pos, preloaded) {
                         stall_secs.set(0);
                         if ui.peek().progress.is_some() {
                             ui.with_mut(|s| s.progress = None);
@@ -2467,12 +2523,39 @@ pub fn Player(
             let Some(v) = video() else { return };
             match ev {
                 "time" => {
-                    if pending_seek.peek().is_some() || seeking_target.peek().is_some() || awaiting_ready() {
+                    if pending_seek.peek().is_some() || seeking_target.peek().is_some() {
                         return;
+                    }
+                    if awaiting_ready() {
+                        if !desired_paused() && !v.paused() && v.ready_state() >= 2 && v.current_time() > 0.15 {
+                            played.set(true);
+                            canplay_seen.set(true);
+                            mark_media_ready();
+                        } else {
+                            return;
+                        }
                     }
                     let pos = offset() + v.current_time();
                     if (pos - last_advance.peek().0).abs() > 0.12 {
                         last_advance.set((pos, platform::now_ms()));
+                        let waiting_for_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                        let s = ui.peek();
+                        if !connecting()
+                            && !v.paused()
+                            && should_clear_buffering_on_time(
+                                s.paused,
+                                desired_paused(),
+                                waiting_for_peer,
+                                s.waiting,
+                                s.status.is_some(),
+                                s.progress.is_some(),
+                            )
+                        {
+                            drop(s);
+                            played.set(true);
+                            canplay_seen.set(true);
+                            mark_media_ready();
+                        }
                     }
                     let direct_len = (!ui.peek().transcoded && v.duration().is_finite()).then(|| v.duration());
                     let mut eff_dur = ui.peek().duration;
@@ -2545,7 +2628,11 @@ pub fn Player(
                     }
                 }
                 "stalled" => {
-                    if !desired_paused() && !closing() && !awaiting_ready() {
+                    if !desired_paused()
+                        && !closing()
+                        && !awaiting_ready()
+                        && should_show_stalled_overlay(v.paused(), v.ready_state(), v.buffered_ahead())
+                    {
                         ui.with_mut(|s| {
                             s.waiting = true;
                             if s.status.is_none() {
@@ -3024,6 +3111,103 @@ pub fn Player(
         });
         std::rc::Rc::new(ScaleGuard)
     });
+
+    // Preserve exact playback position when the browser tab/app goes to background, and avoid
+    // misclassifying background suspension as a stream freeze when returning to the video.
+    {
+        let mut vis_save = save.clone();
+        let mut vis_mark_ready = mark_media_ready;
+        use_hook(move || {
+            spawn(async move {
+                let mut bridge = dioxus::document::eval(
+                    "if (window.__kinoPlayerVisibilityStop) { try { window.__kinoPlayerVisibilityStop(); } catch (e) {} }
+                     var last = document.hidden ? 'hidden' : 'visible';
+                     var onVis = function() {
+                       var cur = document.hidden ? 'hidden' : 'visible';
+                       if (cur !== last) {
+                         last = cur;
+                         dioxus.send(cur);
+                       }
+                     };
+                     document.addEventListener('visibilitychange', onVis);
+                     window.__kinoPlayerVisibilityStop = function() {
+                       document.removeEventListener('visibilitychange', onVis);
+                       delete window.__kinoPlayerVisibilityStop;
+                     };
+                     if (document.hidden) dioxus.send('hidden');",
+                );
+                while let Ok(state) = bridge.recv::<String>().await {
+                    if closing() {
+                        break;
+                    }
+                    match state.as_str() {
+                        "hidden" => {
+                            tab_hidden.set(true);
+                            if info.peek().is_some()
+                                && !connecting()
+                                && !awaiting_ready()
+                                && pending_seek.peek().is_none()
+                                && seeking_target.peek().is_none()
+                            {
+                                let pos = video().map_or_else(|| ui.peek().position, |v| offset() + v.current_time());
+                                if pos.is_finite() && (played() || pos >= 1.0) {
+                                    ui.with_mut(|s| s.position = pos);
+                                    sync::set_playback_state(pos, ui.peek().duration, played());
+                                    if sync_connected() {
+                                        sync::send(&SyncClientMsg::Report {
+                                            position_sec: pos,
+                                            duration_sec: ui.peek().duration,
+                                            paused: desired_paused(),
+                                            rate: rate(),
+                                        });
+                                    }
+                                    vis_save(false);
+                                }
+                            }
+                        }
+                        "visible" => {
+                            tab_hidden.set(false);
+                            stall_secs.set(0);
+                            auto_reloads.set(0);
+                            let now_ms = platform::now_ms();
+                            let pos_ready = info.peek().is_some()
+                                && !connecting()
+                                && !awaiting_ready()
+                                && pending_seek.peek().is_none()
+                                && seeking_target.peek().is_none();
+                            let cur_t = if pos_ready {
+                                video().map_or_else(|| ui.peek().position, |v| offset() + v.current_time())
+                            } else {
+                                ui.peek().position
+                            };
+                            last_advance.set((cur_t, now_ms));
+                            if pos_ready && !desired_paused() {
+                                let waiting_peer = sync_state.peek().as_ref().is_some_and(|st| st.waiting);
+                                if !waiting_peer {
+                                    if let Some(v) = video() {
+                                        let has_buf =
+                                            v.ready_state() >= 3 || v.buffered_ahead().is_some_and(|b| b > 0.5);
+                                        let s = ui.peek();
+                                        let has_overlay = s.waiting || s.status.is_some() || s.progress.is_some();
+                                        drop(s);
+                                        if !v.paused() && has_buf && has_overlay {
+                                            played.set(true);
+                                            canplay_seen.set(true);
+                                            vis_mark_ready();
+                                        } else if v.paused() && !v.ended() {
+                                            attempt_play(play_gen(), false);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            });
+            std::rc::Rc::new(VisibilityGuard)
+        });
+    }
 
     // Desktop keyboard shortcuts (Space/K, ←/→/J/L, ↑/↓ volume, M mute, F fullscreen, Esc).
     {
@@ -3676,5 +3860,34 @@ mod tests {
             },
         };
         assert_eq!(resolve_response_to_choice(picker), None);
+    }
+
+    #[test]
+    fn buffering_overlay_and_progress_guards() {
+        // `stalled` must not show an overlay when the player is paused or still has buffered frames.
+        assert!(!should_show_stalled_overlay(true, 1, Some(0.0)));
+        assert!(!should_show_stalled_overlay(false, 3, Some(0.0)));
+        assert!(!should_show_stalled_overlay(false, 2, Some(2.5)));
+        assert!(should_show_stalled_overlay(false, 2, Some(0.2)));
+        assert!(should_show_stalled_overlay(false, 1, None));
+
+        // TorrServer's 0..32 MB start-preload bar is only relevant during initial startup.
+        assert!(should_poll_stream_progress(true, false, 0.0, false));
+        assert!(should_poll_stream_progress(true, true, 300.0, false));
+        assert!(should_poll_stream_progress(false, false, 1.0, false));
+        assert!(!should_poll_stream_progress(false, true, 1.0, false));
+        assert!(!should_poll_stream_progress(false, false, 313.0, false));
+        assert!(!should_poll_stream_progress(true, false, 0.0, true));
+
+        // Active playback advancement clears stale buffering overlays, unless paused or waiting on a peer.
+        assert!(should_clear_buffering_on_time(false, false, false, true, false, false));
+        assert!(should_clear_buffering_on_time(false, false, false, false, true, false));
+        assert!(should_clear_buffering_on_time(false, false, false, false, false, true));
+        assert!(!should_clear_buffering_on_time(true, false, false, true, true, true));
+        assert!(!should_clear_buffering_on_time(false, true, false, true, true, true));
+        assert!(!should_clear_buffering_on_time(false, false, true, true, true, true));
+        assert!(!should_clear_buffering_on_time(
+            false, false, false, false, false, false
+        ));
     }
 }
