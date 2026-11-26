@@ -438,7 +438,9 @@ pub fn help(base: &Url, is_admin: bool) -> Screen {
          <b>Доступ</b>\n\
          • /login — быстрый вход на сайт в браузере\n\
          • /start — открыть кинопоказ и показать кнопки команд\n\
-         • /help — эта подсказка",
+         • /help — эта подсказка\n\n\
+         <b>Уведомления</b>\n\
+         Бот автоматически сообщает о выходе новых серий, премьер из списка «Жду» и завершении загрузок на сервер",
     );
     if is_admin {
         text.push_str("\n• /invite — создать одноразовое приглашение (админ)");
@@ -1164,6 +1166,7 @@ mod tests {
                 series_status: None,
                 release_date: None,
                 next_episode: None,
+                alternative_titles: Vec::new(),
             },
             relaxed: true,
         };
@@ -1329,6 +1332,7 @@ mod tests {
             series_status: None,
             release_date: None,
             next_episode: None,
+            alternative_titles: Vec::new(),
         };
         let s = title_details_card(&base(), &d);
         assert!(s.text.contains("🎬 Фильм · ★ 8.2 · 136 мин"));

@@ -639,8 +639,28 @@ struct Details {
     #[serde(default)]
     seasons: Vec<RawSeason>,
     external_ids: Option<ExternalIds>,
+    alternative_titles: Option<RawAlternativeTitles>,
     last_episode_to_air: Option<RawEpisodeRef>,
     next_episode_to_air: Option<RawEpisodeRef>,
+}
+
+#[derive(Deserialize)]
+struct RawAlternativeTitles {
+    /// Movies use `titles`.
+    #[serde(default)]
+    titles: Vec<RawAlternativeTitle>,
+    /// TV series use `results`.
+    #[serde(default)]
+    results: Vec<RawAlternativeTitle>,
+}
+
+#[derive(Deserialize)]
+struct RawAlternativeTitle {
+    #[serde(default)]
+    iso_3166_1: String,
+    title: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: String,
 }
 
 /// `credits`, `recommendations` and `similar` of a title, as `append_to_response` returns them.
@@ -856,6 +876,55 @@ struct RawEpisode {
     air_date: Option<String>,
 }
 
+fn is_usable_alternative_title(raw: &RawAlternativeTitle) -> bool {
+    if !matches!(raw.iso_3166_1.as_str(), "RU" | "US" | "GB") {
+        return false;
+    }
+    let kind = raw.kind.to_ascii_lowercase();
+    ![
+        "working",
+        "fake",
+        "codename",
+        "pre-release",
+        "short",
+        "abbreviation",
+        "initial",
+        "tagline",
+    ]
+    .iter()
+    .any(|bad| kind.contains(bad))
+}
+
+fn collect_alternative_titles(alt: Option<RawAlternativeTitles>, primary: &TitleSummary) -> Vec<String> {
+    let Some(alt) = alt else {
+        return Vec::new();
+    };
+    let primary_norm = normalize_search_text(&primary.title);
+    let orig_norm = primary.original_title.as_deref().map(normalize_search_text);
+    let mut seen_norm: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for entry in alt.titles.into_iter().chain(alt.results) {
+        if !is_usable_alternative_title(&entry) {
+            continue;
+        }
+        let Some(raw) = entry.title else { continue };
+        let trimmed = raw.trim();
+        let norm = normalize_search_text(trimmed);
+        if norm.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
+            continue;
+        }
+        if norm == primary_norm || orig_norm.as_deref() == Some(norm.as_str()) || seen_norm.contains(&norm) {
+            continue;
+        }
+        seen_norm.push(norm);
+        out.push(trimmed.to_owned());
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
 pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<TitleDetails, CatalogError> {
     let d: Details = serde_json::from_value(raw).map_err(|e| CatalogError::Upstream(e.to_string()))?;
     let release_date = d
@@ -865,6 +934,7 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
         .or_else(|| d.item.first_air_date.clone())
         .filter(|s| !s.is_empty());
     let summary = d.item.into_summary(Some(kind)).ok_or(CatalogError::NotFound)?;
+    let alternative_titles = collect_alternative_titles(d.alternative_titles, &summary);
     let mut seasons: Vec<SeasonSummary> = d
         .seasons
         .into_iter()
@@ -896,6 +966,7 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
             name: e.name.filter(|n| !n.is_empty()),
             air_date: e.air_date.filter(|a| !a.is_empty()),
         }),
+        alternative_titles,
     })
 }
 
@@ -1544,6 +1615,7 @@ impl Catalog for TmdbCatalog {
                 series_status: None,
                 release_date: None,
                 next_episode: None,
+                alternative_titles: Vec::new(),
             },
         };
         Ok(RandomMoviePick { details, relaxed })
@@ -1551,7 +1623,9 @@ impl Catalog for TmdbCatalog {
 
     async fn details(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleDetails, CatalogError> {
         let path = format!("/{}/{tmdb_id}", kind.as_str());
-        let raw: serde_json::Value = self.get(&path, &[("append_to_response", "external_ids")]).await?;
+        let raw: serde_json::Value = self
+            .get(&path, &[("append_to_response", "external_ids,alternative_titles")])
+            .await?;
         details_from(raw, kind)
     }
 
@@ -1743,6 +1817,45 @@ mod tests {
             "specials last"
         );
         assert_eq!(d.imdb_id.as_deref(), Some("tt0903747"));
+    }
+
+    #[test]
+    fn parses_alternative_titles_filtering_regions_and_working_titles() {
+        let movie_raw = json!({
+            "id": 671,
+            "title": "Гарри Поттер и философский камень",
+            "original_title": "Harry Potter and the Philosopher's Stone",
+            "release_date": "2001-11-16",
+            "alternative_titles": {
+                "titles": [
+                    {"iso_3166_1": "US", "title": "Harry Potter and the Sorcerer's Stone", "type": ""},
+                    {"iso_3166_1": "US", "title": "HP", "type": "abbreviation"},
+                    {"iso_3166_1": "GB", "title": "Harry Potter Working", "type": "working title"},
+                    {"iso_3166_1": "DE", "title": "Harry Potter und der Stein der Weisen", "type": ""},
+                    {"iso_3166_1": "RU", "title": "Гарри Поттер и философский камень", "type": ""},
+                    {"iso_3166_1": "RU", "title": "Гарри Поттер 1", "type": ""}
+                ]
+            }
+        });
+        let m = details_from(movie_raw, MediaKind::Movie).unwrap();
+        assert_eq!(
+            m.alternative_titles,
+            vec!["Harry Potter and the Sorcerer's Stone", "Гарри Поттер 1"]
+        );
+
+        let tv_raw = json!({
+            "id": 11,
+            "name": "Тест",
+            "original_name": "Original Test",
+            "first_air_date": "2020-01-01",
+            "alternative_titles": {
+                "results": [
+                    {"iso_3166_1": "US", "title": "US Alternate Show", "type": "alternative"}
+                ]
+            }
+        });
+        let tv = details_from(tv_raw, MediaKind::Tv).unwrap();
+        assert_eq!(tv.alternative_titles, vec!["US Alternate Show"]);
     }
 
     #[test]

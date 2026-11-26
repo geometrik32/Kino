@@ -120,13 +120,19 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
 }
 
 static NON_VIDEO_KIND: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(аудиокнига|аудиоспектакль|радиоспектакль|audiobook|саундтрек|soundtrack|ost)\b").unwrap()
+    Regex::new(
+        r"(?i)\b(аудиокнига|аудиоспектакль|радиоспектакль|audiobook|саундтрек|soundtrack|ost|fitgirl|xatab|chovka|dodi|elamigos|decepticon|wanterlude|steam-?rip|steamrip|gog|таблетка|nodvd|no-dvd|nocd|crack|keygen|playstation|xbox|nintendo|ps[2-5]|psp|psvita)\b|механики",
+    )
+    .unwrap()
 });
-static NON_VIDEO_EXT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\b(mp3|мр3|flac|alac|ape|wav|m4a|m4b|fb2|epub|mobi|djvu)\b").unwrap());
+static NON_VIDEO_EXT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(mp3|мр3|flac|alac|ape|wav|m4a|m4b|fb2|epub|mobi|djvu|exe|apk|dmg)\b").unwrap()
+});
+static NON_VIDEO_SOFTWARE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\b(pc|repack|portable|windows|win32|win64|macos|linux)\b").unwrap());
 static VIDEO_HINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?i)\b(web-?dl|web-?rip|bd-?rip|bd-?remux|blu-?ray|bluray|dvd-?rip|hd-?rip|hd-?tv|tv-?rip|sat-?rip|1080[pi]?|720[pi]?|2160[pi]?|1440[pi]?|4k|uhd|hevc|[hx]\.?26[45]|avc|av1|mkv|mp4|avi|сезон)\b|\bs\d{1,2}e\d{1,3}\b",
+        r"(?i)\b(web-?dl|web-?rip|bd-?rip|bd-?remux|bdmv|remux|blu-?ray|bluray|dvd-?rip|dvd-?remux|dvd[59]|hd-?rip|hd-?tv|tv-?rip|sat-?rip|cam-?rip|ts|telesync|1080[pi]?|720[pi]?|2160[pi]?|1440[pi]?|4k|uhd|hevc|[hx]\.?26[45]|avc|av1|mkv|mp4|avi|сезон)\b|\bs\d{1,2}e\d{1,3}\b",
     )
     .unwrap()
 });
@@ -141,7 +147,15 @@ static YEAR_TOKEN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b(19[3-9]\d|
 static PAREN_GROUP: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\(([^()]+)\)").unwrap());
 
 fn is_non_video(name: &str) -> bool {
-    NON_VIDEO_KIND.is_match(name) || (NON_VIDEO_EXT.is_match(name) && !VIDEO_HINT.is_match(name))
+    if NON_VIDEO_KIND.is_match(name) {
+        return true;
+    }
+    !VIDEO_HINT.is_match(name) && (NON_VIDEO_EXT.is_match(name) || NON_VIDEO_SOFTWARE.is_match(name))
+}
+
+/// Trackers known to fabricate inflated seeder counts in Torznab feeds.
+fn is_unreliable_tracker(tracker: &str) -> bool {
+    tracker.eq_ignore_ascii_case("bigfangroup")
 }
 
 fn regular_season_count(details: &TitleDetails) -> usize {
@@ -318,19 +332,28 @@ fn is_ignored_latin_segment(seg: &str) -> bool {
 
 fn title_matches(name: &str, details: &TitleDetails) -> bool {
     let s = &details.summary;
-    let want_ru = normalize_words(&s.title);
-    let want_orig = s
-        .original_title
-        .as_deref()
-        .map(normalize_words)
-        .filter(|o| !o.is_empty());
-    let mut wants: Vec<&str> = Vec::new();
-    if !want_ru.is_empty() {
-        wants.push(&want_ru);
+    let mut wants: Vec<String> = Vec::new();
+    let mut latin_wants: Vec<String> = Vec::new();
+    let mut add_want = |raw: &str, allow_latin: bool| {
+        let norm = normalize_words(raw);
+        if norm.is_empty() {
+            return;
+        }
+        if allow_latin && has_ascii_alpha(&norm) && !title::has_cyrillic(&norm) && !latin_wants.contains(&norm) {
+            latin_wants.push(norm.clone());
+        }
+        if !wants.contains(&norm) {
+            wants.push(norm);
+        }
+    };
+    add_want(&s.title, false);
+    if let Some(orig) = s.original_title.as_deref() {
+        add_want(orig, true);
     }
-    if let Some(orig) = want_orig.as_deref() {
-        if !wants.contains(&orig) {
-            wants.push(orig);
+    for alt in &details.alternative_titles {
+        let norm = normalize_words(alt);
+        if norm.chars().filter(|c| c.is_alphanumeric()).count() >= 3 {
+            add_want(alt, true);
         }
     }
     if wants.is_empty() {
@@ -391,11 +414,8 @@ fn title_matches(name: &str, details: &TitleDetails) -> bool {
     }
 
     // Reject localized renamings (`Сверхъестественное / First Light`) when a Latin title
-    // segment contradicts a known Latin original title.
-    if let Some(orig) = want_orig
-        .as_deref()
-        .filter(|o| has_ascii_alpha(o) && !title::has_cyrillic(o))
-    {
+    // segment contradicts a known Latin original or regional alternative title.
+    if !latin_wants.is_empty() {
         let latin_segs: Vec<&str> = primary_segs
             .iter()
             .map(String::as_str)
@@ -404,7 +424,9 @@ fn title_matches(name: &str, details: &TitleDetails) -> bool {
         if !latin_segs.is_empty()
             && !latin_segs.iter().any(|seg| {
                 let trimmed = trim_edition_suffix(seg);
-                segment_matches(seg, orig) || segment_matches(trimmed, orig)
+                latin_wants
+                    .iter()
+                    .any(|orig| segment_matches(seg, orig) || segment_matches(trimmed, orig))
             })
         {
             return false;
@@ -509,9 +531,8 @@ pub fn is_about(name: &str, details: &TitleDetails) -> bool {
     year_and_kind_ok(details, &parsed) && title_matches(name, details)
 }
 
-fn title_queries(details: &TitleDetails, year: Option<i32>) -> Vec<String> {
-    let s = &details.summary;
-    let format_q = |name: &str| match year {
+fn format_query_with_year(name: &str, year: Option<i32>) -> String {
+    match year {
         Some(y) => {
             let ys = y.to_string();
             let already = name.split(|c: char| !c.is_ascii_digit()).any(|part| part == ys);
@@ -522,16 +543,41 @@ fn title_queries(details: &TitleDetails, year: Option<i32>) -> Vec<String> {
             }
         }
         None => name.to_owned(),
-    };
-    let mut queries = vec![format_q(&s.title)];
+    }
+}
+
+fn title_queries(details: &TitleDetails, year: Option<i32>) -> Vec<String> {
+    let s = &details.summary;
+    let mut queries = vec![format_query_with_year(&s.title, year)];
     if let Some(o) = s
         .original_title
         .as_ref()
         .filter(|o| normalize(o) != normalize(&s.title))
     {
-        queries.push(format_q(o));
+        queries.push(format_query_with_year(o, year));
     }
     queries
+}
+
+fn alternative_movie_queries(details: &TitleDetails, year: Option<i32>) -> Option<Vec<String>> {
+    if details.alternative_titles.is_empty() {
+        return None;
+    }
+    let primary = title_queries(details, year);
+    let primary_norms: Vec<String> = primary.iter().map(|q| normalize(q)).collect();
+    let mut alts = Vec::new();
+    for raw in &details.alternative_titles {
+        let q = format_query_with_year(raw, year);
+        let n = normalize(&q);
+        if n.chars().count() < 3 || primary_norms.contains(&n) || alts.iter().any(|x: &String| normalize(x) == n) {
+            continue;
+        }
+        alts.push(q);
+        if alts.len() >= 2 {
+            break;
+        }
+    }
+    (!alts.is_empty()).then_some(alts)
 }
 
 fn search_plan(details: &TitleDetails) -> (&'static str, Vec<String>, Option<Vec<String>>) {
@@ -541,7 +587,11 @@ fn search_plan(details: &TitleDetails) -> (&'static str, Vec<String>, Option<Vec
         .year
         .or_else(|| details.seasons.iter().find(|st| st.number > 0).and_then(|st| st.year));
     match s.kind {
-        MediaKind::Movie => (MOVIE_CATS, title_queries(details, primary_year), None),
+        MediaKind::Movie => (
+            MOVIE_CATS,
+            title_queries(details, primary_year),
+            alternative_movie_queries(details, primary_year),
+        ),
         MediaKind::Tv if regular_seasons == 1 => (
             TV_CATS,
             title_queries(details, primary_year),
@@ -554,6 +604,20 @@ fn search_plan(details: &TitleDetails) -> (&'static str, Vec<String>, Option<Vec
         ),
         MediaKind::Tv => (TV_CATS, title_queries(details, None), None),
     }
+}
+
+fn merge_torznab_item(seen: &mut HashMap<String, TorznabItem>, key: String, it: TorznabItem) {
+    seen.entry(key)
+        .and_modify(|existing| {
+            existing.seeders = existing.seeders.max(it.seeders);
+            if existing.link.is_none() {
+                existing.link = it.link.clone();
+            }
+            if existing.magnet.is_none() {
+                existing.magnet = it.magnet.clone();
+            }
+        })
+        .or_insert(it);
 }
 
 async fn run_queries(
@@ -573,21 +637,11 @@ async fn run_queries(
         match r {
             Ok(items) => {
                 any_ok = true;
-                for it in items
-                    .into_iter()
-                    .filter(|it| category_ok(it, details) && is_about(&it.title, details))
-                {
-                    seen.entry(release_key(&it))
-                        .and_modify(|existing| {
-                            existing.seeders = existing.seeders.max(it.seeders);
-                            if existing.link.is_none() {
-                                existing.link = it.link.clone();
-                            }
-                            if existing.magnet.is_none() {
-                                existing.magnet = it.magnet.clone();
-                            }
-                        })
-                        .or_insert(it);
+                for it in items.into_iter().filter(|it| {
+                    !is_unreliable_tracker(&it.tracker) && category_ok(it, details) && is_about(&it.title, details)
+                }) {
+                    let key = release_key(&it);
+                    merge_torznab_item(&mut seen, key, it);
                 }
             }
             Err(e) => {
@@ -599,16 +653,18 @@ async fn run_queries(
     (seen, any_ok, first_err)
 }
 
-/// Searches every configured indexer for the title, by its Russian and original names.
-pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<TorznabItem>, TorrentError> {
+async fn search_group(
+    indexers: &[Jackett],
+    details: &TitleDetails,
+) -> (HashMap<String, TorznabItem>, bool, Option<torznab::TorznabError>) {
     if indexers.is_empty() {
-        return Ok(Vec::new());
+        return (HashMap::new(), false, None);
     }
     let (cats, queries, fallback) = search_plan(details);
     let (mut seen, mut any_ok, mut first_err) = run_queries(indexers, &queries, cats, details).await;
 
-    // For TV shows: if a single-season query with year found nothing (e.g. releases omit year),
-    // or a multi-season yearless query was crowded out by a namesake film, retry the fallback queries.
+    // For TV shows (yearless/year mismatch) and movies (regional alternative titles):
+    // if the main queries succeeded with 0 matches, try the fallback queries.
     if seen.is_empty() && any_ok {
         if let Some(fb_queries) = fallback {
             let (fb_seen, fb_ok, fb_err) = run_queries(indexers, &fb_queries, cats, details).await;
@@ -618,14 +674,52 @@ pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<
         }
     }
 
+    (seen, any_ok, first_err)
+}
+
+/// Searches `primary` indexers first, falling back to `fallback` only if `primary` failed to answer.
+/// When `fallback` is Jackett behind Sablier, keeping it untouched keeps Jackett asleep.
+pub async fn search_with_fallback(
+    primary: &[Jackett],
+    fallback: &[Jackett],
+    details: &TitleDetails,
+) -> Result<Vec<TorznabItem>, TorrentError> {
+    if primary.is_empty() && fallback.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (mut seen, any_ok, mut first_err) = if primary.is_empty() {
+        search_group(fallback, details).await
+    } else {
+        let (p_seen, p_ok, p_err) = search_group(primary, details).await;
+        if (!p_ok || (p_seen.is_empty() && p_err.is_some())) && !fallback.is_empty() {
+            tracing::warn!(
+                error = ?p_err.as_ref().map(ToString::to_string),
+                "primary indexer failed to respond; falling back to Jackett"
+            );
+            let (fb_seen, fb_ok, fb_err) = search_group(fallback, details).await;
+            let mut merged = p_seen;
+            for (k, it) in fb_seen {
+                merge_torznab_item(&mut merged, k, it);
+            }
+            (merged, p_ok || fb_ok, fb_err.or(p_err))
+        } else {
+            (p_seen, p_ok, p_err)
+        }
+    };
+
     if seen.is_empty() && !any_ok {
-        if let Some(e) = first_err {
+        if let Some(e) = first_err.take() {
             return Err(e.into());
         }
     }
-    let mut items: Vec<_> = seen.into_values().collect();
+    let mut items: Vec<_> = seen.drain().map(|(_, v)| v).collect();
     items.sort_by_key(|it| std::cmp::Reverse(it.seeders));
     Ok(items)
+}
+
+/// Searches every configured indexer for the title, by its Russian and original names.
+pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<TorznabItem>, TorrentError> {
+    search_with_fallback(indexers, &[], details).await
 }
 
 /// Searches for the title unless that was done recently; the search also records
@@ -633,13 +727,14 @@ pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<
 pub async fn search_cached(
     cache: &search_cache::SearchCache,
     pool: &PgPool,
-    indexers: &[Jackett],
+    primary: &[Jackett],
+    fallback: &[Jackett],
     details: &TitleDetails,
 ) -> Result<std::sync::Arc<Vec<TorznabItem>>, TorrentError> {
     let key = (details.summary.kind, details.summary.tmdb_id);
     cache
         .get_or_search(key, || async {
-            let items = search(indexers, details).await?;
+            let items = search_with_fallback(primary, fallback, details).await?;
             save_sources(pool, &items).await?;
             Ok(std::sync::Arc::new(items))
         })
@@ -955,6 +1050,7 @@ mod tests {
             series_status: None,
             release_date: None,
             next_episode: None,
+            alternative_titles: Vec::new(),
         }
     }
 
@@ -972,11 +1068,31 @@ mod tests {
         let movie = details(MediaKind::Movie, "Зелёная миля", "The Green Mile", Some(1999));
         assert!(is_about("Зеленая миля / The Green Mile (1999) BDRip 1080p", &movie));
         assert!(is_about("Зеленая миля / The Green Mile (1999) DVDRip XviD MP3", &movie));
+        assert!(is_about(
+            "Зеленая миля / The Green Mile (1999) 1080p WEB-DL REPACK",
+            &movie
+        ));
         assert!(!is_about(
             "OST - Зеленая миля / The Green Mile Soundtrack [Thomas Newman] (1999) MP3",
             &movie
         ));
         assert!(!is_about("Зелёная миля (1999) Аудиокнига MP3", &movie));
+
+        let hp1 = details(
+            MediaKind::Movie,
+            "Гарри Поттер и философский камень",
+            "Harry Potter and the Philosopher's Stone",
+            Some(2001),
+        );
+        assert!(!is_about("Гарри Поттер и Философский камень (2001) PC", &hp1));
+        assert!(!is_about(
+            "Гарри Поттер и Философский Камень / Harry Potter and the Philosopher’s Stone (2001) PC | RePack-Yaroslav98",
+            &hp1
+        ));
+        assert!(!is_about(
+            "Harry Potter and the Philosopher's Stone (2001) [RePack от FitGirl]",
+            &hp1
+        ));
 
         let tv = details(
             MediaKind::Tv,
@@ -989,6 +1105,41 @@ mod tests {
             &tv
         ));
         assert!(!is_about("Dexter: Resurrection Official Soundtrack FLAC", &tv));
+    }
+
+    #[test]
+    fn accepts_tmdb_alternative_titles_such_as_us_and_episode_variants() {
+        let mut hp1 = details(
+            MediaKind::Movie,
+            "Гарри Поттер и философский камень",
+            "Harry Potter and the Philosopher's Stone",
+            Some(2001),
+        );
+        hp1.alternative_titles = vec!["Harry Potter and the Sorcerer's Stone".into()];
+        assert!(is_about(
+            "Гарри Поттер и философский камень / Harry Potter and the Sorcerer’s Stone (2001) WEB-DL 2160p",
+            &hp1
+        ));
+        assert!(is_about(
+            "Гарри Поттер и философский камень / Harry Potter and the Philosopher's Stone (2001) BDRip 1080p",
+            &hp1
+        ));
+        assert!(!is_about(
+            "Гарри Поттер и философский камень / Something Completely Different (2001) BDRip 1080p",
+            &hp1
+        ));
+
+        let mut sw4 = details(
+            MediaKind::Movie,
+            "Звёздные войны: Эпизод 4 — Новая надежда",
+            "Star Wars",
+            Some(1977),
+        );
+        sw4.alternative_titles = vec!["Star Wars: Episode IV - A New Hope".into()];
+        assert!(is_about(
+            "Звездные войны: Эпизод 4 — Новая надежда / Star Wars: Episode IV - A New Hope (1977) BDRip 1080p",
+            &sw4
+        ));
     }
 
     #[test]
@@ -1154,5 +1305,13 @@ mod tests {
         assert!(MOVIE_CATS.split(',').any(|c| c == "8010"));
         assert!(TV_CATS.split(',').any(|c| c == "8000"));
         assert!(TV_CATS.split(',').any(|c| c == "8010"));
+    }
+
+    #[test]
+    fn filters_known_fake_seeder_trackers() {
+        assert!(is_unreliable_tracker("BigFANGroup"));
+        assert!(is_unreliable_tracker("bigfangroup"));
+        assert!(!is_unreliable_tracker("RuTracker"));
+        assert!(!is_unreliable_tracker("RuTor"));
     }
 }

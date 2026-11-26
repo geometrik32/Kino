@@ -12,11 +12,13 @@ mod native;
 pub use native::*;
 
 /// Deep-link target used to open a title (optionally starting playback at once).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenTarget {
     pub kind: kino_core::MediaKind,
     pub tmdb_id: i64,
     pub autoplay: bool,
+    pub season: Option<i32>,
+    pub release: Option<String>,
 }
 
 /// Parses `?open=<kind>_<id>` (with optional `&play=1`) or `startapp=<kind>_<id>[_play]`.
@@ -36,6 +38,8 @@ pub fn parse_open_target(open: Option<&str>, play: Option<&str>, start: Option<&
         kind,
         tmdb_id,
         autoplay: start_play || query_play,
+        season: None,
+        release: None,
     })
 }
 
@@ -54,11 +58,19 @@ pub enum InitialRoute {
 /// Parses the URL query and optional Mini App `start_param` into an initial screen.
 #[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
 pub fn parse_initial_route(params: &std::collections::BTreeMap<String, String>, start: Option<&str>) -> InitialRoute {
-    if let Some(t) = parse_open_target(
+    if let Some(mut t) = parse_open_target(
         params.get("open").map(String::as_str),
         params.get("play").map(String::as_str),
         start,
     ) {
+        t.season = params
+            .get("season")
+            .and_then(|s| s.trim().parse::<i32>().ok())
+            .filter(|&s| s > 0);
+        t.release = params
+            .get("release")
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|r| kino_core::is_release_key(r));
         return InitialRoute::Title(t);
     }
     if let Some(tab) = params.get("tab").map(String::as_str) {
@@ -95,6 +107,8 @@ mod tests {
                 kind: MediaKind::Tv,
                 tmdb_id: 1396,
                 autoplay: false,
+                season: None,
+                release: None,
             })
         );
         assert_eq!(
@@ -103,6 +117,8 @@ mod tests {
                 kind: MediaKind::Tv,
                 tmdb_id: 1396,
                 autoplay: true,
+                season: None,
+                release: None,
             })
         );
         assert_eq!(
@@ -111,6 +127,8 @@ mod tests {
                 kind: MediaKind::Movie,
                 tmdb_id: 497,
                 autoplay: true,
+                season: None,
+                release: None,
             })
         );
         assert_eq!(
@@ -119,6 +137,8 @@ mod tests {
                 kind: MediaKind::Movie,
                 tmdb_id: 497,
                 autoplay: false,
+                season: None,
+                release: None,
             })
         );
     }
@@ -131,6 +151,8 @@ mod tests {
                 kind: MediaKind::Movie,
                 tmdb_id: 603,
                 autoplay: false,
+                season: None,
+                release: None,
             })
         );
         assert_eq!(
@@ -139,6 +161,8 @@ mod tests {
                 kind: MediaKind::Tv,
                 tmdb_id: 9687,
                 autoplay: true,
+                season: None,
+                release: None,
             })
         );
         assert_eq!(parse_open_target(None, None, Some("inv_abc")), None);
@@ -173,6 +197,38 @@ mod tests {
         assert_eq!(
             parse_initial_route(&map(&[("shelf", "rewatch")]), None),
             InitialRoute::Shelf("rewatch".into())
+        );
+        let hash = "AB".repeat(20);
+        assert_eq!(
+            parse_initial_route(
+                &map(&[("open", "tv_1396"), ("play", "1"), ("season", "2"), ("release", &hash)]),
+                None
+            ),
+            InitialRoute::Title(OpenTarget {
+                kind: MediaKind::Tv,
+                tmdb_id: 1396,
+                autoplay: true,
+                season: Some(2),
+                release: Some("ab".repeat(20)),
+            })
+        );
+        assert_eq!(
+            parse_initial_route(
+                &map(&[
+                    ("open", "movie_603"),
+                    ("play", "1"),
+                    ("season", "0"),
+                    ("release", "bad")
+                ]),
+                None
+            ),
+            InitialRoute::Title(OpenTarget {
+                kind: MediaKind::Movie,
+                tmdb_id: 603,
+                autoplay: true,
+                season: None,
+                release: None,
+            })
         );
     }
 }

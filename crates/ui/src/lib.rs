@@ -2394,6 +2394,7 @@ mod tests {
             series_status: None,
             release_date: None,
             next_episode: None,
+            alternative_titles: vec![],
         };
         let ep = |season, episode, finished| Progress {
             kind: MediaKind::Tv,

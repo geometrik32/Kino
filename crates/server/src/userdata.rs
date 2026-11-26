@@ -1023,8 +1023,20 @@ pub async fn preloads_active(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> 
         .await
 }
 
+/// User preload row that transitioned to a new state in [`preload_progress`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreloadTransition {
+    pub user_id: i64,
+    pub telegram_id: i64,
+    pub kind: MediaKind,
+    pub tmdb_id: i64,
+    pub season: i32,
+    pub title: Option<String>,
+    pub size_bytes: Option<i64>,
+}
+
 /// Progress from the torrent client, for every user who asked for this release.
-/// Returns the `(user_id, media_kind, tmdb_id, season, title)` rows updated from `queued`/`downloading`.
+/// Returns the rows updated from `queued`/`downloading`.
 /// Finished downloads are kept on disk for at most 7 days unless watched earlier.
 pub async fn preload_progress(
     pool: &PgPool,
@@ -1032,16 +1044,22 @@ pub async fn preload_progress(
     state: PreloadState,
     progress: f32,
     size_bytes: Option<i64>,
-) -> Result<Vec<(i64, MediaKind, i64, i32, Option<String>)>, sqlx::Error> {
+) -> Result<Vec<PreloadTransition>, sqlx::Error> {
     let rows = sqlx::query(
-        "UPDATE preload SET state = $2, progress = $3, size_bytes = COALESCE($4, size_bytes),
-             ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END,
+        "UPDATE preload p
+         SET state = $2,
+             progress = $3,
+             size_bytes = COALESCE($4, p.size_bytes),
+             ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(p.ready_at, now()) ELSE p.ready_at END,
              delete_after = CASE
-                 WHEN $2 = 'ready' THEN LEAST(COALESCE(delete_after, now() + interval '7 days'), now() + interval '7 days')
-                 ELSE delete_after
+                 WHEN $2 = 'ready' THEN LEAST(COALESCE(p.delete_after, now() + interval '7 days'), now() + interval '7 days')
+                 ELSE p.delete_after
              END
-         WHERE infohash = $1 AND state IN ('queued', 'downloading')
-         RETURNING user_id, media_kind, tmdb_id, season, title",
+         FROM users u
+         WHERE p.user_id = u.id
+           AND p.infohash = $1
+           AND p.state IN ('queued', 'downloading')
+         RETURNING p.user_id, u.telegram_id, p.media_kind, p.tmdb_id, p.season, p.title, p.size_bytes",
     )
     .bind(infohash)
     .bind(state.as_str())
@@ -1051,13 +1069,15 @@ pub async fn preload_progress(
     .await?;
     rows.iter()
         .map(|row| {
-            Ok((
-                row.try_get("user_id")?,
-                kind_of(row)?,
-                row.try_get("tmdb_id")?,
-                row.try_get("season")?,
-                row.try_get("title")?,
-            ))
+            Ok(PreloadTransition {
+                user_id: row.try_get("user_id")?,
+                telegram_id: row.try_get("telegram_id")?,
+                kind: kind_of(row)?,
+                tmdb_id: row.try_get("tmdb_id")?,
+                season: row.try_get("season")?,
+                title: row.try_get("title")?,
+                size_bytes: row.try_get("size_bytes")?,
+            })
         })
         .collect()
 }

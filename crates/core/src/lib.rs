@@ -340,6 +340,9 @@ pub struct TitleDetails {
     /// Upcoming episode when a series is ongoing.
     #[serde(default)]
     pub next_episode: Option<NextEpisodeInfo>,
+    /// Official regional/localized alternative titles (from TMDB, used for matching releases).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alternative_titles: Vec<String>,
 }
 
 impl TitleDetails {
@@ -1363,6 +1366,7 @@ mod catalog_tests {
             series_status: Some("In Production".into()),
             release_date: Some("2027-01-01".into()),
             next_episode: None,
+            alternative_titles: Vec::new(),
         };
         assert!(future_tv.is_unreleased("2026-11-24"));
         let mut released_tv = future_tv;

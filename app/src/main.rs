@@ -358,8 +358,14 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
 #[derive(Clone, PartialEq)]
 enum View {
     Tab(Tab),
-    /// A title page; the flag starts playback at once (from "Continue watching").
-    Title(MediaKind, i64, bool),
+    /// A title page; `autoplay` starts playback at once (optionally targeting a season and release).
+    Title {
+        kind: MediaKind,
+        id: i64,
+        autoplay: bool,
+        season: Option<i32>,
+        release: Option<String>,
+    },
     /// An actor's page.
     Person(i64),
     /// Full grid of a home shelf ("Смотреть все").
@@ -686,7 +692,7 @@ fn view_url(view: &View, my_section: MySection, query: &str) -> String {
             MySection::Calendar => "/?tab=my&sec=calendar".to_owned(),
         },
         View::Tab(Tab::Profile) => "/?tab=profile".to_owned(),
-        View::Title(kind, id, _) => format!("/?open={}_{id}", kind.as_str()),
+        View::Title { kind, id, .. } => format!("/?open={}_{id}", kind.as_str()),
         View::Person(id) => format!("/?person={id}"),
         View::Shelf { id, .. } => format!("/?shelf={}", urlencoding::encode(id)),
     }
@@ -694,7 +700,13 @@ fn view_url(view: &View, my_section: MySection, query: &str) -> String {
 
 fn normalize_prev_view(v: View) -> View {
     match v {
-        View::Title(k, i, _) => View::Title(k, i, false),
+        View::Title { kind, id, .. } => View::Title {
+            kind,
+            id,
+            autoplay: false,
+            season: None,
+            release: None,
+        },
         other => other,
     }
 }
@@ -779,7 +791,13 @@ fn Main(
         telegram::InitialRoute::Search(_) => View::Tab(Tab::Search),
         telegram::InitialRoute::Mine(_) => View::Tab(Tab::Mine),
         telegram::InitialRoute::Profile => View::Tab(Tab::Profile),
-        telegram::InitialRoute::Title(t) => View::Title(t.kind, t.tmdb_id, t.autoplay),
+        telegram::InitialRoute::Title(t) => View::Title {
+            kind: t.kind,
+            id: t.tmdb_id,
+            autoplay: t.autoplay,
+            season: t.season,
+            release: t.release.clone(),
+        },
         telegram::InitialRoute::Person(id) => View::Person(*id),
         telegram::InitialRoute::Shelf(id) => View::Shelf {
             id: id.clone(),
@@ -959,7 +977,7 @@ fn Main(
         .unwrap_or_default();
     let tab = match view() {
         View::Tab(t) => Some(t),
-        View::Title(..) | View::Person(_) | View::Shelf { .. } => None,
+        View::Title { .. } | View::Person(_) | View::Shelf { .. } => None,
     };
     let open_title = move |kind: MediaKind, id: i64, play: bool| {
         let url = format!("/?open={}_{id}", kind.as_str());
@@ -970,7 +988,13 @@ fn Main(
             cache,
             scroll_req,
             live_scroll_y,
-            View::Title(kind, id, play),
+            View::Title {
+                kind,
+                id,
+                autoplay: play,
+                season: None,
+                release: None,
+            },
             Some(&url),
             true,
         );
@@ -1166,21 +1190,33 @@ fn Main(
                         on_logout,
                     }
                 },
-                View::Title(kind, id, play) => rsx! {
-                    Title {
-                        key: "{kind.as_str()}{id}{play}",
-                        token: token.clone(),
-                        kind,
-                        id,
-                        autoplay: play,
-                        cache,
-                        on_preloads_changed: move |_| active_preloads.restart(),
-                        on_open: open,
-                        on_person: open_person,
-                        // Closing a player started directly from Home / deep-link returns to the previous screen.
-                        on_exit: move |from_pop: bool| {
-                            step_back(view, trail, query, scroll_req, from_pop);
-                        },
+                View::Title {
+                    kind,
+                    id,
+                    autoplay,
+                    season,
+                    release,
+                } => {
+                    let s_key = season.unwrap_or(0);
+                    let r_key = release.as_deref().unwrap_or("");
+                    rsx! {
+                        Title {
+                            key: "{kind.as_str()}{id}{autoplay}{s_key}{r_key}",
+                            token: token.clone(),
+                            kind,
+                            id,
+                            autoplay,
+                            auto_season: season,
+                            auto_release: release,
+                            cache,
+                            on_preloads_changed: move |_| active_preloads.restart(),
+                            on_open: open,
+                            on_person: open_person,
+                            // Closing a player started directly from Home / deep-link returns to the previous screen.
+                            on_exit: move |from_pop: bool| {
+                                step_back(view, trail, query, scroll_req, from_pop);
+                            },
+                        }
                     }
                 },
                 View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, cache, on_open: open } },
@@ -1915,6 +1951,34 @@ fn Mine(
     }
 }
 
+async fn join2<A, B, FA, FB>(fa: FA, fb: FB) -> (A, B)
+where
+    FA: std::future::Future<Output = A>,
+    FB: std::future::Future<Output = B>,
+{
+    let mut fa = std::pin::pin!(fa);
+    let mut fb = std::pin::pin!(fb);
+    let (mut ra, mut rb) = (None, None);
+    std::future::poll_fn(|cx| {
+        if ra.is_none() {
+            if let std::task::Poll::Ready(v) = fa.as_mut().poll(cx) {
+                ra = Some(v);
+            }
+        }
+        if rb.is_none() {
+            if let std::task::Poll::Ready(v) = fb.as_mut().poll(cx) {
+                rb = Some(v);
+            }
+        }
+        if ra.is_some() && rb.is_some() {
+            std::task::Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
+        } else {
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
 async fn join3<A, B, C, FA, FB, FC>(fa: FA, fb: FB, fc: FC) -> (A, B, C)
 where
     FA: std::future::Future<Output = A>,
@@ -2179,12 +2243,104 @@ fn scoped_choice(
         .cloned()
 }
 
+fn auto_play_target_for(
+    kind: MediaKind,
+    details: &TitleDetails,
+    progress: &[Progress],
+    auto_season: Option<i32>,
+    default_target: &PlayTarget,
+) -> PlayTarget {
+    let Some(s) = auto_season.filter(|n| kind == MediaKind::Tv && *n > 0) else {
+        return default_target.clone();
+    };
+    if default_target.season == s {
+        return default_target.clone();
+    }
+    if let Some(last) = progress.iter().filter(|p| p.season == s).max_by_key(|p| p.updated_at) {
+        if !last.finished {
+            return PlayTarget {
+                season: s,
+                episode: last.episode,
+                position_sec: last.position_sec,
+            };
+        }
+        let next_ep = details
+            .seasons
+            .iter()
+            .find(|sec| sec.number == s)
+            .filter(|sec| last.episode < sec.episode_count)
+            .map(|_| last.episode + 1)
+            .filter(|ep| !matches!(details.last_episode, Some((ls, le)) if ls == s && *ep > le))
+            .unwrap_or(1);
+        return PlayTarget {
+            season: s,
+            episode: next_ep,
+            position_sec: 0.0,
+        };
+    }
+    PlayTarget {
+        season: s,
+        episode: 1,
+        position_sec: 0.0,
+    }
+}
+
+fn auto_release_choice_for(
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    hash: &str,
+    preloads: &[PreloadItem],
+    manual_choices: &[ReleaseChoiceUpdate],
+    peer_choices: &[ReleaseChoiceUpdate],
+) -> ReleaseChoiceUpdate {
+    let season_key = if kind == MediaKind::Tv { season } else { 0 };
+    if let Some(p) = preloads
+        .iter()
+        .filter(|p| p.kind == kind && p.tmdb_id == tmdb_id && p.state != PreloadState::Deleted)
+        .filter(|p| p.infohash.eq_ignore_ascii_case(hash))
+        .max_by_key(|p| i32::from(p.season == season_key))
+    {
+        return ReleaseChoiceUpdate {
+            kind,
+            tmdb_id,
+            season: if kind == MediaKind::Tv { p.season } else { 0 },
+            episode: 0,
+            infohash: p.infohash.clone(),
+            title: p.title.clone().filter(|s| !s.is_empty()),
+            quality: p.quality.clone(),
+            quality_key: p.quality.as_deref().map(|q| normalize_quality_key(q).to_owned()),
+            voice: p.voice.clone(),
+        };
+    }
+    if let Some(c) = manual_choices
+        .iter()
+        .chain(peer_choices.iter())
+        .find(|c| c.infohash.eq_ignore_ascii_case(hash))
+    {
+        return c.clone();
+    }
+    ReleaseChoiceUpdate {
+        kind,
+        tmdb_id,
+        season: season_key,
+        episode: 0,
+        infohash: hash.to_owned(),
+        title: None,
+        quality: None,
+        quality_key: None,
+        voice: None,
+    }
+}
+
 #[component]
 fn Title(
     token: String,
     kind: MediaKind,
     id: i64,
     autoplay: bool,
+    #[props(default)] auto_season: Option<i32>,
+    #[props(default)] auto_release: Option<String>,
     cache: Signal<AppCache>,
     on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<TitleSummary>,
@@ -2203,7 +2359,9 @@ fn Title(
         })
     });
     let mut extras_state = use_signal(|| cached_title.as_ref().and_then(|c| c.extras.clone()));
-    let mut chosen_season = use_signal(|| cached_title.as_ref().and_then(|c| c.chosen_season));
+    let mut chosen_season = use_signal(|| auto_season.or_else(|| cached_title.as_ref().and_then(|c| c.chosen_season)));
+    let mut auto_preloads = use_signal(|| None::<Vec<PreloadItem>>);
+    let mut title_preloads = use_signal(Vec::<kino_core::PreloadItem>::new);
     let mut season_state = use_signal(|| {
         cached_title.as_ref().and_then(|c| {
             let last = c.progress.iter().max_by_key(|p| p.updated_at).map(|p| p.season);
@@ -2211,18 +2369,33 @@ fn Title(
             c.chosen_season.or(default_n).and_then(|n| c.seasons.get(&n).cloned())
         })
     });
+    let has_auto_release = autoplay && auto_release.is_some();
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
         async move {
-            let (details, progress, st, choices) = join4(
-                api::details(&t, kind, id),
-                api::title_progress(&t, kind, id),
-                api::title_state(&t, kind, id),
-                api::release_choices(&t, kind, id),
-            )
-            .await;
-            Ok::<_, api::Failure>((details?, progress?, st?, choices?))
+            let fetch_title = async {
+                let (details, progress, st, choices) = join4(
+                    api::details(&t, kind, id),
+                    api::title_progress(&t, kind, id),
+                    api::title_state(&t, kind, id),
+                    api::release_choices(&t, kind, id),
+                )
+                .await;
+                Ok::<_, api::Failure>((details?, progress?, st?, choices?))
+            };
+            if has_auto_release {
+                let (title_res, pre_res) = join2(fetch_title, api::preloads(&t)).await;
+                let pre_items = pre_res.ok().map(|items| {
+                    items
+                        .into_iter()
+                        .filter(|p| p.kind == kind && p.tmdb_id == id && p.state != PreloadState::Deleted)
+                        .collect::<Vec<_>>()
+                });
+                Ok::<_, api::Failure>((title_res?, pre_items))
+            } else {
+                Ok::<_, api::Failure>((fetch_title.await?, None))
+            }
         }
     });
     // Cast and suggestions come apart from the title: if TMDB is slow or fails, the page still works.
@@ -2251,8 +2424,16 @@ fn Title(
         }
     });
     use_effect(move || {
-        if let Some(Ok(v)) = &*data.read() {
+        if let Some(Ok((v, pre_opt))) = &*data.read() {
             data_state.set(Some(v.clone()));
+            if let Some(pre) = pre_opt {
+                auto_preloads.set(Some(pre.clone()));
+                if *title_preloads.peek() != *pre {
+                    title_preloads.set(pre.clone());
+                }
+            } else if has_auto_release && auto_preloads.peek().is_none() {
+                auto_preloads.set(Some(Vec::new()));
+            }
             let user_r = v.2.effective_rating.or_else(|| v.2.rating.map(f32::from));
             let is_pre = v.0.summary.preloaded || v.2.preloaded_ready_at.is_some();
             cache.with_mut(|c| {
@@ -2309,7 +2490,6 @@ fn Title(
     let mut picker_preloaded = use_signal(|| None::<(i32, kino_core::ReleaseList)>);
     let mut resolving = use_signal(|| false);
     let mut resolve_gen = use_signal(|| 0u32);
-    let mut title_preloads = use_signal(Vec::<kino_core::PreloadItem>::new);
     let mut hash_rebinds = use_signal(Vec::<(String, String)>::new);
     let mut title_poll_running = use_signal(|| false);
     let mut title_poll_gen = use_signal(|| 0u32);
@@ -2334,7 +2514,9 @@ fn Title(
     use_hook({
         let refresh = refresh_title_preloads.clone();
         move || {
-            refresh();
+            if !has_auto_release {
+                refresh();
+            }
         }
     });
     let mut filter = use_signal(ReleaseFilter::default);
@@ -2453,13 +2635,24 @@ fn Title(
         defaults_relaxed.set(true);
     });
 
-    let (details, progress, st, loaded) = match data_state() {
-        Some(v) => v,
-        None => match data.read().clone() {
+    let (details, progress, st, loaded, fresh_preloads) = if auto() && has_auto_release && auto_preloads().is_none() {
+        match data.read().clone() {
+            Some(Ok((v, pre_opt))) => (v.0, v.1, v.2, v.3, pre_opt),
+            Some(Err(e)) => match data_state() {
+                Some(v) => (v.0, v.1, v.2, v.3, None),
+                None => return error_text(&e.message),
+            },
             None => return loading(),
-            Some(Err(e)) => return error_text(&e.message),
-            Some(Ok(v)) => v,
-        },
+        }
+    } else {
+        match data_state() {
+            Some(v) => (v.0, v.1, v.2, v.3, auto_preloads()),
+            None => match data.read().clone() {
+                None => return loading(),
+                Some(Err(e)) => return error_text(&e.message),
+                Some(Ok((v, pre_opt))) => (v.0, v.1, v.2, v.3, pre_opt),
+            },
+        }
     };
     let status = status_now().unwrap_or(st.status);
     let my_rating = rating_now().unwrap_or(st.rating);
@@ -2760,6 +2953,26 @@ fn Title(
     let chosen_hash = picker()
         .and_then(|p| scoped_choice(&manual_choices, kind, p.season, p.episode, None))
         .map(|c| c.infohash);
+    let auto_target = auto_play_target_for(kind, &details, &progress, auto_season, &target);
+    let auto_choice = auto_release.as_deref().map(|hash| {
+        let fallback_list;
+        let preloads = match fresh_preloads.as_deref() {
+            Some(list) => list,
+            None => {
+                fallback_list = title_preloads.peek().clone();
+                fallback_list.as_slice()
+            }
+        };
+        auto_release_choice_for(
+            kind,
+            id,
+            auto_target.season,
+            hash,
+            preloads,
+            &manual_choices,
+            &peer_choices,
+        )
+    });
     let summary = details.summary.clone();
     let t3 = token.clone();
     let main_label = format!("▶ {play_label}");
@@ -2778,10 +2991,15 @@ fn Title(
         if auto() {
             AutoPlay {
                 on_start: {
-                    let t = target.clone();
+                    let t = auto_target.clone();
+                    let ac = auto_choice.clone();
                     move |_| {
                         auto.set(false);
-                        on_play.call(t.clone());
+                        if let Some(choice) = ac.clone() {
+                            start_playback.call((t.clone(), choice, RewatchMode::All, true));
+                        } else {
+                            on_play.call(t.clone());
+                        }
                     }
                 },
             }
@@ -3291,5 +3509,158 @@ fn Title(
                 })),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+    use kino_core::{PreloadPhase, SeasonSummary};
+
+    fn sample_details() -> TitleDetails {
+        TitleDetails {
+            summary: TitleSummary {
+                kind: MediaKind::Tv,
+                tmdb_id: 1396,
+                title: "Во все тяжкие".into(),
+                original_title: None,
+                year: Some(2008),
+                poster_path: None,
+                backdrop_path: None,
+                rating: None,
+                overview: None,
+                user_rating: None,
+                user_status: None,
+                peers: vec![],
+                preloaded: true,
+            },
+            genres: vec![],
+            runtime_min: None,
+            tagline: None,
+            seasons: vec![
+                SeasonSummary {
+                    number: 1,
+                    name: "Сезон 1".into(),
+                    episode_count: 7,
+                    year: Some(2008),
+                },
+                SeasonSummary {
+                    number: 2,
+                    name: "Сезон 2".into(),
+                    episode_count: 13,
+                    year: Some(2009),
+                },
+            ],
+            imdb_id: None,
+            last_episode: Some((2, 13)),
+            series_status: None,
+            release_date: None,
+            next_episode: None,
+            alternative_titles: vec![],
+        }
+    }
+
+    fn make_progress(season: i32, episode: i32, pos: f64, finished: bool, sec_offset: i64) -> Progress {
+        Progress {
+            kind: MediaKind::Tv,
+            tmdb_id: 1396,
+            season,
+            episode,
+            position_sec: pos,
+            duration_sec: 2800.0,
+            finished,
+            release: None,
+            updated_at: DateTime::from_timestamp(1_700_000_000 + sec_offset, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn auto_play_target_targets_downloaded_season() {
+        let details = sample_details();
+        let p_s1 = make_progress(1, 3, 120.0, false, 100);
+        let default_t = PlayTarget {
+            season: 1,
+            episode: 3,
+            position_sec: 120.0,
+        };
+
+        // Pack preload keeps user's default target.
+        assert_eq!(
+            auto_play_target_for(MediaKind::Tv, &details, &[p_s1.clone()], None, &default_t),
+            default_t
+        );
+
+        // Season 2 preload jumps straight to S02E01 when user only watched S01.
+        assert_eq!(
+            auto_play_target_for(MediaKind::Tv, &details, &[p_s1], Some(2), &default_t),
+            PlayTarget {
+                season: 2,
+                episode: 1,
+                position_sec: 0.0,
+            }
+        );
+
+        // When user already finished S02E01 earlier, then watched S01 later, resumes S02E02.
+        let p_s2_done = make_progress(2, 1, 2800.0, true, 50);
+        let p_s1_newer = make_progress(1, 5, 300.0, false, 200);
+        assert_eq!(
+            auto_play_target_for(MediaKind::Tv, &details, &[p_s2_done, p_s1_newer], Some(2), &default_t),
+            PlayTarget {
+                season: 2,
+                episode: 2,
+                position_sec: 0.0,
+            }
+        );
+
+        // When default target is already in season 2, preserves exact resume timestamp.
+        let default_s2 = PlayTarget {
+            season: 2,
+            episode: 4,
+            position_sec: 555.0,
+        };
+        assert_eq!(
+            auto_play_target_for(MediaKind::Tv, &details, &[], Some(2), &default_s2),
+            default_s2
+        );
+    }
+
+    #[test]
+    fn auto_release_choice_prefers_preloaded_item_metadata() {
+        let hash = "0123456789abcdef0123456789abcdef01234567";
+        let preload = PreloadItem {
+            id: 42,
+            kind: MediaKind::Tv,
+            tmdb_id: 1396,
+            season: 2,
+            infohash: hash.to_owned(),
+            title: Some("Breaking Bad S02 2160p LostFilm".into()),
+            state: PreloadState::Ready,
+            progress: 1.0,
+            size_bytes: Some(12_000_000_000),
+            requested_at: Utc::now(),
+            ready_at: Some(Utc::now()),
+            delete_after: None,
+            poster_path: None,
+            media_title: None,
+            quality: Some("4K".into()),
+            voice: Some("LostFilm".into()),
+            speed_bps: 0,
+            dl_phase: PreloadPhase::default(),
+        };
+
+        let choice = auto_release_choice_for(MediaKind::Tv, 1396, 2, &hash.to_ascii_uppercase(), &[preload], &[], &[]);
+        assert_eq!(choice.infohash, hash);
+        assert_eq!(choice.season, 2);
+        assert_eq!(choice.quality.as_deref(), Some("4K"));
+        assert_eq!(choice.quality_key.as_deref(), Some("2160p"));
+        assert_eq!(choice.voice.as_deref(), Some("LostFilm"));
+        assert_eq!(choice.title.as_deref(), Some("Breaking Bad S02 2160p LostFilm"));
+
+        // Falls back cleanly when preload metadata is absent.
+        let minimal = auto_release_choice_for(MediaKind::Movie, 550, 0, hash, &[], &[], &[]);
+        assert_eq!(minimal.infohash, hash);
+        assert_eq!(minimal.season, 0);
+        assert_eq!(minimal.quality, None);
     }
 }

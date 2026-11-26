@@ -156,7 +156,7 @@ impl TorrServer {
         if !status.file_stats.is_empty() {
             return Ok(entries(status.file_stats));
         }
-        for _ in 0..30 {
+        for _ in 0..40 {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let s: Status = self
                 .req(self.http.post(format!("{}/torrents", self.base)))

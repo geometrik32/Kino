@@ -910,3 +910,36 @@
 - [x] Устранены ложные `409 Conflict`, перетёртые заголовки заглушек и потеря совпадения `u...`-ключей в сервере и клиенте (`play.rs`, `api.rs`, `qbit.rs`, `app/src/player.rs`, `main.rs`).
 - [x] Единое меню «Качество», живой опрос статусов, отмена загрузок, статусы в `TitleView`/`ReleasePicker`/`ProfileView` и переключение на любую готовую предзагрузку реализованы и проверены под WASM (`cargo check -p kino-ui -p kino-app --target wasm32-unknown-unknown --tests --locked`).
 - [ ] Пройдены полный CI (`.github/workflows/ci.yml`: `fmt`, `clippy`, `cargo test --workspace --locked`, Docker-образ) и деплой на сервер `192.168.3.27` (включая `ConnectionsLimit: 100` в живом конфиге TorrServer) + ручная проверка пользователем.
+
+---
+
+## ISSUE-032: Уведомление в Telegram-боте о завершении скачивания фильма/сериала на сервер
+
+- **Статус:** `В работе`
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Сервер (`kino-server`: `userdata.rs`, `jobs.rs`), клиент/Mini App (`kino-app`: `telegram/mod.rs`, `main.rs`), Telegram-бот (`kino-bot`: `screens.rs`).
+
+### Суть задачи
+При завершении предзагрузки фильма или сезона сериала на диск сервера (`preload`: `queued/downloading → ready`) уведомление `PreloadReady` раньше отправлялось только в открытый плеер по WebSocket. Пользователь, который запустил «Скачать заранее» и закрыл приложение/сайт, не получал сообщения в Telegram-боте с кнопкой, сразу открывающей скачанный файл в плеере.
+
+### Что реализовано
+1. **Серверные уведомления о готовности (`crates/server/src/userdata.rs`, `crates/server/src/jobs.rs`):**
+   - `preload_progress` атомарно возвращает список переходов `PreloadTransition` (`user_id`, `telegram_id`, `kind`, `tmdb_id`, `season`, `title`, `size_bytes`) только при реальном переходе строки из `queued`/`downloading` в `ready` — это исключает дубли при повторных тиках `sync_preloads` и повторных вызовах `POST /api/preload`.
+   - `sync_preloads` ставит фоновую отправку в `spawn_preload_ready_telegram`, не блокируя HTTP-ручки и 5-секундный цикл опроса qBittorrent; при временных сетевых сбоях (например, сброс `TELEGRAM_PROXY`) выполняются 2 повтора (`2 с`, `6 с`); при `telegram_api_url = None` реальные HTTP-запросы отключены.
+   - Сообщение (HTML) содержит название тайтла (с номером сезона для сезонной предзагрузки или пометкой «все сезоны» для пака), качество (`4K`/`1080p`/`720p`/`SD`), озвучку, размер и inline-кнопку `web_app` **«▶ Смотреть»** со ссылкой `/?open=<kind>_<tmdb_id>&play=1[&season=<s_num>]&release=<infohash>`.
+2. **Мгновенный запуск скачанного файла в Mini App (`app/src/telegram/mod.rs`, `app/src/main.rs`) и справка бота (`crates/bot/src/screens.rs`):**
+   - `parse_initial_route` / `OpenTarget` и `View::Title` поддерживают параметры `season` и `release` (с валидацией `infohash` через `is_release_key`).
+   - При открытии по кнопке из уведомления экран `Title` дозагружает список предзагрузок параллельно с карточкой (`join2`) и через `auto_play_target_for` / `auto_release_choice_for` сразу запускает воспроизведение конкретного скачанного релиза и нужного сезона (`explicit_release = true`, в обход диалога несовпадения качества).
+   - В справке `/help` бота добавлено упоминание уведомлений о завершённых загрузках на сервер.
+
+### Проверки
+- `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check` — пройдено.
+- `cargo check -p kino-app --target wasm32-unknown-unknown --locked` — пройдено.
+- Unit-тесты: `kino-core` (9 passed), `kino-app` (12 passed), `kino-bot` (19 passed), `kino-server --lib` (98 passed) — все пройдены.
+- Интеграционные тесты `kino-server` против временного локального PostgreSQL 16 (`tests/api.rs`: 16 passed, `tests/torrents.rs`: 12 passed включая `preload_ready_sends_telegram_notification_once`, `tests/user_state.rs`: 8 passed) — все пройдены.
+
+### Критерии приёмки
+- [x] При переходе предзагрузки в статус `ready` в `jobs::sync_preloads` каждый пользователь, поставивший эту раздачу на скачивание, получает сообщение в Telegram-боте с названием фильма/сезона, качеством/озвучкой/размером и кнопкой **«▶ Смотреть»** для мгновенного открытия и запуска скачанного файла в Mini App.
+- [x] Повторные опросы `sync_preloads` и повторные запросы на уже скачанный релиз не отправляют дублирующих уведомлений; отправка выполняется асинхронно без блокировки HTTP-ручек и 5-секундного цикла телеметрии.
+- [x] Добавлены unit-тесты форматирования/маршрутизации/выбора скачанного релиза и интеграционный тест `preload_ready_sends_telegram_notification_once` в `crates/server/tests/torrents.rs`.
+- [ ] Пройдены полный CI (`.github/workflows/ci.yml`: `clippy --workspace --all-targets`, Docker-сборка), деплой на сервер `192.168.3.27` и ручная проверка пользователем в Telegram.

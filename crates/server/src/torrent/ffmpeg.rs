@@ -154,16 +154,21 @@ fn is_http(input: &str) -> bool {
     input.starts_with("http://") || input.starts_with("https://")
 }
 
-/// Runs ffprobe on a file or URL with the default 45-second timeout.
+/// Runs ffprobe on a file or URL with the default 50-second timeout.
 pub async fn probe(ffprobe: &str, input: &str) -> anyhow::Result<Probe> {
-    probe_with_timeout(ffprobe, input, std::time::Duration::from_secs(45)).await
+    probe_with_timeout(ffprobe, input, std::time::Duration::from_secs(50)).await
 }
 
 /// Runs ffprobe on a file or URL with an explicit timeout.
 pub async fn probe_with_timeout(ffprobe: &str, input: &str, timeout: std::time::Duration) -> anyhow::Result<Probe> {
+    let rw_timeout = timeout
+        .saturating_sub(std::time::Duration::from_secs(5))
+        .max(std::time::Duration::from_secs(5))
+        .as_micros()
+        .to_string();
     let mut args = vec!["-v", "error", "-print_format", "json", "-show_streams", "-show_format"];
     if is_http(input) {
-        args.extend(["-rw_timeout", "30000000"]);
+        args.extend(["-rw_timeout", rw_timeout.as_str()]);
     }
     args.push(input);
     let out = tokio::time::timeout(timeout, Command::new(ffprobe).args(args).kill_on_drop(true).output()).await??;

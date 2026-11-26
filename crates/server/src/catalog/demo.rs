@@ -424,6 +424,7 @@ impl Catalog for DemoCatalog {
             series_status: (t.kind == MediaKind::Tv).then(|| "Ended".to_owned()),
             release_date: Some(format!("{}-01-01", t.year)),
             next_episode: None,
+            alternative_titles: Vec::new(),
         })
     }
 

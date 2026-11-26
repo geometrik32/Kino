@@ -42,7 +42,10 @@ use crate::{
 /// Clients of the torrent services that are configured.
 pub struct Media {
     pub http: reqwest::Client,
+    /// Primary release search indexers (extra Torznab such as JacRed when configured, else Jackett).
     pub indexers: Vec<Jackett>,
+    /// Fallback search indexers (Jackett behind Sablier) used only if primary indexers fail to answer.
+    pub fallback_indexers: Vec<Jackett>,
     pub torrserver: Option<TorrServer>,
     pub qbit: Option<QBittorrent>,
     /// Recent indexer results; see [`torrent::search_cache`].
@@ -59,6 +62,8 @@ pub struct Media {
     pub pause_cache: torrent::pause_cache::PauseCache,
     /// Live `(speed_bps, dl_phase)` telemetry by lowercase infohash from qBittorrent polling.
     pub preload_telemetry: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, (u64, PreloadPhase)>>>,
+    /// Recently stalled/zero-peer hashes deprioritized by auto-pick so retries pick another release.
+    dead_releases: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
 }
 
 /// Default maximum videos re-encoded concurrently (configurable via `MAX_TRANSCODES`).
@@ -69,6 +74,9 @@ const MAX_SUBTITLES: usize = 2;
 const TRANSCODE_STALL_CAPTURE: std::time::Duration = std::time::Duration::from_secs(10);
 /// Drops a paused/stalled transcode if the client stops reading for this long.
 const TRANSCODE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(540);
+/// Remember stalled zero-byte releases this long when auto-picking another candidate.
+const DEAD_RELEASE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const MAX_DEAD_RELEASES: usize = 256;
 
 impl Media {
     pub fn new(c: &TorrentConfig) -> Self {
@@ -79,7 +87,7 @@ impl Media {
         } else {
             DEFAULT_MAX_TRANSCODES
         };
-        let mut indexers = Vec::new();
+        let mut jackett_list = Vec::new();
         if let (Some(url), Some(key)) = (&c.jackett_url, &c.jackett_api_key) {
             let mut j = Jackett::new(http.clone(), url, key);
             if let Some(wake_url) = &c.jackett_wake_url {
@@ -100,14 +108,20 @@ impl Media {
                     duration,
                 ));
             }
-            indexers.push(j);
+            jackett_list.push(j);
         }
+        let mut extras = Vec::new();
         for extra in &c.extra_torznab {
-            indexers.push(
+            extras.push(
                 Jackett::new(http.clone(), &extra.url, extra.api_key.as_deref().unwrap_or(""))
                     .with_timeout(std::time::Duration::from_secs(15)),
             );
         }
+        let (indexers, fallback_indexers) = if extras.is_empty() {
+            (jackett_list, Vec::new())
+        } else {
+            (extras, jackett_list)
+        };
         let transcodes_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(transcodes));
         let pause_cache = torrent::pause_cache::PauseCache::new(
             c.pause_cache_dir.clone(),
@@ -117,6 +131,7 @@ impl Media {
         pause_cache.set_live_transcodes(std::sync::Arc::clone(&transcodes_sem));
         Self {
             indexers,
+            fallback_indexers,
             torrserver: c.torrserver_url.as_ref().map(|url| {
                 let auth = c.torrserver_user.clone().zip(c.torrserver_password.clone());
                 TorrServer::new(url, auth)
@@ -138,15 +153,56 @@ impl Media {
             subtitles: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SUBTITLES)),
             pause_cache,
             preload_telemetry: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+            dead_releases: std::sync::Mutex::default(),
             http,
         }
     }
 
-    /// Proactively wakes a sleeping Jackett container in the background when a user starts browsing.
+    pub fn has_indexers(&self) -> bool {
+        !self.indexers.is_empty() || !self.fallback_indexers.is_empty()
+    }
+
+    pub fn all_indexers(&self) -> Vec<Jackett> {
+        let mut out = Vec::with_capacity(self.indexers.len() + self.fallback_indexers.len());
+        out.extend(self.indexers.iter().cloned());
+        out.extend(self.fallback_indexers.iter().cloned());
+        out
+    }
+
+    /// Proactively wakes a sleeping primary indexer (i.e. Jackett when no external
+    /// primary Torznab is configured) in the background when a user starts browsing.
     pub fn wake_jackett(&self) {
         for idx in &self.indexers {
             idx.wake_in_background();
         }
+    }
+
+    fn mark_dead_release(&self, hash: &str) {
+        if hash.is_empty() {
+            return;
+        }
+        let mut map = self.dead_releases.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, ts| ts.elapsed() < DEAD_RELEASE_TTL);
+        if map.len() >= MAX_DEAD_RELEASES {
+            if let Some(oldest) = map.iter().min_by_key(|(_, ts)| **ts).map(|(k, _)| k.clone()) {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(hash.to_ascii_lowercase(), std::time::Instant::now());
+    }
+
+    fn clear_dead_release(&self, hash: &str) {
+        if hash.is_empty() {
+            return;
+        }
+        let mut map = self.dead_releases.lock().unwrap_or_else(|e| e.into_inner());
+        map.remove(&hash.to_ascii_lowercase());
+    }
+
+    fn dead_hashes(&self) -> std::collections::HashSet<String> {
+        let mut map = self.dead_releases.lock().unwrap_or_else(|e| e.into_inner());
+        map.retain(|_, ts| ts.elapsed() < DEAD_RELEASE_TTL);
+        map.keys().cloned().collect()
     }
 }
 
@@ -298,7 +354,7 @@ async fn fetch_release_list(
     let kind = details.summary.kind;
     let tmdb_id = details.summary.tmdb_id;
     let season_val = if kind == MediaKind::Tv { season.unwrap_or(0) } else { 0 };
-    if state.media.indexers.is_empty() {
+    if !state.media.has_indexers() {
         let s = (kind == MediaKind::Tv).then(|| season.unwrap_or(1));
         let mut releases = demo_releases(&details.summary, s);
         enrich_release_meta(&state.pool, kind, tmdb_id, season_val, &mut releases).await?;
@@ -307,7 +363,14 @@ async fn fetch_release_list(
             configured: false,
         });
     }
-    let items = torrent::search_cached(&state.media.searches, &state.pool, &state.media.indexers, details).await?;
+    let items = torrent::search_cached(
+        &state.media.searches,
+        &state.pool,
+        &state.media.indexers,
+        &state.media.fallback_indexers,
+        details,
+    )
+    .await?;
     let mut releases: Vec<_> = items.iter().map(|it| torrent::to_release(it, details)).collect();
     // Releases downloaded before are shown by their real info-hash, so the
     // remembered choice and "По просмотренным" find them.
@@ -472,6 +535,7 @@ fn find_scoped_choice(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn auto_pick_release<'a>(
     releases: &'a [ReleaseOption],
     kind: MediaKind,
@@ -480,6 +544,7 @@ fn auto_pick_release<'a>(
     preferred_voice: Option<&str>,
     preferred_lang: Option<&str>,
     is_mobile: bool,
+    dead_hashes: &std::collections::HashSet<String>,
 ) -> Option<&'a ReleaseOption> {
     let for_season: Vec<&ReleaseOption> = releases
         .iter()
@@ -532,11 +597,12 @@ fn auto_pick_release<'a>(
         return None;
     }
     candidates.into_iter().max_by_key(|r| {
+        let not_dead = !dead_hashes.contains(&r.infohash.to_ascii_lowercase());
         let voice_match = preferred_voice.is_some_and(|v| r.voice.eq_ignore_ascii_case(v));
         let rus_match = r.language == preferred_lang.unwrap_or("Русский");
         let season_exact = kind == MediaKind::Tv && r.season == Some(season);
         let direct_bonus = !is_mobile && r.direct_play && r.seeders >= 5;
-        (voice_match, rus_match, season_exact, direct_bonus, r.seeders)
+        (not_dead, voice_match, rus_match, season_exact, direct_bonus, r.seeders)
     })
 }
 
@@ -761,6 +827,7 @@ async fn resolve_online_tiers(
     };
     let list = fetch_release_list(state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
 
+    let dead_hashes = state.media.dead_hashes();
     let picked = auto_pick_release(
         &list.releases,
         kind,
@@ -769,6 +836,7 @@ async fn resolve_online_tiers(
         preferred_voice.as_deref(),
         prefs.language.as_deref(),
         is_mobile,
+        &dead_hashes,
     );
     match picked {
         Some(best) => {
@@ -794,7 +862,7 @@ async fn resolve_online_tiers(
 /// by the time someone presses "Смотреть". Skips titles where the user already has
 /// a saved release choice (so "Продолжить просмотр" does not wake a sleeping indexer).
 pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) {
-    if state.media.indexers.is_empty() {
+    if !state.media.has_indexers() {
         return;
     }
     let state = state.clone();
@@ -818,8 +886,14 @@ pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) 
         if has_saved {
             return;
         }
-        if let Err(e) =
-            torrent::search_cached(&state.media.searches, &state.pool, &state.media.indexers, &details).await
+        if let Err(e) = torrent::search_cached(
+            &state.media.searches,
+            &state.pool,
+            &state.media.indexers,
+            &state.media.fallback_indexers,
+            &details,
+        )
+        .await
         {
             tracing::debug!(error = %e, "background release search failed");
         }
@@ -907,7 +981,7 @@ async fn play(
         ));
     }
     let media = &state.media;
-    let src = torrent::resolve(&state.pool, &media.http, &key, &media.indexers).await?;
+    let src = torrent::resolve(&state.pool, &media.http, &key, &media.all_indexers()).await?;
     let hash = src.infohash.clone().ok_or(TorrentError::Unknown)?;
     torrent::rebind_synthetic_hash(&state.pool, &key, &hash).await;
     let episode = (req.kind == MediaKind::Tv).then_some((req.season.max(1), req.episode.max(1)));
@@ -968,6 +1042,7 @@ async fn play(
                 };
                 if list.is_empty() {
                     dead_guard.disarm();
+                    media.mark_dead_release(&hash);
                     drop_torrserver_if_idle(&state, ts, &hash, false).await;
                     return Err(unavailable(
                         "Нет раздающих: не удалось получить список файлов. Попробуйте «Скачать заранее».",
@@ -999,6 +1074,7 @@ async fn play(
                             };
                             if stalled {
                                 dead_guard.disarm();
+                                media.mark_dead_release(&hash);
                                 drop_torrserver_if_idle(&state, ts, &hash, true).await;
                                 return Err(unavailable(
                                     "Нет раздающих: не удалось начать загрузку. Попробуйте другую раздачу или «Скачать заранее».",
@@ -1012,6 +1088,7 @@ async fn play(
                     probed
                 };
                 dead_guard.disarm();
+                media.clear_dead_release(&hash);
                 ((f, probe, false), Some(ts.clone()))
             }
         }
@@ -1386,7 +1463,7 @@ async fn stream(
             })
         });
         let mut reader = tokio_util::io::ReaderStream::new(out);
-        let first = match tokio::time::timeout(std::time::Duration::from_secs(45), reader.next()).await {
+        let first = match tokio::time::timeout(std::time::Duration::from_secs(55), reader.next()).await {
             Ok(Some(Ok(bytes))) => bytes,
             Ok(other) => {
                 if let Some(h) = stderr_handle {
@@ -1810,6 +1887,7 @@ mod tests {
             series_status: None,
             release_date: None,
             next_episode: None,
+            alternative_titles: Vec::new(),
         };
         assert_eq!(next_episode(&d, (1, 6)), Some((1, 7)));
         assert_eq!(next_episode(&d, (1, 7)), Some((2, 1)));
@@ -1874,5 +1952,68 @@ mod tests {
         assert_eq!(out[0].seeders, 250);
         assert!(out[0].preloaded);
         assert_eq!(out[0].picked_by, vec!["Анна", "Борис"]);
+    }
+
+    #[test]
+    fn auto_pick_skips_recently_dead_release() {
+        let make = |hash: &str, seeders: u32| ReleaseOption {
+            infohash: hash.into(),
+            title: "Фильм (2024) BDRip 1080p".into(),
+            quality: "1080p".into(),
+            size_bytes: 5_000_000_000,
+            seeders,
+            voice: "Дубляж".into(),
+            language: "Русский".into(),
+            tracker: "RuTracker".into(),
+            added: "2026-11-26".into(),
+            year: Some(2024),
+            season: None,
+            hdr: false,
+            dolby_vision: false,
+            subtitles: false,
+            direct_play: true,
+            codec: Some("H.264".into()),
+            bitrate_kbps: None,
+            bitrate_approx: false,
+            picked_by: Vec::new(),
+            preloaded: false,
+        };
+        let top_dead = make(&"1".repeat(40), 877);
+        let live = make(&"2".repeat(40), 529);
+        let releases = [top_dead.clone(), live.clone()];
+        let mut dead = std::collections::HashSet::new();
+        dead.insert(top_dead.infohash.clone());
+        let picked = auto_pick_release(
+            &releases,
+            MediaKind::Movie,
+            0,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            false,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(picked.infohash, live.infohash);
+    }
+
+    #[tokio::test]
+    async fn media_puts_extra_torznab_first_and_keeps_jackett_as_fallback() {
+        let cfg = TorrentConfig {
+            jackett_url: Some("http://jackett:9117".into()),
+            jackett_api_key: Some("k".into()),
+            jackett_wake_url: Some("http://sablier:10000".into()),
+            extra_torznab: vec![crate::config::ExtraTorznabConfig {
+                url: "https://jac-red.ru".into(),
+                api_key: None,
+            }],
+            ..TorrentConfig::default()
+        };
+        let media = Media::new(&cfg);
+        assert_eq!(media.indexers.len(), 1);
+        assert_eq!(media.fallback_indexers.len(), 1);
+        assert!(media.indexers[0].owns_link("https://jac-red.ru/dl/1"));
+        assert!(media.fallback_indexers[0].owns_link("http://jackett:9117/dl/1"));
+        assert_eq!(media.all_indexers().len(), 2);
     }
 }

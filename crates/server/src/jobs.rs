@@ -209,20 +209,30 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
             #[derive(Default)]
             struct ReadyGroup {
                 users: Vec<i64>,
+                tg_users: Vec<(i64, i64)>,
                 raw_title: Option<String>,
+                size_bytes: Option<i64>,
             }
             let mut by_title: HashMap<(MediaKind, i64, i32), ReadyGroup> = HashMap::new();
-            for (uid, kind, tmdb_id, season, title) in transitioned {
-                let entry = by_title.entry((kind, tmdb_id, season)).or_default();
-                entry.users.push(uid);
+            for t in transitioned {
+                let entry = by_title.entry((t.kind, t.tmdb_id, t.season)).or_default();
+                if !entry.users.contains(&t.user_id) {
+                    entry.users.push(t.user_id);
+                }
+                if !entry.tg_users.iter().any(|&(uid, _)| uid == t.user_id) {
+                    entry.tg_users.push((t.user_id, t.telegram_id));
+                }
                 if entry.raw_title.is_none() {
-                    entry.raw_title = title;
+                    entry.raw_title = t.title;
+                }
+                if entry.size_bytes.is_none() {
+                    entry.size_bytes = t.size_bytes;
                 }
             }
             for ((kind, tmdb_id, season), grp) in by_title {
                 let parsed = grp.raw_title.as_deref().map(crate::torrent::title::parse_title);
-                let quality = parsed.as_ref().map(|p| p.quality.as_str());
-                let voice = parsed.as_ref().map(|p| p.voice.as_str()).filter(|v| !v.is_empty());
+                let quality = parsed.as_ref().map(|p| p.quality.clone());
+                let voice = parsed.as_ref().map(|p| p.voice.clone()).filter(|v| !v.is_empty());
                 state.sync.notify_preload_ready(
                     &grp.users,
                     kind,
@@ -230,14 +240,288 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
                     season,
                     hash,
                     grp.raw_title.as_deref(),
-                    quality,
-                    voice,
+                    quality.as_deref(),
+                    voice.as_deref(),
+                );
+                spawn_preload_ready_telegram(
+                    state,
+                    PreloadReadyTelegramJob {
+                        recipients: grp.tg_users,
+                        kind,
+                        tmdb_id,
+                        season,
+                        infohash: hash.to_ascii_lowercase(),
+                        raw_title: grp.raw_title,
+                        quality,
+                        voice,
+                        size_bytes: grp.size_bytes,
+                    },
                 );
             }
         }
     }
     *state.media.preload_telemetry.write().await = telemetry_updates;
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct PreloadReadyTelegramJob {
+    recipients: Vec<(i64, i64)>,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    infohash: String,
+    raw_title: Option<String>,
+    quality: Option<String>,
+    voice: Option<String>,
+    size_bytes: Option<i64>,
+}
+
+const CATALOG_NOTIFY_TIMEOUT: Duration = Duration::from_secs(8);
+const TELEGRAM_RETRY_DELAYS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn short_quality(q: &str) -> Option<&str> {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(match kino_core::normalize_quality_key(trimmed) {
+        "2160p" => "4K",
+        other => other,
+    })
+}
+
+fn human_size(bytes: i64) -> Option<String> {
+    if bytes <= 0 {
+        return None;
+    }
+    let gb = bytes as f64 / 1e9;
+    Some(if gb >= 100.0 {
+        format!("{gb:.0} ГБ")
+    } else if gb >= 1.0 {
+        format!("{gb:.1} ГБ")
+    } else {
+        format!("{:.0} МБ", (bytes as f64 / 1e6).max(1.0))
+    })
+}
+
+/// Formats the Telegram HTML message sent when a user's server download completes.
+pub fn format_preload_ready_message(
+    kind: MediaKind,
+    season: i32,
+    catalog_title: Option<&str>,
+    raw_title: Option<&str>,
+    quality: Option<&str>,
+    voice: Option<&str>,
+    size_bytes: Option<i64>,
+) -> String {
+    let clean_title = catalog_title.map(str::trim).filter(|s| !s.is_empty());
+    let mut text = match (kind, season, clean_title) {
+        (MediaKind::Movie, _, Some(name)) => format!("✅ <b>Фильм «{}» скачался</b>", escape_html(name)),
+        (MediaKind::Movie, _, None) => "✅ <b>Фильм скачался</b>".to_owned(),
+        (MediaKind::Tv, s, Some(name)) if s > 0 => {
+            format!("✅ <b>Сезон {s} сериала «{}» скачался</b>", escape_html(name))
+        }
+        (MediaKind::Tv, s, None) if s > 0 => format!("✅ <b>Сезон {s} сериала скачался</b>"),
+        (MediaKind::Tv, _, Some(name)) => format!("✅ <b>Сериал «{}» скачался</b>", escape_html(name)),
+        (MediaKind::Tv, _, None) => "✅ <b>Сериал скачался</b>".to_owned(),
+    };
+    if clean_title.is_none() {
+        if let Some(raw) = raw_title.map(str::trim).filter(|s| !s.is_empty()) {
+            text.push_str(&format!("\n<i>{}</i>", escape_html(raw)));
+        }
+    }
+    let mut meta = Vec::new();
+    if let Some(q) = quality.and_then(short_quality) {
+        meta.push(q.to_owned());
+    }
+    if let Some(v) = voice.map(str::trim).filter(|v| !v.is_empty()) {
+        meta.push(v.to_owned());
+    }
+    if let Some(sz) = size_bytes.and_then(human_size) {
+        meta.push(sz);
+    }
+    if meta.is_empty() {
+        text.push_str("\nГотов к просмотру с сервера.");
+    } else {
+        text.push_str(&format!(
+            "\n{} — готов к просмотру с сервера.",
+            escape_html(&meta.join(" · "))
+        ));
+    }
+    text
+}
+
+fn spawn_preload_ready_telegram(state: &AppState, job: PreloadReadyTelegramJob) {
+    let Some(api_base) = state.config.telegram_api_url.clone() else {
+        return;
+    };
+    if state.config.bot_token.trim().is_empty() || job.recipients.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        send_preload_ready_telegram(&state, &api_base, job).await;
+    });
+}
+
+fn preload_ready_open_url(public_url: &str, kind: MediaKind, tmdb_id: i64, season: i32, infohash: &str) -> String {
+    let base_url = public_url.trim_end_matches('/');
+    let hash = infohash.to_ascii_lowercase();
+    if kind == MediaKind::Tv && season > 0 {
+        format!("{base_url}/?open=tv_{tmdb_id}&play=1&season={season}&release={hash}")
+    } else {
+        format!("{base_url}/?open={}_{tmdb_id}&play=1&release={hash}", kind.as_str())
+    }
+}
+
+async fn send_preload_ready_telegram(state: &AppState, api_base: &str, job: PreloadReadyTelegramJob) {
+    let catalog_title =
+        match tokio::time::timeout(CATALOG_NOTIFY_TIMEOUT, state.catalog.details(job.kind, job.tmdb_id)).await {
+            Ok(Ok(d)) => {
+                let trimmed = d.summary.title.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, tmdb_id = job.tmdb_id, "catalog lookup failed for preload notification");
+                None
+            }
+            Err(_) => {
+                tracing::debug!(
+                    tmdb_id = job.tmdb_id,
+                    "catalog lookup timed out for preload notification"
+                );
+                None
+            }
+        };
+    let text = format_preload_ready_message(
+        job.kind,
+        job.season,
+        catalog_title.as_deref(),
+        job.raw_title.as_deref(),
+        job.quality.as_deref(),
+        job.voice.as_deref(),
+        job.size_bytes,
+    );
+    let open_url = preload_ready_open_url(
+        &state.config.public_url,
+        job.kind,
+        job.tmdb_id,
+        job.season,
+        &job.infohash,
+    );
+    for (user_id, telegram_id) in job.recipients {
+        if telegram_id <= 0 {
+            continue;
+        }
+        let mut attempt = 0usize;
+        loop {
+            match telegram_send_inner(
+                &state.telegram,
+                api_base,
+                &state.config.bot_token,
+                telegram_id,
+                &text,
+                &open_url,
+                "▶ Смотреть",
+                Some("HTML"),
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        user = user_id,
+                        telegram_id,
+                        kind = job.kind.as_str(),
+                        tmdb_id = job.tmdb_id,
+                        season = job.season,
+                        "sent preload-ready telegram notification"
+                    );
+                    break;
+                }
+                Err(SendError::Transient(e)) if attempt < TELEGRAM_RETRY_DELAYS.len() => {
+                    let delay = TELEGRAM_RETRY_DELAYS[attempt];
+                    attempt += 1;
+                    tracing::debug!(
+                        error = %e,
+                        user = user_id,
+                        telegram_id,
+                        attempt,
+                        "retrying preload-ready telegram message"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                Err(SendError::Permanent(e) | SendError::Transient(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        user = user_id,
+                        telegram_id,
+                        kind = job.kind.as_str(),
+                        tmdb_id = job.tmdb_id,
+                        "preload-ready telegram message failed"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum SendError {
+    Permanent(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn telegram_send_inner(
+    client: &reqwest::Client,
+    api_base: &str,
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    open_url: &str,
+    button_text: &str,
+    parse_mode: Option<&str>,
+) -> Result<(), SendError> {
+    let base = api_base.trim_end_matches('/');
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": { "inline_keyboard": [[{ "text": button_text, "web_app": { "url": open_url } }]] },
+    });
+    if let Some(mode) = parse_mode {
+        body["parse_mode"] = serde_json::Value::String(mode.to_owned());
+    }
+    let resp = client
+        .post(format!("{base}/bot{token}/sendMessage"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| SendError::Transient(anyhow::anyhow!("Telegram request failed: {}", e.without_url())))?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let err = anyhow::anyhow!("Telegram answered {status}");
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        Err(SendError::Transient(err))
+    } else {
+        Err(SendError::Permanent(err))
+    }
 }
 
 /// Sends a message through the Telegram Bot API, with a button that opens `open_url` as a Mini App.
@@ -249,19 +533,11 @@ pub async fn telegram_send(
     text: String,
     open_url: String,
 ) -> anyhow::Result<()> {
-    let base = api_base.trim_end_matches('/');
-    let resp = client
-        .post(format!("{base}/bot{token}/sendMessage"))
-        .json(&serde_json::json!({
-            "chat_id": chat_id,
-            "text": text,
-            "reply_markup": { "inline_keyboard": [[{ "text": "Смотреть", "web_app": { "url": open_url } }]] },
-        }))
-        .send()
+    telegram_send_inner(client, api_base, token, chat_id, &text, &open_url, "Смотреть", None)
         .await
-        .map_err(|e| anyhow::anyhow!("Telegram request failed: {}", e.without_url()))?;
-    anyhow::ensure!(resp.status().is_success(), "Telegram answered {}", resp.status());
-    Ok(())
+        .map_err(|e| match e {
+            SendError::Permanent(err) | SendError::Transient(err) => err,
+        })
 }
 
 /// Runs the jobs forever: preload expiry hourly, the episode check every `every`.
@@ -328,4 +604,83 @@ pub fn spawn(state: AppState, every: Duration) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_preload_ready_messages_with_details_and_fallbacks() {
+        let movie = format_preload_ready_message(
+            MediaKind::Movie,
+            0,
+            Some("Интерстеллар"),
+            Some("Interstellar (2014) BDRip 2160p"),
+            Some("2160p"),
+            Some("Дубляж"),
+            Some(28_400_000_000),
+        );
+        assert_eq!(
+            movie,
+            "✅ <b>Фильм «Интерстеллар» скачался</b>\n4K · Дубляж · 28.4 ГБ — готов к просмотру с сервера."
+        );
+
+        let tv_season = format_preload_ready_message(
+            MediaKind::Tv,
+            2,
+            Some("Во все тяжкие & Co <test>"),
+            None,
+            Some("1080p"),
+            Some("LostFilm"),
+            Some(18_700_000_000),
+        );
+        assert_eq!(
+            tv_season,
+            "✅ <b>Сезон 2 сериала «Во все тяжкие &amp; Co &lt;test&gt;» скачался</b>\n1080p · LostFilm · 18.7 ГБ — готов к просмотру с сервера."
+        );
+
+        let tv_pack = format_preload_ready_message(MediaKind::Tv, 0, Some("Тьма"), None, None, None, None);
+        assert_eq!(
+            tv_pack,
+            "✅ <b>Сериал «Тьма» скачался</b>\nГотов к просмотру с сервера."
+        );
+
+        let fallback = format_preload_ready_message(
+            MediaKind::Movie,
+            0,
+            None,
+            Some("Raw <Release> & Name"),
+            Some("720p"),
+            None,
+            Some(500_000_000),
+        );
+        assert_eq!(
+            fallback,
+            "✅ <b>Фильм скачался</b>\n<i>Raw &lt;Release&gt; &amp; Name</i>\n720p · 500 МБ — готов к просмотру с сервера."
+        );
+
+        let hash = "Ab".repeat(20);
+        assert_eq!(
+            preload_ready_open_url("https://kino.example.com/", MediaKind::Movie, 603, 0, &hash),
+            format!(
+                "https://kino.example.com/?open=movie_603&play=1&release={}",
+                "ab".repeat(20)
+            )
+        );
+        assert_eq!(
+            preload_ready_open_url("https://kino.example.com", MediaKind::Tv, 1396, 2, &hash),
+            format!(
+                "https://kino.example.com/?open=tv_1396&play=1&season=2&release={}",
+                "ab".repeat(20)
+            )
+        );
+        assert_eq!(
+            preload_ready_open_url("https://kino.example.com", MediaKind::Tv, 1396, 0, &hash),
+            format!(
+                "https://kino.example.com/?open=tv_1396&play=1&release={}",
+                "ab".repeat(20)
+            )
+        );
+    }
 }

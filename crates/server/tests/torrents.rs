@@ -1007,8 +1007,25 @@ async fn missing_episode_reports_available_episodes(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "./migrations")]
-async fn extra_torznab_merges_and_tolerates_failure(pool: PgPool) {
-    let jackett = start_jackett().await;
+async fn extra_torznab_is_primary_keeps_jackett_asleep_and_falls_back_on_failure(pool: PgPool) {
+    let jackett_hits = Arc::new(AtomicU32::new(0));
+    let jackett = start_jackett_counted(jackett_hits.clone()).await;
+    let sablier_hits = Arc::new(AtomicU32::new(0));
+    let sablier_url = serve(Router::new().route(
+        "/api/strategies/blocking",
+        get({
+            let hits = sablier_hits.clone();
+            move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::OK
+                }
+            }
+        }),
+    ))
+    .await;
+
     let extra_feed = r#"<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
   <item>
@@ -1022,6 +1039,15 @@ async fn extra_torznab_merges_and_tolerates_failure(pool: PgPool) {
   </item>
   <item>
     <title>Во все тяжкие / Breaking Bad (Сезон 2) (2009) BDRip 1080p MVO</title>
+    <jackettindexer id="all">BigFANGroup</jackettindexer>
+    <link>magnet:?xt=urn:btih:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb</link>
+    <category>5000</category>
+    <size>18400000000</size>
+    <torznab:attr name="seeders" value="7944" />
+    <torznab:attr name="infohash" value="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" />
+  </item>
+  <item>
+    <title>Во все тяжкие / Breaking Bad (Сезон 2) (2009) BDRip 1080p MVO</title>
     <jackettindexer id="all">kinozal, rutor</jackettindexer>
     <link>magnet:?xt=urn:btih:c12fe1c06bba254a9dc9f519b335aa7c1367a88a</link>
     <category>5000</category>
@@ -1031,62 +1057,236 @@ async fn extra_torznab_merges_and_tolerates_failure(pool: PgPool) {
   </item>
 </channel></rss>"#;
 
-    let extra_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let extra_url = format!("http://{}", extra_listener.local_addr().unwrap());
-    let extra_router = Router::new().route(
+    let extra_url = serve(Router::new().route(
         "/api/v2.0/indexers/all/results/torznab/api",
         get(move |Query(q): Query<Vec<(String, String)>>| async move {
             assert!(!q.iter().any(|(k, _)| k == "apikey"));
-            extra_feed
+            if q.iter().any(|(k, v)| k == "q" && v.contains("Матрица"))
+                || q.iter().any(|(k, v)| k == "q" && v.contains("Matrix"))
+            {
+                r#"<?xml version="1.0" encoding="UTF-8"?><rss version="2.0"><channel></channel></rss>"#
+            } else {
+                extra_feed
+            }
         }),
-    );
-    tokio::spawn(async move { axum::serve(extra_listener, extra_router).await.unwrap() });
+    ))
+    .await;
 
-    let broken_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let broken_url = format!("http://{}", broken_listener.local_addr().unwrap());
-    let broken_router = Router::new().route(
+    let broken_url = serve(Router::new().route(
         "/api/v2.0/indexers/all/results/torznab/api",
         get(|| async { StatusCode::BAD_GATEWAY }),
-    );
-    tokio::spawn(async move { axum::serve(broken_listener, broken_router).await.unwrap() });
+    ))
+    .await;
 
-    let app = app(test_state_with(
-        pool,
+    let app_primary = app(test_state_with(
+        pool.clone(),
         TorrentConfig {
-            jackett_url: Some(jackett),
+            jackett_url: Some(jackett.clone()),
             jackett_api_key: Some("secret".into()),
+            jackett_wake_url: Some(sablier_url.clone()),
+            jackett_wake_group: "jackett".into(),
+            jackett_wake_duration: "10m".into(),
+            extra_torznab: vec![kino_server::config::ExtraTorznabConfig {
+                url: extra_url.clone(),
+                api_key: None,
+            }],
+            ..Default::default()
+        },
+    ));
+    let t = login_ok(&app_primary, ADMIN_TG, None).await.token;
+
+    // Browsing home/search keeps Jackett asleep while primary extra_torznab is active.
+    let (code, _) = call(&app_primary, Method::GET, "/api/catalog/home", Some(&t), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = call(
+        &app_primary,
+        Method::GET,
+        "/api/catalog/search?q=matrix",
+        Some(&t),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(sablier_hits.load(Ordering::SeqCst), 0);
+
+    // Primary returns 2 valid releases (BigFANGroup dropped) and never wakes/queries Jackett.
+    let (code, body) = call(&app_primary, Method::GET, "/api/releases/tv/1396", Some(&t), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert!(list.configured);
+    assert_eq!(list.releases.len(), 2);
+    assert!(!list
+        .releases
+        .iter()
+        .any(|r| r.tracker.eq_ignore_ascii_case("bigfangroup")));
+    assert_eq!(jackett_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(sablier_hits.load(Ordering::SeqCst), 0);
+
+    // Even when primary responds cleanly with 0 releases, Jackett must stay asleep.
+    let (code, body) = call(&app_primary, Method::GET, "/api/releases/movie/603", Some(&t), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let empty_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert!(empty_list.releases.is_empty());
+    assert_eq!(jackett_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(sablier_hits.load(Ordering::SeqCst), 0);
+
+    // Partial failure across extra_torznab endpoints still uses the healthy one without waking Jackett.
+    let app_partial = app(test_state_with(
+        pool.clone(),
+        TorrentConfig {
+            jackett_url: Some(jackett.clone()),
+            jackett_api_key: Some("secret".into()),
+            jackett_wake_url: Some(sablier_url.clone()),
+            jackett_wake_group: "jackett".into(),
+            jackett_wake_duration: "10m".into(),
             extra_torznab: vec![
                 kino_server::config::ExtraTorznabConfig {
                     url: extra_url,
                     api_key: None,
                 },
                 kino_server::config::ExtraTorznabConfig {
-                    url: broken_url,
+                    url: broken_url.clone(),
                     api_key: None,
                 },
             ],
             ..Default::default()
         },
     ));
-    let t = login_ok(&app, ADMIN_TG, None).await.token;
-    let (code, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&t), None).await;
+    let t_part = login_ok(&app_partial, ADMIN_TG, None).await.token;
+    let (code, body) = call(&app_partial, Method::GET, "/api/releases/tv/1396", Some(&t_part), None).await;
     assert_eq!(code, StatusCode::OK, "{body}");
-    let list: ReleaseList = serde_json::from_value(body).unwrap();
-    assert!(list.configured);
-    // 3 from Jackett + 1 new RuTracker release from extra_torznab (Kinozal hash deduplicated).
-    assert_eq!(list.releases.len(), 4);
-    let extra = list
-        .releases
-        .iter()
-        .find(|r| r.infohash == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
-        .expect("extra RuTracker release present");
-    assert_eq!(extra.tracker, "RuTracker");
-    assert_eq!(extra.seeders, 320);
+    let part_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert_eq!(part_list.releases.len(), 2);
+    assert_eq!(jackett_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(sablier_hits.load(Ordering::SeqCst), 0);
 
-    let kinozal = list
-        .releases
-        .iter()
-        .find(|r| r.infohash == "c12fe1c06bba254a9dc9f519b335aa7c1367a88a")
-        .expect("deduplicated Kinozal release present");
-    assert_eq!(kinozal.seeders, 150);
+    // When all primary endpoints fail to respond, server wakes Jackett and falls back to it.
+    let app_fallback = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            jackett_wake_url: Some(sablier_url),
+            jackett_wake_group: "jackett".into(),
+            jackett_wake_duration: "10m".into(),
+            extra_torznab: vec![kino_server::config::ExtraTorznabConfig {
+                url: broken_url,
+                api_key: None,
+            }],
+            ..Default::default()
+        },
+    ));
+    let t_fb = login_ok(&app_fallback, ADMIN_TG, None).await.token;
+    let (code, body) = call(&app_fallback, Method::GET, "/api/releases/tv/1396", Some(&t_fb), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let fb_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert_eq!(fb_list.releases.len(), 3);
+    assert!(jackett_hits.load(Ordering::SeqCst) >= 2);
+    assert!(sablier_hits.load(Ordering::SeqCst) >= 1);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn preload_ready_sends_telegram_notification_once(pool: PgPool) {
+    let sent: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let mock_tg = Router::new().route(
+        &format!("/bot{BOT_TOKEN}/sendMessage"),
+        post({
+            let sent = sent.clone();
+            move |Json(payload): Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    sent.lock().unwrap().push(payload);
+                    Json(json!({ "ok": true, "result": { "message_id": 1 } }))
+                }
+            }
+        }),
+    );
+    let mock_tg_url = serve(mock_tg).await;
+    let jackett = start_jackett().await;
+    let q = Arc::new(Qbit::default());
+    let qb = serve(qbittorrent(q.clone())).await;
+    let mut state = test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            qbittorrent_url: Some(qb),
+            ..Default::default()
+        },
+    );
+    let mut cfg = (*state.config).clone();
+    cfg.telegram_api_url = Some(mock_tg_url);
+    state.config = Arc::new(cfg);
+    let app = app(state.clone());
+
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer = login_ok(&app, 2006, inv["code"].as_str()).await;
+
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&admin.token), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let lostfilm = list.releases.iter().find(|r| r.voice == "LostFilm").unwrap();
+
+    for tok in [&admin.token, &peer.token] {
+        let (code, body) = call(
+            &app,
+            Method::POST,
+            "/api/preload",
+            Some(tok),
+            Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "infohash": lostfilm.infohash })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+    }
+    let (_, preloads_list) = call(&app, Method::GET, "/api/preload", Some(&admin.token), None).await;
+    let real_hash = preloads_list[0]["infohash"].as_str().unwrap().to_owned();
+
+    // Still downloading: no notification sent yet.
+    *q.progress.lock().unwrap() = 0.45;
+    jobs::sync_preloads(&state).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "must not notify before download finishes"
+    );
+
+    // Once complete, each requesting user gets one Telegram message.
+    *q.progress.lock().unwrap() = 1.0;
+    jobs::sync_preloads(&state).await.unwrap();
+    for _ in 0..40 {
+        if sent.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    // Repeated syncs and duplicate preload requests must not duplicate notifications.
+    jobs::sync_preloads(&state).await.unwrap();
+    let (code, _) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&admin.token),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "infohash": lostfilm.infohash })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let msgs = sent.lock().unwrap().clone();
+    assert_eq!(msgs.len(), 2, "expected one notification per requesting user: {msgs:?}");
+    let mut chats: Vec<i64> = msgs.iter().filter_map(|m| m["chat_id"].as_i64()).collect();
+    chats.sort_unstable();
+    assert_eq!(chats, vec![ADMIN_TG, 2006]);
+    let expected_url = format!("https://kino.example.com/?open=tv_1396&play=1&season=2&release={real_hash}");
+    for m in &msgs {
+        assert_eq!(m["parse_mode"], "HTML");
+        let text = m["text"].as_str().unwrap();
+        assert!(text.contains("Сезон 2 сериала «Во все тяжкие» скачался"), "{text}");
+        assert!(text.contains("1080p") && text.contains("LostFilm"), "{text}");
+        let btn = &m["reply_markup"]["inline_keyboard"][0][0];
+        assert_eq!(btn["text"], "▶ Смотреть");
+        assert_eq!(btn["web_app"]["url"], expected_url);
+    }
 }

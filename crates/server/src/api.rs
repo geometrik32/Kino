@@ -1146,7 +1146,7 @@ async fn add_preload(
         enrich_preloads(&state, std::slice::from_mut(&mut item)).await;
         return Ok(Json(item));
     };
-    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, &media.indexers).await?;
+    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, &media.all_indexers()).await?;
     r.infohash = src.infohash.clone().unwrap_or(r.infohash).to_ascii_lowercase();
     if !src.title.is_empty() {
         r.title = Some(src.title.clone());
@@ -1843,6 +1843,7 @@ mod tests {
             series_status: Some("Ended".into()),
             release_date: None,
             next_episode: None,
+            alternative_titles: Vec::new(),
         }
     }
 
