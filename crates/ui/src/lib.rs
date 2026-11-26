@@ -2837,12 +2837,12 @@ mod tests {
             requested_by: Some("A".into()),
             can_delete: false,
         };
-        let ep1 = episode_download_info(&[partial.clone()], 1, 1).expect("ep1 should match");
+        let ep1 = episode_download_info(std::slice::from_ref(&partial), 1, 1).expect("ep1 should match");
         assert_eq!(ep1.state, PreloadState::Ready);
         assert_eq!(ep1.requested_by.as_deref(), Some("A"));
         assert!(!ep1.can_delete);
 
-        let ep8 = episode_download_info(&[partial.clone()], 1, 8).expect("ep8 should match");
+        let ep8 = episode_download_info(std::slice::from_ref(&partial), 1, 8).expect("ep8 should match");
         assert_eq!(ep8.state, PreloadState::Downloading);
 
         assert!(episode_download_info(&[partial], 1, 7).is_none());

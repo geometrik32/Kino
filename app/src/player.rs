@@ -77,7 +77,7 @@ const PREFETCH_FORCE_REMAINING_SEC: f64 = 20.0;
 #[derive(Debug, Clone, PartialEq)]
 enum NextPrefetchStatus {
     InFlight,
-    Ready { info: PlayInfo, prepared_at_ms: i64 },
+    Ready { info: Box<PlayInfo>, prepared_at_ms: i64 },
     NeedsPicker,
     Failed,
 }
@@ -1544,7 +1544,7 @@ pub fn Player(
             let t = token.clone();
             let now_ms = platform::now_ms();
             enum PrefetchHit {
-                Ready(PlayInfo),
+                Ready(Box<PlayInfo>),
                 InFlight(u32),
                 Miss,
             }
@@ -1593,7 +1593,7 @@ pub fn Player(
                     s.status = None;
                     s.progress = None;
                 });
-                apply_play_result(season, episode, my_gen, t, Ok(prefetched));
+                apply_play_result(season, episode, my_gen, t, Ok(*prefetched));
                 return;
             }
 
@@ -1679,7 +1679,7 @@ pub fn Player(
                                 ) =>
                             {
                                 invalidate_prefetch();
-                                apply_async(season, episode, my_gen, t, Ok(info));
+                                apply_async(season, episode, my_gen, t, Ok(*info));
                                 return;
                             }
                             _ => {
@@ -2651,7 +2651,7 @@ pub fn Player(
                     if let Some(p) = p.as_mut().filter(|p| p.gen == pf_gen) {
                         p.status = match res {
                             Ok(play_info) => NextPrefetchStatus::Ready {
-                                info: play_info,
+                                info: Box::new(play_info),
                                 prepared_at_ms: platform::now_ms(),
                             },
                             Err(_) => NextPrefetchStatus::Failed,
@@ -4509,7 +4509,7 @@ mod tests {
             next_episode: 2,
             resolved_choice: Some(sample_choice('a', 1)),
             status: NextPrefetchStatus::Ready {
-                info: live_info,
+                info: Box::new(live_info),
                 prepared_at_ms: 10_000,
             },
         };

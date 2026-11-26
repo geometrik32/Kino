@@ -187,8 +187,10 @@ pub async fn probe_local_file(ffprobe: &str, path: &Path) -> anyhow::Result<Loca
 /// Decodes `ffmpeg -f chromaprint -fp_format raw` bytes into `u32` sub-fingerprints.
 pub fn parse_raw_chromaprint(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&c| u32::from_le_bytes(c))
         .collect()
 }
 
@@ -401,7 +403,7 @@ pub fn find_matching_span(
             candidate_lags.push((lag, best_hits));
         }
     }
-    candidate_lags.sort_by(|x, y| y.1.cmp(&x.1));
+    candidate_lags.sort_by_key(|x| std::cmp::Reverse(x.1));
 
     let mut chosen = Vec::<isize>::new();
     for (lag, _) in candidate_lags {

@@ -931,7 +931,7 @@ pub fn ProfileView(
             cb.call(next);
         }
     };
-    let mut toggle_series = move |tmdb_id: i64| {
+    let toggle_series = Callback::new(move |tmdb_id: i64| {
         expanded_series.with_mut(|list| {
             if let Some(pos) = list.iter().position(|&x| x == tmdb_id) {
                 list.remove(pos);
@@ -942,7 +942,7 @@ pub fn ProfileView(
         if let Some(cb) = on_toggle_series {
             cb.call(tmdb_id);
         }
-    };
+    });
     let mut bump_hist_limit = move || {
         let next = *hist_limit.peek() + 10;
         hist_limit.set(next);
@@ -1043,7 +1043,7 @@ pub fn ProfileView(
                                     DownloadGroup::Movie(item) => rsx! {
                                         PreloadRow {
                                             key: "m-{item.id}",
-                                            item,
+                                            item: *item,
                                             now,
                                             on_open,
                                             on_delete: on_delete_preload,
@@ -1058,7 +1058,7 @@ pub fn ProfileView(
                                                 items,
                                                 now,
                                                 expanded: is_open,
-                                                on_toggle: move |tid| toggle_series(tid),
+                                                on_toggle: toggle_series,
                                                 on_open,
                                                 on_delete: on_delete_preload,
                                                 on_delete_episode: on_delete_preload_episode,
@@ -1290,7 +1290,7 @@ fn retention_tag(
 }
 
 enum DownloadGroup {
-    Movie(PreloadItem),
+    Movie(Box<PreloadItem>),
     Series { tmdb_id: i64, items: Vec<PreloadItem> },
 }
 
@@ -1311,7 +1311,7 @@ fn group_profile_downloads(preloads: Vec<PreloadItem>) -> Vec<DownloadGroup> {
                 });
             }
         } else {
-            out.push(DownloadGroup::Movie(item));
+            out.push(DownloadGroup::Movie(Box::new(item)));
         }
     }
     out

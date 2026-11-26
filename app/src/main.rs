@@ -3702,7 +3702,7 @@ fn Title(
                                 telegram::pop_history();
                             }
                             if kind == MediaKind::Tv && scope_ep > 0 {
-                                queue_ep(dl_target, r.infohash, (!r.title.is_empty()).then(|| r.title));
+                                queue_ep(dl_target, r.infohash, (!r.title.is_empty()).then_some(r.title));
                             } else {
                                 let req = PreloadRequest {
                                     kind,
@@ -3710,7 +3710,7 @@ fn Title(
                                     season: scope_s,
                                     episode: 0,
                                     infohash: r.infohash.clone(),
-                                    title: (!r.title.is_empty()).then(|| r.title),
+                                    title: (!r.title.is_empty()).then_some(r.title),
                                 };
                                 let t = t_pick_dl.clone();
                                 let refresh_cb = refresh_pick.clone();
