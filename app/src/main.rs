@@ -1063,8 +1063,8 @@ fn Main(
             Some(&url),
             true,
         );
-        if !telegram::is_telegram() && api::reload_for_web_update(play) {
-            return;
+        if !telegram::is_telegram() {
+            let _ = api::reload_for_web_update(play);
         }
     };
     let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id, false);
@@ -1139,9 +1139,7 @@ fn Main(
                     if !telegram::is_telegram() {
                         telegram::reset_history();
                     }
-                    if api::reload_for_web_update(false) {
-                        return;
-                    }
+                    let _ = api::reload_for_web_update(false);
                     return;
                 }
                 if view() == View::Tab(t) {
