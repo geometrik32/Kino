@@ -130,15 +130,8 @@ impl QBittorrent {
     }
 
     /// Starts downloading, files in order so the start of each is ready first.
-    /// Idempotent when the same info-hash is already queued or downloading in qBittorrent.
+    /// Idempotent when qBittorrent responds `409 Conflict` for an already-queued info-hash.
     pub async fn add(&self, src: &Source) -> anyhow::Result<()> {
-        if let Some(hash) = src.infohash.as_deref().filter(|h| !h.is_empty()) {
-            if let Ok(list) = self.info(&[hash.to_owned()]).await {
-                if list.iter().any(|t| t.hash.eq_ignore_ascii_case(hash) && !t.failed()) {
-                    return Ok(());
-                }
-            }
-        }
         let torrent = src.torrent.clone();
         let magnet = src
             .magnet
