@@ -5,7 +5,10 @@ use std::rc::Rc;
 
 use dioxus::html::MountedData;
 use dioxus::prelude::*;
-pub use kino_core::VideoScale;
+pub use kino_core::{
+    active_skip_segment, next_prompt_start, MediaSegment, SegmentKind, VideoScale, NEXT_CREDITS_LEAD_SEC,
+    NEXT_PROMPT_END_RATIO, NEXT_PROMPT_MIN_SEC,
+};
 use kino_core::{
     clock, episode_code, normalize_quality_key, MediaTrack, PreloadItem, PreloadState, ReleaseOption, StreamProgress,
     SyncMemberInfo,
@@ -168,6 +171,8 @@ pub struct PlayerState {
     pub rewatch_label: Option<String>,
     /// Next episode actually present in the current release when the requested episode is missing.
     pub next_available: Option<(i32, i32)>,
+    /// Detected or community-sourced intro / recap / credits segments for the current video.
+    pub segments: Vec<MediaSegment>,
 }
 
 impl Default for PlayerState {
@@ -222,6 +227,7 @@ impl Default for PlayerState {
             disk_ready_prompt: None,
             rewatch_label: None,
             next_available: None,
+            segments: Vec::new(),
         }
     }
 }
@@ -248,9 +254,6 @@ impl PlayerState {
         self.download_item(infohash).map(|p| (p.state, p.progress))
     }
 }
-
-/// Seconds before the end when "next episode" is offered.
-pub const NEXT_PROMPT_SEC: f64 = 40.0;
 
 fn track_name(list: &[MediaTrack], index: Option<i32>, none: &str) -> String {
     index
@@ -336,7 +339,7 @@ fn render_quality_download_action(
         };
     }
     if let Some(item) = dl.filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading)) {
-        if let Some(cancel) = on_cancel_download {
+        if let Some(cancel) = on_cancel_download.filter(|_| item.can_delete) {
             let dl_id = item.id;
             return rsx! {
                 button {
@@ -485,7 +488,8 @@ pub fn PlayerView(
         .clamp(0.0, if dur > 0.0 { dur } else { f64::MAX });
     let pct = if dur > 0.0 { display_pos / dur * 100.0 } else { 0.0 };
     let remaining = (dur - display_pos).max(0.0);
-    let near_end = dur > 0.0 && dur - pos < NEXT_PROMPT_SEC;
+    let prompt_at = next_prompt_start(dur, &s.segments);
+    let near_end = dur > 0.0 && prompt_at.is_some_and(|at| pos >= at);
     let disk_prompt = s.disk_ready_prompt.clone();
     let show_disk_prompt = disk_prompt.is_some();
     let disk_ready_title = match disk_prompt.as_ref().and_then(DiskReadyPrompt::detail_label) {
@@ -498,6 +502,11 @@ pub fn PlayerView(
         && s.next.is_some()
         && dismissed_next().as_deref() != s.next.as_deref()
         && !locked();
+    let active_skip = if !locked() && !show_disk_prompt && !s.waiting && s.error.is_none() {
+        active_skip_segment(pos, dur, &s.segments, s.next.is_some()).cloned()
+    } else {
+        None
+    };
     let sub_name = track_name(&s.subtitle_tracks, s.subtitle_track, "Выкл");
     let sub_lang = s
         .subtitle_track
@@ -885,6 +894,23 @@ pub fn PlayerView(
                     }
                 }
 
+                if let Some(skip) = active_skip {
+                    {
+                        let target_sec = skip.end_sec.min((dur - 1.0).max(0.0));
+                        let cls = if show_next { "p-glass-btn p-skip-btn with-next" } else { "p-glass-btn p-skip-btn" };
+                        let label = skip.kind.skip_label();
+                        rsx! {
+                            button {
+                                class: "{cls}",
+                                title: "{label} (до {clock(target_sec)})",
+                                onclick: move |_| on_seek.call(target_sec),
+                                Icon { svg: icons::FWD10, class: "ic sm" }
+                                span { "{label}" }
+                            }
+                        }
+                    }
+                }
+
                 if let Some(next) = s.next.as_deref().filter(|_| show_next) {
                     div { class: "p-next-card",
                         div { class: "p-next-info",
@@ -1000,6 +1026,21 @@ pub fn PlayerView(
                                     }
                                 });
                             },
+                            if dur > 0.0 {
+                                for seg in &s.segments {
+                                    if matches!(seg.kind, SegmentKind::Intro | SegmentKind::Recap | SegmentKind::Outro)
+                                        && seg.end_sec > seg.start_sec
+                                        && seg.start_sec < dur
+                                    {
+                                        {
+                                            let left = (seg.start_sec / dur * 100.0).clamp(0.0, 100.0);
+                                            let width = ((seg.end_sec.min(dur) - seg.start_sec.max(0.0)) / dur * 100.0)
+                                                .clamp(0.4, 100.0 - left);
+                                            rsx! { div { class: "p-seg", style: "left: {left:.2}%; width: {width:.2}%" } }
+                                        }
+                                    }
+                                }
+                            }
                             div { class: "p-fill", style: "width: {pct:.2}%" }
                             if scrub().is_some() {
                                 div { class: "p-tip", style: "left: {pct:.2}%", "{clock(display_pos)}" }
@@ -1249,6 +1290,8 @@ pub fn PlayerView(
                                                 added: String::new(),
                                                 year: None,
                                                 season: (p.season > 0).then_some(p.season),
+                                                episode_start: None,
+                                                episode_end: None,
                                                 hdr: false,
                                                 dolby_vision: false,
                                                 subtitles: false,
@@ -1276,6 +1319,8 @@ pub fn PlayerView(
                                                 added: String::new(),
                                                 year: None,
                                                 season: (s.season > 0).then_some(s.season),
+                                                episode_start: None,
+                                                episode_end: None,
                                                 hdr: false,
                                                 dolby_vision: false,
                                                 subtitles: false,
@@ -1667,6 +1712,10 @@ mod tests {
             voice: Some("Дубляж".into()),
             speed_bps: 0,
             dl_phase: kino_core::PreloadPhase::Downloading,
+            whole_torrent: true,
+            episodes: Vec::new(),
+            requested_by: None,
+            can_delete: true,
         });
         assert_eq!(s.download_status(&hash), Some((PreloadState::Downloading, 0.42)));
         assert_eq!(s.download_status(&"f".repeat(40)), None);

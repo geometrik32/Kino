@@ -30,6 +30,12 @@ pub struct ReleaseOption {
     pub year: Option<i32>,
     /// Season of a series pack.
     pub season: Option<i32>,
+    /// First episode included in this release when stated in the release title.
+    #[serde(default)]
+    pub episode_start: Option<i32>,
+    /// Last episode included in this release (equals `episode_start` for a single episode).
+    #[serde(default)]
+    pub episode_end: Option<i32>,
     pub hdr: bool,
     pub dolby_vision: bool,
     pub subtitles: bool,
@@ -122,6 +128,36 @@ impl ReleaseOption {
     /// Whether [`ReleaseOption::infohash`] is a real info-hash, not a placeholder key.
     pub fn has_infohash(&self) -> bool {
         is_infohash(&self.infohash)
+    }
+
+    /// Inclusive episode range `(start, end)` when stated in the release name.
+    pub fn episode_range(&self) -> Option<(i32, i32)> {
+        match (self.episode_start, self.episode_end) {
+            (Some(a), Some(b)) if a > 0 && b >= a => Some((a, b)),
+            (Some(a), None) if a > 0 => Some((a, a)),
+            (None, Some(b)) if b > 0 => Some((1, b)),
+            _ => None,
+        }
+    }
+
+    /// True if this release covers `episode`. Releases without an explicit episode
+    /// range (e.g. full season packs like `[S1]`) match any episode.
+    pub fn matches_episode(&self, episode: i32) -> bool {
+        if episode <= 0 {
+            return true;
+        }
+        match self.episode_range() {
+            Some((start, end)) => (start..=end).contains(&episode),
+            None => true,
+        }
+    }
+
+    /// Compact episode label for release rows, e.g. `"1–7 серии"` or `"8 серия"`.
+    pub fn episode_tag(&self) -> Option<String> {
+        match self.episode_range()? {
+            (a, b) if a == b => Some(format!("{a} серия")),
+            (a, b) => Some(format!("{a}–{b} серии")),
+        }
     }
 }
 
@@ -371,7 +407,7 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     Some(s) => format!("S{s:02}"),
                     None => year.map(|y| y.to_string()).unwrap_or_default(),
                 };
-                let size_bytes = ((if tv { gb } else { gb / 2.6 }) * 1e9) as u64;
+                let size_bytes = ((if tv { gb } else { gb / 2.6 }) * crate::GIB_BYTES as f64) as u64;
                 ReleaseOption {
                     infohash: h.to_string().repeat(40),
                     title: format!("{} / {original} ({what}) {q} {rip} | {voice}", title.title),
@@ -384,6 +420,8 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     added: added.into(),
                     year,
                     season: s,
+                    episode_start: None,
+                    episode_end: None,
                     hdr,
                     dolby_vision: dv,
                     subtitles: subs,
@@ -504,6 +542,163 @@ pub struct PlayInfo {
     /// snapped backward to an earlier keyframe, if known.
     #[serde(default)]
     pub stream_start_at: Option<f64>,
+    /// Detected or community-sourced intro / recap / credits segments for this video.
+    #[serde(default)]
+    pub segments: Vec<MediaSegment>,
+}
+
+/// Kind of skippable or cue-bearing segment within an episode or film.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentKind {
+    Intro,
+    Recap,
+    Outro,
+    PostCredits,
+}
+
+impl SegmentKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SegmentKind::Intro => "intro",
+            SegmentKind::Recap => "recap",
+            SegmentKind::Outro => "outro",
+            SegmentKind::PostCredits => "post_credits",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "intro" => Some(SegmentKind::Intro),
+            "recap" => Some(SegmentKind::Recap),
+            "outro" => Some(SegmentKind::Outro),
+            "post_credits" => Some(SegmentKind::PostCredits),
+            _ => None,
+        }
+    }
+
+    pub fn skip_label(self) -> &'static str {
+        match self {
+            SegmentKind::Intro => "Пропустить заставку",
+            SegmentKind::Recap => "Пропустить повтор",
+            SegmentKind::Outro => "Пропустить титры",
+            SegmentKind::PostCredits => "К сцене после титров",
+        }
+    }
+}
+
+/// Origin of a [`MediaSegment`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentSource {
+    LocalAnalysis,
+    Chapters,
+    IntroDb,
+    AniSkip,
+}
+
+impl SegmentSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SegmentSource::LocalAnalysis => "local_analysis",
+            SegmentSource::Chapters => "chapters",
+            SegmentSource::IntroDb => "intro_db",
+            SegmentSource::AniSkip => "ani_skip",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "local_analysis" => Some(SegmentSource::LocalAnalysis),
+            "chapters" => Some(SegmentSource::Chapters),
+            "intro_db" => Some(SegmentSource::IntroDb),
+            "ani_skip" => Some(SegmentSource::AniSkip),
+            _ => None,
+        }
+    }
+}
+
+/// Time interval (seconds) inside a video that can be skipped or used to trigger "Next episode".
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MediaSegment {
+    pub kind: SegmentKind,
+    pub start_sec: f64,
+    pub end_sec: f64,
+    pub source: SegmentSource,
+    /// Confidence in `0.0..=1.0`.
+    #[serde(default)]
+    pub confidence: f32,
+}
+
+/// Fraction of total episode duration from the end used to trigger "Next episode"
+/// when no credits segment (`Outro`) is known (3%).
+pub const NEXT_PROMPT_END_RATIO: f64 = 0.03;
+/// Minimum lead time from the end of short videos when using [`NEXT_PROMPT_END_RATIO`].
+pub const NEXT_PROMPT_MIN_SEC: f64 = 5.0;
+/// Seconds before a known credits (`Outro`) start when "Next episode" banner appears.
+pub const NEXT_CREDITS_LEAD_SEC: f64 = 5.0;
+
+/// Playback timestamp (seconds) from which the "Next episode" prompt should appear.
+/// Uses the known credits start (`Outro`) with a brief lead time, or falls back to
+/// [`NEXT_PROMPT_END_RATIO`] of total duration when credits timestamps are unavailable.
+pub fn next_prompt_start(duration: f64, segments: &[MediaSegment]) -> Option<f64> {
+    if !duration.is_finite() || duration <= 12.0 {
+        return None;
+    }
+    if let Some(outro) = segments.iter().find(|s| {
+        s.kind == SegmentKind::Outro
+            && s.start_sec.is_finite()
+            && s.start_sec > duration * 0.45
+            && s.start_sec < duration - 2.0
+    }) {
+        let start = (outro.start_sec - NEXT_CREDITS_LEAD_SEC).clamp(duration * 0.50, duration - NEXT_PROMPT_MIN_SEC);
+        return Some(start);
+    }
+    let lead = (duration * NEXT_PROMPT_END_RATIO)
+        .max(NEXT_PROMPT_MIN_SEC)
+        .min(duration * 0.25);
+    Some((duration - lead).max(duration * 0.50))
+}
+
+/// Returns the intro/recap (or skippable outro) segment currently active at playback position `pos`.
+pub fn active_skip_segment(
+    pos: f64,
+    duration: f64,
+    segments: &[MediaSegment],
+    has_next_episode: bool,
+) -> Option<&MediaSegment> {
+    if !pos.is_finite() || duration <= 0.0 {
+        return None;
+    }
+    // Prioritize Intro / Recap while playback is within them (allowing 1s pre-cue).
+    for kind in [SegmentKind::Intro, SegmentKind::Recap] {
+        if let Some(seg) = segments.iter().find(|s| s.kind == kind) {
+            if seg.end_sec > seg.start_sec + 3.0
+                && seg.start_sec < duration - 5.0
+                && pos >= (seg.start_sec - 1.0).max(0.0)
+                && pos < (seg.end_sec - 1.5).min(duration)
+            {
+                return Some(seg);
+            }
+        }
+    }
+    // Offer "Пропустить титры" only when skipping leads somewhere useful inside the current file
+    // (post-credits scene exists / outro ends well before EOF) or when there is no next episode.
+    if let Some(outro) = segments.iter().find(|s| s.kind == SegmentKind::Outro) {
+        let has_post_credits = segments
+            .iter()
+            .any(|s| s.kind == SegmentKind::PostCredits && s.start_sec >= outro.end_sec - 2.0)
+            || outro.end_sec + 12.0 < duration;
+        let show_skip = !has_next_episode || has_post_credits;
+        if show_skip
+            && outro.end_sec > outro.start_sec + 3.0
+            && pos >= (outro.start_sec - 1.0).max(0.0)
+            && pos < (outro.end_sec - 1.5).min(duration)
+        {
+            return Some(outro);
+        }
+    }
+    None
 }
 
 /// Body of `POST /api/play/probe`: retries probing an active stream when
@@ -602,6 +797,7 @@ mod tests {
             preloaded: false,
             native: false,
             stream_start_at: None,
+            segments: Vec::new(),
         };
         assert!(info.plays_directly(Some(0)));
         assert!(!info.plays_directly(Some(1)), "another dub needs re-encoding");
@@ -614,6 +810,89 @@ mod tests {
         assert!(info.plays_directly(Some(1)), "native players switch tracks directly");
         assert!(is_release_key(&format!("u{}", "0".repeat(39))));
         assert!(!is_release_key("x"));
+    }
+
+    #[test]
+    fn release_episode_matching_and_tags() {
+        let mut r = ReleaseOption {
+            infohash: "a".repeat(40),
+            title: "Аутсорс S1E1-7 of 8".into(),
+            quality: "1080p".into(),
+            size_bytes: 1_000,
+            seeders: 10,
+            voice: "Русский".into(),
+            language: "Русский".into(),
+            tracker: "RuTracker".into(),
+            added: "2025-02-01".into(),
+            year: Some(2025),
+            season: Some(1),
+            episode_start: None,
+            episode_end: None,
+            hdr: false,
+            dolby_vision: false,
+            subtitles: false,
+            direct_play: true,
+            codec: Some("H.264".into()),
+            bitrate_kbps: None,
+            bitrate_approx: false,
+            picked_by: Vec::new(),
+            preloaded: false,
+        };
+        assert!(r.matches_episode(8));
+        assert_eq!(r.episode_tag(), None);
+
+        r.episode_start = Some(1);
+        r.episode_end = Some(7);
+        assert!(r.matches_episode(1));
+        assert!(r.matches_episode(7));
+        assert!(!r.matches_episode(8));
+        assert_eq!(r.episode_tag().as_deref(), Some("1–7 серии"));
+
+        r.episode_start = Some(8);
+        r.episode_end = Some(8);
+        assert!(!r.matches_episode(7));
+        assert!(r.matches_episode(8));
+        assert_eq!(r.episode_tag().as_deref(), Some("8 серия"));
+    }
+
+    #[test]
+    fn next_prompt_and_skip_segments() {
+        // Without segments: proportional 3% fallback scales with episode duration.
+        assert_eq!(next_prompt_start(360.0, &[]), Some(360.0 - 10.8));
+        assert_eq!(next_prompt_start(3500.0, &[]), Some(3500.0 - 105.0));
+        // Short 60s clip clamps to at least 5s lead time.
+        assert_eq!(next_prompt_start(60.0, &[]), Some(55.0));
+
+        // With Outro segment: triggers NEXT_CREDITS_LEAD_SEC before outro start.
+        let segs = vec![
+            MediaSegment {
+                kind: SegmentKind::Intro,
+                start_sec: 15.0,
+                end_sec: 75.0,
+                source: SegmentSource::LocalAnalysis,
+                confidence: 0.9,
+            },
+            MediaSegment {
+                kind: SegmentKind::Outro,
+                start_sec: 3428.0,
+                end_sec: 3510.0,
+                source: SegmentSource::LocalAnalysis,
+                confidence: 0.9,
+            },
+        ];
+        assert_eq!(next_prompt_start(3510.0, &segs), Some(3423.0));
+        assert_eq!(
+            active_skip_segment(20.0, 3510.0, &segs, true).map(|s| s.kind),
+            Some(SegmentKind::Intro)
+        );
+        // After intro ends, no skip button; during credits with next episode & no post-credits, Next card suffices.
+        assert_eq!(active_skip_segment(80.0, 3510.0, &segs, true), None);
+        assert_eq!(active_skip_segment(3440.0, 3510.0, &segs, true), None);
+        // Without next episode (finale / movie), credits skip button appears.
+        assert_eq!(
+            active_skip_segment(3440.0, 3510.0, &segs, false).map(|s| s.kind),
+            Some(SegmentKind::Outro)
+        );
     }
 }
 

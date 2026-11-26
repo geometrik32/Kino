@@ -69,6 +69,34 @@ struct RawFile {
     index: i32,
     name: String,
     size: u64,
+    #[serde(default)]
+    progress: Option<f32>,
+    #[serde(default)]
+    priority: Option<i32>,
+}
+
+/// Detailed file entry from qBittorrent (`GET /api/v2/torrents/files`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct QbitFile {
+    /// 1-based index matching `FileEntry.index` and TorrServer.
+    pub index: i32,
+    /// 0-based qBittorrent file index used by `torrents/filePrio`.
+    pub qbit_index: i32,
+    pub path: String,
+    pub length: u64,
+    pub progress: f32,
+    /// 0 = do not download, >0 = wanted.
+    pub priority: i32,
+}
+
+impl QbitFile {
+    pub fn as_file_entry(&self) -> FileEntry {
+        FileEntry {
+            index: self.index,
+            path: self.path.clone(),
+            length: self.length,
+        }
+    }
 }
 
 impl QBittorrent {
@@ -132,6 +160,11 @@ impl QBittorrent {
     /// Starts downloading, files in order so the start of each is ready first.
     /// Idempotent when qBittorrent responds `409 Conflict` for an already-queued info-hash.
     pub async fn add(&self, src: &Source) -> anyhow::Result<()> {
+        self.add_with_options(src, false).await
+    }
+
+    /// Adds a torrent, optionally in the stopped/paused state so file priorities can be set first.
+    pub async fn add_with_options(&self, src: &Source, stopped: bool) -> anyhow::Result<()> {
         let torrent = src.torrent.clone();
         let magnet = src
             .magnet
@@ -143,6 +176,9 @@ impl QBittorrent {
                     .text("category", "kino")
                     .text("sequentialDownload", "true")
                     .text("firstLastPiecePrio", "true");
+                if stopped {
+                    form = form.text("stopped", "true").text("paused", "true");
+                }
                 if let Some(p) = &self.save_path {
                     form = form.text("savepath", p.clone());
                 }
@@ -189,8 +225,8 @@ impl QBittorrent {
             .await?)
     }
 
-    /// Files with paths relative to the download folder. Indexes are 1-based, as TorrServer's.
-    pub async fn files(&self, hash: &str) -> anyhow::Result<Vec<FileEntry>> {
+    /// Files with paths relative to the download folder plus per-file progress and priority.
+    pub async fn file_states(&self, hash: &str) -> anyhow::Result<Vec<QbitFile>> {
         let raw: Vec<RawFile> = self
             .call(|http, base| {
                 http.get(format!("{base}/api/v2/torrents/files"))
@@ -201,12 +237,68 @@ impl QBittorrent {
             .await?;
         Ok(raw
             .into_iter()
-            .map(|f| FileEntry {
+            .map(|f| QbitFile {
                 index: f.index + 1,
+                qbit_index: f.index,
                 path: f.name,
                 length: f.size,
+                progress: f.progress.unwrap_or(0.0),
+                priority: f.priority.unwrap_or(1),
             })
             .collect())
+    }
+
+    /// Files with paths relative to the download folder. Indexes are 1-based, as TorrServer's.
+    pub async fn files(&self, hash: &str) -> anyhow::Result<Vec<FileEntry>> {
+        Ok(self
+            .file_states(hash)
+            .await?
+            .into_iter()
+            .map(|f| f.as_file_entry())
+            .collect())
+    }
+
+    /// Sets download priority for the given 0-based qBittorrent file indices (`0` = skip, `1` = normal).
+    pub async fn set_file_priority(&self, hash: &str, qbit_indices: &[i32], priority: i32) -> anyhow::Result<()> {
+        if qbit_indices.is_empty() {
+            return Ok(());
+        }
+        let ids = qbit_indices.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("|");
+        let prio = priority.to_string();
+        self.call(|http, base| {
+            http.post(format!("{base}/api/v2/torrents/filePrio")).form(&[
+                ("hash", hash),
+                ("id", ids.as_str()),
+                ("priority", prio.as_str()),
+            ])
+        })
+        .await?;
+        Ok(())
+    }
+
+    /// Starts (resumes) a torrent in qBittorrent (supports both v5 `/start` and v4 `/resume`).
+    pub async fn start(&self, hash: &str) -> anyhow::Result<()> {
+        let res = self
+            .call(|http, base| {
+                http.post(format!("{base}/api/v2/torrents/start"))
+                    .form(&[("hashes", hash)])
+            })
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.downcast_ref::<reqwest::Error>()
+                    .is_some_and(|re| re.status() == Some(reqwest::StatusCode::NOT_FOUND)) =>
+            {
+                self.call(|http, base| {
+                    http.post(format!("{base}/api/v2/torrents/resume"))
+                        .form(&[("hashes", hash)])
+                })
+                .await?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Removes the torrent and its files.

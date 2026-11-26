@@ -1089,7 +1089,7 @@ impl PreloadState {
     }
 }
 
-/// Body of `POST /api/preload`: download a release to the server in advance.
+/// Body of `POST /api/preload`: download a release (or a single episode) to the server in advance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreloadRequest {
     pub kind: MediaKind,
@@ -1097,6 +1097,9 @@ pub struct PreloadRequest {
     /// 0 for films.
     #[serde(default)]
     pub season: i32,
+    /// 0 for films or full-season/pack downloads; > 0 to download only this episode.
+    #[serde(default)]
+    pub episode: i32,
     pub infohash: String,
     pub title: Option<String>,
 }
@@ -1111,6 +1114,23 @@ pub enum PreloadPhase {
     Checking,
     Ready,
     Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PreloadEpisodeItem {
+    pub season: i32,
+    pub episode: i32,
+    pub state: PreloadState,
+    /// 0.0–1.0 while downloading.
+    pub progress: f32,
+    #[serde(default)]
+    pub size_bytes: Option<i64>,
+    #[serde(default)]
+    pub episode_name: Option<String>,
+    #[serde(default)]
+    pub ready_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub delete_after: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1147,6 +1167,42 @@ pub struct PreloadItem {
     /// Fine-grained phase from the downloader (`Metadata`, `Waiting`, `Downloading`, `Checking`).
     #[serde(default)]
     pub dl_phase: PreloadPhase,
+    /// Per-episode download statuses for TV series.
+    #[serde(default)]
+    pub episodes: Vec<PreloadEpisodeItem>,
+    /// True when the whole torrent was requested; false when only selected episodes were requested.
+    #[serde(default = "default_true")]
+    pub whole_torrent: bool,
+    /// Display name of the user(s) who requested this download (omitted when only the current user requested it).
+    #[serde(default)]
+    pub requested_by: Option<String>,
+    /// True when the current user is allowed to delete this download (owner or admin).
+    #[serde(default = "default_true")]
+    pub can_delete: bool,
+}
+
+/// One binary gibibyte (`1024^3` bytes), matching RuTracker's displayed sizes.
+pub const GIB_BYTES: u64 = 1_073_741_824;
+
+const MIB_BYTES: f64 = 1_048_576.0;
+
+/// Formats a byte size in binary GiB/MiB matching RuTracker (e.g. `"28.4 ГБ"`, `"512 МБ"`).
+pub fn format_size(bytes: u64) -> String {
+    let gb = bytes as f64 / GIB_BYTES as f64;
+    if gb >= 100.0 {
+        format!("{gb:.0} ГБ")
+    } else if gb >= 1.0 {
+        format!("{gb:.1} ГБ")
+    } else if bytes == 0 {
+        "0 МБ".to_string()
+    } else {
+        let mb = (bytes as f64 / MIB_BYTES).max(1.0);
+        if mb >= 1023.5 {
+            "1.0 ГБ".to_string()
+        } else {
+            format!("{mb:.0} МБ")
+        }
+    }
 }
 
 /// Formats a byte-per-second throughput rate for UI labels (e.g. `"12 МБ/с"`, `"2.4 МБ/с"`, `"420 КБ/с"`).
@@ -1162,6 +1218,104 @@ pub fn format_speed(bps: u64) -> String {
         format!("{}\u{a0}КБ/с", (bps / 1024).max(1))
     } else {
         format!("{bps}\u{a0}Б/с")
+    }
+}
+
+fn format_preload_status(
+    state: PreloadState,
+    progress: f32,
+    dl_phase: PreloadPhase,
+    speed_bps: u64,
+    compact: bool,
+) -> String {
+    match state {
+        PreloadState::Ready => {
+            if compact {
+                "На сервере".to_owned()
+            } else {
+                "Готово · играет с диска".to_owned()
+            }
+        }
+        PreloadState::Failed => {
+            if compact {
+                "Ошибка".to_owned()
+            } else {
+                "Ошибка загрузки".to_owned()
+            }
+        }
+        PreloadState::Deleted => "Удалено".to_owned(),
+        PreloadState::Queued | PreloadState::Downloading => {
+            let pct = (progress * 100.0).clamp(0.0, 99.0).round() as i32;
+            match dl_phase {
+                PreloadPhase::Metadata => {
+                    if compact {
+                        "Файлы…".to_owned()
+                    } else {
+                        "Получаем файлы…".to_owned()
+                    }
+                }
+                PreloadPhase::Checking => {
+                    if compact {
+                        "Проверка…".to_owned()
+                    } else {
+                        "Проверяем файлы…".to_owned()
+                    }
+                }
+                PreloadPhase::Waiting if pct == 0 => {
+                    if compact {
+                        "Ждём сидов".to_owned()
+                    } else {
+                        "Ждём раздающих…".to_owned()
+                    }
+                }
+                PreloadPhase::Waiting => {
+                    if compact {
+                        format!("{pct}% · ждём")
+                    } else {
+                        format!("Ждём раздающих · {pct}%")
+                    }
+                }
+                PreloadPhase::Ready => {
+                    if compact {
+                        "На сервере".to_owned()
+                    } else {
+                        "Готово · играет с диска".to_owned()
+                    }
+                }
+                PreloadPhase::Failed => {
+                    if compact {
+                        "Ошибка".to_owned()
+                    } else {
+                        "Ошибка загрузки".to_owned()
+                    }
+                }
+                PreloadPhase::Downloading if speed_bps > 0 => format!("{pct}% · {}", format_speed(speed_bps)),
+                PreloadPhase::Downloading if pct == 0 => {
+                    if compact {
+                        "Ждём сидов".to_owned()
+                    } else {
+                        "Ждём раздающих…".to_owned()
+                    }
+                }
+                PreloadPhase::Downloading => {
+                    if compact {
+                        format!("{pct}%")
+                    } else {
+                        format!("Скачивается · {pct}%")
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl PreloadEpisodeItem {
+    pub fn status_text(&self, dl_phase: PreloadPhase, speed_bps: u64) -> String {
+        format_preload_status(self.state, self.progress, dl_phase, speed_bps, false)
+    }
+
+    pub fn compact_status_text(&self, dl_phase: PreloadPhase, speed_bps: u64) -> String {
+        format_preload_status(self.state, self.progress, dl_phase, speed_bps, true)
     }
 }
 
@@ -1189,51 +1343,57 @@ impl PreloadItem {
 
     /// Detailed human status shown in Profile -> Server Downloads and title card notices.
     pub fn status_text(&self) -> String {
-        match self.state {
-            PreloadState::Ready => "Готово · играет с диска".to_owned(),
-            PreloadState::Failed => "Ошибка загрузки".to_owned(),
-            PreloadState::Deleted => "Удалено".to_owned(),
-            PreloadState::Queued | PreloadState::Downloading => {
-                let pct = (self.progress * 100.0).clamp(0.0, 99.0).round() as i32;
-                match self.dl_phase {
-                    PreloadPhase::Metadata => "Получаем файлы…".to_owned(),
-                    PreloadPhase::Checking => "Проверяем файлы…".to_owned(),
-                    PreloadPhase::Waiting if pct == 0 => "Ждём раздающих…".to_owned(),
-                    PreloadPhase::Waiting => format!("Ждём раздающих · {pct}%"),
-                    PreloadPhase::Ready => "Готово · играет с диска".to_owned(),
-                    PreloadPhase::Failed => "Ошибка загрузки".to_owned(),
-                    PreloadPhase::Downloading if self.speed_bps > 0 => {
-                        format!("{pct}% · {}", format_speed(self.speed_bps))
-                    }
-                    PreloadPhase::Downloading if pct == 0 => "Ждём раздающих…".to_owned(),
-                    PreloadPhase::Downloading => format!("Скачивается · {pct}%"),
-                }
-            }
-        }
+        format_preload_status(self.state, self.progress, self.dl_phase, self.speed_bps, false)
     }
 
     /// Compact button/badge status used in tight rows (ReleasePicker / Player Quality list).
     pub fn compact_status_text(&self) -> String {
-        match self.state {
-            PreloadState::Ready => "На сервере".to_owned(),
-            PreloadState::Failed => "Ошибка".to_owned(),
-            PreloadState::Deleted => "Удалено".to_owned(),
-            PreloadState::Queued | PreloadState::Downloading => {
-                let pct = (self.progress * 100.0).clamp(0.0, 99.0).round() as i32;
-                match self.dl_phase {
-                    PreloadPhase::Metadata => "Файлы…".to_owned(),
-                    PreloadPhase::Checking => "Проверка…".to_owned(),
-                    PreloadPhase::Waiting if pct == 0 => "Ждём сидов".to_owned(),
-                    PreloadPhase::Waiting => format!("{pct}% · ждём"),
-                    PreloadPhase::Ready => "На сервере".to_owned(),
-                    PreloadPhase::Failed => "Ошибка".to_owned(),
-                    PreloadPhase::Downloading if self.speed_bps > 0 => {
-                        format!("{pct}% · {}", format_speed(self.speed_bps))
-                    }
-                    PreloadPhase::Downloading if pct == 0 => "Ждём сидов".to_owned(),
-                    PreloadPhase::Downloading => format!("{pct}%"),
-                }
-            }
+        format_preload_status(self.state, self.progress, self.dl_phase, self.speed_bps, true)
+    }
+
+    /// Returns per-episode download state for `(season, episode)`, if tracked.
+    pub fn episode_for(&self, season: i32, episode: i32) -> Option<&PreloadEpisodeItem> {
+        self.episodes
+            .iter()
+            .find(|e| e.season == season && e.episode == episode && e.state != PreloadState::Deleted)
+    }
+
+    /// True if this preload is ready on server disk for the requested `(kind, season, episode)`.
+    pub fn is_ready_for(&self, kind: MediaKind, season: i32, episode: i32) -> bool {
+        if kind == MediaKind::Movie {
+            return self.state == PreloadState::Ready;
+        }
+        if episode <= 0 {
+            return self.state == PreloadState::Ready
+                && (self.whole_torrent || self.episodes.iter().any(|e| e.state == PreloadState::Ready))
+                && (season <= 0
+                    || self.season == 0
+                    || self.season == season
+                    || self
+                        .episodes
+                        .iter()
+                        .any(|e| e.season == season && e.state == PreloadState::Ready));
+        }
+        if !self.episodes.is_empty() {
+            return self
+                .episode_for(season, episode)
+                .is_some_and(|e| e.state == PreloadState::Ready);
+        }
+        self.whole_torrent && self.state == PreloadState::Ready && (self.season == 0 || self.season == season)
+    }
+
+    /// Compact range summary of non-deleted episodes inside this preload (e.g. `"S01E01–E07"`).
+    pub fn episodes_range_summary(&self) -> Option<String> {
+        let pairs: Vec<(i32, i32)> = self
+            .episodes
+            .iter()
+            .filter(|e| e.state != PreloadState::Deleted)
+            .map(|e| (e.season, e.episode))
+            .collect();
+        if pairs.is_empty() {
+            None
+        } else {
+            Some(format_episode_ranges(&pairs))
         }
     }
 }
@@ -1262,6 +1422,10 @@ mod preload_tests {
             voice: Some("Дубляж".into()),
             speed_bps: 0,
             dl_phase: PreloadPhase::Metadata,
+            episodes: Vec::new(),
+            whole_torrent: true,
+            requested_by: None,
+            can_delete: true,
         }
     }
 
@@ -1289,12 +1453,43 @@ mod preload_tests {
 
         it.state = PreloadState::Ready;
         assert_eq!(it.status_text(), "Готово · играет с диска");
+
+        it.kind = MediaKind::Tv;
+        it.season = 1;
+        it.whole_torrent = false;
+        it.episodes = vec![PreloadEpisodeItem {
+            season: 1,
+            episode: 3,
+            state: PreloadState::Ready,
+            progress: 1.0,
+            size_bytes: Some(2_000_000_000),
+            episode_name: None,
+            ready_at: Some(Utc::now()),
+            delete_after: None,
+        }];
+        assert!(it.is_ready_for(MediaKind::Tv, 1, 3));
+        assert!(!it.is_ready_for(MediaKind::Tv, 1, 4));
+        assert_eq!(it.episodes_range_summary().as_deref(), Some("S01E03"));
     }
 }
 
 #[cfg(test)]
 mod catalog_tests {
     use super::*;
+
+    #[test]
+    fn size_and_speed_formatting() {
+        assert_eq!(GIB_BYTES, 1_073_741_824);
+        assert_eq!(format_size(0), "0 МБ");
+        assert_eq!(format_size(500), "1 МБ");
+        assert_eq!(format_size(500_000_000), "477 МБ");
+        assert_eq!(format_size(1_073_700_000), "1.0 ГБ");
+        assert_eq!(format_size(GIB_BYTES), "1.0 ГБ");
+        // Exact size of Harry Potter 1 Extended Cut shown as 16.77 GB on RuTracker.
+        assert_eq!(format_size(18_006_650_388), "16.8 ГБ");
+        assert_eq!(format_size(28_400_000_000), "26.4 ГБ");
+        assert_eq!(format_size(120 * GIB_BYTES), "120 ГБ");
+    }
 
     #[test]
     fn helpers() {

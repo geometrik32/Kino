@@ -17,6 +17,8 @@ pub struct ParsedTitle {
     pub subtitles: bool,
     /// Single season; `None` for films and multi-season packs.
     pub season: Option<i32>,
+    /// Inclusive episode range `(start, end)` when stated in the release title.
+    pub episode_range: Option<(i32, i32)>,
     pub year: Option<i32>,
     /// Upper bound of a year span such as `(2005-2020)` when stated.
     pub year_end: Option<i32>,
@@ -51,9 +53,24 @@ const STUDIOS: &[(&str, &str)] = &[
     ("гоблин", "Гоблин"),
     ("кравец", "Кравец"),
     ("сербин", "Сербин"),
+    ("володарский", "Володарский"),
     ("дохалов", "Дохалов"),
     ("живов", "Живов"),
 ];
+
+/// Studios that produce official Russian dubbing rather than multi-voiceover (MVO/AVO).
+fn is_dub_studio(studio: &str) -> bool {
+    matches!(studio, "Пифагор" | "Red Head Sound")
+}
+
+/// Detects combined single-letter voice lists like `| D, P |` or `| Д, П |` in Cyrillic titles.
+fn has_multi_cyr_voice(name: &str) -> bool {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)(?:(?:^|[\s|,/\[\(])[дd]\s*[,+/]\s*[palпал]|[palпал]\s*,\s*[дd])(?:$|[\s|,\]\)/])").unwrap()
+    })
+    .is_match(name)
+}
 
 static RE: LazyLock<Regexes> = LazyLock::new(Regexes::new);
 
@@ -80,8 +97,13 @@ struct Regexes {
     ukr_only: Regex,
     mbps: Regex,
     kbps: Regex,
-    episode: Regex,
-    x_episode: Regex,
+    ep_se: Regex,
+    ep_x: Regex,
+    ep_plus: Regex,
+    ep_ru_before: Regex,
+    ep_ru_after: Regex,
+    ep_en: Regex,
+    ep_of: Regex,
     sxx_exx: Regex,
     complete_series: Regex,
 }
@@ -116,16 +138,140 @@ impl Regexes {
             ukr_only: re(r"(?i)\b(ukr|укр)\b"),
             mbps: re(r"(?i)(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:mbps|mbit/s|mbit|мбит/с|мбит/сек|мбит)"),
             kbps: re(r"(?i)(\d{3,6})\s*(?:kbps|kbit/s|kbit|кбит/с|кбит/сек|кбит)"),
-            episode: re(
-                r"(?i)(?:\bs\d{1,2}e\d{1,3}(\s*[-–]\s*e?\d{1,3})?)|(?:\bсери[яи][:\s]*\d{1,3}(\s*[-–]\s*\d{1,3})?)",
+            ep_se: re(
+                r"(?i)\bs\d{1,2}\s*[._-]?\s*e(\d{1,3})(?:[-–](?:s\d{1,2}\s*[._-]?\s*)?e?(\d{1,3})|\s+[-–]\s+(?:s\d{1,2}\s*[._-]?\s*)?e(\d{1,3}))?\b",
             ),
-            x_episode: re(r"(?i)\b(?:[1-9]|[12]\d)x\d{2,3}\b"),
+            ep_x: re(r"(?i)(?:^|[\s\[(\/._-])(0?[1-9]|[12]\d)x(\d{2,3})(?:[-–]e?(\d{2,3}))?(?:\b|$)"),
+            ep_plus: re(
+                r"(?i)\+\s*(?:(\d{1,3})\s*[-–]\s*)?(\d{1,3})(?:\s*(?:из|of)\s*\d{1,3})?\s*(?:сери(?:я|и|й)|ep(?:isode)?s?)\b|\[\s*\+\s*(?:(\d{1,3})\s*[-–]\s*)?(\d{1,3})\s*(?:из|of)\s*\d{1,3}\s*\]",
+            ),
+            ep_ru_before: re(
+                r"(?i)(?:^|[\s\[(\(:,/+])(?:(\d{1,3})\s*[-–]\s*(\d{1,3})|(\d{1,3}))\s*сери(?:я|и|й)(?:\b|$)",
+            ),
+            ep_ru_after: re(r"(?i)\bсери(?:я|и|й)\s*[:.\-\s]*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\b"),
+            ep_en: re(r"(?i)\bep(?:isode)?s?\.?\s*[:\-]?\s*(\d{1,3})(?:\s*[-–]\s*(\d{1,3}))?\b"),
+            ep_of: re(
+                r"(?i)\b(\d{1,3})\s*[-–]\s*(\d{1,3})\s*(?:сери(?:я|и|й)|ep(?:isode)?s?)?\s*(?:из|of)\s*(\d{1,3})\b",
+            ),
             sxx_exx: re(
-                r"(?i)(?:\bs\d{1,2}(?:\s*[-–]\s*s?\d{1,2})?\s*[._-]?\s*e\d{1,3}\b|\b(?:[1-9]|[12]\d)x\d{2,3}\b)",
+                r"(?i)(?:\bs\d{1,2}(?:\s*[-–]\s*s?\d{1,2})?\s*[._-]?\s*e\d{1,3}\b|\b(?:0?[1-9]|[12]\d)x\d{2,3}\b)",
             ),
             complete_series: re(r"(?i)\bcomplete\s+series\b|\bсезоны\b|\bвсе\s+сезоны\b"),
         }
     }
+}
+
+fn norm_episode_span(a: &str, b: Option<&str>) -> Option<(i32, i32)> {
+    let first = a.parse::<i32>().ok()?;
+    if !(1..=2000).contains(&first) {
+        return None;
+    }
+    match b {
+        Some(bs) => {
+            let last = bs.parse::<i32>().ok()?;
+            (last >= first && last <= 2000).then_some((first, last))
+        }
+        None => Some((first, first)),
+    }
+}
+
+fn is_non_episode_of_prefix(prefix: &str) -> bool {
+    let trimmed =
+        prefix.trim_end_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '-' | '–' | '[' | '(' | '/'));
+    let word: String = trimmed
+        .chars()
+        .rev()
+        .take_while(|c| c.is_alphanumeric())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    matches!(
+        word.to_lowercase().as_str(),
+        "сезон"
+            | "сезона"
+            | "сезонов"
+            | "сезоны"
+            | "season"
+            | "seasons"
+            | "диск"
+            | "диска"
+            | "дисков"
+            | "disc"
+            | "disk"
+            | "dvd"
+            | "cd"
+            | "часть"
+            | "части"
+            | "частей"
+            | "part"
+            | "том"
+            | "тома"
+            | "vol"
+    )
+}
+
+/// Extracts `(episode_range, fallback_season_from_nnxee)` from a release name.
+fn extract_episode_info(name: &str, re: &Regexes) -> (Option<(i32, i32)>, Option<i32>) {
+    if let Some(c) = re.ep_se.captures(name) {
+        let end = c.get(2).or_else(|| c.get(3)).map(|m| m.as_str());
+        if let Some(span) = norm_episode_span(&c[1], end) {
+            return (Some(span), None);
+        }
+    }
+    if let Some(c) = re.ep_x.captures(name) {
+        let s = c[1].parse::<i32>().ok().filter(|&n| (1..=99).contains(&n));
+        if let Some(span) = norm_episode_span(&c[2], c.get(3).map(|m| m.as_str())) {
+            return (Some(span), s);
+        }
+    }
+    if let Some(c) = re.ep_plus.captures(name) {
+        let (start, end) = if let Some(last) = c.get(2) {
+            (c.get(1).map(|m| m.as_str()).unwrap_or("1"), Some(last.as_str()))
+        } else {
+            (
+                c.get(3).map(|m| m.as_str()).unwrap_or("1"),
+                c.get(4).map(|m| m.as_str()),
+            )
+        };
+        if let Some(span) = norm_episode_span(start, end) {
+            return (Some(span), None);
+        }
+    }
+    if let Some(c) = re.ep_ru_before.captures(name) {
+        let span = if let (Some(a), Some(b)) = (c.get(1), c.get(2)) {
+            norm_episode_span(a.as_str(), Some(b.as_str()))
+        } else if let Some(one) = c.get(3) {
+            norm_episode_span(one.as_str(), None)
+        } else {
+            None
+        };
+        if let Some(span) = span {
+            return (Some(span), None);
+        }
+    }
+    if let Some(c) = re.ep_ru_after.captures(name) {
+        if let Some(span) = norm_episode_span(&c[1], c.get(2).map(|m| m.as_str())) {
+            return (Some(span), None);
+        }
+    }
+    if let Some(c) = re.ep_en.captures(name) {
+        if let Some(span) = norm_episode_span(&c[1], c.get(2).map(|m| m.as_str())) {
+            return (Some(span), None);
+        }
+    }
+    if let Some(c) = re.ep_of.captures(name) {
+        if let Some(m) = c.get(0) {
+            if !is_non_episode_of_prefix(&name[..m.start()]) {
+                if let (Some(span), Ok(total)) = (norm_episode_span(&c[1], Some(&c[2])), c[3].parse::<i32>()) {
+                    if span.1 <= total && total <= 2000 {
+                        return (Some(span), None);
+                    }
+                }
+            }
+        }
+    }
+    (None, None)
 }
 
 pub fn parse_title(name: &str) -> ParsedTitle {
@@ -143,17 +289,22 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         .map(|q| format!("{q}p"))
         .unwrap_or_else(|| "SD".into());
 
-    let season = re.season.captures(name).and_then(|c| {
-        let groups = [(1, 2), (3, 4), (5, 6), (7, 0)];
-        groups.iter().find_map(|&(a, b)| {
-            let first = c.get(a)?.as_str().parse::<i32>().ok()?;
-            match c.get(b).and_then(|m| m.as_str().parse::<i32>().ok()) {
-                // A range of seasons is a pack, not one season.
-                Some(last) if last != first => Some(None),
-                _ => Some(Some(first)),
-            }
+    let (season, is_multi_season) = re
+        .season
+        .captures(name)
+        .and_then(|c| {
+            let groups = [(1, 2), (3, 4), (5, 6), (7, 0)];
+            groups.iter().find_map(|&(a, b)| {
+                let first = c.get(a)?.as_str().parse::<i32>().ok()?;
+                match c.get(b).and_then(|m| m.as_str().parse::<i32>().ok()) {
+                    // A range of seasons is a pack, not one season.
+                    Some(last) if last != first => Some((None, true)),
+                    _ => Some((Some(first), false)),
+                }
+            })
         })
-    });
+        .unwrap_or((None, false));
+    let is_multi_season = is_multi_season || (season.is_none() && re.complete_series.is_match(name));
 
     let codec = if re.hevc.is_match(name) {
         Some("HEVC")
@@ -167,23 +318,57 @@ pub fn parse_title(name: &str) -> ParsedTitle {
 
     let has_cyr = has_cyrillic(name);
     let audio_text = re.sub_lang.replace_all(name, " ");
-    let studio = STUDIOS.iter().find(|(k, _)| lower.contains(k)).map(|(_, v)| *v);
-    let voice = match studio {
-        Some(s) => s.to_string(),
-        None if re.dub.is_match(name) => "Дубляж".into(),
-        None if re.mvo.is_match(name) => "Многоголосый".into(),
-        None if re.dvo.is_match(name) => "Двухголосый".into(),
-        None if re.avo.is_match(name) => "Авторский".into(),
-        None if has_cyr && re.dub_cyr.is_match(name) => "Дубляж".into(),
-        None if re.rus.is_match(&audio_text) => "Русский".into(),
-        None if re.orig.is_match(&audio_text) => "Оригинал".into(),
-        None if has_cyr => "Русский".into(),
-        None => "Оригинал".into(),
+    let mut matched_studios: Vec<(usize, &str)> = Vec::new();
+    for &(k, v) in STUDIOS {
+        if let Some(pos) = lower.find(k) {
+            if let Some(existing) = matched_studios.iter_mut().find(|(_, s)| *s == v) {
+                existing.0 = existing.0.min(pos);
+            } else {
+                matched_studios.push((pos, v));
+            }
+        }
+    }
+    matched_studios.sort_by_key(|(pos, _)| *pos);
+
+    let has_dub = re.dub.is_match(name) || (has_cyr && re.dub_cyr.is_match(name));
+    let has_other_voice = re.mvo.is_match(name)
+        || re.dvo.is_match(name)
+        || re.avo.is_match(name)
+        || (has_cyr && has_multi_cyr_voice(name));
+
+    let voice = if has_dub {
+        if matched_studios.len() == 1 && !has_other_voice {
+            let (pos, s) = matched_studios[0];
+            let co_listed = lower[..pos].trim_end().ends_with([',', '+']);
+            if is_dub_studio(s) && !co_listed {
+                s.to_string()
+            } else {
+                "Дубляж".into()
+            }
+        } else {
+            "Дубляж".into()
+        }
+    } else if let Some((_, s)) = matched_studios.first() {
+        (*s).to_string()
+    } else if re.mvo.is_match(name) {
+        "Многоголосый".into()
+    } else if re.dvo.is_match(name) {
+        "Двухголосый".into()
+    } else if re.avo.is_match(name) {
+        "Авторский".into()
+    } else if re.rus.is_match(&audio_text) {
+        "Русский".into()
+    } else if re.orig.is_match(&audio_text) {
+        "Оригинал".into()
+    } else if has_cyr {
+        "Русский".into()
+    } else {
+        "Оригинал".into()
     };
     let language = if voice == "Оригинал" {
         "Английский"
     } else if re.ukr_only.is_match(name)
-        && studio.is_none()
+        && matched_studios.is_empty()
         && !re.rus.is_match(&audio_text)
         && !lower.contains("rus")
         && !lower.contains("рус")
@@ -194,10 +379,11 @@ pub fn parse_title(name: &str) -> ParsedTitle {
     };
 
     let (year, year_end) = extract_years(name, re);
-    let has_series_marker = re.season.is_match(name)
-        || re.episode.is_match(name)
-        || re.x_episode.is_match(name)
-        || re.complete_series.is_match(name);
+    let (raw_ep_range, ep_season) = extract_episode_info(name, re);
+    let episode_range = (!is_multi_season).then_some(raw_ep_range).flatten();
+    let season = season.or(if is_multi_season { None } else { ep_season });
+    let single_episode = matches!(episode_range, Some((a, b)) if a == b);
+    let has_series_marker = re.season.is_match(name) || raw_ep_range.is_some() || re.complete_series.is_match(name);
 
     ParsedTitle {
         quality,
@@ -207,14 +393,12 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         voice,
         language: language.into(),
         subtitles: re.sub.is_match(name),
-        season: season.flatten(),
+        season,
+        episode_range,
         year,
         year_end,
         bitrate_kbps: bitrate_in(name),
-        single_episode: re
-            .episode
-            .captures(name)
-            .is_some_and(|c| c.get(1).is_none() && c.get(2).is_none()),
+        single_episode,
         has_series_marker,
     }
 }
@@ -419,5 +603,102 @@ mod tests {
         let p =
             parse_title("Сверхъестественное. Разлом времени / Taklee Genesis x Worlds Collide (2024) WEB-DL 1080p | D");
         assert_eq!((p.year, p.season, p.has_series_marker), (Some(2024), None, false));
+    }
+
+    #[test]
+    fn voice_prioritizes_dub_over_secondary_tracks_and_picks_earliest_studio() {
+        let p = parse_title(
+            "Гарри Поттер и философский камень / Harry Potter and the Philosopher's Stone (2001) BDRip 1080p [Расширенная версия / Extended Cut] Dub + 2x AVO (Володарский, Сербин) + Original (Eng) + Sub (Rus, Eng) | [Дубляж Сербин Володарский].rus",
+        );
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title(
+            "Гарри Поттер и философский камень (2001) BDRip-AVC [Театральная версия / Theatrical Cut] Dub (BD EUR) + MVO (Кравец) + Original (Eng) + Sub (Rus, Ukr, Eng) | [Дубляж Кравец].rus",
+        );
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title(
+            "Гарри Поттер (2001) ДБ, 3 x ПМ, 5 x ПД, 3 x АП, 2 x ЛО, СТ / Blu-Ray Remux (1080p) | Дубляж | Карусель | Кравец",
+        );
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title(
+            "Человек-паук / Spider-Man (2002) BDRip 1080p | D | MovieDalen, Red Head Sound, HDRezka Studio",
+        );
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title("Человек-паук / Spider-Man (2002) BDRip 1080p | D | MovieDalen, Red Head Sound");
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title(
+            "Стражи Галактики / Guardians (2023) WEB-DL 1080p | D, P | MovieDalen, Red Head Sound, HDrezka Studio, Jaskier, LostFilm, TVShows",
+        );
+        assert_eq!(p.voice, "Дубляж");
+
+        let p = parse_title("Стражи Галактики (2023) WEB-DL 1080p от Scarabey | Full IMAX | D | Red Head Sound");
+        assert_eq!(p.voice, "Red Head Sound");
+
+        let p = parse_title("План А / Plan A (2024) WEB-DL 1080p | D | Red Head Sound");
+        assert_eq!(p.voice, "Red Head Sound");
+
+        let p = parse_title("Фильм / Movie (2024) BDRip 1080p Dub (Пифагор) + Original (Eng)");
+        assert_eq!(p.voice, "Пифагор");
+
+        let p = parse_title("Сериал / Show (2024) WEB-DL 1080p [MVO] [HDRezka Studio, NewStudio]");
+        assert_eq!(p.voice, "HDRezka");
+
+        let p = parse_title("Фильм / Movie (2001) BDRip 1080p AVO (Леонид Володарский) + AVO (Юрий Сербин)");
+        assert_eq!(p.voice, "Володарский");
+    }
+
+    #[test]
+    fn episode_ranges_from_tracker_formats() {
+        let p = parse_title("Аутсорс / S1E1-7 of 8 (2025) WEB-DL 1080p");
+        assert_eq!(
+            (p.season, p.episode_range, p.single_episode),
+            (Some(1), Some((1, 7)), false)
+        );
+
+        let p = parse_title("Аутсорс (1 сезон: 1-8 серии из 8) / 2024 / РУ, СТ / WEB-DL (1080p)");
+        assert_eq!(
+            (p.season, p.episode_range, p.single_episode),
+            (Some(1), Some((1, 8)), false)
+        );
+
+        let p = parse_title("Аутсорс [01x01-07 из 08] (2025) WEB-DL 1080p");
+        assert_eq!(
+            (p.season, p.episode_range, p.has_series_marker),
+            (Some(1), Some((1, 7)), true)
+        );
+
+        let p = parse_title("Аутсорс / S1 (2025) WEB-DL 1080p [+8 серия]");
+        assert_eq!(
+            (p.season, p.episode_range, p.single_episode),
+            (Some(1), Some((1, 8)), false)
+        );
+
+        let p = parse_title("Аутсорс [S1] (2025) WEB-DL 1080p");
+        assert_eq!((p.season, p.episode_range, p.has_series_marker), (Some(1), None, true));
+
+        let p = parse_title("Во все тяжкие / Сезон: 2 / Серии: 1-13 из 13 [BDRip 1080p]");
+        assert_eq!((p.season, p.episode_range), (Some(2), Some((1, 13))));
+
+        let p = parse_title("Смешарики [001-209 из 209] (2004-2012) WEB-DL 1080p");
+        assert_eq!(p.episode_range, Some((1, 209)));
+
+        let p = parse_title("Аутсорс 8 серия (2025) WEB-DL 1080p");
+        assert_eq!((p.episode_range, p.single_episode), (Some((8, 8)), true));
+
+        let p = parse_title("Breaking.Bad.S03E01-E13.1080p.WEB-DL");
+        assert_eq!(
+            (p.season, p.episode_range, p.single_episode),
+            (Some(3), Some((1, 13)), false)
+        );
+
+        let p = parse_title("Сверхъестественное / Supernatural [S01-15] (2005-2020) BDRip 1080p");
+        assert_eq!((p.season, p.episode_range), (None, None));
+
+        let p = parse_title("Breaking Bad S01-15E01-327 Complete 720p");
+        assert_eq!((p.season, p.episode_range), (None, None));
     }
 }

@@ -1,15 +1,20 @@
 //! "Мои" (titles by status, type and sort) and "Профиль" (theme, downloads, default release settings, history).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use dioxus::prelude::*;
 use kino_core::{
-    clock, episode_code, image_url, normalize_quality_key, CalendarEntry, HistoryEntry, ImageSize, MediaKind,
-    PreloadItem, PreloadState, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
+    clock, episode_code, format_episode_ranges, format_speed, image_url, normalize_quality_key, CalendarEntry,
+    HistoryEntry, ImageSize, MediaKind, PreloadEpisodeItem, PreloadItem, PreloadPhase, PreloadState, TitleState,
+    TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
 };
 
 use crate::icons::{self, Icon};
 use crate::releases::{ReleaseSort, CODECS, SEEDER_STEPS, SIZE_STEPS};
-use crate::{fallback_bg, handle_aux_click, is_plain_primary_click, ru_date, title_href, AvatarContent, PosterCard};
+use crate::{
+    fallback_bg, handle_aux_click, is_plain_primary_click, plural, ru_date, title_href, AvatarContent, PosterCard,
+};
 
 /// Sub-section inside "Мои".
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -904,22 +909,38 @@ pub fn ProfileView(
     on_theme: EventHandler<Theme>,
     on_prefs: EventHandler<UserPrefs>,
     on_delete_preload: EventHandler<i64>,
+    #[props(default)] on_delete_preload_episode: Option<EventHandler<(i64, i32, i32)>>,
     #[props(default)] dl_error: Option<String>,
     #[props(default)] on_refresh: Option<EventHandler<()>>,
     #[props(default)] initial_prefs_open: bool,
     #[props(default)] on_prefs_open: Option<EventHandler<bool>>,
     #[props(default)] initial_hist_limit: Option<usize>,
     #[props(default)] on_hist_limit: Option<EventHandler<usize>>,
+    #[props(default)] initial_expanded_series: Vec<i64>,
+    #[props(default)] on_toggle_series: Option<EventHandler<i64>>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
     let mut prefs_open = use_signal(|| initial_prefs_open);
     let mut hist_limit = use_signal(|| initial_hist_limit.unwrap_or(10));
+    let mut expanded_series = use_signal(|| initial_expanded_series);
     let mut toggle_prefs = move || {
         let next = !*prefs_open.peek();
         prefs_open.set(next);
         if let Some(cb) = on_prefs_open {
             cb.call(next);
+        }
+    };
+    let mut toggle_series = move |tmdb_id: i64| {
+        expanded_series.with_mut(|list| {
+            if let Some(pos) = list.iter().position(|&x| x == tmdb_id) {
+                list.remove(pos);
+            } else {
+                list.push(tmdb_id);
+            }
+        });
+        if let Some(cb) = on_toggle_series {
+            cb.call(tmdb_id);
         }
     };
     let mut bump_hist_limit = move || {
@@ -1010,11 +1031,43 @@ pub fn ProfileView(
                 }
                 if preloads.is_empty() {
                     div { class: "panel muted-box",
-                        "Нет активных загрузок. Для редких раздач с малым числом сидов нажмите «Заранее» в списке раздач."
+                        "Нет активных загрузок. Для редких раздач с малым числом сидов нажмите «Заранее» в списке раздач или значок загрузки напротив нужной серии."
                     }
                 } else {
-                    for item in preloads {
-                        PreloadRow { key: "{item.id}", item, now, on_open, on_delete: on_delete_preload }
+                    {
+                        let groups = group_profile_downloads(preloads);
+                        let expanded_ids = expanded_series();
+                        rsx! {
+                            for entry in groups {
+                                match entry {
+                                    DownloadGroup::Movie(item) => rsx! {
+                                        PreloadRow {
+                                            key: "m-{item.id}",
+                                            item,
+                                            now,
+                                            on_open,
+                                            on_delete: on_delete_preload,
+                                        }
+                                    },
+                                    DownloadGroup::Series { tmdb_id, items } => {
+                                        let is_open = expanded_ids.contains(&tmdb_id);
+                                        rsx! {
+                                            SeriesPreloadCard {
+                                                key: "s-{tmdb_id}",
+                                                tmdb_id,
+                                                items,
+                                                now,
+                                                expanded: is_open,
+                                                on_toggle: move |tid| toggle_series(tid),
+                                                on_open,
+                                                on_delete: on_delete_preload,
+                                                on_delete_episode: on_delete_preload_episode,
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1217,16 +1270,12 @@ fn PrefYesNo(name: &'static str, value: Option<bool>, on_select: EventHandler<Op
     }
 }
 
-#[component]
-fn PreloadRow(
-    item: PreloadItem,
+fn retention_tag(
+    state: PreloadState,
+    delete_after: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-    on_open: EventHandler<(MediaKind, i64)>,
-    on_delete: EventHandler<i64>,
-) -> Element {
-    let pct = (item.progress * 100.0).clamp(0.0, 100.0).round();
-    let status_text = item.status_text();
-    let delete_tag = match (item.state, item.delete_after) {
+) -> Option<(String, &'static str)> {
+    match (state, delete_after) {
         (_, Some(at)) => {
             let days = (at - now).num_hours().max(0) as f64 / 24.0;
             if days < 1.0 {
@@ -1237,7 +1286,48 @@ fn PreloadRow(
         }
         (PreloadState::Ready, None) => Some(("Удалится после просмотра".to_string(), "tag")),
         _ => None,
-    };
+    }
+}
+
+enum DownloadGroup {
+    Movie(PreloadItem),
+    Series { tmdb_id: i64, items: Vec<PreloadItem> },
+}
+
+fn group_profile_downloads(preloads: Vec<PreloadItem>) -> Vec<DownloadGroup> {
+    let mut out: Vec<DownloadGroup> = Vec::new();
+    let mut tv_idx: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    for item in preloads {
+        if item.kind == MediaKind::Tv {
+            if let Some(&pos) = tv_idx.get(&item.tmdb_id) {
+                if let DownloadGroup::Series { ref mut items, .. } = out[pos] {
+                    items.push(item);
+                }
+            } else {
+                tv_idx.insert(item.tmdb_id, out.len());
+                out.push(DownloadGroup::Series {
+                    tmdb_id: item.tmdb_id,
+                    items: vec![item],
+                });
+            }
+        } else {
+            out.push(DownloadGroup::Movie(item));
+        }
+    }
+    out
+}
+
+#[component]
+fn PreloadRow(
+    item: PreloadItem,
+    now: DateTime<Utc>,
+    on_open: EventHandler<(MediaKind, i64)>,
+    on_delete: EventHandler<i64>,
+) -> Element {
+    let mut confirm_del = use_signal(|| false);
+    let pct = (item.progress * 100.0).clamp(0.0, 100.0).round();
+    let status_text = item.status_text();
+    let delete_tag = retention_tag(item.state, item.delete_after, now);
     let size = item.size_bytes.map(|b| crate::human_size(b.max(0) as u64));
     let id = item.id;
     let (kind, tmdb_id) = (item.kind, item.tmdb_id);
@@ -1269,6 +1359,7 @@ fn PreloadRow(
     let href = title_href(kind, tmdb_id);
     let in_progress = matches!(item.state, PreloadState::Queued | PreloadState::Downloading);
     let wait_bar = in_progress && item.progress <= 0.001;
+    let confirm = confirm_del();
     rsx! {
         div { class: "dl-row",
             a {
@@ -1299,6 +1390,12 @@ fn PreloadRow(
                         if let Some(q) = q_tag { span { class: "tag", "{q}" } }
                         if let Some(v) = voice_tag { span { class: "tag", "{v}" } }
                         if let Some(s) = size { span { class: "tag", "{s}" } }
+                        if let Some(who) = item.requested_by.as_deref() {
+                            span { class: "tag", title: "Добавил: {who}",
+                                Icon { svg: icons::USERS, class: "ic xs" }
+                                "{who}"
+                            }
+                        }
                         if let Some((txt, tcls)) = delete_tag {
                             span { class: "{tcls}",
                                 Icon { svg: icons::CLOCK, class: "ic xs" }
@@ -1313,15 +1410,592 @@ fn PreloadRow(
                     }
                 }
             }
-            button {
-                class: "round-act danger",
-                title: "Удалить загрузку",
-                "aria-label": "Удалить загрузку",
-                onclick: move |e| {
-                    e.stop_propagation();
-                    on_delete.call(id);
+            if item.can_delete {
+                button {
+                    class: if confirm { "round-act danger-confirm" } else { "round-act danger" },
+                    title: if confirm { "Нажмите ещё раз, чтобы удалить загрузку" } else { "Удалить загрузку" },
+                    "aria-label": if confirm { "Подтвердить удаление" } else { "Удалить загрузку" },
+                    onblur: move |_| confirm_del.set(false),
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        if *confirm_del.peek() {
+                            confirm_del.set(false);
+                            on_delete.call(id);
+                        } else {
+                            confirm_del.set(true);
+                        }
+                    },
+                    Icon { svg: icons::TRASH, class: "ic sm" }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct DrawerEpisode {
+    preload_id: i64,
+    can_delete: bool,
+    dl_phase: PreloadPhase,
+    speed_bps: u64,
+    quality: Option<String>,
+    voice: Option<String>,
+    ep: PreloadEpisodeItem,
+}
+
+#[component]
+fn SeriesPreloadCard(
+    tmdb_id: i64,
+    items: Vec<PreloadItem>,
+    now: DateTime<Utc>,
+    expanded: bool,
+    on_toggle: EventHandler<i64>,
+    on_open: EventHandler<(MediaKind, i64)>,
+    on_delete: EventHandler<i64>,
+    #[props(default)] on_delete_episode: Option<EventHandler<(i64, i32, i32)>>,
+) -> Element {
+    let mut confirm_del = use_signal(|| false);
+    let primary_title = items
+        .iter()
+        .find_map(|p| p.media_title.as_deref())
+        .map(str::to_owned)
+        .or_else(|| items.iter().find_map(|p| p.title.clone()))
+        .unwrap_or_else(|| format!("Сериал #{tmdb_id}"));
+    let poster_path = items.iter().find_map(|p| p.poster_path.clone());
+    let release_sub = if items.len() == 1 {
+        items[0]
+            .media_title
+            .as_deref()
+            .and_then(|name| items[0].title.as_deref().filter(|raw| *raw != name))
+            .map(str::to_owned)
+    } else {
+        Some(format!(
+            "{} {}",
+            items.len(),
+            plural(items.len(), "раздача", "раздачи", "раздач")
+        ))
+    };
+
+    let mut seasons_map: BTreeMap<i32, Vec<DrawerEpisode>> = BTreeMap::new();
+    let mut no_ep_items: Vec<PreloadItem> = Vec::new();
+    let mut ready_ep_keys: Vec<(i32, i32)> = Vec::new();
+    let mut all_ep_keys: Vec<(i32, i32)> = Vec::new();
+
+    for item in &items {
+        let non_deleted: Vec<PreloadEpisodeItem> = item
+            .episodes
+            .iter()
+            .filter(|e| e.state != PreloadState::Deleted)
+            .cloned()
+            .collect();
+        if non_deleted.is_empty() {
+            no_ep_items.push(item.clone());
+            continue;
+        }
+        let q = item.quality_short().map(str::to_owned);
+        let v = item
+            .voice
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        for ep in non_deleted {
+            let key = (ep.season, ep.episode);
+            if !all_ep_keys.contains(&key) {
+                all_ep_keys.push(key);
+            }
+            if ep.state == PreloadState::Ready && !ready_ep_keys.contains(&key) {
+                ready_ep_keys.push(key);
+            }
+            seasons_map.entry(ep.season).or_default().push(DrawerEpisode {
+                preload_id: item.id,
+                can_delete: item.can_delete,
+                dl_phase: item.dl_phase,
+                speed_bps: item.speed_bps,
+                quality: q.clone(),
+                voice: v.clone(),
+                ep,
+            });
+        }
+    }
+    for rows in seasons_map.values_mut() {
+        rows.sort_by_key(|r| (r.ep.episode, r.preload_id));
+    }
+
+    let badge_lbl = if seasons_map.len() == 1 {
+        seasons_map
+            .keys()
+            .next()
+            .filter(|&&s| s > 0)
+            .map(|s| format!("S{s:02}"))
+            .unwrap_or_else(|| "TV".to_owned())
+    } else if items.len() == 1 && items[0].season > 0 {
+        format!("S{:02}", items[0].season)
+    } else {
+        "TV".to_owned()
+    };
+
+    let ep_summary_str = format_episode_ranges(&all_ep_keys);
+    let ep_summary = (!ep_summary_str.is_empty()).then_some(ep_summary_str);
+
+    let any_active = items
+        .iter()
+        .any(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading));
+    let any_ready = items.iter().any(|p| p.state == PreloadState::Ready) || !ready_ep_keys.is_empty();
+    let total_speed: u64 = items
+        .iter()
+        .filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
+        .map(|p| p.speed_bps)
+        .sum();
+    let agg_progress: f32 = {
+        let total_w: f64 = items.iter().map(|p| p.size_bytes.unwrap_or(1).max(1) as f64).sum();
+        let done_w: f64 = items
+            .iter()
+            .map(|p| {
+                let w = p.size_bytes.unwrap_or(1).max(1) as f64;
+                let pr = if p.state == PreloadState::Ready {
+                    1.0
+                } else {
+                    f64::from(p.progress.clamp(0.0, 1.0))
+                };
+                w * pr
+            })
+            .sum();
+        if total_w > 0.0 {
+            (done_w / total_w) as f32
+        } else {
+            0.0
+        }
+    };
+    let (status_cls, status_text) = if any_active {
+        let pct = (agg_progress * 100.0).clamp(0.0, 100.0).round() as u32;
+        let lbl = if total_speed > 0 && agg_progress > 0.0 {
+            format!("Качается {pct}% · {}", format_speed(total_speed))
+        } else if agg_progress > 0.0 {
+            format!("Качается {pct}%")
+        } else {
+            "В очереди".to_owned()
+        };
+        ("tag acc", lbl)
+    } else if any_ready {
+        let lbl = if !ready_ep_keys.is_empty() {
+            let n = ready_ep_keys.len();
+            format!("На сервере · {n} {}", plural(n, "серия", "серии", "серий"))
+        } else {
+            "Готово".to_owned()
+        };
+        ("tag ok", lbl)
+    } else {
+        ("tag err", "Ошибка".to_owned())
+    };
+
+    let mut qualities: Vec<String> = Vec::new();
+    let mut voices: Vec<String> = Vec::new();
+    let mut requesters: Vec<String> = Vec::new();
+    let mut known_bytes: i64 = 0;
+    for p in &items {
+        if let Some(q) = p.quality_short() {
+            let qs = q.to_owned();
+            if !qualities.contains(&qs) {
+                qualities.push(qs);
+            }
+        }
+        if let Some(v) = p.voice.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let vs = v.to_owned();
+            if !voices.contains(&vs) {
+                voices.push(vs);
+            }
+        }
+        if let Some(who) = p.requested_by.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            for part in who.split(", ").map(str::trim).filter(|s| !s.is_empty()) {
+                let ps = part.to_owned();
+                if !requesters.contains(&ps) {
+                    requesters.push(ps);
+                }
+            }
+        }
+        if let Some(b) = p.size_bytes.filter(|&b| b > 0) {
+            known_bytes += b;
+        }
+    }
+    let delete_tag = if !any_active && any_ready {
+        let min_del = items.iter().filter_map(|p| p.delete_after).min();
+        retention_tag(PreloadState::Ready, min_del, now)
+    } else {
+        None
+    };
+
+    let href = title_href(MediaKind::Tv, tmdb_id);
+    let pct = (agg_progress * 100.0).clamp(0.0, 100.0).round();
+    let wait_bar = any_active && agg_progress <= 0.001;
+    let total_eps = all_ep_keys.len();
+    let toggle_lbl = if total_eps > 0 {
+        format!("Серии · {total_eps}")
+    } else {
+        "Серии".to_owned()
+    };
+    let single_deletable_id = (items.len() == 1 && items[0].can_delete).then(|| items[0].id);
+    let show_ep_release = items.len() > 1;
+    let confirm = confirm_del();
+    let card_cls = if expanded {
+        "dl-series-card open"
+    } else {
+        "dl-series-card"
+    };
+    let bar_cls = if wait_bar { "dl-bar wait" } else { "dl-bar" };
+    let toggle_cls = if expanded {
+        "chip sm active dl-ep-toggle"
+    } else {
+        "chip sm dl-ep-toggle"
+    };
+    let toggle_title = if expanded {
+        "Скрыть серии"
+    } else {
+        "Показать скачанные серии"
+    };
+    let toggle_chev_cls = if expanded { "ic xs rot" } else { "ic xs" };
+    let del_cls = if confirm {
+        "round-act danger-confirm"
+    } else {
+        "round-act danger"
+    };
+    let del_title = if confirm {
+        "Нажмите ещё раз, чтобы удалить все серии этого релиза"
+    } else {
+        "Удалить загрузку"
+    };
+    let del_aria = if confirm {
+        "Подтвердить удаление"
+    } else {
+        "Удалить загрузку"
+    };
+    let req_label = (!requesters.is_empty()).then(|| requesters.join(", "));
+    let can_delete_season = items.len() > 1;
+
+    rsx! {
+        div { class: "{card_cls}",
+            div { class: "dl-series-head",
+                a {
+                    class: "dl-main",
+                    href: "{href}",
+                    onclick: move |e: Event<MouseData>| {
+                        if is_plain_primary_click(&e) {
+                            e.prevent_default();
+                            on_open.call((MediaKind::Tv, tmdb_id));
+                        }
+                    },
+                    onauxclick: handle_aux_click,
+                    div { class: "dl-poster", style: "background: {fallback_bg(tmdb_id)}",
+                        if let Some(p) = &poster_path {
+                            img { src: image_url(p, ImageSize::Poster), alt: "{primary_title}", loading: "lazy" }
+                            span { class: "dl-poster-tag over", "{badge_lbl}" }
+                        } else {
+                            span { class: "dl-poster-tag", "{badge_lbl}" }
+                        }
+                    }
+                    div { class: "dl-body",
+                        div { class: "dl-title", "{primary_title}" }
+                        if let Some(sub) = release_sub {
+                            div { class: "dl-sub", title: "{sub}", "{sub}" }
+                        }
+                        div { class: "dl-tags",
+                            span { class: "{status_cls}", "{status_text}" }
+                            if let Some(sum) = ep_summary {
+                                span { class: "tag srv", title: "Скачанные серии", "{sum}" }
+                            }
+                            for q in qualities {
+                                span { class: "tag", "{q}" }
+                            }
+                            for v in voices {
+                                span { class: "tag", "{v}" }
+                            }
+                            if known_bytes > 0 {
+                                span { class: "tag", "{crate::human_size(known_bytes as u64)}" }
+                            }
+                            if let Some(who) = req_label {
+                                span { class: "tag", title: "Добавил: {who}",
+                                    Icon { svg: icons::USERS, class: "ic xs" }
+                                    "{who}"
+                                }
+                            }
+                            if let Some((txt, tcls)) = delete_tag {
+                                span { class: "{tcls}",
+                                    Icon { svg: icons::CLOCK, class: "ic xs" }
+                                    "{txt}"
+                                }
+                            }
+                        }
+                        if any_active {
+                            div { class: "{bar_cls}",
+                                div { style: "width: {pct:.0}%" }
+                            }
+                        }
+                    }
+                }
+                div { class: "dl-series-acts",
+                    button {
+                        class: "{toggle_cls}",
+                        title: "{toggle_title}",
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            on_toggle.call(tmdb_id);
+                        },
+                        span { "{toggle_lbl}" }
+                        Icon { svg: icons::CHEV_D, class: toggle_chev_cls }
+                    }
+                    if let Some(pid) = single_deletable_id {
+                        button {
+                            class: "{del_cls}",
+                            title: "{del_title}",
+                            "aria-label": "{del_aria}",
+                            onblur: move |_| confirm_del.set(false),
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                if *confirm_del.peek() {
+                                    confirm_del.set(false);
+                                    on_delete.call(pid);
+                                } else {
+                                    confirm_del.set(true);
+                                }
+                            },
+                            Icon { svg: icons::TRASH, class: "ic sm" }
+                        }
+                    }
+                }
+            }
+            if expanded {
+                SeriesPreloadDrawer {
+                    tmdb_id,
+                    seasons_map,
+                    no_ep_items,
+                    show_ep_release,
+                    can_delete_season,
+                    now,
+                    on_open,
+                    on_delete,
+                    on_delete_episode,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SeriesPreloadDrawer(
+    tmdb_id: i64,
+    seasons_map: BTreeMap<i32, Vec<DrawerEpisode>>,
+    no_ep_items: Vec<PreloadItem>,
+    show_ep_release: bool,
+    can_delete_season: bool,
+    now: DateTime<Utc>,
+    on_open: EventHandler<(MediaKind, i64)>,
+    on_delete: EventHandler<i64>,
+    #[props(default)] on_delete_episode: Option<EventHandler<(i64, i32, i32)>>,
+) -> Element {
+    rsx! {
+        div { class: "dl-ep-drawer",
+            if seasons_map.is_empty() && no_ep_items.is_empty() {
+                div { class: "dl-ep-empty", "Нет данных о сериях." }
+            }
+            for (s_num, rows) in seasons_map {
+                {
+                    let ready_cnt = rows.iter().filter(|r| r.ep.state == PreloadState::Ready).count();
+                    let count_lbl = if ready_cnt == rows.len() {
+                        format!("{} {}", rows.len(), plural(rows.len(), "серия", "серии", "серий"))
+                    } else {
+                        format!("{ready_cnt} из {} готово", rows.len())
+                    };
+                    let single_s_pid = {
+                        let first = rows.first().filter(|r| r.can_delete).map(|r| r.preload_id);
+                        first.filter(|&pid| can_delete_season && rows.iter().all(|r| r.preload_id == pid))
+                    };
+                    let season_lbl = if s_num > 0 {
+                        format!("Сезон {s_num}")
+                    } else {
+                        "Серии".to_owned()
+                    };
+                    rsx! {
+                        div { key: "ds-{s_num}",
+                            div { class: "dl-ep-shead",
+                                span { class: "dl-ep-stitle", "{season_lbl}" }
+                                span { class: "muted", "{count_lbl}" }
+                                if let Some(pid) = single_s_pid {
+                                    SeriesSeasonDeleteBtn { preload_id: pid, on_delete }
+                                }
+                            }
+                            div { class: "dl-ep-rows",
+                                for row in rows {
+                                    SeriesEpisodeRow {
+                                        key: "{row.preload_id}-{row.ep.season}-{row.ep.episode}",
+                                        tmdb_id,
+                                        row,
+                                        show_release: show_ep_release,
+                                        now,
+                                        on_open,
+                                        on_delete_episode,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for rel_item in no_ep_items {
+                SeriesPendingReleaseRow {
+                    key: "nop-{rel_item.id}",
+                    item: rel_item,
+                    on_delete,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SeriesSeasonDeleteBtn(preload_id: i64, on_delete: EventHandler<i64>) -> Element {
+    let mut confirm = use_signal(|| false);
+    rsx! {
+        button {
+            class: if confirm() { "link warn" } else { "link" },
+            title: "Удалить этот сезон с сервера",
+            onblur: move |_| confirm.set(false),
+            onclick: move |e| {
+                e.stop_propagation();
+                if *confirm.peek() {
+                    confirm.set(false);
+                    on_delete.call(preload_id);
+                } else {
+                    confirm.set(true);
+                }
+            },
+            if confirm() { "Точно удалить сезон?" } else { "Удалить сезон" }
+        }
+    }
+}
+
+#[component]
+fn SeriesPendingReleaseRow(item: PreloadItem, on_delete: EventHandler<i64>) -> Element {
+    let mut confirm = use_signal(|| false);
+    let label = if item.season > 0 {
+        format!("Сезон {}", item.season)
+    } else {
+        item.title.clone().unwrap_or_else(|| "Раздача".to_owned())
+    };
+    let status = item.status_text();
+    let pid = item.id;
+    rsx! {
+        div { class: "dl-ep-rel-note",
+            span { "{label} · {status} — список серий появится после получения метаданных" }
+            if item.can_delete {
+                button {
+                    class: if confirm() { "round-act xs danger-confirm" } else { "round-act xs danger" },
+                    title: if confirm() { "Нажмите ещё раз, чтобы удалить" } else { "Удалить раздачу" },
+                    onblur: move |_| confirm.set(false),
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        if *confirm.peek() {
+                            confirm.set(false);
+                            on_delete.call(pid);
+                        } else {
+                            confirm.set(true);
+                        }
+                    },
+                    Icon { svg: icons::TRASH, class: "ic xs" }
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn SeriesEpisodeRow(
+    tmdb_id: i64,
+    row: DrawerEpisode,
+    show_release: bool,
+    now: DateTime<Utc>,
+    on_open: EventHandler<(MediaKind, i64)>,
+    #[props(default)] on_delete_episode: Option<EventHandler<(i64, i32, i32)>>,
+) -> Element {
+    let mut confirm_del = use_signal(|| false);
+    let ep = &row.ep;
+    let code = episode_code(ep.season, ep.episode);
+    let title_txt = match ep.episode_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => format!("{}. {n}", ep.episode),
+        None => format!("Серия {}", ep.episode),
+    };
+    let st_cls = match ep.state {
+        PreloadState::Ready => "tag ok",
+        PreloadState::Queued | PreloadState::Downloading => "tag acc",
+        PreloadState::Failed => "tag err",
+        PreloadState::Deleted => "tag",
+    };
+    let st_lbl = if ep.state == PreloadState::Ready {
+        "На сервере".to_owned()
+    } else {
+        ep.status_text(row.dl_phase, row.speed_bps)
+    };
+    let sz_txt = ep.size_bytes.filter(|&b| b > 0).map(|b| crate::human_size(b as u64));
+    let href = title_href(MediaKind::Tv, tmdb_id);
+    let pid = row.preload_id;
+    let (s_num, ep_num) = (ep.season, ep.episode);
+    let confirm = confirm_del();
+    let del_days = ep.delete_after.map(|at| (at - now).num_hours().max(0) as f64 / 24.0);
+    rsx! {
+        div { class: "dl-ep-row",
+            a {
+                class: "dl-ep-main",
+                href: "{href}",
+                onclick: move |e: Event<MouseData>| {
+                    if is_plain_primary_click(&e) {
+                        e.prevent_default();
+                        on_open.call((MediaKind::Tv, tmdb_id));
+                    }
                 },
-                Icon { svg: icons::TRASH, class: "ic sm" }
+                onauxclick: handle_aux_click,
+                span { class: "dl-ep-code", "{code}" }
+                span { class: "dl-ep-name", title: "{title_txt}", "{title_txt}" }
+            }
+            div { class: "dl-ep-meta",
+                if show_release {
+                    if let Some(ref q) = row.quality {
+                        span { class: "tag", "{q}" }
+                    }
+                    if let Some(ref v) = row.voice {
+                        span { class: "tag", "{v}" }
+                    }
+                }
+                if let Some(sz) = sz_txt {
+                    span { class: "dl-ep-sz", "{sz}" }
+                }
+                span { class: "{st_cls}", "{st_lbl}" }
+                if let Some(days) = del_days {
+                    {
+                        let del_lbl = if days < 1.0 {
+                            "удалится сегодня".to_owned()
+                        } else {
+                            format!("удалится через {} дн.", days.ceil())
+                        };
+                        rsx! { span { class: "tag warn", "{del_lbl}" } }
+                    }
+                }
+            }
+            if let (true, Some(cb)) = (row.can_delete, on_delete_episode) {
+                button {
+                    class: if confirm { "round-act xs danger-confirm" } else { "round-act xs danger" },
+                    title: if confirm { "Нажмите ещё раз, чтобы удалить серию" } else { "Удалить серию с сервера" },
+                    "aria-label": if confirm { "Подтвердить удаление серии" } else { "Удалить серию с сервера" },
+                    onblur: move |_| confirm_del.set(false),
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        if *confirm_del.peek() {
+                            confirm_del.set(false);
+                            cb.call((pid, s_num, ep_num));
+                        } else {
+                            confirm_del.set(true);
+                        }
+                    },
+                    Icon { svg: icons::TRASH, class: "ic xs" }
+                }
             }
         }
     }
@@ -1340,5 +2014,47 @@ mod tests {
         };
         assert_eq!(MyFilters::decode(&f.encode()), f);
         assert_eq!(MyFilters::decode("invalid"), MyFilters::default());
+    }
+
+    #[test]
+    fn groups_tv_preloads_by_series_and_keeps_movies_separate() {
+        let base = |id, kind, tmdb_id, season| PreloadItem {
+            id,
+            kind,
+            tmdb_id,
+            season,
+            infohash: format!("{id:040}"),
+            title: None,
+            state: PreloadState::Ready,
+            progress: 1.0,
+            size_bytes: None,
+            requested_at: Utc::now(),
+            ready_at: Some(Utc::now()),
+            delete_after: None,
+            poster_path: None,
+            media_title: None,
+            quality: None,
+            voice: None,
+            speed_bps: 0,
+            dl_phase: PreloadPhase::Ready,
+            whole_torrent: kind == MediaKind::Movie,
+            episodes: Vec::new(),
+            requested_by: None,
+            can_delete: true,
+        };
+        let grouped = group_profile_downloads(vec![
+            base(1, MediaKind::Tv, 250703, 1),
+            base(2, MediaKind::Movie, 603, 0),
+            base(3, MediaKind::Tv, 250703, 2),
+        ]);
+        assert_eq!(grouped.len(), 2);
+        match &grouped[0] {
+            DownloadGroup::Series { tmdb_id, items } => {
+                assert_eq!(*tmdb_id, 250703);
+                assert_eq!(items.len(), 2);
+            }
+            _ => panic!("expected series group first"),
+        }
+        assert!(matches!(grouped[1], DownloadGroup::Movie(ref m) if m.tmdb_id == 603));
     }
 }

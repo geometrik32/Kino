@@ -331,12 +331,14 @@ impl SyncHub {
 
     /// Broadcasts `PreloadReady` to active players watching `(kind, tmdb_id)` when their download finishes.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_preload_ready(
         &self,
         ready_users: &[i64],
         kind: MediaKind,
         tmdb_id: i64,
         season: i32,
+        episode: i32,
         infohash: &str,
         title: Option<&str>,
         quality: Option<&str>,
@@ -347,6 +349,7 @@ impl SyncHub {
             kind,
             tmdb_id,
             season,
+            episode,
             infohash,
             title,
             quality,
@@ -362,6 +365,7 @@ impl SyncHub {
         kind: MediaKind,
         tmdb_id: i64,
         season: i32,
+        episode: i32,
         infohash: &str,
         title: Option<&str>,
         quality: Option<&str>,
@@ -383,6 +387,7 @@ impl SyncHub {
             kind,
             tmdb_id,
             season,
+            episode,
             infohash: infohash.to_ascii_lowercase(),
             title: title.map(str::to_owned),
             quality: quality.map(str::to_owned),
@@ -1406,6 +1411,7 @@ mod tests {
             kind: MediaKind::Movie,
             tmdb_id: 603,
             season: 0,
+            episode: 0,
             infohash: "a".repeat(40),
             title: Some("Матрица 1080p".into()),
             quality: Some("1080p".into()),
@@ -1895,6 +1901,7 @@ mod tests {
             &[1],
             MediaKind::Movie,
             603,
+            0,
             0,
             &hash_a,
             Some("Матрица 1080p"),

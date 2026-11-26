@@ -662,6 +662,7 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
    Seasons, Rich 16:9 Episodes (with Inset Progress Bar), Cast & Person
    ========================================================================= */
 .season-head-r { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sec-sub.srv { display: inline-flex; align-items: center; gap: 5px; color: var(--ok); font-weight: 600; }
 .season-chips { margin-bottom: 16px; }
 .ep-list { display: grid; gap: 10px; }
 .ep-card {
@@ -696,7 +697,22 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 
 .ep-body { min-width: 0; text-align: left; }
 .ep-title { font-weight: 700; font-size: 15px; line-height: 1.3; }
-.ep-meta { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+.ep-meta-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 3px; }
+.ep-meta { font-size: 12.5px; color: var(--muted); }
+.ep-dl-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.ep-dl-pill.ready {
+  background: var(--ok-bg); color: var(--ok);
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent);
+}
+.ep-dl-pill.busy {
+  background: var(--accent-bg); color: var(--accent-text);
+  border: 1px solid color-mix(in srgb, var(--accent) 42%, transparent);
+}
+.ep-dl-pill.fail { background: var(--err-bg); color: var(--err); }
 .ep-desc { font-size: 13px; color: var(--soft); margin-top: 6px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; opacity: .88; line-height: 1.44; }
 .ep-right { display: flex; align-items: center; gap: 10px; }
 .ep-acts { display: flex; align-items: center; gap: 8px; }
@@ -709,9 +725,31 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
   display: grid; place-items: center; flex: none;
   transition: background .15s, color .15s, border-color .15s;
 }
-.round-act:hover { color: var(--fg); background: var(--tint); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.round-act.xs { width: 28px; height: 28px; }
+.round-act:hover:not(.ro) { color: var(--fg); background: var(--tint); border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .round-act.done { background: var(--ok-bg); border-color: transparent; color: var(--ok); }
+.round-act.srv {
+  background: var(--ok-bg);
+  border-color: color-mix(in srgb, var(--ok) 40%, transparent);
+  color: var(--ok);
+}
+.round-act.srv:hover:not(.ro) {
+  color: var(--err);
+  background: var(--err-bg);
+  border-color: color-mix(in srgb, var(--err) 45%, transparent);
+}
+.round-act.busy {
+  background: var(--accent-bg);
+  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
+  color: var(--accent-text);
+}
 .round-act.danger:hover { color: var(--err); background: var(--err-bg); border-color: color-mix(in srgb, var(--err) 40%, transparent); }
+.round-act.danger-confirm {
+  color: var(--err);
+  background: var(--err-bg);
+  border-color: var(--err);
+}
+.round-act.ro { cursor: default; opacity: .88; }
 
 /* Cast & Person */
 .cast { gap: 18px; }
@@ -772,6 +810,14 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 .f-row:last-child { border-bottom: 0; }
 .f-lbl { font-size: 13px; font-weight: 600; color: var(--muted); }
 .f-opts { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip-input {
+  width: 96px; height: 32px; padding: 0 12px; border-radius: 999px;
+  background: var(--bg2); border: 1px solid var(--line); color: var(--fg);
+  font-family: inherit; text-align: center; outline: none;
+  transition: border-color .15s, box-shadow .15s;
+}
+.chip-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); }
+.chip-input::placeholder { color: var(--muted); font-size: 12.5px; }
 
 .rel-list { display: grid; gap: 8px; }
 .rel-card {
@@ -966,6 +1012,51 @@ html[data-theme="light"] .play-cta-inset-track > div, html.tg.tg-light:not([data
 .dl-bar { position: relative; height: 5px; border-radius: 999px; background: var(--line); margin: 10px 2px 2px; overflow: hidden; }
 .dl-bar > div { height: 100%; background: var(--accent); border-radius: 999px; transition: width .35s ease; }
 .dl-bar.wait > div { position: absolute; width: 35% !important; animation: slide 1.4s ease-in-out infinite; }
+.dl-series-card {
+  border-radius: 14px; background: var(--bg2); border: 1px solid var(--line-soft);
+  margin-bottom: 10px; overflow: hidden; transition: border-color .15s;
+}
+.dl-series-card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
+.dl-series-head {
+  display: grid; grid-template-columns: 1fr auto; gap: 14px; align-items: center;
+  padding: 12px 14px;
+}
+.dl-series-acts { display: flex; align-items: center; gap: 8px; flex: none; }
+.dl-ep-toggle { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.dl-ep-drawer {
+  border-top: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--bg) 52%, var(--bg2));
+  padding: 10px 14px 12px; display: grid; gap: 10px;
+}
+.dl-ep-shead {
+  display: flex; align-items: baseline; justify-content: space-between;
+  gap: 8px; font-size: 12.5px; padding: 2px 2px 4px;
+}
+.dl-ep-stitle { font-weight: 700; color: var(--fg); }
+.dl-ep-rows { display: grid; gap: 6px; }
+.dl-ep-row {
+  display: grid; grid-template-columns: 1fr auto auto; gap: 10px; align-items: center;
+  padding: 7px 10px; border-radius: 10px;
+  background: var(--card); border: 1px solid var(--line-soft);
+}
+.dl-ep-main { display: flex; align-items: center; gap: 8px; min-width: 0; color: inherit; }
+.dl-ep-main:hover .dl-ep-name { color: var(--accent-text); }
+.dl-ep-code {
+  font-size: 11.5px; font-weight: 700; padding: 2px 6px; border-radius: 6px;
+  background: var(--bg2); color: var(--muted); font-variant-numeric: tabular-nums; flex: none;
+}
+.dl-ep-name {
+  font-size: 13.5px; font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.dl-ep-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.dl-ep-sz { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.dl-ep-empty { font-size: 12.5px; color: var(--muted); padding: 4px 2px; }
+.dl-ep-rel-note {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  padding: 7px 10px; border-radius: 10px; background: var(--card); border: 1px solid var(--line-soft);
+  font-size: 12.5px;
+}
 
 /* Collapsible Default Release Settings Accordion */
 .acc-card {
@@ -1174,7 +1265,8 @@ html.native-video .player.native-video * { visibility: visible; }
 .p-time.r { text-align: right; }
 .p-track { position: relative; flex: 1; height: 6px; border-radius: 999px; background: rgba(255,255,255,.20); touch-action: none; cursor: pointer; }
 .p-track::before { content: ""; position: absolute; inset: -14px 0; }
-.p-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--accent); }
+.p-seg { position: absolute; top: 0; bottom: 0; border-radius: 999px; background: rgba(245, 196, 81, .50); pointer-events: none; z-index: 1; }
+.p-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 999px; background: var(--accent); z-index: 2; }
 .p-fill::after { content: ""; position: absolute; right: -7px; top: -4px; width: 14px; height: 14px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 4px rgba(56,198,189,.32); }
 .p-tip {
   position: absolute; bottom: 18px; transform: translateX(-50%);
@@ -1282,6 +1374,14 @@ button.p-q-dl.busy:hover { background: var(--err-bg); color: var(--err); border-
   transition: bottom .25s;
 }
 .player.show .p-next-card { bottom: calc(134px + var(--sab)); }
+.p-skip-btn {
+  position: absolute; right: calc(24px + var(--sar)); bottom: calc(24px + var(--sab)); z-index: 5;
+  background: rgba(14, 22, 33, .84); border-color: rgba(245, 196, 81, .45); box-shadow: 0 10px 28px rgba(0,0,0,.5);
+  transition: bottom .25s, background .15s, border-color .15s;
+}
+.player.show .p-skip-btn { bottom: calc(134px + var(--sab)); }
+.p-skip-btn.with-next { bottom: calc(96px + var(--sab)); }
+.player.show .p-skip-btn.with-next { bottom: calc(206px + var(--sab)); }
 .p-next-sub { font-size: 11.5px; color: var(--muted); }
 .p-next-title { font-weight: 700; font-size: 14px; margin-top: 1px; }
 .p-next-close { width: 32px !important; height: 32px !important; }
@@ -1408,6 +1508,10 @@ button.p-q-dl.busy:hover { background: var(--err-bg); color: var(--err); border-
   .dd-menu.right { left: 0; right: auto; }
   .hist-row { grid-template-columns: 38px 1fr; }
   .dev-pill { grid-column: 2; justify-self: start; margin-top: -4px; }
+  .dl-series-head { grid-template-columns: 1fr; gap: 10px; }
+  .dl-series-acts { justify-content: space-between; }
+  .dl-ep-row { grid-template-columns: 1fr auto; gap: 6px 8px; }
+  .dl-ep-meta { grid-column: 1 / -1; justify-content: flex-start; }
 
   /* Mobile Player */
   .p-top { padding: calc(12px + var(--sat)) calc(14px + var(--sar)) 12px calc(14px + var(--sal)); }
@@ -1424,6 +1528,10 @@ button.p-q-dl.busy:hover { background: var(--err-bg); color: var(--err); border-
   .p-popover.sync { top: calc(58px + var(--sat)); bottom: auto; left: 12px; right: 12px; width: auto; }
   .p-next-card { left: 12px; right: 12px; bottom: calc(16px + var(--sab)); justify-content: space-between; }
   .player.show .p-next-card { bottom: calc(130px + var(--sab)); }
+  .p-skip-btn { right: 12px; bottom: calc(16px + var(--sab)); }
+  .player.show .p-skip-btn { bottom: calc(130px + var(--sab)); }
+  .p-skip-btn.with-next { bottom: calc(88px + var(--sab)); }
+  .player.show .p-skip-btn.with-next { bottom: calc(202px + var(--sab)); }
 }
 
 @media (max-width: 480px) {
@@ -1449,6 +1557,10 @@ button.p-q-dl.busy:hover { background: var(--err-bg); color: var(--err); border-
   .p-opt { padding: 8px 10px; font-size: 13.5px; }
   .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
   .player.show .p-next-card { bottom: calc(104px + var(--sab)); }
+  .p-skip-btn { right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
+  .player.show .p-skip-btn { bottom: calc(104px + var(--sab)); }
+  .p-skip-btn.with-next { bottom: calc(84px + var(--sab)); }
+  .player.show .p-skip-btn.with-next { bottom: calc(170px + var(--sab)); }
   .player.show .p-unmute-btn { bottom: calc(104px + var(--sab)); }
 }
 
@@ -1486,6 +1598,10 @@ button.p-q-dl.busy:hover { background: var(--err-bg); color: var(--err); border-
   html.tg.tg-player-rot .player .p-opt { padding: 8px 10px; font-size: 13.5px; }
   html.tg.tg-player-rot .player .p-next-card { left: auto; right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
   html.tg.tg-player-rot .player.show .p-next-card { bottom: calc(96px + var(--sab)); }
+  html.tg.tg-player-rot .player .p-skip-btn { right: calc(18px + var(--sar)); bottom: calc(18px + var(--sab)); }
+  html.tg.tg-player-rot .player.show .p-skip-btn { bottom: calc(96px + var(--sab)); }
+  html.tg.tg-player-rot .player .p-skip-btn.with-next { bottom: calc(84px + var(--sab)); }
+  html.tg.tg-player-rot .player.show .p-skip-btn.with-next { bottom: calc(162px + var(--sab)); }
   html.tg.tg-player-rot .player.show .p-unmute-btn { bottom: calc(96px + var(--sab)); }
 }
 

@@ -492,6 +492,7 @@ struct ProfileCache {
     prefs: Option<UserPrefs>,
     prefs_open: bool,
     hist_limit: Option<usize>,
+    expanded_series: Vec<i64>,
 }
 
 #[derive(Clone)]
@@ -2224,6 +2225,7 @@ fn Profile(
     };
     let (now, utc_offset_min) = platform::now();
     let t2 = token.clone();
+    let t3 = token.clone();
     rsx! {
         ProfileView {
             name,
@@ -2264,6 +2266,24 @@ fn Profile(
                     }
                 });
             },
+            on_delete_preload_episode: {
+                let t_ep = t3.clone();
+                move |(pid, s_num, ep_num): (i64, i32, i32)| {
+                    dl_error.set(None);
+                    let t = t_ep.clone();
+                    spawn(async move {
+                        match api::delete_preload_episode(&t, pid, s_num, ep_num).await {
+                            Ok(()) => {
+                                data.restart();
+                                on_preloads_changed.call(());
+                            }
+                            Err(e) => {
+                                dl_error.set(Some(format!("Не удалось удалить серию: {}", e.message)));
+                            }
+                        }
+                    });
+                }
+            },
             dl_error: dl_error(),
             on_refresh: move |_| {
                 dl_error.set(None);
@@ -2280,6 +2300,17 @@ fn Profile(
             on_hist_limit: move |limit| {
                 cache.with_mut(|c| {
                     c.profile.get_or_insert_with(ProfileCache::default).hist_limit = Some(limit);
+                });
+            },
+            initial_expanded_series: cached.expanded_series.clone(),
+            on_toggle_series: move |tid: i64| {
+                cache.with_mut(|c| {
+                    let list = &mut c.profile.get_or_insert_with(ProfileCache::default).expanded_series;
+                    if let Some(pos) = list.iter().position(|&x| x == tid) {
+                        list.remove(pos);
+                    } else {
+                        list.push(tid);
+                    }
                 });
             },
             on_open,
@@ -2585,6 +2616,9 @@ fn Title(
     let mut picked_now = use_signal(Vec::<ReleaseChoiceUpdate>::new);
     let mut picker = use_signal(|| None::<PlayTarget>);
     let mut picker_ep_scoped = use_signal(|| false);
+    let mut picker_download_only = use_signal(|| false);
+    let mut picker_note_override = use_signal(|| None::<String>);
+    let mut downloading_ep = use_signal(|| None::<(i32, i32)>);
     let mut picker_preloaded = use_signal(|| None::<(i32, kino_core::ReleaseList)>);
     let mut resolving = use_signal(|| false);
     let mut resolve_gen = use_signal(|| 0u32);
@@ -2691,6 +2725,8 @@ fn Title(
                     picker.set(None);
                     picker_preloaded.set(None);
                     picker_ep_scoped.set(false);
+                    picker_download_only.set(false);
+                    picker_note_override.set(None);
                     if *overlay_pushed.peek() {
                         overlay_pushed.set(false);
                         telegram::pop_history();
@@ -2750,7 +2786,21 @@ fn Title(
         let season = (kind == MediaKind::Tv)
             .then(|| picker.peek().as_ref().map(|t| t.season))
             .flatten();
+        let episode = (kind == MediaKind::Tv).then_some(f.episode).flatten();
         if f.language.is_some() {
+            if episode.is_some() {
+                let lang_season_ep = ReleaseFilter {
+                    language: f.language.clone(),
+                    season,
+                    episode,
+                    ..ReleaseFilter::default()
+                };
+                if list.releases.iter().any(|r| lang_season_ep.matches(r)) {
+                    filter.set(lang_season_ep);
+                    defaults_relaxed.set(true);
+                    return;
+                }
+            }
             let lang_season = ReleaseFilter {
                 language: f.language.clone(),
                 season,
@@ -2770,9 +2820,26 @@ fn Title(
                 defaults_relaxed.set(true);
                 return;
             }
-            // Keep the chosen language active even when 0 releases match it.
-            filter.set(lang_season);
+            // Keep the chosen language (and requested episode) active even when 0 releases match.
+            filter.set(ReleaseFilter {
+                language: f.language.clone(),
+                season,
+                episode,
+                ..ReleaseFilter::default()
+            });
             return;
+        }
+        if episode.is_some() {
+            let season_ep = ReleaseFilter {
+                season,
+                episode,
+                ..ReleaseFilter::default()
+            };
+            if list.releases.iter().any(|r| season_ep.matches(r)) {
+                filter.set(season_ep);
+                defaults_relaxed.set(true);
+                return;
+            }
         }
         let season_only = ReleaseFilter {
             season,
@@ -2867,7 +2934,17 @@ fn Title(
                     || (c.release.season == 0 && c.release.episode == 0))
         })
     });
-    let release_label = if details.summary.preloaded && picked_now().is_empty() && !manual_after_preload {
+    let target_preloaded = {
+        let cur_preloads = title_preloads();
+        if cur_preloads.is_empty() {
+            details.summary.preloaded
+        } else {
+            cur_preloads
+                .iter()
+                .any(|p| p.is_ready_for(kind, target.season, target.episode))
+        }
+    };
+    let release_label = if target_preloaded && picked_now().is_empty() && !manual_after_preload {
         Some("На сервере · готово".to_owned())
     } else {
         display_choice_for(target.season, target.episode).map(|c| choice_label(&c))
@@ -2889,7 +2966,7 @@ fn Title(
         let latest = latest.clone();
         let manual_choices = manual_choices.clone();
         let loaded_prefs_opt = loaded_prefs_opt.clone();
-        move |t: PlayTarget, ep_scoped: bool| {
+        move |t: PlayTarget, ep_scoped: bool, filter_ep: bool| {
             let base = match (scoped_choice(&manual_choices, kind, t.season, t.episode, None), &latest) {
                 (None, Some(prev)) => ReleaseFilter::like(prev),
                 _ => ReleaseFilter::default(),
@@ -2901,7 +2978,12 @@ fn Title(
                 f.direct_play = None;
             }
             let f = if kind == MediaKind::Tv {
-                f.for_season(t.season)
+                let f = f.for_season(t.season);
+                if filter_ep && t.episode > 0 {
+                    f.for_episode(t.episode)
+                } else {
+                    f
+                }
             } else {
                 f
             };
@@ -2923,20 +3005,103 @@ fn Title(
         let mut open_picker_with_scope = open_picker_with_scope.clone();
         move |t: PlayTarget| {
             picker_preloaded.set(None);
-            open_picker_with_scope(t, false);
+            picker_download_only.set(false);
+            picker_note_override.set(None);
+            let filter_ep = t.episode > 0;
+            open_picker_with_scope(t, false, filter_ep);
+        }
+    };
+    let open_season_picker = {
+        let mut open_picker_with_scope = open_picker_with_scope.clone();
+        move |t: PlayTarget| {
+            picker_preloaded.set(None);
+            picker_download_only.set(false);
+            picker_note_override.set(None);
+            open_picker_with_scope(t, false, false);
         }
     };
     let open_episode_picker = {
         let mut open_picker_with_scope = open_picker_with_scope.clone();
         move |t: PlayTarget| {
             picker_preloaded.set(None);
-            open_picker_with_scope(t, true);
+            picker_download_only.set(false);
+            picker_note_override.set(None);
+            let filter_ep = t.episode > 0;
+            open_picker_with_scope(t, true, filter_ep);
+        }
+    };
+    let open_episode_download_picker = {
+        let mut open_picker_with_scope = open_picker_with_scope.clone();
+        move |t: PlayTarget, note_msg: Option<String>| {
+            picker_preloaded.set(None);
+            picker_download_only.set(true);
+            picker_note_override.set(note_msg);
+            let filter_ep = t.episode > 0;
+            open_picker_with_scope(t, true, filter_ep);
+        }
+    };
+    let queue_episode_preload = {
+        let t_dl = token.clone();
+        let refresh = refresh_title_preloads.clone();
+        let open_ep_dl = open_episode_download_picker.clone();
+        move |t: PlayTarget, rel_hash: String, rel_title: Option<String>| {
+            if downloading_ep.peek().is_some() {
+                return;
+            }
+            let dl_key = (t.season, t.episode);
+            downloading_ep.set(Some(dl_key));
+            let req = PreloadRequest {
+                kind,
+                tmdb_id: id,
+                season: if kind == MediaKind::Tv { t.season } else { 0 },
+                episode: if kind == MediaKind::Tv { t.episode.max(0) } else { 0 },
+                infohash: rel_hash.clone(),
+                title: rel_title,
+            };
+            let tok = t_dl.clone();
+            let refresh_cb = refresh.clone();
+            let mut open_ep_dl_cb = open_ep_dl.clone();
+            telegram::haptic(telegram::Haptic::Success);
+            spawn(async move {
+                match api::add_preload(&tok, &req).await {
+                    Ok(item) => {
+                        downloading_ep.set(None);
+                        let resolved = item.infohash.clone();
+                        if !resolved.eq_ignore_ascii_case(&rel_hash) {
+                            hash_rebinds.with_mut(|v| {
+                                v.retain(|(k, _)| k != &rel_hash);
+                                v.push((rel_hash.clone(), resolved));
+                            });
+                        }
+                        title_preloads.with_mut(|v| {
+                            v.retain(|p| p.id != item.id && !p.infohash.eq_ignore_ascii_case(&item.infohash));
+                            v.insert(0, item);
+                        });
+                        refresh_cb();
+                        on_preloads_changed.call(());
+                    }
+                    Err(e) => {
+                        downloading_ep.set(None);
+                        if e.code == "missing_episode" && kind == MediaKind::Tv {
+                            open_ep_dl_cb(t, Some(e.message));
+                        } else {
+                            if !*notice_pushed.peek() {
+                                notice_pushed.set(true);
+                                telegram::push_history(None);
+                            }
+                            notice.set(Some(format!("Не удалось поставить в загрузку: {}", e.message)));
+                        }
+                    }
+                }
+            });
         }
     };
     let close_picker = Callback::new(move |_: ()| {
         picker.set(None);
         picker_preloaded.set(None);
         picker_ep_scoped.set(false);
+        picker_download_only.set(false);
+        picker_note_override.set(None);
         if *overlay_pushed.peek() {
             overlay_pushed.set(false);
             telegram::pop_history();
@@ -2956,7 +3121,10 @@ fn Title(
             telegram::pop_history();
         }
     });
-    let open_picker_scope = Callback::new(move |(t, ep_scoped)| open_picker_with_scope(t, ep_scoped));
+    let open_picker_scope = Callback::new(move |(t, ep_scoped): (PlayTarget, bool)| {
+        let filter_ep = t.episode > 0;
+        open_picker_with_scope(t, ep_scoped, filter_ep);
+    });
     let start_playback = Callback::new(
         move |(t, c, mode, explicit_rel): (PlayTarget, ReleaseChoiceUpdate, RewatchMode, bool)| {
             if !*exit_on_close.peek() && !*overlay_pushed.peek() {
@@ -3025,6 +3193,7 @@ fn Title(
                     .collect();
                 if *title_preloads.peek() != filtered {
                     title_preloads.set(filtered);
+                    on_preloads_changed.call(());
                 }
             }
             if *title_poll_gen.peek() == my_gen {
@@ -3105,6 +3274,18 @@ fn Title(
         h
     });
     let picker_season = picker().map(|p| season_key(&p));
+    let picker_episode_count = if kind == MediaKind::Tv {
+        picker_season.and_then(|s| {
+            details
+                .seasons
+                .iter()
+                .find(|x| x.number == s)
+                .map(|x| x.episode_count)
+                .filter(|&c| c > 0)
+        })
+    } else {
+        None
+    };
     let chosen_hash = picker()
         .and_then(|p| scoped_choice(&manual_choices, kind, p.season, p.episode, None))
         .map(|c| c.infohash);
@@ -3192,16 +3373,89 @@ fn Title(
             on_play_rewatch: Some(on_play_rewatch),
             on_change_release: open_picker.clone(),
             on_change_season_release: Some(Callback::new({
-                let mut open_picker = open_picker.clone();
+                let mut open_season_picker = open_season_picker.clone();
                 let details_s = details.clone();
                 let progress_s = progress.clone();
                 let target_s = default_target.clone();
                 move |s_num: i32| {
                     let season_target = auto_play_target_for(kind, &details_s, &progress_s, Some(s_num), &target_s);
-                    open_picker(season_target);
+                    open_season_picker(season_target);
                 }
             })),
             on_change_episode_release: Some(Callback::new(open_episode_picker)),
+            on_download_episode: Some(Callback::new({
+                let mut queue_ep = queue_episode_preload.clone();
+                let mut open_ep_dl = open_episode_download_picker.clone();
+                let manual_choices = manual_choices.clone();
+                let display_choice_for = display_choice_for.clone();
+                let picked_now_sig = picked_now;
+                move |t: PlayTarget| {
+                    if kind != MediaKind::Tv || t.episode <= 0 {
+                        return;
+                    }
+                    let explicit_pick = scoped_choice(&picked_now_sig.peek(), kind, t.season, t.episode, None);
+                    let server_preload = title_preloads
+                        .peek()
+                        .iter()
+                        .filter(|p| {
+                            p.kind == MediaKind::Tv
+                                && (p.season == 0 || p.season == t.season)
+                                && matches!(
+                                    p.state,
+                                    kino_core::PreloadState::Queued
+                                        | kino_core::PreloadState::Downloading
+                                        | kino_core::PreloadState::Ready
+                                )
+                        })
+                        .max_by_key(|p| (p.state == kino_core::PreloadState::Ready, !p.whole_torrent, p.requested_at))
+                        .map(|p| (p.infohash.clone(), p.title.clone()));
+                    let chosen_release = explicit_pick
+                        .map(|c| (c.infohash, c.title))
+                        .or(server_preload)
+                        .or_else(|| {
+                            scoped_choice(&manual_choices, kind, t.season, t.episode, None).map(|c| (c.infohash, c.title))
+                        })
+                        .or_else(|| display_choice_for(t.season, t.episode).map(|c| (c.infohash, c.title)));
+                    if let Some((hash, title)) = chosen_release {
+                        queue_ep(t, hash, title);
+                    } else {
+                        open_ep_dl(t, None);
+                    }
+                }
+            })),
+            on_cancel_episode_download: Some(Callback::new({
+                let t_cancel = token.clone();
+                let refresh = refresh_title_preloads.clone();
+                move |(pid, s_num, ep_num): (i64, i32, i32)| {
+                    let tok = t_cancel.clone();
+                    let refresh_cb = refresh.clone();
+                    telegram::haptic(telegram::Haptic::Tap);
+                    spawn(async move {
+                        match api::delete_preload_episode(&tok, pid, s_num, ep_num).await {
+                            Ok(()) => {
+                                title_preloads.with_mut(|v| {
+                                    for p in v.iter_mut() {
+                                        if p.id == pid {
+                                            p.episodes.retain(|e| !(e.season == s_num && e.episode == ep_num));
+                                        }
+                                    }
+                                    v.retain(|p| p.id != pid || (p.whole_torrent && !p.episodes.is_empty()));
+                                });
+                                refresh_cb();
+                                on_preloads_changed.call(());
+                            }
+                            Err(e) => {
+                                if !*notice_pushed.peek() {
+                                    notice_pushed.set(true);
+                                    telegram::push_history(None);
+                                }
+                                notice.set(Some(format!("Не удалось удалить серию: {}", e.message)));
+                            }
+                        }
+                    });
+                }
+            })),
+            downloading_episode: downloading_ep(),
             on_status: {
                 let token = token.clone();
                 move |s: Option<TitleStatus>| {
@@ -3381,20 +3635,34 @@ fn Title(
                             kind == MediaKind::Movie || p.season == 0 || Some(p.season) == picker_season
                         })
                         .collect();
+                    let scope_s = picker_season.unwrap_or(0);
+                    let scope_ep = if kind == MediaKind::Tv && scope_s > 0 {
+                        filter().episode.unwrap_or(0)
+                    } else {
+                        0
+                    };
                     {
                         let rebinds = hash_rebinds.read();
                         for r in &mut list.releases {
                             if let Some((_, real)) = rebinds.iter().find(|(k, _)| k == &r.infohash) {
                                 r.infohash = real.clone();
                             }
-                            if cur_preloads.iter().any(|p| {
-                                p.state == kino_core::PreloadState::Ready
-                                    && p.infohash.eq_ignore_ascii_case(&r.infohash)
-                            }) {
+                            if cur_preloads
+                                .iter()
+                                .any(|p| p.infohash.eq_ignore_ascii_case(&r.infohash) && p.is_ready_for(kind, scope_s, scope_ep))
+                            {
                                 r.preloaded = true;
                             }
                         }
                     }
+                    let picker_note = picker_note_override().or_else(|| {
+                        defaults_relaxed().then(|| match filter().language {
+                            Some(l) => {
+                                format!("По строгим фильтрам ничего не нашлось — показаны все доступные в озвучке «{l}».")
+                            }
+                            None => "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned(),
+                        })
+                    });
                     rsx! { ReleasePicker {
                 heading,
                 releases: list.releases,
@@ -3404,67 +3672,126 @@ fn Title(
                 sort: sort(),
                 panel: panel(),
                 native_player: cfg!(feature = "mobile"),
+                episode_count: picker_episode_count,
                 mock: !list.configured,
-                note: defaults_relaxed().then(|| match filter().language {
-                    Some(l) => format!("По строгим фильтрам ничего не нашлось — показаны все доступные в озвучке «{l}»."),
-                    None => "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned(),
-                }),
+                note: picker_note,
                 preloads: cur_preloads,
+                picker_season: scope_s,
+                download_only: picker_download_only(),
                 on_filter: move |f| filter.set(f),
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),
-                on_pick: move |r: ReleaseOption| {
-                    let ep_scope = if kind == MediaKind::Tv && *picker_ep_scoped.peek() {
-                        target.episode
-                    } else {
-                        0
-                    };
-                    let choice = r.to_scoped_choice(&summary, season_key(&target), ep_scope);
-                    picked_now.with_mut(|v| {
-                        v.retain(|c| !(c.season == choice.season && c.episode == choice.episode && c.quality_key == choice.quality_key));
-                        v.insert(0, choice.clone());
-                    });
-                    picker.set(None);
-                    picker_preloaded.set(None);
-                    picker_ep_scoped.set(false);
-                    let mut play_target = target.clone();
-                    if kind == MediaKind::Tv && play_target.episode <= 0 {
-                        play_target.episode = 1;
+                on_pick: {
+                    let mut queue_ep = queue_episode_preload.clone();
+                    let t_pick_dl = token.clone();
+                    let refresh_pick = refresh_title_preloads.clone();
+                    move |r: ReleaseOption| {
+                        if *picker_download_only.peek() {
+                            let dl_target = PlayTarget {
+                                season: scope_s,
+                                episode: scope_ep,
+                                position_sec: 0.0,
+                            };
+                            picker.set(None);
+                            picker_preloaded.set(None);
+                            picker_ep_scoped.set(false);
+                            picker_download_only.set(false);
+                            picker_note_override.set(None);
+                            if *overlay_pushed.peek() {
+                                overlay_pushed.set(false);
+                                telegram::pop_history();
+                            }
+                            if kind == MediaKind::Tv && scope_ep > 0 {
+                                queue_ep(dl_target, r.infohash, (!r.title.is_empty()).then(|| r.title));
+                            } else {
+                                let req = PreloadRequest {
+                                    kind,
+                                    tmdb_id: id,
+                                    season: scope_s,
+                                    episode: 0,
+                                    infohash: r.infohash.clone(),
+                                    title: (!r.title.is_empty()).then(|| r.title),
+                                };
+                                let t = t_pick_dl.clone();
+                                let refresh_cb = refresh_pick.clone();
+                                spawn(async move {
+                                    match api::add_preload(&t, &req).await {
+                                        Ok(item) => {
+                                            title_preloads.with_mut(|v| {
+                                                v.retain(|p| p.id != item.id && !p.infohash.eq_ignore_ascii_case(&item.infohash));
+                                                v.insert(0, item);
+                                            });
+                                            refresh_cb();
+                                            on_preloads_changed.call(());
+                                        }
+                                        Err(e) => notice.set(Some(format!("Не удалось поставить в загрузку: {}", e.message))),
+                                    }
+                                });
+                            }
+                            return;
+                        }
+                        let ep_scope = if kind == MediaKind::Tv && *picker_ep_scoped.peek() {
+                            target.episode
+                        } else {
+                            0
+                        };
+                        let choice = r.to_scoped_choice(&summary, season_key(&target), ep_scope);
+                        picked_now.with_mut(|v| {
+                            v.retain(|c| !(c.season == choice.season && c.episode == choice.episode && c.quality_key == choice.quality_key));
+                            v.insert(0, choice.clone());
+                        });
+                        picker.set(None);
+                        picker_preloaded.set(None);
+                        picker_ep_scoped.set(false);
+                        picker_download_only.set(false);
+                        picker_note_override.set(None);
+                        let mut play_target = target.clone();
+                        if kind == MediaKind::Tv && play_target.episode <= 0 {
+                            play_target.episode = 1;
+                        }
+                        let explicit_ep =
+                            play_target.season != default_target.season || play_target.episode != default_target.episode;
+                        let qk = choice
+                            .quality_key
+                            .clone()
+                            .unwrap_or_else(|| normalize_quality_key(&r.quality).to_owned());
+                        playing.set(Some((play_target, choice.clone(), explicit_ep, true, RewatchMode::All)));
+                        let t = t3.clone();
+                        let req_q = api::SetDeviceQualityRequest {
+                            kind,
+                            tmdb_id: id,
+                            season: choice.season,
+                            episode: choice.episode,
+                            is_mobile: telegram::is_mobile(),
+                            quality_key: qk,
+                        };
+                        spawn(async move {
+                            let _ = api::save_release_choice(&t, &choice).await;
+                            let _ = api::set_release_quality(&t, &req_q).await;
+                        });
                     }
-                    let explicit_ep =
-                        play_target.season != default_target.season || play_target.episode != default_target.episode;
-                    let qk = choice
-                        .quality_key
-                        .clone()
-                        .unwrap_or_else(|| normalize_quality_key(&r.quality).to_owned());
-                    playing.set(Some((play_target, choice.clone(), explicit_ep, true, RewatchMode::All)));
-                    let t = t3.clone();
-                    let req_q = api::SetDeviceQualityRequest {
-                        kind,
-                        tmdb_id: id,
-                        season: choice.season,
-                        episode: choice.episode,
-                        is_mobile: telegram::is_mobile(),
-                        quality_key: qk,
-                    };
-                    spawn(async move {
-                        let _ = api::save_release_choice(&t, &choice).await;
-                        let _ = api::set_release_quality(&t, &req_q).await;
-                    });
                 },
                 on_preload: {
                     let t4 = token.clone();
+                    let refresh_pre = refresh_title_preloads.clone();
                     let pre_season = picker_season.unwrap_or(0);
+                    let pre_ep = if kind == MediaKind::Tv {
+                        filter().episode.unwrap_or(0).max(0)
+                    } else {
+                        0
+                    };
                     move |r: ReleaseOption| {
                         let orig_key = r.infohash.clone();
                         let req = PreloadRequest {
                             kind,
                             tmdb_id: id,
                             season: pre_season,
+                            episode: pre_ep,
                             infohash: orig_key.clone(),
                             title: (!r.title.is_empty()).then(|| r.title.clone()),
                         };
                         let t = t4.clone();
+                        let refresh_cb = refresh_pre.clone();
                         telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
                             match api::add_preload(&t, &req).await {
@@ -3491,6 +3818,7 @@ fn Title(
                                         });
                                         v.insert(0, item);
                                     });
+                                    refresh_cb();
                                     on_preloads_changed.call(());
                                 }
                                 Err(e) => {
@@ -3506,12 +3834,47 @@ fn Title(
                 },
                 on_cancel_preload: Some(Callback::new({
                     let t5 = token.clone();
+                    let refresh_cancel = refresh_title_preloads.clone();
+                    let cancel_season = picker_season.unwrap_or(0);
+                    let cancel_ep = if kind == MediaKind::Tv {
+                        filter().episode.unwrap_or(0).max(0)
+                    } else {
+                        0
+                    };
                     move |preload_id: i64| {
                         let t = t5.clone();
+                        let refresh_cb = refresh_cancel.clone();
+                        let cancel_single = kind == MediaKind::Tv
+                            && cancel_season > 0
+                            && cancel_ep > 0
+                            && title_preloads
+                                .peek()
+                                .iter()
+                                .find(|p| p.id == preload_id)
+                                .is_some_and(|p| !p.whole_torrent);
                         spawn(async move {
-                            match api::delete_preload(&t, preload_id).await {
+                            let res = if cancel_single {
+                                api::delete_preload_episode(&t, preload_id, cancel_season, cancel_ep).await
+                            } else {
+                                api::delete_preload(&t, preload_id).await
+                            };
+                            match res {
                                 Ok(()) => {
-                                    title_preloads.with_mut(|v| v.retain(|p| p.id != preload_id));
+                                    title_preloads.with_mut(|v| {
+                                        if cancel_single {
+                                            for p in v.iter_mut() {
+                                                if p.id == preload_id {
+                                                    p.episodes.retain(|e| {
+                                                        !(e.season == cancel_season && e.episode == cancel_ep)
+                                                    });
+                                                }
+                                            }
+                                            v.retain(|p| p.id != preload_id || !p.episodes.is_empty());
+                                        } else {
+                                            v.retain(|p| p.id != preload_id);
+                                        }
+                                    });
+                                    refresh_cb();
                                     on_preloads_changed.call(());
                                 }
                                 Err(e) => {
@@ -3838,6 +4201,10 @@ mod tests {
             voice: Some("LostFilm".into()),
             speed_bps: 0,
             dl_phase: PreloadPhase::default(),
+            whole_torrent: true,
+            episodes: Vec::new(),
+            requested_by: None,
+            can_delete: true,
         };
 
         let choice = auto_release_choice_for(MediaKind::Tv, 1396, 2, &hash.to_ascii_uppercase(), &[preload], &[], &[]);

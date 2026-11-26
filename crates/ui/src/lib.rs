@@ -1374,6 +1374,9 @@ pub fn TitleView(
     on_change_release: EventHandler<PlayTarget>,
     #[props(default)] on_change_season_release: Option<EventHandler<i32>>,
     #[props(default)] on_change_episode_release: Option<EventHandler<PlayTarget>>,
+    #[props(default)] on_download_episode: Option<EventHandler<PlayTarget>>,
+    #[props(default)] on_cancel_episode_download: Option<EventHandler<(i64, i32, i32)>>,
+    #[props(default)] downloading_episode: Option<(i32, i32)>,
     on_status: EventHandler<Option<TitleStatus>>,
     on_rate: EventHandler<Option<i16>>,
     #[props(default)] on_rate_season: Option<EventHandler<(i32, Option<i16>)>>,
@@ -1704,7 +1707,11 @@ pub fn TitleView(
                                             Icon { svg: icons::DOWNLOAD, class: "ic xs acc" }
                                             span { class: "muted", "На сервер качается:" }
                                             if s.kind == MediaKind::Tv && dl.season > 0 {
-                                                span { class: "tag", {format!("S{:02}", dl.season)} }
+                                                if let Some(ep_sum) = dl.episodes_range_summary() {
+                                                    span { class: "tag", "{ep_sum}" }
+                                                } else {
+                                                    span { class: "tag", {format!("S{:02}", dl.season)} }
+                                                }
                                             }
                                             if let Some(q) = dl.quality_short() {
                                                 span { class: "tag", "{q}" }
@@ -1771,6 +1778,17 @@ pub fn TitleView(
                     .count();
                 let all_done = total_in_s > 0 && done_in_s == total_in_s;
                 let s_num = season.number;
+                let srv_in_s = if s_num > 0 {
+                    all.iter()
+                        .filter(|&&n| {
+                            title_downloads
+                                .iter()
+                                .any(|p| p.is_ready_for(MediaKind::Tv, s_num, n))
+                        })
+                        .count()
+                } else {
+                    0
+                };
                 let sr = season_ratings.iter().find(|r| r.season == s_num);
                 let sr_manual = sr.and_then(|r| r.manual_rating);
                 let sr_eff = sr.and_then(|r| r.effective_rating);
@@ -1791,6 +1809,14 @@ pub fn TitleView(
                                         }
                                     }
                                     span { class: "sec-sub", "{done_in_s} из {total_in_s} просмотрено" }
+                                    if srv_in_s > 0 {
+                                        span {
+                                            class: "sec-sub srv",
+                                            title: "Скачано на сервер в этом сезоне",
+                                            Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                            "{srv_in_s} на сервере"
+                                        }
+                                    }
                                     if s_num > 0 {
                                         {
                                             let s_rel_lbl = season_release_label
@@ -1842,6 +1868,8 @@ pub fn TitleView(
                                         .iter()
                                         .find(|r| r.season == season.number && r.episode == ep_num)
                                         .map(|r| r.rating);
+                                    let ep_dl = episode_download_info(&title_downloads, season.number, ep_num);
+                                    let ep_dl_starting = downloading_episode == Some((season.number, ep_num));
                                     rsx! {
                                         EpisodeRow {
                                             key: "{ep.number}",
@@ -1856,6 +1884,8 @@ pub fn TitleView(
                                             progress: progress.iter().find(|p| p.season == season.number && p.episode == ep.number).cloned(),
                                             current: current == Some((season.number, ep.number)),
                                             rating: ep_r,
+                                            download: ep_dl,
+                                            download_starting: ep_dl_starting,
                                             on_play,
                                             on_change_release: on_change_episode_release.unwrap_or(on_change_release),
                                             on_mark,
@@ -1864,6 +1894,8 @@ pub fn TitleView(
                                                     cb.call((s_num, ep_num, r));
                                                 }
                                             },
+                                            on_download: on_download_episode,
+                                            on_cancel_download: on_cancel_episode_download,
                                         }
                                     }
                                 }
@@ -2013,6 +2045,133 @@ fn initials(name: &str) -> String {
         .collect()
 }
 
+#[derive(Clone, PartialEq)]
+struct EpisodeDownloadInfo {
+    preload_id: i64,
+    state: PreloadState,
+    compact_text: String,
+    status_text: String,
+    quality: Option<String>,
+    voice: Option<String>,
+    size_bytes: Option<i64>,
+    requested_by: Option<String>,
+    can_delete: bool,
+}
+
+fn episode_download_info(downloads: &[PreloadItem], season: i32, episode: i32) -> Option<EpisodeDownloadInfo> {
+    let mut best: Option<(u8, bool, chrono::DateTime<chrono::Utc>, EpisodeDownloadInfo)> = None;
+    for p in downloads {
+        if p.state == PreloadState::Deleted || p.kind != MediaKind::Tv {
+            continue;
+        }
+        if p.season != 0 && p.season != season && p.episode_for(season, episode).is_none() {
+            continue;
+        }
+        let ep_opt = p.episode_for(season, episode);
+        let candidate = if p.is_ready_for(MediaKind::Tv, season, episode) {
+            let sz = ep_opt
+                .and_then(|e| e.size_bytes)
+                .or_else(|| p.whole_torrent.then_some(p.size_bytes).flatten());
+            Some((
+                3u8,
+                EpisodeDownloadInfo {
+                    preload_id: p.id,
+                    state: PreloadState::Ready,
+                    compact_text: "На сервере".to_owned(),
+                    status_text: "На сервере".to_owned(),
+                    quality: p.quality_short().map(str::to_owned),
+                    voice: p.voice.clone(),
+                    size_bytes: sz,
+                    requested_by: p.requested_by.clone(),
+                    can_delete: p.can_delete,
+                },
+            ))
+        } else if !p.whole_torrent {
+            ep_opt.and_then(|ep| match ep.state {
+                PreloadState::Queued | PreloadState::Downloading => Some((
+                    2u8,
+                    EpisodeDownloadInfo {
+                        preload_id: p.id,
+                        state: ep.state,
+                        compact_text: ep.compact_status_text(p.dl_phase, p.speed_bps),
+                        status_text: ep.status_text(p.dl_phase, p.speed_bps),
+                        quality: p.quality_short().map(str::to_owned),
+                        voice: p.voice.clone(),
+                        size_bytes: ep.size_bytes,
+                        requested_by: p.requested_by.clone(),
+                        can_delete: p.can_delete,
+                    },
+                )),
+                PreloadState::Failed => Some((
+                    1u8,
+                    EpisodeDownloadInfo {
+                        preload_id: p.id,
+                        state: PreloadState::Failed,
+                        compact_text: "Ошибка".to_owned(),
+                        status_text: "Ошибка".to_owned(),
+                        quality: p.quality_short().map(str::to_owned),
+                        voice: p.voice.clone(),
+                        size_bytes: ep.size_bytes,
+                        requested_by: p.requested_by.clone(),
+                        can_delete: p.can_delete,
+                    },
+                )),
+                PreloadState::Ready | PreloadState::Deleted => None,
+            })
+        } else {
+            match p.state {
+                PreloadState::Queued | PreloadState::Downloading => {
+                    let (st, compact, status) = match ep_opt {
+                        Some(ep) => (
+                            ep.state,
+                            ep.compact_status_text(p.dl_phase, p.speed_bps),
+                            ep.status_text(p.dl_phase, p.speed_bps),
+                        ),
+                        None => (p.state, p.compact_status_text(), p.status_text()),
+                    };
+                    Some((
+                        2u8,
+                        EpisodeDownloadInfo {
+                            preload_id: p.id,
+                            state: st,
+                            compact_text: compact,
+                            status_text: status,
+                            quality: p.quality_short().map(str::to_owned),
+                            voice: p.voice.clone(),
+                            size_bytes: ep_opt.and_then(|e| e.size_bytes),
+                            requested_by: p.requested_by.clone(),
+                            can_delete: p.can_delete,
+                        },
+                    ))
+                }
+                PreloadState::Failed => Some((
+                    1u8,
+                    EpisodeDownloadInfo {
+                        preload_id: p.id,
+                        state: PreloadState::Failed,
+                        compact_text: "Ошибка".to_owned(),
+                        status_text: "Ошибка".to_owned(),
+                        quality: p.quality_short().map(str::to_owned),
+                        voice: p.voice.clone(),
+                        size_bytes: None,
+                        requested_by: p.requested_by.clone(),
+                        can_delete: p.can_delete,
+                    },
+                )),
+                PreloadState::Ready | PreloadState::Deleted => None,
+            }
+        };
+        if let Some((rank, info)) = candidate {
+            let key = (rank, info.can_delete, p.requested_at);
+            let replace = best.as_ref().is_none_or(|(r, d, t, _)| key > (*r, *d, *t));
+            if replace {
+                best = Some((rank, info.can_delete, p.requested_at, info));
+            }
+        }
+    }
+    best.map(|(_, _, _, info)| info)
+}
+
 #[component]
 fn EpisodeRow(
     tmdb_id: i64,
@@ -2026,11 +2185,16 @@ fn EpisodeRow(
     progress: Option<Progress>,
     current: bool,
     #[props(default)] rating: Option<i16>,
+    #[props(default)] download: Option<EpisodeDownloadInfo>,
+    #[props(default)] download_starting: bool,
     on_play: EventHandler<PlayTarget>,
     on_change_release: EventHandler<PlayTarget>,
     on_mark: EventHandler<(i32, Vec<i32>, bool)>,
     #[props(default)] on_rate: Option<EventHandler<Option<i16>>>,
+    #[props(default)] on_download: Option<EventHandler<PlayTarget>>,
+    #[props(default)] on_cancel_download: Option<EventHandler<(i64, i32, i32)>>,
 ) -> Element {
+    let mut confirm_del = use_signal(|| false);
     let mut sub = Vec::new();
     if let Some(m) = runtime_min {
         sub.push(format!("{m} мин"));
@@ -2050,12 +2214,29 @@ fn EpisodeRow(
         position_sec: resume_at,
     };
     let target_rel = target.clone();
+    let target_dl = target.clone();
     let done = progress.as_ref().is_some_and(|p| p.finished);
     let in_prog_pct = progress
         .as_ref()
         .filter(|p| !p.finished && p.duration_sec > 0.0 && p.position_sec > 0.0)
         .map(percent);
     let ep_tag = format!("E{number:02}");
+    let dl_tooltip = download.as_ref().map(|dl| {
+        let mut parts = vec![dl.status_text.clone()];
+        if let Some(q) = &dl.quality {
+            parts.push(q.clone());
+        }
+        if let Some(v) = dl.voice.as_deref().filter(|v| !v.is_empty()) {
+            parts.push(v.to_owned());
+        }
+        if let Some(sz) = dl.size_bytes.filter(|&b| b > 0) {
+            parts.push(human_size(sz as u64));
+        }
+        if let Some(who) = &dl.requested_by {
+            parts.push(format!("скачал: {who}"));
+        }
+        parts.join(" · ")
+    });
     rsx! {
         div { class: if current { "ep-card current" } else { "ep-card" },
             button {
@@ -2081,8 +2262,47 @@ fn EpisodeRow(
                 class: "ep-body",
                 onclick: move |_| on_play.call(PlayTarget { season, episode: number, position_sec: resume_at }),
                 div { class: "ep-title", "{number}. {name}" }
-                if !sub.is_empty() {
-                    div { class: "ep-meta", "{sub}" }
+                if !sub.is_empty() || download_starting || download.is_some() {
+                    span { class: "ep-meta-row",
+                        if !sub.is_empty() {
+                            span { class: "ep-meta", "{sub}" }
+                        }
+                        if download_starting {
+                            span { class: "ep-dl-pill busy",
+                                Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                "Запуск…"
+                            }
+                        } else if let Some(dl) = &download {
+                            {
+                                let tip = dl_tooltip.clone().unwrap_or_default();
+                                match dl.state {
+                                    PreloadState::Ready => {
+                                        let sz_txt = dl.size_bytes.filter(|&b| b > 0).map(|b| human_size(b as u64));
+                                        let lbl = match sz_txt {
+                                            Some(sz) => format!("На сервере · {sz}"),
+                                            None => "На сервере".to_owned(),
+                                        };
+                                        rsx! {
+                                            span { class: "ep-dl-pill ready", title: "{tip}",
+                                                Icon { svg: icons::CHECK, class: "ic xs" }
+                                                "{lbl}"
+                                            }
+                                        }
+                                    }
+                                    PreloadState::Queued | PreloadState::Downloading => rsx! {
+                                        span { class: "ep-dl-pill busy", title: "{tip}",
+                                            Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                            "{dl.compact_text}"
+                                        }
+                                    },
+                                    PreloadState::Failed => rsx! {
+                                        span { class: "ep-dl-pill fail", title: "{tip}", "Ошибка загрузки" }
+                                    },
+                                    PreloadState::Deleted => rsx! {},
+                                }
+                            }
+                        }
+                    }
                 }
                 if let Some(desc) = overview.as_deref().filter(|d| !d.is_empty()) {
                     div { class: "ep-desc", "{desc}" }
@@ -2105,6 +2325,129 @@ fn EpisodeRow(
                     }
                 }
                 div { class: "ep-acts",
+                    if download_starting {
+                        button {
+                            class: "round-act busy",
+                            title: "Запуск загрузки серии на сервер…",
+                            "aria-label": "Запуск загрузки серии на сервер",
+                            disabled: true,
+                            Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                        }
+                    } else if let Some(dl) = download.clone() {
+                        match dl.state {
+                            PreloadState::Ready => {
+                                let pid = dl.preload_id;
+                                if dl.can_delete {
+                                    if let Some(cb) = on_cancel_download {
+                                        let confirm = confirm_del();
+                                        let tip = if confirm {
+                                            "Нажмите ещё раз, чтобы удалить серию с сервера"
+                                        } else {
+                                            "Скачано на сервер (нажмите для удаления)"
+                                        };
+                                        rsx! {
+                                            button {
+                                                class: if confirm { "round-act danger-confirm" } else { "round-act srv" },
+                                                title: "{tip}",
+                                                "aria-label": "{tip}",
+                                                onblur: move |_| confirm_del.set(false),
+                                                onclick: move |_| {
+                                                    if *confirm_del.peek() {
+                                                        confirm_del.set(false);
+                                                        cb.call((pid, season, number));
+                                                    } else {
+                                                        confirm_del.set(true);
+                                                    }
+                                                },
+                                                Icon { svg: if confirm { icons::TRASH } else { icons::DOWNLOAD }, class: "ic sm" }
+                                            }
+                                        }
+                                    } else {
+                                        rsx! {
+                                            span { class: "round-act srv ro", title: "Скачано на сервер",
+                                                Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    let tip = match &dl.requested_by {
+                                        Some(who) => format!("Скачано на сервер ({who})"),
+                                        None => "Скачано на сервер".to_owned(),
+                                    };
+                                    rsx! {
+                                        span { class: "round-act srv ro", title: "{tip}",
+                                            Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                                        }
+                                    }
+                                }
+                            }
+                            PreloadState::Queued | PreloadState::Downloading => {
+                                let pid = dl.preload_id;
+                                if dl.can_delete {
+                                    if let Some(cb) = on_cancel_download {
+                                        let confirm = confirm_del();
+                                        let tip = if confirm {
+                                            "Нажмите ещё раз, чтобы отменить скачивание серии"
+                                        } else {
+                                            "Скачивается на сервер (нажмите для отмены)"
+                                        };
+                                        rsx! {
+                                            button {
+                                                class: if confirm { "round-act danger-confirm" } else { "round-act busy" },
+                                                title: "{tip}",
+                                                "aria-label": "{tip}",
+                                                onblur: move |_| confirm_del.set(false),
+                                                onclick: move |_| {
+                                                    if *confirm_del.peek() {
+                                                        confirm_del.set(false);
+                                                        cb.call((pid, season, number));
+                                                    } else {
+                                                        confirm_del.set(true);
+                                                    }
+                                                },
+                                                Icon { svg: if confirm { icons::CLOSE } else { icons::DOWNLOAD }, class: "ic sm" }
+                                            }
+                                        }
+                                    } else {
+                                        rsx! {
+                                            span { class: "round-act busy ro", title: "{dl.status_text}",
+                                                Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    rsx! {
+                                        span { class: "round-act busy ro", title: "{dl.status_text}",
+                                            Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                                        }
+                                    }
+                                }
+                            }
+                            PreloadState::Failed | PreloadState::Deleted => {
+                                if let (true, Some(cb)) = (season > 0, on_download) {
+                                    rsx! {
+                                        button {
+                                            class: "round-act",
+                                            title: "Повторить скачивание серии на сервер",
+                                            "aria-label": "Скачать серию на сервер",
+                                            onclick: move |_| cb.call(target_dl.clone()),
+                                            Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                                        }
+                                    }
+                                } else {
+                                    rsx! {}
+                                }
+                            }
+                        }
+                    } else if let (true, Some(cb)) = (season > 0, on_download) {
+                        button {
+                            class: "round-act",
+                            title: "Скачать серию на сервер",
+                            "aria-label": "Скачать серию на сервер",
+                            onclick: move |_| cb.call(target_dl.clone()),
+                            Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                        }
+                    }
                     button {
                         class: "round-act",
                         title: "Выбрать раздачу для этой серии",
@@ -2345,7 +2688,7 @@ pub fn LoginView(invite: Option<String>, error: Option<String>, children: Elemen
     }
 }
 
-fn plural(n: usize, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
+pub(crate) fn plural(n: usize, one: &'static str, few: &'static str, many: &'static str) -> &'static str {
     let (m10, m100) = (n % 10, n % 100);
     if m10 == 1 && m100 != 11 {
         one
@@ -2444,5 +2787,64 @@ mod tests {
         let (t, lbl) = play_target(&details, &[ep(1, 1, true), ep(2, 3, true)]);
         assert_eq!((t.season, t.episode), (1, 1));
         assert_eq!(lbl, "Смотреть S01E01");
+    }
+
+    #[test]
+    fn episode_download_info_distinguishes_ready_and_missing_episodes() {
+        let now = chrono::Utc::now();
+        let partial = PreloadItem {
+            id: 9,
+            kind: MediaKind::Tv,
+            tmdb_id: 250703,
+            season: 1,
+            infohash: "b".repeat(40),
+            title: Some("Аутсорс S01".into()),
+            state: PreloadState::Downloading,
+            progress: 0.7,
+            size_bytes: Some(12_000_000_000),
+            requested_at: now,
+            ready_at: None,
+            delete_after: None,
+            poster_path: None,
+            media_title: Some("Аутсорс".into()),
+            quality: Some("1080p".into()),
+            voice: Some("Оригинал".into()),
+            speed_bps: 10_000_000,
+            dl_phase: kino_core::PreloadPhase::Downloading,
+            whole_torrent: false,
+            episodes: vec![
+                kino_core::PreloadEpisodeItem {
+                    season: 1,
+                    episode: 1,
+                    state: PreloadState::Ready,
+                    progress: 1.0,
+                    size_bytes: Some(2_000_000_000),
+                    episode_name: None,
+                    ready_at: Some(now),
+                    delete_after: None,
+                },
+                kino_core::PreloadEpisodeItem {
+                    season: 1,
+                    episode: 8,
+                    state: PreloadState::Downloading,
+                    progress: 0.35,
+                    size_bytes: Some(2_000_000_000),
+                    episode_name: None,
+                    ready_at: None,
+                    delete_after: None,
+                },
+            ],
+            requested_by: Some("A".into()),
+            can_delete: false,
+        };
+        let ep1 = episode_download_info(&[partial.clone()], 1, 1).expect("ep1 should match");
+        assert_eq!(ep1.state, PreloadState::Ready);
+        assert_eq!(ep1.requested_by.as_deref(), Some("A"));
+        assert!(!ep1.can_delete);
+
+        let ep8 = episode_download_info(&[partial.clone()], 1, 8).expect("ep8 should match");
+        assert_eq!(ep8.state, PreloadState::Downloading);
+
+        assert!(episode_download_info(&[partial], 1, 7).is_none());
     }
 }

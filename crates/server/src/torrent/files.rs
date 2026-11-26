@@ -92,6 +92,19 @@ pub fn available_episodes(files: &[FileEntry], default_season: i32) -> Vec<(i32,
     out
 }
 
+/// 1-based file indices needed to cover all requested `(season, episode)` pairs.
+pub fn indices_for_episodes(files: &[FileEntry], wanted: &[(i32, i32)]) -> Vec<i32> {
+    let mut indices = Vec::new();
+    for &(s, e) in wanted {
+        if let Some(f) = pick(files, Some((s, e))) {
+            if !indices.contains(&f.index) {
+                indices.push(f.index);
+            }
+        }
+    }
+    indices
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

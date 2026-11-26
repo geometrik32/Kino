@@ -203,6 +203,8 @@ pub enum SyncServerMsg {
         kind: MediaKind,
         tmdb_id: i64,
         season: i32,
+        #[serde(default)]
+        episode: i32,
         infohash: String,
         #[serde(default)]
         title: Option<String>,

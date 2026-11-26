@@ -3,7 +3,7 @@
 
 use dioxus::prelude::*;
 pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
-use kino_core::{format_bitrate, PreloadItem, PreloadState, ReleaseChoiceUpdate, UserPrefs};
+use kino_core::{format_bitrate, MediaKind, PreloadItem, PreloadState, ReleaseChoiceUpdate, UserPrefs};
 
 use crate::icons::{self, seeder_signal, Icon};
 
@@ -16,16 +16,9 @@ pub const SIZE_STEPS: [u32; 5] = [5, 10, 20, 40, 80];
 /// Seeds below this count make streaming unreliable; highlight preloading instead.
 pub const LOW_SEEDS: u32 = 5;
 
-/// "28.4 ГБ".
+/// Formats a byte count in binary GiB/MiB matching RuTracker, e.g. `"28.4 ГБ"`.
 pub fn human_size(bytes: u64) -> String {
-    let gb = bytes as f64 / 1e9;
-    if gb >= 100.0 {
-        format!("{gb:.0} ГБ")
-    } else if gb >= 1.0 {
-        format!("{gb:.1} ГБ")
-    } else {
-        format!("{:.0} МБ", bytes as f64 / 1e6)
-    }
+    kino_core::format_size(bytes)
 }
 
 fn quality_rank(q: &str) -> u32 {
@@ -50,6 +43,7 @@ pub struct ReleaseFilter {
     pub voice: Option<String>,
     pub language: Option<String>,
     pub season: Option<i32>,
+    pub episode: Option<i32>,
     pub tracker: Option<String>,
     pub year: Option<i32>,
     /// "H.264", "HEVC" or "AV1"; releases that do not say are left out.
@@ -98,6 +92,7 @@ impl ReleaseFilter {
             voice: self.voice.or(other.voice),
             language: self.language.or(other.language),
             season: self.season.or(other.season),
+            episode: self.episode.or(other.episode),
             tracker: self.tracker.or(other.tracker),
             year: self.year.or(other.year),
             codec: self.codec.or(other.codec),
@@ -115,6 +110,14 @@ impl ReleaseFilter {
         }
     }
 
+    /// The same filter, narrowed to releases that contain `episode`.
+    pub fn for_episode(self, episode: i32) -> Self {
+        Self {
+            episode: (episode > 0).then_some(episode),
+            ..self
+        }
+    }
+
     pub fn matches(&self, r: &ReleaseOption) -> bool {
         fn ok<T: PartialEq>(want: &Option<T>, have: &T) -> bool {
             want.as_ref().is_none_or(|w| w == have)
@@ -127,12 +130,13 @@ impl ReleaseFilter {
             && ok(&self.language, &r.language)
             // A release with no single season is a pack of several (or the name does not say): it has the season too.
             && self.season.is_none_or(|s| r.season.is_none_or(|have| have == s))
+            && self.episode.is_none_or(|e| r.matches_episode(e))
             && ok(&self.tracker, &r.tracker)
             && self.year.is_none_or(|y| r.year == Some(y))
             && self.codec.as_ref().is_none_or(|c| r.codec.as_ref() == Some(c))
             && ok(&self.direct_play, &r.direct_play)
             && self.min_seeders.is_none_or(|n| r.seeders >= n)
-            && self.max_size_gb.is_none_or(|g| r.size_bytes <= u64::from(g) * 1_000_000_000)
+            && self.max_size_gb.is_none_or(|g| r.size_bytes <= u64::from(g) * kino_core::GIB_BYTES)
     }
 
     pub fn active(&self) -> usize {
@@ -144,6 +148,7 @@ impl ReleaseFilter {
             self.voice.is_some(),
             self.language.is_some(),
             self.season.is_some(),
+            self.episode.is_some(),
             self.tracker.is_some(),
             self.year.is_some(),
             self.codec.is_some(),
@@ -260,9 +265,18 @@ pub fn ReleasePicker(
     /// True for native desktop/mobile players that decode MKV/HEVC/AC3/DTS without transcoding.
     #[props(default)]
     native_player: bool,
+    /// Number of episodes in the active season (used to offer episode chips in Filters).
+    #[props(default)]
+    episode_count: Option<i32>,
     /// Active or ready server preloads matching this title/season (matched by infohash).
     #[props(default)]
     preloads: Vec<PreloadItem>,
+    /// Active season number (> 0 for TV) used to check per-episode readiness cleanly.
+    #[props(default)]
+    picker_season: i32,
+    /// When true, picking a release queues a server download instead of starting playback.
+    #[props(default)]
+    download_only: bool,
     on_filter: EventHandler<ReleaseFilter>,
     on_sort: EventHandler<ReleaseSort>,
     on_panel: EventHandler<Option<PickerPanel>>,
@@ -289,8 +303,21 @@ pub fn ReleasePicker(
             .find(|p| p.infohash.eq_ignore_ascii_case(hash) && p.state != PreloadState::Deleted)
             .cloned()
     };
-    let is_ready_rel =
-        |r: &ReleaseOption| r.preloaded || preload_for(&r.infohash).is_some_and(|p| p.state == PreloadState::Ready);
+    let scope_ep = if picker_season > 0 {
+        filter.episode.unwrap_or(0)
+    } else {
+        0
+    };
+    let is_ready_rel = |r: &ReleaseOption| {
+        r.preloaded
+            || preload_for(&r.infohash).is_some_and(|p| {
+                if picker_season > 0 {
+                    p.is_ready_for(MediaKind::Tv, picker_season, scope_ep)
+                } else {
+                    p.state == PreloadState::Ready
+                }
+            })
+    };
     let (preloaded_top, rest): (Vec<ReleaseOption>, Vec<ReleaseOption>) =
         shown.into_iter().partition(|r| is_ready_rel(r));
     let n_active = filter.active();
@@ -330,7 +357,15 @@ pub fn ReleasePicker(
                 div { class: "sheet-head",
                     div {
                         h3 {
-                            "Выбор раздачи"
+                            if download_only {
+                                if let Some(ep) = filter.episode {
+                                    "Скачать {ep} серию на сервер"
+                                } else {
+                                    "Скачать на сервер"
+                                }
+                            } else {
+                                "Выбор раздачи"
+                            }
                             if mock { span { class: "mock", "примеры" } }
                         }
                         div { class: "hint", "{heading}" }
@@ -385,6 +420,19 @@ pub fn ReleasePicker(
                             "Играет сразу"
                         }
                     }
+                    if let Some(ep) = filter.episode {
+                        {
+                            let f_ep = filter.clone();
+                            rsx! {
+                                button {
+                                    class: "chip sm active",
+                                    title: "Показываются раздачи с {ep} серией — нажмите, чтобы показать все",
+                                    onclick: move |_| on_filter.call(ReleaseFilter { episode: None, ..f_ep.clone() }),
+                                    "Серия {ep} ×"
+                                }
+                            }
+                        }
+                    }
                     button {
                         class: if panel == Some(PickerPanel::Filter) || n_active > 0 { "chip sm active" } else { "chip sm" },
                         onclick: move |_| toggle(PickerPanel::Filter),
@@ -400,7 +448,7 @@ pub fn ReleasePicker(
                     span { class: "count", "{shown_count} из {total}" }
                 }
                 match panel {
-                    Some(PickerPanel::Filter) => rsx! { FilterPanel { releases: releases.clone(), filter: filter.clone(), native_player, on_filter } },
+                    Some(PickerPanel::Filter) => rsx! { FilterPanel { releases: releases.clone(), filter: filter.clone(), native_player, episode_count, on_filter } },
                     Some(PickerPanel::Sort) => rsx! {
                         div { class: "filter-drawer sort-drawer",
                             for s in ReleaseSort::ALL {
@@ -421,7 +469,20 @@ pub fn ReleasePicker(
                             {
                                 let dl = preload_for(&r.infohash);
                                 rsx! {
-                                    ReleaseRow { key: "pinned-{r.infohash}", release: r.clone(), chosen: true, watched: true, native_player, preload: dl, on_pick, on_preload, on_cancel_preload }
+                                    ReleaseRow {
+                                        key: "pinned-{r.infohash}",
+                                        release: r.clone(),
+                                        chosen: true,
+                                        watched: true,
+                                        native_player,
+                                        preload: dl,
+                                        scope_season: picker_season,
+                                        scope_episode: scope_ep,
+                                        download_only,
+                                        on_pick,
+                                        on_preload,
+                                        on_cancel_preload,
+                                    }
                                 }
                             }
                         }
@@ -436,6 +497,9 @@ pub fn ReleasePicker(
                                         chosen: false,
                                         native_player,
                                         preload: dl,
+                                        scope_season: picker_season,
+                                        scope_episode: scope_ep,
+                                        download_only,
                                         on_pick,
                                         on_preload,
                                         on_cancel_preload,
@@ -455,6 +519,9 @@ pub fn ReleasePicker(
                                         chosen: false,
                                         native_player,
                                         preload: dl,
+                                        scope_season: picker_season,
+                                        scope_episode: scope_ep,
+                                        download_only,
                                         on_pick,
                                         on_preload,
                                         on_cancel_preload,
@@ -466,7 +533,20 @@ pub fn ReleasePicker(
                             {
                                 let dl = preload_for(&r.infohash);
                                 rsx! {
-                                    ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, preload: dl, on_pick, on_preload, on_cancel_preload }
+                                    ReleaseRow {
+                                        key: "pinned-{r.infohash}",
+                                        release: r,
+                                        chosen: true,
+                                        watched: true,
+                                        native_player,
+                                        preload: dl,
+                                        scope_season: picker_season,
+                                        scope_episode: scope_ep,
+                                        download_only,
+                                        on_pick,
+                                        on_preload,
+                                        on_cancel_preload,
+                                    }
                                 }
                             }
                         }
@@ -482,6 +562,9 @@ pub fn ReleasePicker(
                                     chosen: false,
                                     native_player,
                                     preload: dl,
+                                    scope_season: picker_season,
+                                    scope_episode: scope_ep,
+                                    download_only,
                                     on_pick,
                                     on_preload,
                                     on_cancel_preload,
@@ -493,10 +576,15 @@ pub fn ReleasePicker(
                         if let Some(lang) = filter.language.clone() {
                             {
                                 let f_nolang = ReleaseFilter { language: None, ..filter.clone() };
+                                let f_noep = ReleaseFilter { episode: None, ..filter.clone() };
                                 rsx! {
                                     p { class: "muted rel-empty",
                                         "В озвучке «{lang}» подходящих раздач не найдено (всего: {total}). "
                                         button { class: "link", onclick: move |_| on_filter.call(f_nolang.clone()), "Показать на всех языках" }
+                                        if filter.episode.is_some() {
+                                            " · "
+                                            button { class: "link", onclick: move |_| on_filter.call(f_noep.clone()), "Показать для всех серий" }
+                                        }
                                         if n_active > 1 {
                                             " · "
                                             button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтры" }
@@ -505,9 +593,20 @@ pub fn ReleasePicker(
                                 }
                             }
                         } else {
-                            p { class: "muted rel-empty",
-                                "Под фильтр ничего не подходит. "
-                                button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтры" }
+                            {
+                                let f_noep = ReleaseFilter { episode: None, ..filter.clone() };
+                                rsx! {
+                                    p { class: "muted rel-empty",
+                                        "Под фильтр ничего не подходит. "
+                                        if filter.episode.is_some() {
+                                            button { class: "link", onclick: move |_| on_filter.call(f_noep.clone()), "Показать для всех серий" }
+                                            if n_active > 1 { " · " }
+                                        }
+                                        if filter.episode.is_none() || n_active > 1 {
+                                            button { class: "link", onclick: move |_| on_filter.call(ReleaseFilter::default()), "Сбросить фильтры" }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -522,6 +621,7 @@ fn FilterPanel(
     releases: Vec<ReleaseOption>,
     filter: ReleaseFilter,
     #[props(default)] native_player: bool,
+    #[props(default)] episode_count: Option<i32>,
     on_filter: EventHandler<ReleaseFilter>,
 ) -> Element {
     let mut qualities = distinct(&releases, |r| Some(r.quality.clone()));
@@ -532,6 +632,17 @@ fn FilterPanel(
     let trackers = distinct(&releases, |r| Some(r.tracker.clone()));
     let years = distinct(&releases, |r| r.year);
     let codecs = distinct(&releases, |r| r.codec.clone());
+    let max_in_releases = releases
+        .iter()
+        .filter(|r| filter.season.is_none_or(|s| r.season.is_none() || r.season == Some(s)))
+        .filter_map(|r| r.episode_range().map(|(_, b)| b))
+        .max()
+        .unwrap_or(0);
+    let max_ep = episode_count
+        .unwrap_or(0)
+        .max(max_in_releases)
+        .max(filter.episode.unwrap_or(0));
+    let show_episodes = filter.episode.is_some() || episode_count.is_some_and(|c| c > 1) || max_in_releases > 0;
     let set = move |f: ReleaseFilter| on_filter.call(f);
     let f = filter.clone();
     let flag_label = |v: Option<bool>, pos: &'static str, neg: &'static str| -> &'static str {
@@ -602,6 +713,72 @@ fn FilterPanel(
                     options: seasons.iter().map(|s| s.to_string()).collect::<Vec<_>>(), selected: f.season.map(|s| s.to_string()),
                     on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { season: v.and_then(|s| s.parse().ok()), ..f.clone() }) } }
             }
+            if show_episodes {
+                if (1..=24).contains(&max_ep) {
+                    FilterRow { name: "Серия", any: "Любая",
+                        options: (1..=max_ep).map(|e| e.to_string()).collect::<Vec<_>>(), selected: f.episode.map(|e| e.to_string()),
+                        on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { episode: v.and_then(|e| e.parse().ok()), ..f.clone() }) } }
+                } else {
+                    {
+                        let ep_val = f.episode.map(|e| e.to_string()).unwrap_or_default();
+                        let quick_eps: Vec<i32> = {
+                            let mut v: Vec<i32> = releases
+                                .iter()
+                                .filter(|r| f.season.is_none_or(|s| r.season.is_none() || r.season == Some(s)))
+                                .filter_map(|r| r.episode_range().map(|(_, b)| b))
+                                .collect();
+                            if let Some(c) = episode_count.filter(|&c| c > 0) {
+                                v.push(c);
+                            }
+                            if let Some(e) = f.episode {
+                                v.push(e);
+                            }
+                            v.sort_unstable();
+                            v.dedup();
+                            v.into_iter().take(6).collect()
+                        };
+                        rsx! {
+                            div { class: "f-row",
+                                div { class: "f-lbl", "Серия" }
+                                div { class: "f-opts",
+                                    button {
+                                        class: if f.episode.is_none() { "chip sm active" } else { "chip sm" },
+                                        onclick: { let f = f.clone(); move |_| set(ReleaseFilter { episode: None, ..f.clone() }) },
+                                        "Любая"
+                                    }
+                                    for ep in quick_eps {
+                                        {
+                                            let f = f.clone();
+                                            rsx! {
+                                                button {
+                                                    key: "ep-{ep}",
+                                                    class: if f.episode == Some(ep) { "chip sm active" } else { "chip sm" },
+                                                    onclick: move |_| set(ReleaseFilter { episode: Some(ep), ..f.clone() }),
+                                                    "{ep}"
+                                                }
+                                            }
+                                        }
+                                    }
+                                    input {
+                                        class: "chip-input",
+                                        r#type: "number",
+                                        min: "1",
+                                        placeholder: "№ серии",
+                                        value: "{ep_val}",
+                                        oninput: {
+                                            let f = f.clone();
+                                            move |e: Event<FormData>| {
+                                                let parsed = e.value().trim().parse::<i32>().ok().filter(|&n| n > 0);
+                                                set(ReleaseFilter { episode: parsed, ..f.clone() });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             if codecs.len() > 1 || f.codec.is_some() {
                 FilterRow { name: "Кодек", any: "Любой",
                     options: CODECS.map(String::from).to_vec(), selected: f.codec.clone(),
@@ -660,6 +837,9 @@ fn ReleaseRow(
     watched: bool,
     #[props(default)] native_player: bool,
     #[props(default)] preload: Option<PreloadItem>,
+    #[props(default)] scope_season: i32,
+    #[props(default)] scope_episode: i32,
+    #[props(default)] download_only: bool,
     on_pick: EventHandler<ReleaseOption>,
     on_preload: EventHandler<ReleaseOption>,
     #[props(default)] on_cancel_preload: Option<EventHandler<i64>>,
@@ -667,10 +847,33 @@ fn ReleaseRow(
     let mut confirm_cancel = use_signal(|| false);
     let low = release.seeders < LOW_SEEDS;
     let is_uhd = quality_rank(&release.quality) >= 2160;
-    let is_ready = release.preloaded || preload.as_ref().is_some_and(|p| p.state == PreloadState::Ready);
-    let active_dl = preload
-        .as_ref()
-        .filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading));
+    let is_ready = release.preloaded
+        || preload.as_ref().is_some_and(|p| {
+            if scope_season > 0 {
+                p.is_ready_for(MediaKind::Tv, scope_season, scope_episode)
+            } else {
+                p.state == PreloadState::Ready
+            }
+        });
+    let active_dl: Option<(i64, bool, String, String)> = preload.as_ref().and_then(|p| {
+        if is_ready {
+            return None;
+        }
+        if !p.whole_torrent && scope_season > 0 && scope_episode > 0 {
+            let ep = p.episode_for(scope_season, scope_episode)?;
+            matches!(ep.state, PreloadState::Queued | PreloadState::Downloading).then(|| {
+                (
+                    p.id,
+                    p.can_delete,
+                    ep.compact_status_text(p.dl_phase, p.speed_bps),
+                    ep.status_text(p.dl_phase, p.speed_bps),
+                )
+            })
+        } else {
+            matches!(p.state, PreloadState::Queued | PreloadState::Downloading)
+                .then(|| (p.id, p.can_delete, p.compact_status_text(), p.status_text()))
+        }
+    });
     let q_sub = match (release.dolby_vision, release.hdr, release.codec.as_deref()) {
         (true, true, _) => "DV · HDR",
         (true, false, _) => "DV",
@@ -704,8 +907,8 @@ fn ReleaseRow(
                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
                             "На сервере"
                         }
-                    } else if let Some(dl) = active_dl {
-                        span { class: "tag acc", title: "{dl.status_text()}", "{dl.compact_status_text()}" }
+                    } else if let Some((_, _, compact_lbl, status_tip)) = active_dl.as_ref() {
+                        span { class: "tag acc", title: "{status_tip}", "{compact_lbl}" }
                     }
                     if chosen {
                         span { class: "tag acc", "Ваша раздача" }
@@ -736,6 +939,9 @@ fn ReleaseRow(
                     if release.subtitles {
                         span { class: "tag", "Субтитры" }
                     }
+                    if let Some(ep_tag) = release.episode_tag() {
+                        span { class: "tag", "{ep_tag}" }
+                    }
                     span { class: "tag", "{release.tracker}" }
                 }
                 div { class: "rel-raw", title: "{release.title} · {added}", "{release.title}" }
@@ -748,11 +954,10 @@ fn ReleaseRow(
                         Icon { svg: icons::CHECK, class: "ic sm" }
                         "На сервере"
                     }
-                } else if let Some(dl) = active_dl {
-                    if let Some(on_cancel) = on_cancel_preload {
+                } else if let Some((dl_id, can_cancel, compact_lbl, _)) = active_dl {
+                    if let Some(on_cancel) = on_cancel_preload.filter(|_| can_cancel) {
                         {
-                            let dl_id = dl.id;
-                            let status_lbl = dl.compact_status_text();
+                            let status_lbl = compact_lbl;
                             rsx! {
                                 button {
                                     class: if confirm_cancel() { "pre-btn cancel-confirm" } else { "pre-btn active" },
@@ -781,13 +986,15 @@ fn ReleaseRow(
                             }
                         }
                     } else {
-                        span { class: "pre-btn active", "{dl.compact_status_text()}" }
+                        span { class: "pre-btn active", "{compact_lbl}" }
                     }
                 } else {
                     button {
                         class: if low { "pre-btn recommend" } else { "pre-btn" },
                         title: if low {
                             "Мало сидов — лучше скачать заранее на сервер"
+                        } else if download_only {
+                            "Скачать на сервер"
                         } else {
                             "Скачать заранее на сервер"
                         },
@@ -796,7 +1003,7 @@ fn ReleaseRow(
                             on_preload.call(b.clone());
                         },
                         Icon { svg: icons::DOWNLOAD, class: "ic sm" }
-                        "Заранее"
+                        if download_only { "Скачать" } else { "Заранее" }
                     }
                 }
             }
@@ -894,6 +1101,22 @@ mod tests {
         let mut pack = all[0].clone();
         pack.season = None;
         assert!(s2.matches(&pack));
+        // An episode filter keeps packs that cover the episode and drops partial packs that end earlier.
+        let mut partial = all[0].clone();
+        partial.episode_start = Some(1);
+        partial.episode_end = Some(7);
+        let mut complete = all[0].clone();
+        complete.episode_start = Some(1);
+        complete.episode_end = Some(8);
+        let mut ep8_only = all[0].clone();
+        ep8_only.episode_start = Some(8);
+        ep8_only.episode_end = Some(8);
+        let ep8 = ReleaseFilter::default().for_episode(8);
+        assert_eq!(ep8.active(), 1);
+        assert!(!ep8.matches(&partial));
+        assert!(ep8.matches(&complete));
+        assert!(ep8.matches(&ep8_only));
+        assert!(ep8.matches(&pack));
         // Defaults from the profile become filters; what the user already picked wins over them.
         let prefs = UserPrefs {
             language: Some("Русский".into()),
@@ -910,7 +1133,7 @@ mod tests {
         assert!(fit.iter().all(|r| r.language == "Русский"
             && r.codec.as_deref() == Some("H.264")
             && r.seeders >= 50
-            && r.size_bytes <= 30_000_000_000
+            && r.size_bytes <= 30 * kino_core::GIB_BYTES
             && !r.hdr));
         let mine = ReleaseFilter {
             quality: Some("720p".into()),
@@ -930,7 +1153,8 @@ mod tests {
         assert!(ReleaseSort::ALL
             .iter()
             .all(|s| ReleaseSort::from_key(Some(s.key())) == *s));
-        assert_eq!(human_size(28_400_000_000), "28.4 ГБ");
+        assert_eq!(human_size(28_400_000_000), "26.4 ГБ");
+        assert_eq!(human_size(18_006_650_388), "16.8 ГБ");
         assert_eq!(ru_short_date("2024-03-08"), "08.03.24");
     }
 

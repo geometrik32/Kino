@@ -127,6 +127,10 @@ pub fn router() -> Router<AppState> {
         .route("/prefs", get(get_prefs).put(put_prefs))
         .route("/preload", get(preloads).post(add_preload))
         .route("/preload/{id}", axum::routing::delete(delete_preload))
+        .route(
+            "/preload/{id}/episode/{season}/{episode}",
+            axum::routing::delete(delete_preload_episode),
+        )
         .route("/watchlist", get(watchlist))
         .route(
             "/watchlist/{kind}/{tmdb_id}",
@@ -393,6 +397,10 @@ async fn after_finished(
     season: i32,
     episode: i32,
 ) -> Result<(), AppError> {
+    let at = Utc::now() + state.config.preload_keep;
+    if kind == MediaKind::Tv && season > 0 && episode > 0 {
+        userdata::preload_schedule_episode_removal(&state.pool, tmdb_id, season, episode, at).await?;
+    }
     let season_done = match kind {
         MediaKind::Movie => true,
         MediaKind::Tv => state
@@ -403,7 +411,6 @@ async fn after_finished(
             .unwrap_or(false),
     };
     if season_done {
-        let at = Utc::now() + state.config.preload_keep;
         userdata::preload_schedule_removal(&state.pool, user_id, kind, tmdb_id, season, at).await?;
     }
     Ok(())
@@ -1059,10 +1066,21 @@ async fn enrich_preloads(state: &AppState, list: &mut [PreloadItem]) {
         return;
     }
     let mut unique: Vec<(MediaKind, i64)> = Vec::new();
+    let mut unique_seasons: Vec<(i64, i32)> = Vec::new();
     for p in list.iter() {
         let key = (p.kind, p.tmdb_id);
         if !unique.contains(&key) {
             unique.push(key);
+        }
+        if p.kind == MediaKind::Tv {
+            for ep in &p.episodes {
+                if ep.season > 0 && ep.episode_name.is_none() {
+                    let skey = (p.tmdb_id, ep.season);
+                    if !unique_seasons.contains(&skey) {
+                        unique_seasons.push(skey);
+                    }
+                }
+            }
         }
     }
     let fetched: HashMap<(MediaKind, i64), Option<TitleSummary>> = stream::iter(
@@ -1073,11 +1091,37 @@ async fn enrich_preloads(state: &AppState, list: &mut [PreloadItem]) {
     .buffer_unordered(8)
     .collect()
     .await;
+    let fetched_seasons: Vec<((i64, i32), Option<Season>)> = stream::iter(
+        unique_seasons
+            .into_iter()
+            .map(|(id, s)| async move { ((id, s), state.catalog.season(id, s).await.ok()) }),
+    )
+    .buffer_unordered(8)
+    .collect()
+    .await;
+    let mut ep_names: HashMap<(i64, i32, i32), String> = HashMap::new();
+    for ((tmdb_id, s_num), season) in fetched_seasons {
+        if let Some(season) = season {
+            for ep in season.episodes {
+                let name = ep.name.trim();
+                if !name.is_empty() {
+                    ep_names.insert((tmdb_id, s_num, ep.number), name.to_owned());
+                }
+            }
+        }
+    }
     let telemetry = state.media.preload_telemetry.read().await.clone();
     for p in list.iter_mut() {
         if let Some(Some(summary)) = fetched.get(&(p.kind, p.tmdb_id)) {
             p.poster_path = summary.poster_path.clone();
             p.media_title = Some(summary.title.clone());
+        }
+        if p.kind == MediaKind::Tv {
+            for ep in &mut p.episodes {
+                if ep.episode_name.is_none() {
+                    ep.episode_name = ep_names.get(&(p.tmdb_id, ep.season, ep.episode)).cloned();
+                }
+            }
         }
         if let Some(parsed) = p.title.as_deref().map(crate::torrent::title::parse_title) {
             if !parsed.quality.is_empty() {
@@ -1117,25 +1161,55 @@ async fn enrich_preloads(state: &AppState, list: &mut [PreloadItem]) {
 }
 
 async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Vec<PreloadItem>>, AppError> {
+    let is_admin = db::get_user(&state.pool, user.0)
+        .await?
+        .is_some_and(|u| u.role == kino_core::Role::Admin);
     if state.media.qbit.is_some() {
         let _ = crate::jobs::sync_preloads(&state).await;
     }
-    let mut list = userdata::preloads(&state.pool, user.0).await?;
+    let mut list = userdata::all_server_preloads(&state.pool, user.0, is_admin).await?;
     enrich_preloads(&state, &mut list).await;
     Ok(Json(list))
 }
 
 const MAX_ACTIVE_PRELOADS: usize = 10;
 
+fn missing_episode_error(entries: &[crate::torrent::files::FileEntry], season: i32, episode: i32) -> AppError {
+    let code = kino_core::episode_code(season, episode);
+    let avail = crate::torrent::files::available_episodes(entries, season);
+    let summary = kino_core::format_episode_ranges(&avail);
+    let msg = if summary.is_empty() {
+        format!("В этой раздаче не найдена серия {code}")
+    } else {
+        format!("В этой раздаче нет серии {code} (есть только: {summary})")
+    };
+    AppError::new(StatusCode::UNPROCESSABLE_ENTITY, "missing_episode", msg)
+}
+
+fn qbit_unavailable(e: impl std::fmt::Display) -> AppError {
+    tracing::warn!(error = %e, "qBittorrent add failed");
+    AppError::new(
+        StatusCode::BAD_GATEWAY,
+        "downloader_unavailable",
+        "Загрузчик сейчас недоступен",
+    )
+}
+
 async fn add_preload(
     State(state): State<AppState>,
     user: CurrentUser,
     Json(mut r): Json<PreloadRequest>,
 ) -> Result<Json<PreloadItem>, AppError> {
-    if !infohash_ok(&r.infohash) || r.tmdb_id <= 0 || r.season < 0 {
+    if !infohash_ok(&r.infohash) || r.tmdb_id <= 0 || r.season < 0 || r.episode < 0 {
         return Err(AppError::bad_request(
-            "need a hex infohash, a positive tmdb_id and season >= 0",
+            "need a hex infohash, a positive tmdb_id and season/episode >= 0",
         ));
+    }
+    if r.kind == MediaKind::Movie {
+        r.season = 0;
+        r.episode = 0;
+    } else if r.episode > 0 && r.season <= 0 {
+        return Err(AppError::bad_request("need season > 0 for an episode preload"));
     }
     let orig_key = r.infohash.to_ascii_lowercase();
     r.infohash = orig_key.clone();
@@ -1143,6 +1217,7 @@ async fn add_preload(
     let Some(qbit) = &media.qbit else {
         // Without a downloader the request is only recorded (demo mode).
         let mut item = userdata::preload_add(&state.pool, user.0, &r).await?;
+        item.can_delete = true;
         enrich_preloads(&state, std::slice::from_mut(&mut item)).await;
         return Ok(Json(item));
     };
@@ -1151,27 +1226,57 @@ async fn add_preload(
     if !src.title.is_empty() {
         r.title = Some(src.title.clone());
     }
-    crate::torrent::rebind_synthetic_hash(&state.pool, &orig_key, &r.infohash).await;
-    let existing = userdata::preloads(&state.pool, user.0).await?;
-    if let Some(mut cur) = existing
-        .iter()
-        .find(|p| {
-            p.infohash.eq_ignore_ascii_case(&r.infohash)
-                && matches!(
-                    p.state,
-                    PreloadState::Queued | PreloadState::Downloading | PreloadState::Ready
-                )
-        })
-        .cloned()
-    {
-        if state.media.qbit.is_some() {
-            let _ = crate::jobs::sync_preloads(&state).await;
-            if let Ok(fresh) = userdata::preloads(&state.pool, user.0).await {
-                if let Some(updated) = fresh.into_iter().find(|p| p.id == cur.id) {
-                    cur = updated;
+    if r.kind == MediaKind::Tv && r.episode > 0 {
+        if let Some(torrent_bytes) = src.torrent.as_deref() {
+            if let Ok(meta) = crate::torrent::bencode::parse_torrent(torrent_bytes) {
+                let entries: Vec<crate::torrent::files::FileEntry> = meta
+                    .files
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, f)| crate::torrent::files::FileEntry {
+                        index: i as i32 + 1,
+                        path: f.path,
+                        length: f.length,
+                    })
+                    .collect();
+                if !entries.is_empty() && crate::torrent::files::pick(&entries, Some((r.season, r.episode))).is_none() {
+                    return Err(missing_episode_error(&entries, r.season, r.episode));
                 }
             }
         }
+    }
+    crate::torrent::rebind_synthetic_hash(&state.pool, &orig_key, &r.infohash).await;
+    let existing = userdata::preloads(&state.pool, user.0).await?;
+    let already_covered = existing.iter().find(|p| {
+        p.infohash.eq_ignore_ascii_case(&r.infohash)
+            && matches!(
+                p.state,
+                PreloadState::Queued | PreloadState::Downloading | PreloadState::Ready
+            )
+            && if r.kind == MediaKind::Movie {
+                true
+            } else if r.episode <= 0 {
+                p.whole_torrent
+            } else {
+                p.whole_torrent
+                    || p.episode_for(r.season, r.episode).is_some_and(|e| {
+                        matches!(
+                            e.state,
+                            PreloadState::Queued | PreloadState::Downloading | PreloadState::Ready
+                        )
+                    })
+            }
+    });
+    if let Some(mut cur) = already_covered.cloned() {
+        let _ = crate::jobs::sync_qbit_file_priorities(&state, &r.infohash).await;
+        let _ = qbit.start(&r.infohash).await;
+        let _ = crate::jobs::sync_preloads(&state).await;
+        if let Ok(fresh) = userdata::preloads(&state.pool, user.0).await {
+            if let Some(updated) = fresh.into_iter().find(|p| p.id == cur.id) {
+                cur = updated;
+            }
+        }
+        cur.can_delete = true;
         enrich_preloads(&state, std::slice::from_mut(&mut cur)).await;
         return Ok(Json(cur));
     }
@@ -1186,17 +1291,75 @@ async fn add_preload(
             "Достигнут лимит одновременных загрузок (10). Удалите ненужные в профиле.",
         ));
     }
-    qbit.add(&src).await.map_err(|e| {
-        tracing::warn!(error = %e, "qBittorrent add failed");
-        AppError::new(
-            StatusCode::BAD_GATEWAY,
-            "downloader_unavailable",
-            "Загрузчик сейчас недоступен",
-        )
-    })?;
+
+    let already_in_qbit = qbit
+        .info(std::slice::from_ref(&r.infohash))
+        .await
+        .ok()
+        .is_some_and(|list| list.into_iter().any(|t| !t.failed()));
+
+    if !already_in_qbit {
+        if r.kind == MediaKind::Tv && r.episode > 0 && src.torrent.is_some() {
+            qbit.add_with_options(&src, true).await.map_err(qbit_unavailable)?;
+            let mut qfiles = Vec::new();
+            for _ in 0..10 {
+                if let Ok(files) = qbit.file_states(&r.infohash).await {
+                    if !files.is_empty() {
+                        qfiles = files;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+            if !qfiles.is_empty() {
+                let entries: Vec<crate::torrent::files::FileEntry> = qfiles.iter().map(|f| f.as_file_entry()).collect();
+                if crate::torrent::files::pick(&entries, Some((r.season, r.episode))).is_none() {
+                    let _ = qbit.delete(&r.infohash).await;
+                    return Err(missing_episode_error(&entries, r.season, r.episode));
+                }
+            }
+        } else {
+            qbit.add(&src).await.map_err(qbit_unavailable)?;
+        }
+    }
+
     let mut item = userdata::preload_add(&state.pool, user.0, &r).await?;
+    let _ = crate::jobs::sync_qbit_file_priorities(&state, &r.infohash).await;
+    if already_in_qbit || (r.kind == MediaKind::Tv && r.episode > 0 && src.torrent.is_some()) {
+        let _ = qbit.start(&r.infohash).await;
+    }
+    let _ = crate::jobs::sync_preloads(&state).await;
+    if let Ok(fresh) = userdata::preloads(&state.pool, user.0).await {
+        if let Some(updated) = fresh.into_iter().find(|p| p.id == item.id) {
+            item = updated;
+        }
+    }
+    item.can_delete = true;
     enrich_preloads(&state, std::slice::from_mut(&mut item)).await;
     Ok(Json(item))
+}
+
+async fn apply_delete_preload_result(
+    state: &AppState,
+    res: userdata::DeletePreloadResult,
+) -> Result<StatusCode, AppError> {
+    match res {
+        userdata::DeletePreloadResult::NotFound => Err(AppError::not_found()),
+        userdata::DeletePreloadResult::Forbidden => Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Можно удалять только свои загрузки",
+        )),
+        userdata::DeletePreloadResult::Deleted(hash) => {
+            let wanted = userdata::preload_wanted_for_hash(&state.pool, &hash).await?;
+            if !wanted.whole_torrent && wanted.episodes.is_empty() {
+                crate::jobs::remove_files(state, &hash).await;
+            } else {
+                let _ = crate::jobs::sync_qbit_file_priorities(state, &hash).await;
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
+    }
 }
 
 async fn delete_preload(
@@ -1204,11 +1367,26 @@ async fn delete_preload(
     user: CurrentUser,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AppError> {
-    let Some(hash) = userdata::preload_delete(&state.pool, user.0, id).await? else {
-        return Err(AppError::not_found());
-    };
-    crate::jobs::remove_files(&state, &hash).await;
-    Ok(StatusCode::NO_CONTENT)
+    let is_admin = db::get_user(&state.pool, user.0)
+        .await?
+        .is_some_and(|u| u.role == kino_core::Role::Admin);
+    let res = userdata::preload_delete_for_actor(&state.pool, id, user.0, is_admin).await?;
+    apply_delete_preload_result(&state, res).await
+}
+
+async fn delete_preload_episode(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path((id, season, episode)): Path<(i64, i32, i32)>,
+) -> Result<StatusCode, AppError> {
+    if season <= 0 || episode <= 0 {
+        return Err(AppError::bad_request("season and episode must be positive"));
+    }
+    let is_admin = db::get_user(&state.pool, user.0)
+        .await?
+        .is_some_and(|u| u.role == kino_core::Role::Admin);
+    let res = userdata::preload_delete_episode_for_actor(&state.pool, id, season, episode, user.0, is_admin).await?;
+    apply_delete_preload_result(&state, res).await
 }
 
 pub(crate) fn parse_kind(kind: &str) -> Result<MediaKind, AppError> {

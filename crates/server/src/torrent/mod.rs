@@ -64,8 +64,14 @@ fn running_minutes(p: &title::ParsedTitle, details: &TitleDetails) -> Option<f64
     let each = f64::from(details.runtime_min.filter(|m| *m > 0)?);
     match details.summary.kind {
         MediaKind::Movie => Some(each),
-        MediaKind::Tv if p.single_episode => Some(each),
         MediaKind::Tv => {
+            if let Some((a, b)) = p.episode_range {
+                let count = (b - a + 1).max(1);
+                return Some(each * f64::from(count));
+            }
+            if p.single_episode {
+                return Some(each);
+            }
             let season = p.season?;
             // A running season is only as long as what has aired.
             let aired = match details.last_episode {
@@ -107,6 +113,8 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
         added: item.added.clone(),
         year: p.year,
         season: p.season,
+        episode_start: p.episode_range.map(|(a, _)| a),
+        episode_end: p.episode_range.map(|(_, b)| b),
         hdr: p.hdr,
         dolby_vision: p.dolby_vision,
         subtitles: p.subtitles,

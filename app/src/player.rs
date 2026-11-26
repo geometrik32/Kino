@@ -4,13 +4,13 @@
 
 use dioxus::prelude::*;
 use kino_core::{
-    episode_code, normalize_quality_key, EpisodeRating, MediaKind, MediaTrack, PlayInfo, PlayProbeRequest, PlayRequest,
-    PreloadItem, PreloadPhase, PreloadRequest, PreloadState, ProgressUpdate, ReleaseChoiceUpdate, ReleaseRef,
-    ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, StreamPhase, SyncClientMsg, SyncEventKind,
-    SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState, TracksUpdate,
+    episode_code, normalize_quality_key, EpisodeRating, MediaKind, MediaSegment, MediaTrack, PlayInfo,
+    PlayProbeRequest, PlayRequest, PreloadItem, PreloadPhase, PreloadRequest, PreloadState, ProgressUpdate,
+    ReleaseChoiceUpdate, ReleaseRef, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, StreamPhase,
+    SyncClientMsg, SyncEventKind, SyncJoinRequest, SyncLeaveRequest, SyncServerMsg, SyncState, TracksUpdate,
 };
 use kino_ui::{
-    DiskReadyPrompt, PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale, NEXT_PROMPT_SEC,
+    next_prompt_start, DiskReadyPrompt, PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale,
 };
 
 use crate::{
@@ -136,12 +136,15 @@ fn prefetch_is_fresh(info: &PlayInfo, prepared_at_ms: i64, now_ms: i64, ttl_ms: 
     info.preloaded || now_ms.saturating_sub(prepared_at_ms) <= ttl_ms
 }
 
-fn can_prefetch_next(pos: f64, dur: f64, buffered_ahead: Option<f64>) -> bool {
+fn can_prefetch_next(pos: f64, dur: f64, buffered_ahead: Option<f64>, segments: &[MediaSegment]) -> bool {
     if !pos.is_finite() || !dur.is_finite() || dur <= 20.0 || pos < 5.0 {
         return false;
     }
+    let Some(prompt_at) = next_prompt_start(dur, segments) else {
+        return false;
+    };
     let remaining = dur - pos;
-    if remaining >= NEXT_PROMPT_SEC {
+    if pos < prompt_at || remaining > 180.0 {
         return false;
     }
     match buffered_ahead {
@@ -176,7 +179,9 @@ fn best_per_quality(
     list: &[ReleaseOption],
     choices: &[ReleaseChoiceUpdate],
     active: &ReleaseChoiceUpdate,
+    kind: MediaKind,
     season: i32,
+    episode: i32,
     preloads: &[PreloadItem],
 ) -> Vec<ReleaseOption> {
     let mut out = Vec::<ReleaseOption>::new();
@@ -186,11 +191,17 @@ fn best_per_quality(
         r_preloaded
             || preloads
                 .iter()
-                .any(|p| p.state == PreloadState::Ready && p.infohash.eq_ignore_ascii_case(hash))
+                .any(|p| p.infohash.eq_ignore_ascii_case(hash) && p.is_ready_for(kind, season, episode))
     };
     let is_downloading = |hash: &str| {
         preloads.iter().any(|p| {
-            matches!(p.state, PreloadState::Queued | PreloadState::Downloading) && p.infohash.eq_ignore_ascii_case(hash)
+            p.infohash.eq_ignore_ascii_case(hash)
+                && if kind == MediaKind::Tv && season > 0 && episode > 0 && !p.whole_torrent {
+                    p.episode_for(season, episode)
+                        .is_some_and(|e| matches!(e.state, PreloadState::Queued | PreloadState::Downloading))
+                } else {
+                    matches!(p.state, PreloadState::Queued | PreloadState::Downloading)
+                }
         })
     };
     let push_unique = |out: &mut Vec<ReleaseOption>, mut item: ReleaseOption| {
@@ -302,6 +313,8 @@ fn best_per_quality(
             added: String::new(),
             year: None,
             season: (p.season > 0).then_some(p.season),
+            episode_start: None,
+            episode_end: None,
             hdr: false,
             dolby_vision: false,
             subtitles: false,
@@ -310,7 +323,7 @@ fn best_per_quality(
             bitrate_kbps: None,
             bitrate_approx: false,
             picked_by: Vec::new(),
-            preloaded: p.state == PreloadState::Ready,
+            preloaded: p.is_ready_for(kind, season, episode),
         };
         let insert_at = out
             .iter()
@@ -1146,6 +1159,10 @@ pub fn Player(
                     let should_probe = i.duration.is_none();
                     let probe_stream = i.stream.clone();
                     let probe_native = i.native;
+                    let seg_empty = i.segments.is_empty();
+                    let seg_dur = i.duration;
+                    let seg_hash = resolved_hash.clone();
+                    let seg_tok = t.clone();
                     let computed_next = next_target_episode(season, episode, i.next, rewatch_mode, &ep_ratings_fetch);
                     ui.with_mut(|s| {
                         s.duration = i.duration;
@@ -1159,6 +1176,7 @@ pub fn Player(
                         };
                         s.next = computed_next.map(|(s, e)| episode_code(s, e));
                         s.preloaded = i.preloaded;
+                        s.segments = i.segments.clone();
                         if !resolved_hash.is_empty() {
                             s.active_infohash = Some(resolved_hash.clone());
                         }
@@ -1176,6 +1194,30 @@ pub fn Player(
                     last_saved.set(at);
                     info.set(Some(i));
                     load_source(at);
+
+                    if seg_empty {
+                        spawn(async move {
+                            if let Ok(segs) =
+                                api::segments(&seg_tok, kind, id, season, episode, &seg_hash, seg_dur).await
+                            {
+                                if play_gen() != my_gen || closing() || segs.is_empty() {
+                                    return;
+                                }
+                                info.with_mut(|cur| {
+                                    if let Some(cur) = cur.as_mut() {
+                                        if cur.segments.is_empty() {
+                                            cur.segments = segs.clone();
+                                        }
+                                    }
+                                });
+                                ui.with_mut(|s| {
+                                    if s.segments.is_empty() {
+                                        s.segments = segs;
+                                    }
+                                });
+                            }
+                        });
+                    }
 
                     if should_probe {
                         let probe_token = t;
@@ -1300,8 +1342,13 @@ pub fn Player(
     // Syncs `player_preloads` download states into `ui.release_downloads` and `quality_cache`.
     let mut sync_preloads_ui = move || {
         let items = player_preloads.peek().clone();
-        let cur_season = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
-        let relevant: Vec<PreloadItem> = items
+        let (cur_season, cur_episode) = if kind == MediaKind::Tv {
+            let (s, e) = *target.peek();
+            (s, e)
+        } else {
+            (0, 0)
+        };
+        let raw_relevant: Vec<PreloadItem> = items
             .iter()
             .filter(|p| {
                 p.kind == kind
@@ -1311,12 +1358,45 @@ pub fn Player(
             })
             .cloned()
             .collect();
-        ui.with_mut(|s| s.release_downloads = relevant.clone());
+        let ui_downloads: Vec<PreloadItem> = if kind == MediaKind::Tv && cur_season > 0 && cur_episode > 0 {
+            raw_relevant
+                .iter()
+                .filter_map(|p| {
+                    if p.whole_torrent {
+                        Some(p.clone())
+                    } else {
+                        let ep = p.episode_for(cur_season, cur_episode)?;
+                        let mut proj = p.clone();
+                        proj.state = ep.state;
+                        proj.progress = ep.progress;
+                        if let Some(sz) = ep.size_bytes {
+                            proj.size_bytes = Some(sz);
+                        }
+                        if ep.state == PreloadState::Ready {
+                            proj.dl_phase = PreloadPhase::Ready;
+                            proj.speed_bps = 0;
+                        }
+                        Some(proj)
+                    }
+                })
+                .collect()
+        } else {
+            raw_relevant.clone()
+        };
+        ui.with_mut(|s| s.release_downloads = ui_downloads);
         if let Some((rs, raw)) = raw_releases_cache.peek().clone() {
             if rs == cur_season {
                 let cur_rel = release.peek().clone();
                 let cur_choices = choices.peek().clone();
-                let rebuilt = best_per_quality(&raw, &cur_choices, &cur_rel, cur_season, &relevant);
+                let rebuilt = best_per_quality(
+                    &raw,
+                    &cur_choices,
+                    &cur_rel,
+                    kind,
+                    cur_season,
+                    cur_episode,
+                    &raw_relevant,
+                );
                 quality_cache.set(Some((cur_season, rebuilt)));
                 return;
             }
@@ -1324,10 +1404,9 @@ pub fn Player(
         quality_cache.with_mut(|qc| {
             if let Some((_, ref mut list)) = qc.as_mut() {
                 for r in list.iter_mut() {
-                    if relevant
-                        .iter()
-                        .any(|p| p.state == PreloadState::Ready && p.infohash.eq_ignore_ascii_case(&r.infohash))
-                    {
+                    if raw_relevant.iter().any(|p| {
+                        p.infohash.eq_ignore_ascii_case(&r.infohash) && p.is_ready_for(kind, cur_season, cur_episode)
+                    }) {
                         r.preloaded = true;
                     }
                 }
@@ -1371,15 +1450,14 @@ pub fn Player(
             player_preloads.set(items.clone());
             sync_preloads_ui();
             if check_prompt {
-                let cur_s = if kind == MediaKind::Tv { target.peek().0 } else { 0 };
+                let (cur_s, cur_e) = if kind == MediaKind::Tv { *target.peek() } else { (0, 0) };
                 let active_hash = ui.peek().active_infohash.clone();
                 let already_on_disk = ui.peek().preloaded;
                 let prompted = prompted_hashes.peek().clone();
                 if let Some(hit) = items.iter().find(|p| {
                     p.kind == kind
                         && p.tmdb_id == id
-                        && p.state == PreloadState::Ready
-                        && (kind == MediaKind::Movie || p.season == 0 || p.season == cur_s)
+                        && p.is_ready_for(kind, cur_s, cur_e)
                         && !(already_on_disk
                             && active_hash
                                 .as_deref()
@@ -1507,6 +1585,7 @@ pub fn Player(
                     s.menu = None;
                     s.position = initial_pos;
                     s.duration = None;
+                    s.segments.clear();
                     s.waiting = false;
                     s.release = release_label(&rel);
                     s.active_infohash = Some(rel.infohash.clone());
@@ -1565,6 +1644,7 @@ pub fn Player(
                 s.menu = None;
                 s.position = initial_pos;
                 s.duration = None;
+                s.segments.clear();
                 s.waiting = false;
                 s.release = release_label(&rel);
                 s.active_infohash = Some(rel.infohash.clone());
@@ -1664,6 +1744,7 @@ pub fn Player(
                 s.menu = None;
                 s.position = 0.0;
                 s.duration = None;
+                s.segments.clear();
                 s.waiting = false;
                 s.release = release_label(&rel);
                 s.subtitle = (kind == MediaKind::Tv).then(|| episode_code(season, episode));
@@ -2004,6 +2085,7 @@ pub fn Player(
                                                 kind: pk,
                                                 tmdb_id: pid,
                                                 season: pseason,
+                                                episode: pepisode,
                                                 infohash,
                                                 title,
                                                 quality,
@@ -2012,15 +2094,44 @@ pub fn Player(
                                                 if pk == kind && pid == id {
                                                     let fallback_title = ui.peek().title.clone();
                                                     let item_title = title.clone().or(Some(fallback_title));
+                                                    let now_utc = chrono::Utc::now();
                                                     player_preloads.with_mut(|list| {
                                                         if let Some(existing) = list
                                                             .iter_mut()
                                                             .find(|p| p.infohash.eq_ignore_ascii_case(&infohash))
                                                         {
-                                                            existing.state = PreloadState::Ready;
-                                                            existing.progress = 1.0;
-                                                            existing.speed_bps = 0;
-                                                            existing.dl_phase = PreloadPhase::Ready;
+                                                            if pepisode > 0 && kind == MediaKind::Tv {
+                                                                let s_num = pseason.max(1);
+                                                                if let Some(ep) =
+                                                                    existing.episodes.iter_mut().find(|e| {
+                                                                        e.season == s_num && e.episode == pepisode
+                                                                    })
+                                                                {
+                                                                    ep.state = PreloadState::Ready;
+                                                                    ep.progress = 1.0;
+                                                                    if ep.ready_at.is_none() {
+                                                                        ep.ready_at = Some(now_utc);
+                                                                    }
+                                                                } else {
+                                                                    existing.episodes.push(
+                                                                        kino_core::PreloadEpisodeItem {
+                                                                            season: s_num,
+                                                                            episode: pepisode,
+                                                                            state: PreloadState::Ready,
+                                                                            progress: 1.0,
+                                                                            size_bytes: None,
+                                                                            episode_name: None,
+                                                                            ready_at: Some(now_utc),
+                                                                            delete_after: None,
+                                                                        },
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                existing.state = PreloadState::Ready;
+                                                                existing.progress = 1.0;
+                                                                existing.speed_bps = 0;
+                                                                existing.dl_phase = PreloadPhase::Ready;
+                                                            }
                                                             if existing
                                                                 .title
                                                                 .as_deref()
@@ -2035,6 +2146,20 @@ pub fn Player(
                                                                 existing.voice = voice.clone();
                                                             }
                                                         } else {
+                                                            let eps = if pepisode > 0 && kind == MediaKind::Tv {
+                                                                vec![kino_core::PreloadEpisodeItem {
+                                                                    season: pseason.max(1),
+                                                                    episode: pepisode,
+                                                                    state: PreloadState::Ready,
+                                                                    progress: 1.0,
+                                                                    size_bytes: None,
+                                                                    episode_name: None,
+                                                                    ready_at: Some(now_utc),
+                                                                    delete_after: None,
+                                                                }]
+                                                            } else {
+                                                                Vec::new()
+                                                            };
                                                             list.insert(
                                                                 0,
                                                                 PreloadItem {
@@ -2052,22 +2177,31 @@ pub fn Player(
                                                                     speed_bps: 0,
                                                                     dl_phase: PreloadPhase::Ready,
                                                                     size_bytes: None,
-                                                                    requested_at: chrono::Utc::now(),
-                                                                    ready_at: Some(chrono::Utc::now()),
+                                                                    requested_at: now_utc,
+                                                                    ready_at: Some(now_utc),
                                                                     delete_after: None,
                                                                     poster_path: None,
+                                                                    whole_torrent: pepisode <= 0,
+                                                                    episodes: eps,
+                                                                    requested_by: None,
+                                                                    can_delete: false,
                                                                 },
                                                             );
                                                         }
                                                     });
                                                     sync_preloads_ui();
-                                                    ws_trigger_ready(DiskReadyPrompt {
-                                                        infohash: infohash.clone(),
-                                                        season: pseason,
-                                                        title: item_title,
-                                                        quality,
-                                                        voice,
-                                                    });
+                                                    let matches_ep = kind == MediaKind::Movie
+                                                        || pepisode <= 0
+                                                        || pepisode == target.peek().1;
+                                                    if matches_ep {
+                                                        ws_trigger_ready(DiskReadyPrompt {
+                                                            infohash: infohash.clone(),
+                                                            season: pseason,
+                                                            title: item_title,
+                                                            quality,
+                                                            voice,
+                                                        });
+                                                    }
                                                 }
                                             }
                                             SyncServerMsg::Error { .. } => {}
@@ -2415,13 +2549,11 @@ pub fn Player(
             if closing() || kind != MediaKind::Tv || connecting() || awaiting_ready() || !played() || desired_paused() {
                 return;
             }
-            {
+            let can_pf = {
                 let s = ui.peek();
-                if s.paused || s.waiting || s.error.is_some() {
-                    return;
-                }
-            }
-            if !can_prefetch_next(pos, dur, buffered_ahead) {
+                !s.paused && !s.waiting && s.error.is_none() && can_prefetch_next(pos, dur, buffered_ahead, &s.segments)
+            };
+            if !can_pf {
                 return;
             }
             let (season, cur_ep) = *target.peek();
@@ -3874,7 +4006,9 @@ pub fn Player(
                             let raw = res.map(|l| l.releases).unwrap_or_default();
                             raw_releases_cache.set(Some((scope_s, raw.clone())));
                             let cur_preloads = player_preloads.peek().clone();
-                            let items = best_per_quality(&raw, &cur_choices, &cur_rel, scope_s, &cur_preloads);
+                            let cur_ep = if kind == MediaKind::Tv { target.peek().1 } else { 0 };
+                            let items =
+                                best_per_quality(&raw, &cur_choices, &cur_rel, kind, scope_s, cur_ep, &cur_preloads);
                             quality_cache.set(Some((scope_s, items)));
                             sync_preloads_ui();
                         });
@@ -3888,6 +4022,7 @@ pub fn Player(
                     kind,
                     tmdb_id: id,
                     season: dl_season,
+                    episode: 0,
                     infohash: orig_key.clone(),
                     title: (!rel.title.is_empty()).then(|| rel.title.clone()),
                 };
@@ -3928,7 +4063,8 @@ pub fn Player(
                                 list.insert(0, item.clone());
                             });
                             sync_preloads_ui();
-                            if item.state == PreloadState::Ready {
+                            let cur_ep = if kind == MediaKind::Tv { target.peek().1 } else { 0 };
+                            if item.is_ready_for(kind, dl_season, cur_ep) {
                                 trigger_ready(DiskReadyPrompt {
                                     infohash: item.infohash.clone(),
                                     season: item.season,
@@ -4299,6 +4435,7 @@ mod tests {
             preloaded,
             native: false,
             stream_start_at: None,
+            segments: Vec::new(),
         }
     }
 
@@ -4319,17 +4456,29 @@ mod tests {
     #[test]
     fn next_prefetch_timing_and_buffer_guards() {
         // Too early or invalid durations never prefetch.
-        assert!(!can_prefetch_next(100.0, 200.0, Some(30.0)));
-        assert!(!can_prefetch_next(3.0, 35.0, Some(30.0)));
-        assert!(!can_prefetch_next(10.0, 15.0, Some(15.0)));
+        assert!(!can_prefetch_next(100.0, 200.0, Some(30.0), &[]));
+        assert!(!can_prefetch_next(3.0, 35.0, Some(30.0), &[]));
+        assert!(!can_prefetch_next(10.0, 15.0, Some(15.0), &[]));
 
-        // Inside the prompt window: require >= 5s buffered ahead unless at EOF or <= 20s remaining.
-        assert!(!can_prefetch_next(965.0, 1000.0, Some(2.0)));
-        assert!(can_prefetch_next(965.0, 1000.0, Some(6.0)));
-        assert!(can_prefetch_next(981.0, 1000.0, Some(1.0)));
-        assert!(can_prefetch_next(998.5, 1000.0, Some(1.5)));
+        // Inside the proportional 3% prompt window (1000s -> last 30s -> >= 970s): require >= 5s buffered ahead unless <= 20s remaining.
+        assert!(!can_prefetch_next(965.0, 1000.0, Some(10.0), &[]));
+        assert!(!can_prefetch_next(972.0, 1000.0, Some(2.0), &[]));
+        assert!(can_prefetch_next(972.0, 1000.0, Some(6.0), &[]));
+        assert!(can_prefetch_next(981.0, 1000.0, Some(1.0), &[]));
+        assert!(can_prefetch_next(998.5, 1000.0, Some(1.5), &[]));
         // Native player without JS buffer telemetry triggers right in the prompt window.
-        assert!(can_prefetch_next(965.0, 1000.0, None));
+        assert!(can_prefetch_next(972.0, 1000.0, None, &[]));
+
+        // Known Outro triggers ~5s before credits start even on long 60m episodes.
+        let segs = [MediaSegment {
+            kind: kino_core::SegmentKind::Outro,
+            start_sec: 3428.0,
+            end_sec: 3510.0,
+            source: kino_core::SegmentSource::LocalAnalysis,
+            confidence: 0.9,
+        }];
+        assert!(!can_prefetch_next(3415.0, 3510.0, Some(10.0), &segs));
+        assert!(can_prefetch_next(3424.0, 3510.0, Some(10.0), &segs));
     }
 
     #[test]

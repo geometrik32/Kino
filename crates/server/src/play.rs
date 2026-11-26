@@ -58,6 +58,10 @@ pub struct Media {
     pub transcodes: std::sync::Arc<tokio::sync::Semaphore>,
     /// Subtitle extraction spawns ffmpeg too; cap it so requests cannot pile up.
     pub subtitles: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Background preloaded episode analyzer concurrency cap (single worker to avoid starving CPU).
+    pub analysis_sem: std::sync::Arc<tokio::sync::Semaphore>,
+    /// Wakes the background segment analyzer right when a TV download completes.
+    pub segment_notify: std::sync::Arc<tokio::sync::Notify>,
     /// SSD pause-resume cache for torrent streams (Direct and transcoded).
     pub pause_cache: torrent::pause_cache::PauseCache,
     /// Live `(speed_bps, dl_phase)` telemetry by lowercase infohash from qBittorrent polling.
@@ -151,6 +155,8 @@ impl Media {
             hw: HwAccel::parse(&c.hwaccel),
             transcodes: transcodes_sem,
             subtitles: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SUBTITLES)),
+            analysis_sem: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            segment_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
             pause_cache,
             preload_telemetry: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             dead_releases: std::sync::Mutex::default(),
@@ -214,6 +220,7 @@ pub fn routes() -> Router<AppState> {
         .route("/play", post(play))
         .route("/play/probe", post(play_probe))
         .route("/play/progress/{release}", get(play_progress))
+        .route("/segments/{kind}/{tmdb_id}", get(episode_segments))
         .merge(
             // The stream links are signed and the apps play them from another origin,
             // subtitles included: let any page read them.
@@ -540,6 +547,7 @@ fn auto_pick_release<'a>(
     releases: &'a [ReleaseOption],
     kind: MediaKind,
     season: i32,
+    episode: i32,
     target: &TargetQuality,
     preferred_voice: Option<&str>,
     preferred_lang: Option<&str>,
@@ -548,7 +556,9 @@ fn auto_pick_release<'a>(
 ) -> Option<&'a ReleaseOption> {
     let for_season: Vec<&ReleaseOption> = releases
         .iter()
-        .filter(|r| kind == MediaKind::Movie || r.season.is_none() || r.season == Some(season))
+        .filter(|r| {
+            kind == MediaKind::Movie || ((r.season.is_none() || r.season == Some(season)) && r.matches_episode(episode))
+        })
         .collect();
     if for_season.is_empty() {
         return None;
@@ -648,10 +658,7 @@ async fn resolve_release(
 
     // Tier 1: Ready preloaded download on server disk beats every older manual/peer/profile choice.
     let ready_preloads = userdata::ready_preloads_for_title(&state.pool, kind, tmdb_id).await?;
-    let best_ready = ready_preloads
-        .iter()
-        .find(|p| kind == MediaKind::Movie || p.season == season)
-        .or_else(|| ready_preloads.iter().find(|p| p.season == 0));
+    let best_ready = ready_preloads.iter().find(|p| p.covers(kind, season, episode));
 
     let mut preload_mismatch: Option<(ReleaseChoiceUpdate, String)> = None;
     if let Some(rp) = best_ready {
@@ -680,8 +687,18 @@ async fn resolve_release(
             let preloaded_choice = ReleaseChoiceUpdate {
                 kind,
                 tmdb_id,
-                season: if kind == MediaKind::Movie { 0 } else { rp.season },
-                episode: 0,
+                season: if kind == MediaKind::Movie {
+                    0
+                } else if rp.whole_torrent {
+                    rp.season
+                } else {
+                    season
+                },
+                episode: if kind == MediaKind::Movie || rp.whole_torrent {
+                    0
+                } else {
+                    episode
+                },
                 infohash: rp.infohash.clone(),
                 title: rp.title.clone(),
                 quality: q,
@@ -732,6 +749,19 @@ async fn resolve_release(
     Ok(Json(fallback))
 }
 
+fn choice_covers_episode(c: &ReleaseChoice, kind: MediaKind, episode: i32) -> bool {
+    if kind == MediaKind::Movie || episode <= 0 || c.release.episode > 0 {
+        return true;
+    }
+    let Some(title) = c.release.title.as_deref() else {
+        return true;
+    };
+    match torrent::title::parse_title(title).episode_range {
+        Some((a, b)) => (a..=b).contains(&episode),
+        None => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn resolve_online_tiers(
     state: &AppState,
@@ -750,7 +780,10 @@ async fn resolve_online_tiers(
     // Tier 2: user's own manual choices (`manual = TRUE`), beating profile/default quality.
     // Only if the user switched device quality inside the player strictly *after* their newest manual pick
     // do we filter manual picks by that explicit per-title device quality override.
-    let mine_manual: Vec<ReleaseChoice> = mine.into_iter().filter(|c| c.manual).collect();
+    let mine_manual: Vec<ReleaseChoice> = mine
+        .into_iter()
+        .filter(|c| c.manual && choice_covers_episode(c, kind, episode))
+        .collect();
     let newest_manual = find_any_scoped_choice(&mine_manual, season, episode);
     let dev_switch_is_newer = match (dev_override, newest_manual) {
         (Some((dq, dev_ts)), Some(c)) => *dev_ts > c.chosen_at && normalize_quality_key(dq) != choice_quality_key(c),
@@ -775,7 +808,11 @@ async fn resolve_online_tiers(
 
     // Tier 3: other users' manual choices (most picked first, then newest).
     // Beats profile quality settings; respects an explicit per-title player quality override if set.
-    let shared = db::shared_release_choices(&state.pool, user_id, kind, tmdb_id).await?;
+    let shared: Vec<ReleaseChoice> = db::shared_release_choices(&state.pool, user_id, kind, tmdb_id)
+        .await?
+        .into_iter()
+        .filter(|c| choice_covers_episode(c, kind, episode))
+        .collect();
     let shared_pick = if let Some(dq) = dev_quality_newest {
         find_scoped_choice(&shared, season, episode, |k| k == dq)
     } else {
@@ -832,6 +869,7 @@ async fn resolve_online_tiers(
         &list.releases,
         kind,
         season,
+        episode,
         target,
         preferred_voice.as_deref(),
         prefs.language.as_deref(),
@@ -845,7 +883,12 @@ async fn resolve_online_tiers(
             } else {
                 season
             };
-            let choice = best.to_scoped_choice(&details.summary, save_season, 0);
+            let save_ep = if kind == MediaKind::Tv && episode > 0 && best.episode_range().is_some_and(|(a, b)| a == b) {
+                episode
+            } else {
+                0
+            };
+            let choice = best.to_scoped_choice(&details.summary, save_season, save_ep);
             Ok(ResolveReleaseResponse::Ready {
                 choice,
                 from_peer: None,
@@ -994,7 +1037,7 @@ async fn play(
         .unwrap_or(0);
 
     // A release downloaded in advance is played from disk; otherwise through pause-cache / TorrServer.
-    let local = preloaded_files(&state, &hash).await;
+    let local = preloaded_files(&state, &hash, episode).await;
     let ((file, probe, preloaded), torrent_ts) = match local {
         Some((list, dir)) => {
             let f = files::pick(&list, episode)
@@ -1143,6 +1186,12 @@ async fn play(
         Some(e) => next_episode(&state.catalog.details(MediaKind::Tv, req.tmdb_id).await?, e),
         None => None,
     };
+    let segments =
+        crate::segments::load_segments_for_play(&state.pool, req.kind, req.tmdb_id, season, ep, &hash, probe.duration)
+            .await;
+    if preloaded && req.kind == MediaKind::Tv {
+        media.segment_notify.notify_one();
+    }
 
     Ok(Json(PlayInfo {
         infohash: hash,
@@ -1160,6 +1209,7 @@ async fn play(
         preloaded,
         native: req.native,
         stream_start_at,
+        segments,
     }))
 }
 
@@ -1246,6 +1296,42 @@ async fn play_probe(
     }))
 }
 
+#[derive(Deserialize)]
+struct SegmentsQuery {
+    #[serde(default)]
+    season: i32,
+    #[serde(default)]
+    episode: i32,
+    #[serde(default)]
+    release: String,
+    duration: Option<f64>,
+}
+
+/// Returns intro / recap / credits segments from PostgreSQL, fetching IntroDB/AniSkip
+/// on the first lookup and caching them for all users.
+async fn episode_segments(
+    State(state): State<AppState>,
+    _user: CurrentUser,
+    Path((kind_raw, tmdb_id)): Path<(String, i64)>,
+    Query(q): Query<SegmentsQuery>,
+) -> Result<Json<Vec<kino_core::MediaSegment>>, AppError> {
+    let kind = parse_kind(&kind_raw)?;
+    if tmdb_id <= 0 || q.season < 0 || q.episode < 0 {
+        return Err(AppError::bad_request("invalid title or episode coordinates"));
+    }
+    let segs = crate::segments::resolve_or_fetch_segments(
+        &state,
+        kind,
+        tmdb_id,
+        q.season,
+        q.episode,
+        &q.release,
+        q.duration.filter(|d| d.is_finite() && *d > 0.0),
+    )
+    .await;
+    Ok(Json(segs))
+}
+
 /// How far the connection to a release has got, for the bar shown while the
 /// player starts. Never fails: until TorrServer knows the torrent it is "connecting".
 async fn play_progress(
@@ -1297,19 +1383,59 @@ fn missing_file(list: &[FileEntry], episode: Option<(i32, i32)>) -> AppError {
 }
 
 /// Files of any finished preload on server disk, with the folder they are in.
-async fn preloaded_files(state: &AppState, hash: &str) -> Option<(Vec<FileEntry>, PathBuf)> {
+async fn preloaded_files(
+    state: &AppState,
+    hash: &str,
+    episode: Option<(i32, i32)>,
+) -> Option<(Vec<FileEntry>, PathBuf)> {
     let (qbit, dir) = (state.media.qbit.as_ref()?, state.media.preload_dir.clone()?);
-    let ready: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND state = 'ready')")
+    let ready: bool = match episode {
+        None => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM preload WHERE infohash = $1 AND state = 'ready')")
             .bind(hash)
             .fetch_one(&state.pool)
             .await
-            .ok()?;
+            .ok()?,
+        Some((s, e)) => sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM preload p
+                 WHERE p.infohash = $1 AND p.state <> 'deleted' AND (
+                     EXISTS (
+                         SELECT 1 FROM preload_episode pe
+                         WHERE pe.preload_id = p.id AND pe.season = $2 AND pe.episode = $3 AND pe.state = 'ready'
+                     )
+                     OR (
+                         p.whole_torrent = TRUE AND p.state = 'ready'
+                         AND NOT EXISTS (
+                             SELECT 1 FROM preload_episode pe
+                             WHERE pe.preload_id = p.id AND pe.season = $2 AND pe.episode = $3 AND pe.state = 'deleted'
+                         )
+                     )
+                 )
+             )",
+        )
+        .bind(hash)
+        .bind(s)
+        .bind(e)
+        .fetch_one(&state.pool)
+        .await
+        .ok()?,
+    };
     if !ready {
         return None;
     }
-    match qbit.files(hash).await {
-        Ok(list) => Some((list, dir)),
+    match qbit.file_states(hash).await {
+        Ok(qfiles) => {
+            let list: Vec<FileEntry> = qfiles
+                .into_iter()
+                .filter(|f| episode.is_none() || f.priority > 0)
+                .map(|f| f.as_file_entry())
+                .collect();
+            if list.is_empty() {
+                None
+            } else {
+                Some((list, dir))
+            }
+        }
         Err(e) => {
             tracing::warn!(error = %e, "qBittorrent files failed, streaming instead");
             None
@@ -1941,6 +2067,8 @@ mod tests {
             added: "2026-11-25".into(),
             year: Some(2026),
             season: None,
+            episode_start: None,
+            episode_end: None,
             hdr: false,
             dolby_vision: false,
             subtitles: false,
@@ -1982,6 +2110,8 @@ mod tests {
             added: "2026-11-26".into(),
             year: Some(2024),
             season: None,
+            episode_start: None,
+            episode_end: None,
             hdr: false,
             dolby_vision: false,
             subtitles: false,
@@ -2001,6 +2131,7 @@ mod tests {
             &releases,
             MediaKind::Movie,
             0,
+            0,
             &TargetQuality::Exact("1080p".into()),
             None,
             Some("Русский"),
@@ -2009,6 +2140,88 @@ mod tests {
         )
         .unwrap();
         assert_eq!(picked.infohash, live.infohash);
+    }
+
+    #[test]
+    fn auto_pick_skips_partial_season_missing_requested_episode() {
+        let mut partial = ReleaseOption {
+            infohash: "1".repeat(40),
+            title: "Аутсорс / S1E1-7 of 8 (2025) WEB-DL 1080p".into(),
+            quality: "1080p".into(),
+            size_bytes: 20_000_000_000,
+            seeders: 500,
+            voice: "Русский".into(),
+            language: "Русский".into(),
+            tracker: "RuTracker".into(),
+            added: "2025-03-01".into(),
+            year: Some(2025),
+            season: Some(1),
+            episode_start: Some(1),
+            episode_end: Some(7),
+            hdr: false,
+            dolby_vision: false,
+            subtitles: false,
+            direct_play: true,
+            codec: Some("H.264".into()),
+            bitrate_kbps: None,
+            bitrate_approx: false,
+            picked_by: Vec::new(),
+            preloaded: false,
+        };
+        let mut full = partial.clone();
+        full.infohash = "2".repeat(40);
+        full.title = "Аутсорс (1 сезон: 1-8 серии из 8) / 2024 / WEB-DL (1080p)".into();
+        full.seeders = 120;
+        full.episode_start = Some(1);
+        full.episode_end = Some(8);
+        let releases = [partial.clone(), full.clone()];
+        let dead = std::collections::HashSet::new();
+
+        // Episode 7 can pick the high-seeder 1-7 pack.
+        let ep7 = auto_pick_release(
+            &releases,
+            MediaKind::Tv,
+            1,
+            7,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            false,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(ep7.infohash, partial.infohash);
+
+        // Episode 8 must skip 1-7 and pick 1-8.
+        let ep8 = auto_pick_release(
+            &releases,
+            MediaKind::Tv,
+            1,
+            8,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            false,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(ep8.infohash, full.infohash);
+
+        // No match returns None so caller falls back to NeedsPicker instead of playing a broken file.
+        partial.season = Some(1);
+        let only_partial = [partial];
+        assert!(auto_pick_release(
+            &only_partial,
+            MediaKind::Tv,
+            1,
+            8,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            false,
+            &dead,
+        )
+        .is_none());
     }
 
     #[tokio::test]

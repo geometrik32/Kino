@@ -148,6 +148,8 @@ fn Page(props: PageProps) -> Element {
                 on_theme: |_| {},
                 on_prefs: |_| {},
                 on_delete_preload: |_| {},
+                on_delete_preload_episode: |_| {},
+                initial_expanded_series: vec![1396],
                 on_refresh: |_| {},
                 on_open: |_| {},
                 on_logout: |_| {},
@@ -403,9 +405,9 @@ async fn main() -> anyhow::Result<()> {
         title: Some(title.into()),
         state,
         progress,
-        size_bytes: Some((gb * 1e9) as i64),
+        size_bytes: Some((gb * kino_core::GIB_BYTES as f64) as i64),
         requested_at: Utc::now() - Duration::hours(3),
-        ready_at: None,
+        ready_at: (state == PreloadState::Ready).then(|| Utc::now() - Duration::hours(1)),
         delete_after: delete_days.map(|d| Utc::now() + Duration::days(d) + Duration::hours(1)),
         poster_path: None,
         media_title: None,
@@ -421,19 +423,72 @@ async fn main() -> anyhow::Result<()> {
         } else {
             kino_core::PreloadPhase::Downloading
         },
+        whole_torrent: k == MediaKind::Movie,
+        episodes: Vec::new(),
+        requested_by: None,
+        can_delete: true,
     };
+    let mut tlou = preload(
+        1,
+        MediaKind::Tv,
+        100088,
+        2,
+        "Одни из нас / The Last of Us (S02) 2160p BDRemux | Оригинал",
+        PreloadState::Downloading,
+        0.42,
+        12.4,
+        None,
+    );
+    tlou.episodes = vec![
+        kino_core::PreloadEpisodeItem {
+            season: 2,
+            episode: 1,
+            state: PreloadState::Ready,
+            progress: 1.0,
+            size_bytes: Some(4_200_000_000),
+            episode_name: Some("Future Days".into()),
+            ready_at: Some(Utc::now() - Duration::minutes(40)),
+            delete_after: None,
+        },
+        kino_core::PreloadEpisodeItem {
+            season: 2,
+            episode: 2,
+            state: PreloadState::Downloading,
+            progress: 0.58,
+            size_bytes: Some(4_100_000_000),
+            episode_name: Some("Through the Valley".into()),
+            ready_at: None,
+            delete_after: None,
+        },
+    ];
+    let mut bb_pre = preload(
+        4,
+        MediaKind::Tv,
+        1396,
+        2,
+        "Breaking Bad S02 1080p LostFilm",
+        PreloadState::Ready,
+        1.0,
+        7.8,
+        None,
+    );
+    bb_pre.requested_by = Some("А".into());
+    bb_pre.can_delete = false;
+    bb_pre.episodes = (1..=4)
+        .map(|n| kino_core::PreloadEpisodeItem {
+            season: 2,
+            episode: n,
+            state: PreloadState::Ready,
+            progress: 1.0,
+            size_bytes: Some(1_950_000_000),
+            episode_name: Some(format!("Серия {n}")),
+            ready_at: Some(Utc::now() - Duration::hours(2)),
+            delete_after: None,
+        })
+        .collect();
     let preloads = vec![
-        preload(
-            1,
-            MediaKind::Tv,
-            100088,
-            2,
-            "Одни из нас / The Last of Us (S02) 2160p BDRemux | Оригинал",
-            PreloadState::Downloading,
-            0.42,
-            61.0,
-            None,
-        ),
+        tlou,
+        bb_pre,
         preload(
             2,
             MediaKind::Movie,

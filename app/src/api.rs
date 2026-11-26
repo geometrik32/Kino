@@ -4,12 +4,12 @@ use std::sync::LazyLock;
 
 use kino_core::{
     ApiError, AuthResponse, CalendarEntry, CatalogRow, ContinueItem, EpisodeRatingUpdate, HistoryEntry, HomeFeed,
-    LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PlayInfo, PlayProbe,
-    PlayProbeRequest, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice,
-    ReleaseChoiceUpdate, ReleaseList, ResolveReleaseRequest, ResolveReleaseResponse, SearchResults, Season,
-    SeasonRatingUpdate, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse, SyncLeaveRequest,
-    TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary,
-    VideoScale, WebAppAuthRequest, WidgetAuthRequest,
+    LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, MediaSegment, PersonDetails, PlayInfo,
+    PlayProbe, PlayProbeRequest, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
+    ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ResolveReleaseRequest, ResolveReleaseResponse, SearchResults,
+    Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse,
+    SyncLeaveRequest, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, UserPublicProfile,
+    UserSocialLibrary, VideoScale, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -418,6 +418,16 @@ pub async fn delete_preload(token: &str, id: i64) -> Result<(), Failure> {
     send("DELETE", &format!("/api/preload/{id}"), token, None::<&()>).await
 }
 
+pub async fn delete_preload_episode(token: &str, id: i64, season: i32, episode: i32) -> Result<(), Failure> {
+    send(
+        "DELETE",
+        &format!("/api/preload/{id}/episode/{season}/{episode}"),
+        token,
+        None::<&()>,
+    )
+    .await
+}
+
 #[derive(serde::Serialize)]
 pub struct SetDeviceQualityRequest {
     pub kind: MediaKind,
@@ -465,6 +475,26 @@ pub async fn play_probe(token: &str, r: &PlayProbeRequest) -> Result<PlayProbe, 
 /// How far connecting to a release has got.
 pub async fn play_progress(token: &str, release: &str) -> Result<StreamProgress, Failure> {
     get(&format!("/api/play/progress/{release}"), token).await
+}
+
+/// Fetches intro / recap / credits timestamps (DB cache + IntroDB / AniSkip).
+pub async fn segments(
+    token: &str,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+    release: &str,
+    duration: Option<f64>,
+) -> Result<Vec<MediaSegment>, Failure> {
+    let mut path = format!(
+        "/api/segments/{}/{tmdb_id}?season={season}&episode={episode}&release={release}",
+        kind.as_str()
+    );
+    if let Some(d) = duration.filter(|d| d.is_finite() && *d > 0.0) {
+        path.push_str(&format!("&duration={d:.1}"));
+    }
+    get(&path, token).await
 }
 
 pub async fn save_progress(token: &str, u: &ProgressUpdate) -> Result<Progress, Failure> {

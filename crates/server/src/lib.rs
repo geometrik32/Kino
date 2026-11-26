@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod jobs;
 pub mod play;
+pub mod segments;
 pub mod session;
 pub mod social;
 pub mod sync;

@@ -123,13 +123,17 @@ fn torrserver() -> Router {
 #[derive(Default)]
 struct Qbit {
     progress: Mutex<f32>,
+    file_progress: Mutex<std::collections::HashMap<i32, f32>>,
+    file_prios: Mutex<std::collections::HashMap<i32, i32>>,
+    prio_calls: Mutex<Vec<(i32, i32)>>,
+    started: Mutex<Vec<String>>,
     added: AtomicU32,
     deleted: Mutex<Vec<String>>,
     /// File list to report instead of the two episodes.
     files: Mutex<Option<serde_json::Value>>,
 }
 
-/// qBittorrent: login cookie, add, progress, files, delete.
+/// qBittorrent: login cookie, add, progress, files, filePrio, start, delete.
 fn qbittorrent(q: Arc<Qbit>) -> Router {
     qbittorrent_with_cookie(q, "SID", "s1", StatusCode::OK)
 }
@@ -180,6 +184,9 @@ fn qbittorrent_with_cookie(
             "/api/v2/torrents/info",
             get(
                 |State(q): State<Arc<Qbit>>, Query(p): Query<Vec<(String, String)>>| async move {
+                    if q.added.load(Ordering::SeqCst) == 0 {
+                        return Json(json!([]));
+                    }
                     let hash = p[0].1.clone();
                     let progress = *q.progress.lock().unwrap();
                     Json(json!([{ "hash": hash, "progress": progress, "state": "downloading", "size": 2000 }]))
@@ -189,12 +196,58 @@ fn qbittorrent_with_cookie(
         .route(
             "/api/v2/torrents/files",
             get(|State(q): State<Arc<Qbit>>| async move {
-                Json(q.files.lock().unwrap().clone().unwrap_or_else(|| {
-                    json!([
-                        { "index": 0, "name": EPISODES[0], "size": 1000 },
-                        { "index": 1, "name": EPISODES[1], "size": 1000 }
-                    ])
-                }))
+                if let Some(custom) = q.files.lock().unwrap().clone() {
+                    return Json(custom);
+                }
+                let default_p = *q.progress.lock().unwrap();
+                let fp = q.file_progress.lock().unwrap().clone();
+                let prios = q.file_prios.lock().unwrap().clone();
+                Json(json!([
+                    {
+                        "index": 0,
+                        "name": EPISODES[0],
+                        "size": 1000,
+                        "progress": fp.get(&0).copied().unwrap_or(default_p),
+                        "priority": prios.get(&0).copied().unwrap_or(1)
+                    },
+                    {
+                        "index": 1,
+                        "name": EPISODES[1],
+                        "size": 1000,
+                        "progress": fp.get(&1).copied().unwrap_or(default_p),
+                        "priority": prios.get(&1).copied().unwrap_or(1)
+                    }
+                ]))
+            }),
+        )
+        .route(
+            "/api/v2/torrents/filePrio",
+            post(|State(q): State<Arc<Qbit>>, body: String| async move {
+                let mut ids_str = String::new();
+                let mut prio = 1i32;
+                for (k, v) in url::form_urlencoded::parse(body.as_bytes()) {
+                    if k == "id" {
+                        ids_str = v.into_owned();
+                    } else if k == "priority" {
+                        prio = v.parse().unwrap_or(1);
+                    }
+                }
+                let mut prios = q.file_prios.lock().unwrap();
+                let mut calls = q.prio_calls.lock().unwrap();
+                for part in ids_str.split('|').filter(|s| !s.is_empty()) {
+                    if let Ok(idx) = part.parse::<i32>() {
+                        prios.insert(idx, prio);
+                        calls.push((idx, prio));
+                    }
+                }
+                StatusCode::OK
+            }),
+        )
+        .route(
+            "/api/v2/torrents/start",
+            post(|State(q): State<Arc<Qbit>>, body: String| async move {
+                q.started.lock().unwrap().push(body);
+                StatusCode::OK
             }),
         )
         .route(
@@ -1289,4 +1342,218 @@ async fn preload_ready_sends_telegram_notification_once(pool: PgPool) {
         assert_eq!(btn["text"], "▶ Смотреть");
         assert_eq!(btn["web_app"]["url"], expected_url);
     }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn single_episode_preload_priorities_playback_and_resolve(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let q = Arc::new(Qbit::default());
+    let qb = serve(qbittorrent(q.clone())).await;
+    let dir = temp_dir("single-ep-preload");
+    std::fs::create_dir_all(dir.join("Breaking Bad S02")).unwrap();
+    std::fs::write(dir.join(EPISODES[1]), b"EP2-LOCAL-BYTES").unwrap();
+
+    let state = test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            qbittorrent_url: Some(qb),
+            qbittorrent_password: "pw".into(),
+            preload_dir: Some(dir),
+            ffprobe: "kino-test-no-ffprobe".into(),
+            ..Default::default()
+        },
+    );
+    let app = app(state.clone());
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&admin.token), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let lostfilm = list.releases.iter().find(|r| r.voice == "LostFilm").unwrap();
+
+    // Download only Episode 2 from a 2-episode season pack.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&admin.token),
+        Some(json!({
+            "kind": "tv",
+            "tmdb_id": 1396,
+            "season": 2,
+            "episode": 2,
+            "infohash": lostfilm.infohash,
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let item: PreloadItem = serde_json::from_value(body).unwrap();
+    assert!(!item.whole_torrent);
+    assert_eq!(item.episodes.len(), 1);
+    assert_eq!((item.episodes[0].season, item.episodes[0].episode), (2, 2));
+    assert!(
+        !q.started.lock().unwrap().is_empty(),
+        "torrent started after priority setup"
+    );
+    assert!(
+        q.prio_calls.lock().unwrap().contains(&(0, 0)),
+        "unwanted E01 must be set to priority=0"
+    );
+
+    // Only E02 completes downloading on disk; E01 remains at 0%.
+    q.file_progress.lock().unwrap().insert(1, 1.0);
+    jobs::sync_preloads(&state).await.unwrap();
+    let (_, body) = call(&app, Method::GET, "/api/preload", Some(&admin.token), None).await;
+    let preloads: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
+    assert_eq!(preloads.len(), 1);
+    assert!(preloads[0].is_ready_for(kino_core::MediaKind::Tv, 2, 2));
+    assert!(!preloads[0].is_ready_for(kino_core::MediaKind::Tv, 2, 1));
+
+    // Resolve E02 hits Tier 1 disk preload; resolve E01 must NOT claim E02's partial preload.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&admin.token),
+        Some(json!({ "season": 2, "episode": 2, "is_mobile": false })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    match serde_json::from_value::<ResolveReleaseResponse>(body).unwrap() {
+        ResolveReleaseResponse::Ready { choice, .. } => assert_eq!(choice.infohash, item.infohash),
+        other => panic!("expected E02 ready preload, got {other:?}"),
+    }
+
+    // Play E02 streams from disk (`preloaded: true`), while E01 is not falsely treated as preloaded.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/play",
+        Some(&admin.token),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "episode": 2, "release": item.infohash })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let info2: PlayInfo = serde_json::from_value(body).unwrap();
+    assert!(info2.preloaded);
+
+    let (code, _) = call(
+        &app,
+        Method::POST,
+        "/api/play",
+        Some(&admin.token),
+        Some(json!({ "kind": "tv", "tmdb_id": 1396, "season": 2, "episode": 1, "release": item.infohash })),
+    )
+    .await;
+    assert_ne!(
+        code,
+        StatusCode::OK,
+        "un-downloaded E01 must not play from disk without TorrServer"
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn all_server_preloads_visibility_and_single_episode_deletion(pool: PgPool) {
+    let jackett = start_jackett().await;
+    let q = Arc::new(Qbit::default());
+    let qb = serve(qbittorrent(q.clone())).await;
+    let state = test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            qbittorrent_url: Some(qb),
+            ..Default::default()
+        },
+    );
+    let app = app(state.clone());
+
+    let admin = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv1) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer1 = login_ok(&app, 3001, inv1["code"].as_str()).await;
+    let (_, inv2) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
+    let peer2 = login_ok(&app, 3002, inv2["code"].as_str()).await;
+
+    let (_, body) = call(&app, Method::GET, "/api/releases/tv/1396", Some(&peer1.token), None).await;
+    let list: ReleaseList = serde_json::from_value(body).unwrap();
+    let lostfilm = list.releases.iter().find(|r| r.voice == "LostFilm").unwrap();
+
+    // Peer1 downloads both E01 and E02 separately.
+    for ep in [1, 2] {
+        let (code, body) = call(
+            &app,
+            Method::POST,
+            "/api/preload",
+            Some(&peer1.token),
+            Some(json!({
+                "kind": "tv",
+                "tmdb_id": 1396,
+                "season": 2,
+                "episode": ep,
+                "infohash": lostfilm.infohash,
+            })),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+    }
+    *q.progress.lock().unwrap() = 1.0;
+    jobs::sync_preloads(&state).await.unwrap();
+
+    // Admin sees Peer1's series with both episodes and `can_delete: true`.
+    let (code, body) = call(&app, Method::GET, "/api/preload", Some(&admin.token), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let admin_list: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
+    assert_eq!(admin_list.len(), 1);
+    assert!(admin_list[0].can_delete);
+    assert!(admin_list[0].requested_by.is_some());
+    assert_eq!(admin_list[0].episodes.len(), 2);
+
+    // Peer2 sees Peer1's server download & episodes, with `can_delete: false`, and cannot delete it.
+    let (code, body) = call(&app, Method::GET, "/api/preload", Some(&peer2.token), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let peer2_list: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
+    assert_eq!(peer2_list.len(), 1);
+    assert!(!peer2_list[0].can_delete);
+    assert_eq!(peer2_list[0].episodes.len(), 2);
+    let pid = peer2_list[0].id;
+    let (code, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/preload/{pid}/episode/2/1"),
+        Some(&peer2.token),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+
+    // Peer1 deletes only E01 -> torrent remains on qBittorrent with E01 filePrio=0 and E02 still ready.
+    let (code, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/preload/{pid}/episode/2/1"),
+        Some(&peer1.token),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    assert!(q.deleted.lock().unwrap().is_empty(), "E02 still needed, keep torrent");
+    assert_eq!(q.file_prios.lock().unwrap().get(&0).copied(), Some(0));
+
+    let (_, body) = call(&app, Method::GET, "/api/preload", Some(&peer1.token), None).await;
+    let after_ep1: Vec<PreloadItem> = serde_json::from_value(body).unwrap();
+    assert_eq!(after_ep1.len(), 1);
+    assert_eq!(after_ep1[0].episodes.len(), 1);
+    assert_eq!(after_ep1[0].episodes[0].episode, 2);
+
+    // Deleting the last episode (E02) removes the entire torrent and files.
+    let (code, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/preload/{pid}/episode/2/2"),
+        Some(&peer1.token),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    assert_eq!(q.deleted.lock().unwrap().len(), 1);
 }
