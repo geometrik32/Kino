@@ -128,7 +128,7 @@ jobs:
           lines = [
               "",
               "[bundle.android]",
-              'jks_file = "android/release.jks"',
+              f'jks_file = {json.dumps(os.path.abspath("app/android/release.jks"))}',
               f'jks_password = {json.dumps(os.environ.get("ANDROID_KEYSTORE_PASSWORD", ""))}',
               f'key_alias = {json.dumps(os.environ.get("ANDROID_KEY_ALIAS", ""))}',
               f'key_password = {json.dumps(os.environ.get("ANDROID_KEY_PASSWORD", ""))}',
