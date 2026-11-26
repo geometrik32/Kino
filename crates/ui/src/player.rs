@@ -62,7 +62,12 @@ pub struct DiskReadyPrompt {
 impl DiskReadyPrompt {
     /// Compact `1080p · Дубляж` hint displayed in the banner title when available.
     pub fn detail_label(&self) -> Option<String> {
-        let q = self.quality.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let q = self
+            .quality
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(quality_short_label);
         let v = self.voice.as_deref().map(str::trim).filter(|s| !s.is_empty());
         match (q, v) {
             (Some(q), Some(v)) => Some(format!("{q} · {v}")),
