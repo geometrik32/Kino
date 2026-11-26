@@ -416,7 +416,7 @@ pub fn ReleasePicker(
                     None => rsx! {},
                 }
                 div { class: "rel-list",
-                    if pinned.as_ref().is_some_and(|r| is_ready_rel(r)) {
+                    if pinned.as_ref().is_some_and(is_ready_rel) {
                         if let Some(r) = &pinned {
                             {
                                 let dl = preload_for(&r.infohash);

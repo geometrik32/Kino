@@ -206,23 +206,33 @@ pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
         }
         let transitioned = userdata::preload_progress(&state.pool, hash, st, progress, size).await?;
         if st == PreloadState::Ready && !transitioned.is_empty() {
-            let mut by_title: HashMap<(MediaKind, i64, i32), (Vec<i64>, Option<String>)> = HashMap::new();
+            #[derive(Default)]
+            struct ReadyGroup {
+                users: Vec<i64>,
+                raw_title: Option<String>,
+            }
+            let mut by_title: HashMap<(MediaKind, i64, i32), ReadyGroup> = HashMap::new();
             for (uid, kind, tmdb_id, season, title) in transitioned {
-                let entry = by_title
-                    .entry((kind, tmdb_id, season))
-                    .or_insert_with(|| (Vec::new(), None));
-                entry.0.push(uid);
-                if entry.1.is_none() {
-                    entry.1 = title;
+                let entry = by_title.entry((kind, tmdb_id, season)).or_default();
+                entry.users.push(uid);
+                if entry.raw_title.is_none() {
+                    entry.raw_title = title;
                 }
             }
-            for ((kind, tmdb_id, season), (users, title)) in by_title {
-                let parsed = title.as_deref().map(crate::torrent::title::parse_title);
+            for ((kind, tmdb_id, season), grp) in by_title {
+                let parsed = grp.raw_title.as_deref().map(crate::torrent::title::parse_title);
                 let quality = parsed.as_ref().map(|p| p.quality.as_str());
                 let voice = parsed.as_ref().map(|p| p.voice.as_str()).filter(|v| !v.is_empty());
-                state
-                    .sync
-                    .notify_preload_ready(&users, kind, tmdb_id, season, hash, title.as_deref(), quality, voice);
+                state.sync.notify_preload_ready(
+                    &grp.users,
+                    kind,
+                    tmdb_id,
+                    season,
+                    hash,
+                    grp.raw_title.as_deref(),
+                    quality,
+                    voice,
+                );
             }
         }
     }
