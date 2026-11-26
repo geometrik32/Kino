@@ -118,31 +118,46 @@ pub fn apply_theme(theme: kino_ui::Theme) {
 }
 
 /// Toggles Telegram's native fullscreen inside Mini App (avoiding Android WebView DOM
-/// fullscreen that covers Telegram's header/BackButton) and DOM fullscreen in regular browsers.
+/// fullscreen that covers Telegram's header/BackButton) and DOM fullscreen in regular browsers
+/// (including iOS Safari's `webkitEnterFullscreen` fallback on `<video>`).
 pub fn toggle_fullscreen() {
-    let js = "try { \
-        var root = document.documentElement; \
-        var tg = window.Telegram && window.Telegram.WebApp; \
-        var inTg = root.classList.contains('tg') || !!(tg && tg.initData); \
-        if (inTg) { \
-          if (document.fullscreenElement && document.exitFullscreen) { \
-            document.exitFullscreen().catch(function(){}); \
-          } \
-          if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast('8.0')) { \
-            if (tg.isFullscreen && tg.exitFullscreen) tg.exitFullscreen(); \
-            else if (tg.requestFullscreen) tg.requestFullscreen(); \
-          } \
-        } else if (document.fullscreenElement) { \
-          window.__kinoFsUserExit = true; \
-          if (document.exitFullscreen) document.exitFullscreen().catch(function(){}); \
-        } else if (root.requestFullscreen && document.fullscreenEnabled !== false) { \
-          window.__kinoFsUserExit = false; \
-          var go = function () { if (window.matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
-          try { root.requestFullscreen({ navigationUI: 'hide' }).then(go, function () { try { root.requestFullscreen().then(go, go); } catch (e) { go(); } }); } \
-          catch (e) { try { root.requestFullscreen().then(go, go); } catch (e2) { go(); } } \
-        } \
-      } catch (e) {}";
-    let _ = dioxus::document::eval(js);
+    #[cfg(not(target_os = "android"))]
+    {
+        let js = "try { \
+            var root = document.documentElement; \
+            var vid = document.getElementById('kino-video'); \
+            var tg = window.Telegram && window.Telegram.WebApp; \
+            var inTg = root.classList.contains('tg') || !!(tg && tg.initData); \
+            if (inTg) { \
+              if (document.fullscreenElement && document.exitFullscreen) { \
+                document.exitFullscreen().catch(function(){}); \
+              } \
+              if (tg && tg.isVersionAtLeast && tg.isVersionAtLeast('8.0')) { \
+                if (tg.isFullscreen && tg.exitFullscreen) tg.exitFullscreen(); \
+                else if (tg.requestFullscreen) tg.requestFullscreen(); \
+              } \
+            } else if (document.fullscreenElement || document.webkitFullscreenElement) { \
+              window.__kinoFsUserExit = true; \
+              if (document.exitFullscreen) document.exitFullscreen().catch(function(){}); \
+              else if (document.webkitExitFullscreen) document.webkitExitFullscreen(); \
+            } else if (vid && vid.webkitDisplayingFullscreen && vid.webkitExitFullscreen) { \
+              window.__kinoFsUserExit = true; \
+              vid.webkitExitFullscreen(); \
+            } else if (root.requestFullscreen && document.fullscreenEnabled !== false) { \
+              window.__kinoFsUserExit = false; \
+              var go = function () { if (window.matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+              try { root.requestFullscreen({ navigationUI: 'hide' }).then(go, function () { try { root.requestFullscreen().then(go, go); } catch (e) { go(); } }); } \
+              catch (e) { try { root.requestFullscreen().then(go, go); } catch (e2) { go(); } } \
+            } else if (root.webkitRequestFullscreen) { \
+              window.__kinoFsUserExit = false; \
+              root.webkitRequestFullscreen(); \
+            } else if (vid && vid.webkitEnterFullscreen) { \
+              window.__kinoFsUserExit = false; \
+              vid.webkitEnterFullscreen(); \
+            } \
+          } catch (e) {}";
+        let _ = dioxus::document::eval(js);
+    }
 }
 
 /// The player takes the screen: hides the underlying page scrollbar everywhere,

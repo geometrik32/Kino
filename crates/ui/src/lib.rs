@@ -369,6 +369,7 @@ pub fn PosterCard(
     item: TitleSummary,
     #[props(default)] status_badge: Option<TitleStatus>,
     #[props(default)] hide_status_badge: bool,
+    #[props(default)] rating_tooltip: Option<String>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
     let sub = match item.year {
@@ -422,8 +423,13 @@ pub fn PosterCard(
                     _ => rsx! {},
                 }
                 if let Some(ur) = item.user_rating.filter(|r| *r > 0.0) {
-                    span { class: "p-badge rate mine", title: "Моя оценка",
-                        "★ {format_rating_short(ur)}"
+                    {
+                        let tip = rating_tooltip.as_deref().unwrap_or("Моя оценка");
+                        rsx! {
+                            span { class: "p-badge rate mine", title: "{tip}",
+                                "★ {format_rating_short(ur)}"
+                            }
+                        }
                     }
                 } else if let Some(r) = rate {
                     span { class: "p-badge rate", "{r}" }
@@ -550,35 +556,42 @@ pub fn ContinueCard(
                         Icon { svg: icons::MORE, class: "ic sm" }
                     }
                 }
-                if menu_open() {
-                    div {
-                        class: "cw-pop",
-                        onclick: move |e| e.stop_propagation(),
-                        if let Some(open_cb) = on_open {
-                            a {
-                                class: "cw-pop-item",
-                                href: "{href}",
-                                onclick: move |e: Event<MouseData>| {
-                                    if is_plain_primary_click(&e) {
-                                        e.prevent_default();
-                                        menu_open.set(false);
-                                        open_cb.call((kind, tmdb_id));
-                                    }
-                                },
-                                onauxclick: handle_aux_click,
-                                Icon { svg: icons::INFO, class: "ic sm" }
-                                "Страница тайтла"
-                            }
-                        }
-                        button {
-                            class: "cw-pop-item warn",
-                            onclick: move |_| {
-                                menu_open.set(false);
-                                on_drop.call(it_drop_menu.clone());
+            }
+            if menu_open() {
+                div {
+                    class: "dd-backdrop",
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        menu_open.set(false);
+                    },
+                }
+                div {
+                    class: "cw-pop",
+                    onclick: move |e| e.stop_propagation(),
+                    if let Some(open_cb) = on_open {
+                        a {
+                            class: "cw-pop-item",
+                            href: "{href}",
+                            onclick: move |e: Event<MouseData>| {
+                                if is_plain_primary_click(&e) {
+                                    e.prevent_default();
+                                    menu_open.set(false);
+                                    open_cb.call((kind, tmdb_id));
+                                }
                             },
-                            Icon { svg: icons::CLOSE, class: "ic sm" }
-                            "Убрать из списка"
+                            onauxclick: handle_aux_click,
+                            Icon { svg: icons::INFO, class: "ic sm" }
+                            "Страница тайтла"
                         }
+                    }
+                    button {
+                        class: "cw-pop-item warn",
+                        onclick: move |_| {
+                            menu_open.set(false);
+                            on_drop.call(it_drop_menu.clone());
+                        },
+                        Icon { svg: icons::CLOSE, class: "ic sm" }
+                        "Убрать из списка"
                     }
                 }
             }
@@ -1174,7 +1187,11 @@ pub fn SearchView(
                     let total = r.items.len();
                     let movies = r.items.iter().filter(|i| i.kind == MediaKind::Movie).count();
                     let tv = r.items.iter().filter(|i| i.kind == MediaKind::Tv).count();
-                    let active = kind();
+                    let active = match kind() {
+                        MyKindFilter::Movie if movies == 0 => MyKindFilter::All,
+                        MyKindFilter::Tv if tv == 0 => MyKindFilter::All,
+                        other => other,
+                    };
                     let shown: Vec<TitleSummary> = r
                         .items
                         .into_iter()
@@ -1364,6 +1381,7 @@ pub fn TitleView(
     /// Mark episodes watched (`true`) or not: `(season, episodes, watched)`.
     on_mark: EventHandler<(i32, Vec<i32>, bool)>,
     on_season: EventHandler<i32>,
+    #[props(default)] on_external: Option<EventHandler<String>>,
 ) -> Element {
     let mut rewatch_open = use_signal(|| false);
     let s = &details.summary;
@@ -1514,13 +1532,25 @@ pub fn TitleView(
                         }
                         for m in meta { span { "{m}" } }
                         if let Some(id) = details.imdb_id.as_deref().filter(|id| is_valid_imdb_id(id)) {
-                            a {
-                                class: "imdb-pill",
-                                href: "https://www.imdb.com/title/{id}/",
-                                target: "_blank",
-                                rel: "noopener noreferrer",
-                                "IMDb"
-                                Icon { svg: icons::EXT, class: "ic xs" }
+                            {
+                                let imdb_url = format!("https://www.imdb.com/title/{id}/");
+                                let imdb_click_url = imdb_url.clone();
+                                rsx! {
+                                    a {
+                                        class: "imdb-pill",
+                                        href: "{imdb_url}",
+                                        target: "_blank",
+                                        rel: "noopener noreferrer",
+                                        onclick: move |e: Event<MouseData>| {
+                                            if let Some(cb) = on_external {
+                                                e.prevent_default();
+                                                cb.call(imdb_click_url.clone());
+                                            }
+                                        },
+                                        "IMDb"
+                                        Icon { svg: icons::EXT, class: "ic xs" }
+                                    }
+                                }
                             }
                         }
                     }

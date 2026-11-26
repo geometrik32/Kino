@@ -147,8 +147,13 @@ fn sanitize_rate(rate: f32) -> f32 {
 }
 
 impl Room {
+    /// True while a sole member is still loading/connecting before the player reports `Ready`.
+    fn startup_pending(&self) -> bool {
+        self.members.len() == 1 && !self.members[0].ready
+    }
+
     fn current_pos(&self, now_ms: i64) -> f64 {
-        if self.paused || self.waiting {
+        if self.paused || self.waiting || self.startup_pending() {
             return self.anchor_pos;
         }
         let dt = ((now_ms - self.anchor_at_ms).max(0) as f64) / 1000.0;
@@ -499,7 +504,7 @@ impl SyncHub {
                     anchor_pos: initial_pos,
                     anchor_at_ms: now_ms,
                     duration_sec: None,
-                    paused: false,
+                    paused: req.paused.unwrap_or(false),
                     waiting: false,
                     waiting_for: Vec::new(),
                     rate: 1.0,
@@ -541,7 +546,7 @@ impl SyncHub {
             room.anchor_pos = initial_pos;
             room.anchor_at_ms = now_ms;
             room.duration_sec = None;
-            room.paused = false;
+            room.paused = req.paused.unwrap_or(false);
             room.waiting = false;
             room.waiting_for.clear();
             room.rate = 1.0;
@@ -593,6 +598,7 @@ impl SyncHub {
         }
 
         room.last_device = device.clone();
+        let sole_self_rejoin = room.members.len() == 1 && room.members.iter().any(|m| m.client_id == req.client_id);
         if let Some(m) = room.members.iter_mut().find(|m| m.client_id == req.client_id) {
             m.device = device;
             m.joined_at_ms = now_ms;
@@ -601,6 +607,15 @@ impl SyncHub {
                 m.ready = false;
                 m.buffering = true;
                 m.waiting_since_ms = Some(now_ms);
+            }
+            if sole_self_rejoin {
+                if let Some(p) = req.paused {
+                    room.paused = p;
+                    if let Some(rpos) = req.reconnect_pos.filter(|x| x.is_finite() && *x >= 0.0) {
+                        room.anchor_pos = sanitize_pos(rpos, room.duration_sec);
+                    }
+                    room.anchor_at_ms = now_ms;
+                }
             }
         } else {
             if room.members.len() >= MAX_MEMBERS_PER_ROOM {
@@ -923,7 +938,11 @@ impl SyncHub {
                     room.anchor_at_ms = now_ms;
                     room.rate = sanitize_rate(rate);
                 }
-                if !room.paused && !room.waiting && now_ms - room.last_saved_ms >= AUTO_SAVE_INTERVAL_MS {
+                if !room.paused
+                    && !room.waiting
+                    && !room.startup_pending()
+                    && now_ms - room.last_saved_ms >= AUTO_SAVE_INTERVAL_MS
+                {
                     return room.make_save_job(now_ms, None, false);
                 }
                 None
@@ -1044,6 +1063,8 @@ impl SyncHub {
         for (key, room_arc) in room_list {
             let mut room = room_arc.lock().expect("sync room lock");
             let before = room.members.len();
+            let any_ready_before = room.members.iter().any(|m| m.ready);
+            let pre_retain_pos = room.current_pos(now_ms);
             let was_waiting = room.waiting;
 
             room.members.retain(|m| {
@@ -1055,22 +1076,24 @@ impl SyncHub {
             });
 
             if room.members.is_empty() {
-                if before > 0 {
-                    saves.extend(room.make_save_job(now_ms, None, false));
+                if before > 0 && any_ready_before {
+                    saves.extend(room.make_save_job(now_ms, Some(pre_retain_pos), false));
                 }
                 empty_keys.push((key, room_arc.clone()));
                 continue;
             }
 
             let mut barrier_released = false;
-            for m in &mut room.members {
-                if m.waiting_since_ms
-                    .is_some_and(|since| now_ms - since >= BARRIER_TIMEOUT_MS)
-                {
-                    m.ready = true;
-                    m.buffering = false;
-                    m.waiting_since_ms = None;
-                    barrier_released = true;
+            if room.members.len() > 1 {
+                for m in &mut room.members {
+                    if m.waiting_since_ms
+                        .is_some_and(|since| now_ms - since >= BARRIER_TIMEOUT_MS)
+                    {
+                        m.ready = true;
+                        m.buffering = false;
+                        m.waiting_since_ms = None;
+                        barrier_released = true;
+                    }
                 }
             }
 
@@ -1087,7 +1110,11 @@ impl SyncHub {
                 room.broadcast(&state);
             }
 
-            if !room.paused && !room.waiting && now_ms - room.last_saved_ms >= AUTO_SAVE_INTERVAL_MS {
+            if !room.paused
+                && !room.waiting
+                && !room.startup_pending()
+                && now_ms - room.last_saved_ms >= AUTO_SAVE_INTERVAL_MS
+            {
                 saves.extend(room.make_save_job(now_ms, None, false));
             }
         }
@@ -1323,6 +1350,7 @@ mod tests {
             explicit_episode: false,
             explicit_release: false,
             reconnect_pos: None,
+            paused: None,
         }
     }
 
@@ -1975,5 +2003,165 @@ mod tests {
         assert_eq!(job.update.duration_sec, 0.0);
         assert_eq!(job.update.season, 1);
         assert_eq!(job.update.episode, 1);
+    }
+
+    #[test]
+    fn solo_reconnect_preserves_paused_state_and_does_not_tick() {
+        let hub = SyncHub::new();
+        let mut t = 6_000_000_i64;
+        let saved = vec![Progress {
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            season: 0,
+            episode: 0,
+            position_sec: 1200.0,
+            duration_sec: 5000.0,
+            finished: false,
+            release: None,
+            updated_at: Utc::now(),
+        }];
+
+        // Initial solo open, Ready, then Pause at 1250s.
+        hub.join_in_memory(1, &join_req("a", "ПК"), &saved, None, t);
+        let claims = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 603,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (tx1, _rx1) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let (key, conn1, _) = hub.attach_ws(&claims, tx1, t).unwrap();
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn1,
+            SyncClientMsg::Ready {
+                position_sec: 1200.0,
+                duration_sec: Some(5000.0),
+                file_index: Some(0),
+            },
+            None,
+            t,
+        );
+        t += 50_000;
+        hub.handle_ws_msg(key, "a", conn1, SyncClientMsg::Pause { position_sec: 1250.0 }, None, t);
+
+        // Backgrounded tab misses heartbeats -> room swept after timeout.
+        t += HEARTBEAT_TIMEOUT_MS + 1_000;
+        let timeout_saves = hub.sweep(t);
+        assert_eq!(timeout_saves.len(), 1);
+        assert!((timeout_saves[0].update.position_sec - 1250.0).abs() < 0.01);
+
+        // Client reconnects 10 minutes later still paused -> recreated room stays paused & frozen.
+        t += 600_000;
+        let mut rejoin = join_req("a", "ПК");
+        rejoin.reconnect_pos = Some(1250.0);
+        rejoin.paused = Some(true);
+        let (st, joined_existing) = hub.join_in_memory(1, &rejoin, &saved, None, t);
+        assert!(!joined_existing);
+        assert!(st.paused);
+        assert!((st.position_sec - 1250.0).abs() < 0.01);
+
+        // Even while connected paused for 30s, periodic sweep must not tick or auto-save ahead.
+        let (tx2, _rx2) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let _ = hub.attach_ws(&claims, tx2, t).unwrap();
+        t += 30_000;
+        assert!(hub.sweep(t).is_empty());
+
+        // Offline pause before quick (<18s) sole-member reconnect must also preserve pause.
+        let claims_b = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 604,
+            cid: "b".into(),
+            exp: 9_999_999_999,
+        };
+        let mut quick_req = join_req("b", "Телефон");
+        quick_req.tmdb_id = 604;
+        hub.join_in_memory(1, &quick_req, &[], None, t);
+        let (tx_b, _rx_b) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let (key_b, conn_b, _) = hub.attach_ws(&claims_b, tx_b, t).unwrap();
+        hub.handle_ws_msg(
+            key_b,
+            "b",
+            conn_b,
+            SyncClientMsg::Ready {
+                position_sec: 100.0,
+                duration_sec: Some(3000.0),
+                file_index: None,
+            },
+            None,
+            t,
+        );
+        t += 5_000;
+        quick_req.paused = Some(true);
+        quick_req.reconnect_pos = Some(102.0);
+        let (st_b, joined_b) = hub.join_in_memory(1, &quick_req, &[], None, t);
+        assert!(joined_b);
+        assert!(st_b.paused);
+        assert!((st_b.position_sec - 102.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn solo_room_clock_does_not_tick_before_ready() {
+        let hub = SyncHub::new();
+        let mut t = 7_000_000_i64;
+        let saved = vec![Progress {
+            kind: MediaKind::Movie,
+            tmdb_id: 605,
+            season: 0,
+            episode: 0,
+            position_sec: 1000.0,
+            duration_sec: 6000.0,
+            finished: false,
+            release: None,
+            updated_at: Utc::now(),
+        }];
+        let mut req = join_req("a", "ПК");
+        req.tmdb_id = 605;
+        let (s0, _) = hub.join_in_memory(1, &req, &saved, None, t);
+        assert!(!s0.waiting);
+        assert!(!s0.paused);
+        assert!((s0.position_sec - 1000.0).abs() < 0.01);
+
+        let claims = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 605,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let (tx, _rx) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let (key, conn, _) = hub.attach_ws(&claims, tx, t).unwrap();
+
+        // Keep connection alive with Ping for 40s (past BARRIER_TIMEOUT_MS & AUTO_SAVE_INTERVAL_MS)
+        // while client is still connecting to torrent / ffprobe without Ready.
+        for _ in 0..4 {
+            t += 10_000;
+            hub.handle_ws_msg(key, "a", conn, SyncClientMsg::Ping { client_ms: t }, None, t);
+            assert!(
+                hub.sweep(t).is_empty(),
+                "startup wait must not tick or overwrite DB before Ready"
+            );
+        }
+
+        // Now Ready arrives at 1000s -> timer unlocks cleanly from 1000s, not 1040s!
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn,
+            SyncClientMsg::Ready {
+                position_sec: 1000.0,
+                duration_sec: Some(6000.0),
+                file_index: Some(1),
+            },
+            None,
+            t,
+        );
+        t += 15_000;
+        let jobs = hub.sweep(t);
+        assert_eq!(jobs.len(), 1);
+        assert!((jobs[0].update.position_sec - 1015.0).abs() < 0.1);
     }
 }

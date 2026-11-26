@@ -129,6 +129,8 @@ struct ReadySegmentMeta {
     tracks: Vec<TrackCodecInfo>,
     split_idr_hash: Option<String>,
     cont_seek_str: String,
+    #[serde(default)]
+    actual_start_sec: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -455,6 +457,69 @@ impl PauseCache {
         Some(hit)
     }
 
+    fn ready_tracks_in_sync(r: &ReadySegmentMeta) -> bool {
+        let Some(v_ts) = r
+            .tracks
+            .iter()
+            .find(|t| t.track_id == 1 && t.timescale > 0)
+            .map(|t| t.timescale)
+        else {
+            return true;
+        };
+        let Some(a_ts) = r
+            .tracks
+            .iter()
+            .find(|t| t.track_id == 2 && t.timescale > 0)
+            .map(|t| t.timescale)
+        else {
+            return true;
+        };
+        let Some(v_end) = r.track_ends.iter().find(|(id, _)| *id == 1).map(|(_, e)| *e) else {
+            return false;
+        };
+        let Some(a_end) = r.track_ends.iter().find(|(id, _)| *id == 2).map(|(_, e)| *e) else {
+            return false;
+        };
+        let v_sec = v_end as f64 / f64::from(v_ts);
+        let a_sec = a_end as f64 / f64::from(a_ts);
+        a_end > 0 && (v_sec - a_sec).abs() <= 1.0
+    }
+
+    /// Returns the actual snapped start timestamp (e.g. preceding H.264 keyframe `k0`)
+    /// when a matching synced `ready.mp4` exists in cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn lookup_ready_stream_start(
+        &self,
+        user_id: i64,
+        hash: &str,
+        file_index: i32,
+        audio_track: i32,
+        start_sec: u64,
+        copy_video: bool,
+        hw: HwAccel,
+    ) -> Option<f64> {
+        if !self.is_enabled() {
+            return None;
+        }
+        let key = CacheKey::new(user_id, hash, file_index);
+        let now = Utc::now().timestamp();
+        let guard = self.inner.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get(&key)?;
+        if now - entry.last_accessed_unix > self.inner.ttl_secs {
+            return None;
+        }
+        let r = entry.ready.as_ref()?;
+        if r.audio_track != audio_track
+            || r.copy_video != copy_video
+            || r.hw != hw
+            || start_sec.abs_diff(r.start_sec) > READY_MATCH_TOLERANCE_SECS
+            || !Self::ready_tracks_in_sync(r)
+        {
+            return None;
+        }
+        r.actual_start_sec
+    }
+
     /// Looks up a pre-transcoded `ready.mp4` prefix matching this exact stream setup.
     #[allow(clippy::too_many_arguments)]
     pub async fn lookup_ready_transcode(
@@ -484,6 +549,7 @@ impl PauseCache {
                 || r.copy_video != copy_video
                 || r.hw != hw
                 || start_sec.abs_diff(r.start_sec) > READY_MATCH_TOLERANCE_SECS
+                || !Self::ready_tracks_in_sync(r)
             {
                 return None;
             }
@@ -1309,6 +1375,7 @@ impl PauseCache {
             tracks: prep.tracks,
             split_idr_hash: prep.split_idr_hash,
             cont_seek_str,
+            actual_start_sec: Some(k0_secs.unwrap_or(start_sec as f64)),
         })
     }
 
@@ -2671,14 +2738,19 @@ mod tests {
             tracks: vec![],
             split_idr_hash: Some("deadbeef".into()),
             cont_seek_str: "626".into(),
+            actual_start_sec: Some(594.0),
         });
         write_meta(&entry_dir, &meta).await.unwrap();
-        cache.inner.entries.lock().unwrap().insert(key, meta);
+        cache.inner.entries.lock().unwrap().insert(key.clone(), meta);
 
         assert!(cache
             .lookup_ready_transcode(3, &hash, 1, 1, 601, true, HwAccel::Vaapi)
             .await
             .is_some());
+        assert_eq!(
+            cache.lookup_ready_stream_start(3, &hash, 1, 1, 601, true, HwAccel::Vaapi),
+            Some(594.0)
+        );
         assert!(cache
             .lookup_ready_transcode(3, &hash, 1, 0, 600, true, HwAccel::Vaapi)
             .await
@@ -2690,6 +2762,33 @@ mod tests {
         assert!(cache
             .lookup_ready_transcode(3, &hash, 1, 1, 600, false, HwAccel::Vaapi)
             .await
+            .is_none());
+
+        // Corrupted ready clip whose video track ends 8s after audio must be rejected.
+        {
+            let mut guard = cache.inner.entries.lock().unwrap();
+            let entry = guard.get_mut(&key).unwrap();
+            let ready = entry.ready.as_mut().unwrap();
+            ready.tracks = vec![
+                fmp4::TrackCodecInfo {
+                    track_id: 1,
+                    timescale: 16000,
+                    stsd: vec![1],
+                },
+                fmp4::TrackCodecInfo {
+                    track_id: 2,
+                    timescale: 48000,
+                    stsd: vec![2],
+                },
+            ];
+            ready.track_ends = vec![(1, 609_280), (2, 1_445_232)]; // 38.08s vs 30.11s
+        }
+        assert!(cache
+            .lookup_ready_transcode(3, &hash, 1, 1, 600, true, HwAccel::Vaapi)
+            .await
+            .is_none());
+        assert!(cache
+            .lookup_ready_stream_start(3, &hash, 1, 1, 600, true, HwAccel::Vaapi)
             .is_none());
 
         let _ = std::fs::remove_dir_all(dir);

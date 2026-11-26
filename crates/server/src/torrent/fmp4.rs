@@ -265,34 +265,41 @@ fn parse_traf(moof: &[u8], traf_start: usize, traf: &[u8]) -> anyhow::Result<Par
             if flags & 0x04 != 0 {
                 p += 4;
             }
-            for idx in 0..count {
-                if p >= payload.len() {
-                    break;
+            if flags & 0x0f00 == 0 {
+                if count > 0 && first_sample_size.is_none() {
+                    first_sample_size = Some(default_sz);
                 }
-                let dur = if flags & 0x100 != 0 {
-                    let d = read_u32(payload, p).unwrap_or(default_dur);
-                    p += 4;
-                    d
-                } else {
-                    default_dur
-                };
-                let sz = if flags & 0x200 != 0 {
-                    let s = read_u32(payload, p).unwrap_or(default_sz);
-                    p += 4;
-                    s
-                } else {
-                    default_sz
-                };
-                if idx == 0 && first_sample_size.is_none() {
-                    first_sample_size = Some(sz);
+                total_duration = total_duration.saturating_add(u64::from(count).saturating_mul(u64::from(default_dur)));
+            } else {
+                for idx in 0..count {
+                    if p >= payload.len() {
+                        break;
+                    }
+                    let dur = if flags & 0x100 != 0 {
+                        let d = read_u32(payload, p).unwrap_or(default_dur);
+                        p += 4;
+                        d
+                    } else {
+                        default_dur
+                    };
+                    let sz = if flags & 0x200 != 0 {
+                        let s = read_u32(payload, p).unwrap_or(default_sz);
+                        p += 4;
+                        s
+                    } else {
+                        default_sz
+                    };
+                    if idx == 0 && first_sample_size.is_none() {
+                        first_sample_size = Some(sz);
+                    }
+                    if flags & 0x400 != 0 {
+                        p += 4;
+                    }
+                    if flags & 0x800 != 0 {
+                        p += 4;
+                    }
+                    total_duration = total_duration.saturating_add(u64::from(dur));
                 }
-                if flags & 0x400 != 0 {
-                    p += 4;
-                }
-                if flags & 0x800 != 0 {
-                    p += 4;
-                }
-                total_duration = total_duration.saturating_add(u64::from(dur));
             }
         }
         pos += csz;
@@ -442,23 +449,57 @@ pub fn prepare_ready_segment(raw_fmp4: &[u8]) -> anyhow::Result<PreparedReadySeg
     let Some(video_ts) = tracks.iter().find(|t| t.track_id == 1).map(|t| t.timescale) else {
         bail!("missing video track 1 in moov");
     };
+    let audio_ts = tracks
+        .iter()
+        .find(|t| t.track_id == 2 && t.timescale > 0)
+        .map(|t| t.timescale);
     ensure!(video_ts > 0, "invalid video timescale");
     ensure!(
         frags.len() >= 2,
         "need at least 2 fragments to drop trailing partial GOP"
     );
 
-    // Walk backward until the dropped boundary fragment contains a video track keyframe sample.
+    let frag_infos: Vec<MoofInfo> = frags
+        .iter()
+        .map(|(moof, _)| parse_moof(moof))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
+    // Walk backward until the dropped boundary fragment starts with a video keyframe sample
+    // and the kept prefix ends with aligned video/audio durations (prevents silent video tails).
     let mut split_idx = frags.len() - 1;
     let mut split_idr_hash = None;
     while split_idx >= 1 {
         if let Some(h) = first_sample_sha256(&frags[split_idx].0, &frags[split_idx].1, 1) {
-            split_idr_hash = Some(h);
-            break;
+            let mut v_ticks = 0u64;
+            let mut a_end = 0u64;
+            for info in &frag_infos[..split_idx] {
+                for t in &info.tracks {
+                    if t.track_id == 1 {
+                        v_ticks = v_ticks.saturating_add(t.total_duration);
+                    } else if t.track_id == 2 {
+                        a_end = t.base_dts.saturating_add(t.total_duration);
+                    }
+                }
+            }
+            let av_ok = match audio_ts {
+                Some(ats) => {
+                    let v_sec = v_ticks as f64 / f64::from(video_ts);
+                    let a_sec = a_end as f64 / f64::from(ats);
+                    a_end > 0 && (v_sec - a_sec).abs() <= 0.8
+                }
+                None => true,
+            };
+            if av_ok {
+                split_idr_hash = Some(h);
+                break;
+            }
         }
         split_idx -= 1;
     }
-    ensure!(split_idx >= 1, "no clean video keyframe split fragment found");
+    ensure!(
+        split_idr_hash.is_some(),
+        "no aligned video/audio keyframe split fragment found"
+    );
 
     let kept = &frags[..split_idx];
     let mut out =
@@ -602,5 +643,105 @@ mod tests {
         let parsed = parse_moof(&m_cont).unwrap();
         assert_eq!(parsed.seq, 3);
         assert_eq!(parsed.tracks[0].base_dts, 128000);
+    }
+
+    fn make_synthetic_av_moov() -> Vec<u8> {
+        let make_trak = |id: u32, ts: u32, codec: &[u8]| {
+            let mut tkhd = vec![0u8; 20];
+            tkhd[8..12].copy_from_slice(&id.to_be_bytes());
+            let mut mdhd = vec![0u8; 16];
+            mdhd[8..12].copy_from_slice(&ts.to_be_bytes());
+            let mut stsd_p = b"\x00\x00\x00\x01".to_vec();
+            stsd_p.extend_from_slice(codec);
+            let stsd = make_full_box(b"stsd", 0, 0, &stsd_p);
+            let stbl = make_box(b"stbl", &stsd);
+            let minf = make_box(b"minf", &stbl);
+            let mut mdia = make_full_box(b"mdhd", 0, 0, &mdhd);
+            mdia.extend_from_slice(&minf);
+            let mut tb = make_full_box(b"tkhd", 0, 1, &tkhd);
+            tb.extend_from_slice(&make_box(b"mdia", &mdia));
+            make_box(b"trak", &tb)
+        };
+        let mut moov_body = make_trak(1, 16000, b"avc1_cfg");
+        moov_body.extend_from_slice(&make_trak(2, 48000, b"mp4a_cfg"));
+        make_box(b"moov", &moov_body)
+    }
+
+    fn make_av_frag(
+        seq: u32,
+        v_dts: u64,
+        v_dur: u32,
+        v_sample: &[u8],
+        audio: Option<(u64, u32)>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let mfhd = make_full_box(b"mfhd", 0, 0, &seq.to_be_bytes());
+        let a_sample = b"aac_frame";
+        let build_moof = |v_off: i32, a_off: i32| {
+            let mut moof_body = mfhd.clone();
+            let tfhd1 = make_full_box(b"tfhd", 0, 0x02_0000, &1u32.to_be_bytes());
+            let tfdt1 = make_full_box(b"tfdt", 1, 0, &v_dts.to_be_bytes());
+            let mut trun1_r = Vec::new();
+            trun1_r.extend_from_slice(&1u32.to_be_bytes());
+            trun1_r.extend_from_slice(&v_off.to_be_bytes());
+            trun1_r.extend_from_slice(&v_dur.to_be_bytes());
+            trun1_r.extend_from_slice(&(v_sample.len() as u32).to_be_bytes());
+            let trun1 = make_full_box(b"trun", 0, 0x0301, &trun1_r);
+            let mut t1 = tfhd1;
+            t1.extend_from_slice(&tfdt1);
+            t1.extend_from_slice(&trun1);
+            moof_body.extend_from_slice(&make_box(b"traf", &t1));
+            if let Some((a_dts, a_dur)) = audio {
+                let tfhd2 = make_full_box(b"tfhd", 0, 0x02_0000, &2u32.to_be_bytes());
+                let tfdt2 = make_full_box(b"tfdt", 1, 0, &a_dts.to_be_bytes());
+                let mut trun2_r = Vec::new();
+                trun2_r.extend_from_slice(&1u32.to_be_bytes());
+                trun2_r.extend_from_slice(&a_off.to_be_bytes());
+                trun2_r.extend_from_slice(&a_dur.to_be_bytes());
+                trun2_r.extend_from_slice(&(a_sample.len() as u32).to_be_bytes());
+                let trun2 = make_full_box(b"trun", 0, 0x0301, &trun2_r);
+                let mut t2 = tfhd2;
+                t2.extend_from_slice(&tfdt2);
+                t2.extend_from_slice(&trun2);
+                moof_body.extend_from_slice(&make_box(b"traf", &t2));
+            }
+            make_box(b"moof", &moof_body)
+        };
+        let dummy = build_moof(0, 0);
+        let base = (dummy.len() + 8) as i32;
+        let moof = build_moof(base, base + v_sample.len() as i32);
+        let mut mdat_body = v_sample.to_vec();
+        if audio.is_some() {
+            mdat_body.extend_from_slice(a_sample);
+        }
+        (moof, make_box(b"mdat", &mdat_body))
+    }
+
+    #[test]
+    fn trims_trailing_video_only_fragments_with_audio_mismatch() {
+        let moov = make_synthetic_av_moov();
+        let ftyp = make_box(b"ftyp", b"isom\x00\x00\x02\x00");
+        // First 2 frags synced at 10s + 10s (20s video, 20s audio);
+        // frag 3 & 4 add 16s of silent video without audio -> must split before frag 3.
+        let (m1, d1) = make_av_frag(1, 0, 160_000, b"k1", Some((0, 480_000)));
+        let (m2, d2) = make_av_frag(2, 160_000, 160_000, b"k2", Some((480_000, 480_000)));
+        let (m3, d3) = make_av_frag(3, 320_000, 128_000, b"k3", None);
+        let (m4, d4) = make_av_frag(4, 448_000, 128_000, b"k4", None);
+
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&ftyp);
+        raw.extend_from_slice(&moov);
+        for (m, d) in [&(m1, d1), &(m2, d2), &(m3, d3), &(m4, d4)] {
+            raw.extend_from_slice(m);
+            raw.extend_from_slice(d);
+        }
+
+        let prep = prepare_ready_segment(&raw).unwrap();
+        assert_eq!(prep.last_seq, 2);
+        assert!((prep.duration_secs - 20.0).abs() < 0.01);
+        assert_eq!(prep.track_ends, vec![(1, 320_000), (2, 960_000)]);
+        assert_eq!(
+            prep.split_idr_hash.as_deref(),
+            Some(hex::encode(Sha256::digest(b"k3")).as_str())
+        );
     }
 }

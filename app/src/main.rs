@@ -219,10 +219,13 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
     let mut state = use_signal(|| LinkLogin::Idle);
     // Made in advance so the button is a plain link: browsers block pop-ups
     // opened after a network round trip.
+    let mut invite_input = use_signal(|| telegram::invite().unwrap_or_default());
     let mut invite = use_signal(telegram::invite);
+    let mut invite_gen = use_signal(|| 0u64);
     let mut link = use_resource(move || api::start_login_link(invite()));
     let mut edit_server = use_signal(|| false);
     let mut server_input = use_signal(platform::server_base);
+    let mut server_err = use_signal(|| None::<String>);
     let mut wait = move |token: String| {
         state.set(LinkLogin::Waiting);
         spawn(async move {
@@ -263,6 +266,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
         }
         _ => None,
     };
+    let link_failed = link_error.is_some();
     let shown_error = match state() {
         LinkLogin::Failed(e) => Some(e),
         _ => link_error.or(error),
@@ -277,6 +281,26 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
         .to_owned();
     rsx! {
         LoginView { invite: telegram::invite(), error: shown_error,
+            if !platform::is_web() && state() != LinkLogin::Waiting {
+                input {
+                    class: "input-field",
+                    placeholder: "Код приглашения (если есть)",
+                    value: "{invite_input()}",
+                    oninput: move |e| {
+                        let raw = e.value();
+                        invite_input.set(raw.clone());
+                        let next_gen = *invite_gen.peek() + 1;
+                        invite_gen.set(next_gen);
+                        let trimmed = Some(raw.trim().to_owned()).filter(|v| !v.is_empty());
+                        spawn(async move {
+                            platform::sleep(400).await;
+                            if *invite_gen.peek() == next_gen && *invite.peek() != trimmed {
+                                invite.set(trimmed);
+                            }
+                        });
+                    },
+                }
+            }
             match (state(), ready) {
                 (LinkLogin::Waiting, Some(l)) => rsx! {
                     p { class: "login-wait-txt", "Откройте Telegram и нажмите «Войти на сайт» в сообщении бота. Эта страница откроется сама." }
@@ -294,14 +318,6 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                     }
                 },
                 (_, Some(l)) => rsx! {
-                    if !platform::is_web() {
-                        input {
-                            class: "input-field",
-                            placeholder: "Код приглашения (если есть)",
-                            value: "{invite().unwrap_or_default()}",
-                            oninput: move |e| invite.set(Some(e.value().trim().to_owned()).filter(|v| !v.is_empty())),
-                        }
-                    }
                     a { class: "btn primary", href: "{l.url}", target: "_blank", rel: "noopener noreferrer",
                         onclick: move |e: Event<MouseData>| {
                             open_link(&e, &l.url);
@@ -309,6 +325,17 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                         },
                         Icon { svg: icons::TG, class: "ic sm" }
                         "Войти через Telegram"
+                    }
+                },
+                (_, None) if link_failed => rsx! {
+                    button {
+                        class: "btn primary",
+                        onclick: move |_| {
+                            state.set(LinkLogin::Idle);
+                            link.restart();
+                        },
+                        Icon { svg: icons::REFRESH, class: "ic sm" }
+                        "Повторить"
                     }
                 },
                 (_, None) => rsx! { p { class: "muted", "Готовим вход…" } },
@@ -319,6 +346,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                         class: "server-toggle",
                         onclick: move |_| {
                             server_input.set(platform::server_base());
+                            server_err.set(None);
                             edit_server.toggle();
                         },
                         "Адрес сервера: {server_host} · Сменить"
@@ -329,23 +357,52 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
                                 class: "input-field",
                                 placeholder: "https://kino.example.ru",
                                 value: "{server_input()}",
-                                oninput: move |e| server_input.set(e.value()),
+                                oninput: move |e| {
+                                    server_err.set(None);
+                                    server_input.set(e.value());
+                                },
                             }
                             button {
                                 class: "btn glass sm",
                                 style: "width: auto",
                                 onclick: move |_| {
-                                    let url = server_input().trim().trim_end_matches('/').to_owned();
-                                    if url.starts_with("http://") || url.starts_with("https://") {
+                                    let raw = server_input().trim().trim_end_matches('/').to_owned();
+                                    if raw.is_empty() {
+                                        server_err.set(Some("Введите адрес сервера.".into()));
+                                        return;
+                                    }
+                                    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+                                        raw
+                                    } else {
+                                        format!("https://{raw}")
+                                    };
+                                    let host = url
+                                        .trim_start_matches("https://")
+                                        .trim_start_matches("http://")
+                                        .split('/')
+                                        .next()
+                                        .unwrap_or("");
+                                    let valid = !host.is_empty()
+                                        && !url.chars().any(char::is_whitespace)
+                                        && (host.contains('.') || host.starts_with("localhost") || host.starts_with('['));
+                                    if valid {
+                                        server_err.set(None);
                                         platform::save_server(&url);
                                         platform::set_server_base(&url);
                                         edit_server.set(false);
                                         state.set(LinkLogin::Idle);
                                         link.restart();
+                                    } else {
+                                        server_err.set(Some(
+                                            "Некорректный адрес сервера. Пример: https://kino.example.ru".into(),
+                                        ));
                                     }
                                 },
                                 "Сохранить"
                             }
+                        }
+                        if let Some(err) = server_err() {
+                            p { class: "err-text", style: "margin-top:8px;", "{err}" }
                         }
                     }
                 }
@@ -492,13 +549,15 @@ impl AppCache {
         kind: MediaKind,
         tmdb_id: i64,
         user_status: Option<TitleStatus>,
-        user_rating: Option<f32>,
+        user_rating: Option<Option<f32>>,
         preloaded: Option<bool>,
     ) {
         let patch_summary = |s: &mut TitleSummary| {
             if s.kind == kind && s.tmdb_id == tmdb_id {
                 s.user_status = user_status;
-                s.user_rating = user_rating;
+                if let Some(r) = user_rating {
+                    s.user_rating = r;
+                }
                 if let Some(pre) = preloaded {
                     s.preloaded = pre;
                 }
@@ -554,7 +613,9 @@ impl AppCache {
                 for st in items {
                     if st.kind == kind && st.tmdb_id == tmdb_id {
                         st.status = user_status;
-                        st.effective_rating = user_rating;
+                        if let Some(r) = user_rating {
+                            st.effective_rating = r;
+                        }
                     }
                     if let Some(t) = &mut st.title {
                         patch_summary(t);
@@ -967,7 +1028,11 @@ fn Main(
         .read()
         .as_ref()
         .and_then(Option::as_ref)
-        .and_then(|list| list.iter().find(|p| p.state == PreloadState::Downloading))
+        .and_then(|list| {
+            list.iter()
+                .find(|p| p.state == PreloadState::Downloading)
+                .or_else(|| list.iter().find(|p| p.state == PreloadState::Queued))
+        })
         .map(|p| (p.progress * 100.0).clamp(0.0, 100.0).round() as u8);
 
     let initial = name
@@ -1175,6 +1240,7 @@ fn Main(
                             platform::storage_set(MY_FILTERS_KEY, &f.encode());
                         },
                         on_open: open,
+                        on_open_id: move |(k, id)| open_title(k, id, false),
                     }
                 },
                 View::Tab(Tab::Profile) => rsx! {
@@ -1824,6 +1890,7 @@ fn Mine(
     on_section: EventHandler<MySection>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
+    on_open_id: EventHandler<(MediaKind, i64)>,
 ) -> Element {
     let cached = use_hook(|| cache.peek().mine.clone().unwrap_or_default());
     let mut selected_user_id = use_signal(|| cached.selected_user_id);
@@ -1853,7 +1920,7 @@ fn Mine(
         let uid = selected_user_id().or_else(|| users_state().first().map(|u| u.id));
         async move {
             match uid {
-                Some(id) => api::user_titles(&t, id).await.ok(),
+                Some(id) => Some(api::user_titles(&t, id).await),
                 None => None,
             }
         }
@@ -1878,7 +1945,7 @@ fn Mine(
         }
     });
     use_effect(move || {
-        if let Some(Some(lib)) = &*peer_res.read() {
+        if let Some(Some(Ok(lib))) = &*peer_res.read() {
             let uid = lib.profile.id;
             peer_libs.with_mut(|m| {
                 m.insert(uid, lib.clone());
@@ -1905,7 +1972,11 @@ fn Mine(
     let users = users_state();
     let active_uid = selected_user_id().or_else(|| users.first().map(|u| u.id));
     let peer_library = active_uid.and_then(|uid| peer_libs().get(&uid).cloned());
-    let peer_loading = active_uid.is_some() && peer_library.is_none() && !users.is_empty();
+    let peer_error = match &*peer_res.read() {
+        Some(Some(Err(e))) if peer_library.is_none() => Some(e.message.clone()),
+        _ => None,
+    };
+    let peer_loading = active_uid.is_some() && peer_library.is_none() && peer_error.is_none() && !users.is_empty();
     let calendar = calendar_state();
     rsx! {
         MyView {
@@ -1916,6 +1987,7 @@ fn Mine(
             selected_user_id: active_uid,
             peer_library,
             peer_loading,
+            peer_error,
             calendar,
             today_ymd: today_ymd(),
             on_section,
@@ -1945,6 +2017,7 @@ fn Mine(
                     c.mine.get_or_insert_with(MineCache::default).cal_day = day;
                 });
             },
+            on_open_id: Some(on_open_id),
             on_filters,
             on_open,
         }
@@ -2099,6 +2172,7 @@ fn Profile(
         }
     });
     let mut prefs_now = use_signal(|| None::<UserPrefs>);
+    let mut dl_error = use_signal(|| None::<String>);
     let state = data.read().clone();
     let active_preloads_list = preloads_state();
     let has_active_dl = active_preloads_list.as_ref().is_some_and(|pl| {
@@ -2160,15 +2234,23 @@ fn Profile(
                 });
             },
             on_delete_preload: move |pid: i64| {
+                dl_error.set(None);
                 let t = t2.clone();
                 spawn(async move {
-                    if api::delete_preload(&t, pid).await.is_ok() {
-                        data.restart();
-                        on_preloads_changed.call(());
+                    match api::delete_preload(&t, pid).await {
+                        Ok(()) => {
+                            data.restart();
+                            on_preloads_changed.call(());
+                        }
+                        Err(e) => {
+                            dl_error.set(Some(format!("Не удалось удалить загрузку: {}", e.message)));
+                        }
                     }
                 });
             },
+            dl_error: dl_error(),
             on_refresh: move |_| {
+                dl_error.set(None);
                 data.restart();
                 on_preloads_changed.call(());
             },
@@ -2453,7 +2535,7 @@ fn Title(
                         seasons: prev.map(|p| p.seasons).unwrap_or_default(),
                     },
                 );
-                c.patch_title(kind, id, v.2.status, user_r, Some(is_pre));
+                c.patch_title(kind, id, v.2.status, Some(user_r), Some(is_pre));
             });
         }
     });
@@ -2548,6 +2630,60 @@ fn Title(
         )>
     });
     let mut mismatch_pushed = use_signal(|| false);
+    struct TitleKeyGuard;
+    impl Drop for TitleKeyGuard {
+        fn drop(&mut self) {
+            let _ = dioxus::document::eval(
+                "if (window.__kinoTitleKeysStop) { try { window.__kinoTitleKeysStop(); } catch (e) {} }",
+            );
+        }
+    }
+    use_hook(move || {
+        spawn(async move {
+            let mut bridge = dioxus::document::eval(
+                "if (window.__kinoTitleKeysStop) { try { window.__kinoTitleKeysStop(); } catch (e) {} }
+                 var handler = function(e) {
+                   if (e.key === 'Escape') { dioxus.send(1); }
+                 };
+                 window.addEventListener('keydown', handler);
+                 window.__kinoTitleKeysStop = function() {
+                   window.removeEventListener('keydown', handler);
+                   delete window.__kinoTitleKeysStop;
+                 };",
+            );
+            while bridge.recv::<i32>().await.is_ok() {
+                if playing.peek().is_some() {
+                    continue;
+                }
+                if notice.peek().is_some() {
+                    notice.set(None);
+                    if *notice_pushed.peek() {
+                        notice_pushed.set(false);
+                        telegram::pop_history();
+                    }
+                } else if mismatch_prompt.peek().is_some() {
+                    mismatch_prompt.set(None);
+                    if *mismatch_pushed.peek() {
+                        mismatch_pushed.set(false);
+                        telegram::pop_history();
+                    }
+                } else if *resolving.peek() {
+                    let next = *resolve_gen.peek() + 1;
+                    resolve_gen.set(next);
+                    resolving.set(false);
+                } else if picker.peek().is_some() {
+                    picker.set(None);
+                    picker_preloaded.set(None);
+                    picker_ep_scoped.set(false);
+                    if *overlay_pushed.peek() {
+                        overlay_pushed.set(false);
+                        telegram::pop_history();
+                    }
+                }
+            }
+        });
+        std::rc::Rc::new(TitleKeyGuard)
+    });
     let t0 = token.clone();
     // Releases for the open picker, loaded from the indexer (or demo data).
     let releases = use_resource(move || {
@@ -2979,11 +3115,23 @@ fn Title(
     let main_target = target.clone();
     rsx! {
         // Inside Telegram: the native big button plays, the native Back closes what is open.
-        if !auto() && playing().is_none() && picker().is_none() && notice().is_none() && mismatch_prompt().is_none() {
+        if !auto()
+            && playing().is_none()
+            && picker().is_none()
+            && notice().is_none()
+            && mismatch_prompt().is_none()
+            && !resolving()
+        {
             native::MainButton { text: main_label, on_click: move |_| on_play.call(main_target.clone()) }
         }
         if picker().is_some() {
             native::BackButton { on_back: move |_| close_picker.call(()) }
+        }
+        if resolving() {
+            native::BackButton { on_back: move |_| close_resolving.call(()) }
+        }
+        if mismatch_prompt().is_some() {
+            native::BackButton { on_back: move |_| close_mismatch.call(()) }
         }
         if notice().is_some() {
             native::BackButton { on_back: move |_| close_notice.call(()) }
@@ -3007,7 +3155,7 @@ fn Title(
         TitleView {
             details: details.clone(),
             season: cur_season_data,
-            progress,
+            progress: progress.clone(),
             status,
             my_rating,
             effective_rating: st.effective_rating,
@@ -3023,12 +3171,12 @@ fn Title(
             on_change_release: open_picker.clone(),
             on_change_season_release: Some(Callback::new({
                 let mut open_picker = open_picker.clone();
+                let details_s = details.clone();
+                let progress_s = progress.clone();
+                let target_s = default_target.clone();
                 move |s_num: i32| {
-                    open_picker(PlayTarget {
-                        season: s_num,
-                        episode: 0,
-                        position_sec: 0.0,
-                    });
+                    let season_target = auto_play_target_for(kind, &details_s, &progress_s, Some(s_num), &target_s);
+                    open_picker(season_target);
                 }
             })),
             on_change_episode_release: Some(Callback::new(open_episode_picker)),
@@ -3039,16 +3187,26 @@ fn Title(
                     status_now.set(Some(s));
                     let t = token.clone();
                     spawn(async move {
-                        if let Ok(saved) = api::set_status(&t, kind, id, s).await {
-                            // Reflect automatic server adjustments (e.g. "Want" -> "WaitingRelease" on unreleased titles).
-                            status_now.set(Some(saved.status));
-                            let user_r = saved.effective_rating.or_else(|| saved.rating.map(f32::from));
-                            cache.with_mut(|c| {
-                                c.patch_title(kind, id, saved.status, user_r, None);
-                            });
-                            // A film marked "Просмотрено" also changes its progress.
-                            data.restart();
-                            status_now.set(None);
+                        match api::set_status(&t, kind, id, s).await {
+                            Ok(saved) => {
+                                // Reflect automatic server adjustments (e.g. "Want" -> "WaitingRelease" on unreleased titles).
+                                status_now.set(Some(saved.status));
+                                let user_r = saved.effective_rating.or_else(|| saved.rating.map(f32::from));
+                                cache.with_mut(|c| {
+                                    c.patch_title(kind, id, saved.status, Some(user_r), None);
+                                });
+                                // A film marked "Просмотрено" also changes its progress.
+                                data.restart();
+                                status_now.set(None);
+                            }
+                            Err(e) => {
+                                status_now.set(None);
+                                if !*notice_pushed.peek() {
+                                    notice_pushed.set(true);
+                                    telegram::push_history(None);
+                                }
+                                notice.set(Some(format!("Не удалось сохранить статус: {}", e.message)));
+                            }
                         }
                     });
                 }
@@ -3078,7 +3236,7 @@ fn Title(
                                 }
                                 let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
                                 cache.with_mut(|c| {
-                                    c.patch_title(kind, id, updated.status, user_r, None);
+                                    c.patch_title(kind, id, updated.status, Some(user_r), None);
                                 });
                                 data.restart();
                             }
@@ -3103,7 +3261,7 @@ fn Title(
                             status_now.set(None);
                             let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
                             cache.with_mut(|c| {
-                                c.patch_title(kind, id, updated.status, user_r, None);
+                                c.patch_title(kind, id, updated.status, Some(user_r), None);
                             });
                             data.restart();
                         }
@@ -3120,7 +3278,7 @@ fn Title(
                             status_now.set(None);
                             let user_r = updated.effective_rating.or_else(|| updated.rating.map(f32::from));
                             cache.with_mut(|c| {
-                                c.patch_title(kind, id, updated.status, user_r, None);
+                                c.patch_title(kind, id, updated.status, Some(user_r), None);
                             });
                             data.restart();
                         }
@@ -3152,6 +3310,7 @@ fn Title(
                     }
                 });
             },
+            on_external: (!platform::is_web()).then(|| Callback::new(|url: String| platform::open_external(&url))),
         }
         if let Some(extras) = extras_state() {
             TitleExtrasView { extras, on_open, on_person }
@@ -3246,13 +3405,17 @@ fn Title(
                     picker.set(None);
                     picker_preloaded.set(None);
                     picker_ep_scoped.set(false);
+                    let mut play_target = target.clone();
+                    if kind == MediaKind::Tv && play_target.episode <= 0 {
+                        play_target.episode = 1;
+                    }
                     let explicit_ep =
-                        target.season != default_target.season || target.episode != default_target.episode;
+                        play_target.season != default_target.season || play_target.episode != default_target.episode;
                     let qk = choice
                         .quality_key
                         .clone()
                         .unwrap_or_else(|| normalize_quality_key(&r.quality).to_owned());
-                    playing.set(Some((target.clone(), choice.clone(), explicit_ep, true, RewatchMode::All)));
+                    playing.set(Some((play_target, choice.clone(), explicit_ep, true, RewatchMode::All)));
                     let t = t3.clone();
                     let req_q = api::SetDeviceQualityRequest {
                         kind,
@@ -3495,9 +3658,9 @@ fn Title(
                 },
                 on_need_release: {
                     let mut open_picker = open_picker.clone();
-                    move |(season, episode): (i32, i32)| {
+                    move |(season, episode, position_sec): (i32, i32, f64)| {
                         playing.set(None);
-                        open_picker(PlayTarget { season, episode, position_sec: 0.0 });
+                        open_picker(PlayTarget { season, episode, position_sec });
                     }
                 },
                 on_preloads_changed: Some(Callback::new({

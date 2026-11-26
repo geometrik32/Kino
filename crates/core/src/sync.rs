@@ -36,6 +36,9 @@ pub struct SyncJoinRequest {
     /// Position used only when creating a fresh room on reconnect after a brief drop.
     #[serde(default)]
     pub reconnect_pos: Option<f64>,
+    /// Client's local paused state when reconnecting after a disconnect so pause survives room recreation.
+    #[serde(default)]
+    pub paused: Option<bool>,
 }
 
 /// Answer of `POST /api/sync/join`.

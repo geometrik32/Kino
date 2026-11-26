@@ -943,3 +943,90 @@
 - [x] Повторные опросы `sync_preloads` и повторные запросы на уже скачанный релиз не отправляют дублирующих уведомлений; отправка выполняется асинхронно без блокировки HTTP-ручек и 5-секундного цикла телеметрии.
 - [x] Добавлены unit-тесты форматирования/маршрутизации/выбора скачанного релиза и интеграционный тест `preload_ready_sends_telegram_notification_once` в `crates/server/tests/torrents.rs`.
 - [ ] Пройдены полный CI (`.github/workflows/ci.yml`: `clippy --workspace --all-targets`, Docker-сборка), деплой на сервер `192.168.3.27` и ручная проверка пользователем в Telegram.
+
+---
+
+## ISSUE-033: Самопроизвольное снятие воспроизведения с паузы
+
+- **Статус:** `Исправлено` (исправлено в `kino-core`, `kino-app`, `kino-server`; локально пройдены `fmt`, `wasm32 check` и unit-тесты; полные `clippy`/интеграционные тесты в CI и деплой на сервер ожидают согласования)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Все клиенты (`kino-app` Web / Telegram Mini App / Desktop / Android, `kino-core`) и сервер (`kino-server`: `sync.rs`).
+
+### Суть проблемы
+Воспроизведение самопроизвольно снимается с паузы в двух связанных сценариях:
+1. **Переподключение WebSocket синхронизации сбрасывает паузу на `paused = false`:**
+   - При паузе в свернутой/фоновой вкладке браузера (троттлинг таймеров до 1 мин в Chrome/Edge при серверном `HEARTBEAT_TIMEOUT_MS = 18_000`), при кратковременном обрыве сети/прокси или при перезапуске/обновлении `kino-server` (комнаты хранятся только в RAM) последний участник удаляется из `SyncHub`, а сама комната удаляется.
+   - При автоматическом переподключении (`app/src/player.rs`, `POST /api/sync/join`) клиент передавал только `reconnect_pos` в `SyncJoinRequest` (без признака `paused`).
+   - Сервер (`SyncHub::join_in_memory` в `crates/server/src/sync.rs`) создавал новую комнату с `paused: false`, и при получении `SyncServerMsg::State` (либо сразу при возвращении на вкладку через `visibilitychange` → `"visible"`, т.к. `desired_paused` уже сброшен в `false`) клиент вызывал `attempt_play` или перезапускал поток с `autoplay = true`.
+2. **Локальная пауза перезаписывается устаревшим `sync_state.paused` или теряется при обрыве WS:**
+   - При постановке на паузу (`toggle_play`, `on_video("pause")`) `app/src/player.rs` выставлял `desired_paused = true`, но не обновлял локальный `sync_state.paused`, а при закрытом WebSocket `sync::send` молча отбрасывал `SyncClientMsg::Pause`.
+   - Функции `mark_media_ready` и `open_source` отдавали приоритет `sync_state.paused` вместо `desired_paused`, из-за чего события `canplay`/`seeked`/`metadata`/`playing` или перезапуск потока до прихода эха `Pause` снимали плеер с паузы.
+
+### Что реализовано
+- В `SyncJoinRequest` (`crates/core/src/sync.rs`) добавлено поле `paused: Option<bool>`. Клиент (`app/src/player.rs`) передаёт `*desired_paused.peek()` при `rejoin` и удерживает локальную паузу, а при `WsBridgeEvent::Open` досылает `SyncClientMsg::Pause`, если пауза была нажата до установки сокета.
+- В `SyncHub::join_in_memory` (`crates/server/src/sync.rs`) новая, пустая или переподключаемая одиночная комната (`sole_self_rejoin`) сохраняет `paused` и `reconnect_pos` вместо безусловного сброса в `paused: false`.
+- На клиенте (`resolve_pause_on_state`, `mark_media_ready`, `open_source`, `toggle_play`, `on_video("pause")`) оптимистично обновляется `sync_state.paused`, а устаревшие серверные широковещания (`Members`/`Snapshot`/`Seek`/само-эхо) и события загрузки видео больше не отменяют локальную паузу (при этом удалённый `Play`/`Resumed` от другого устройства в совместном просмотре по-прежнему работает).
+
+### Проверки
+- `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check` — пройдено.
+- `cargo check -p kino-app --target wasm32-unknown-unknown --locked` — пройдено.
+- `cargo check --target x86_64-pc-windows-gnullvm --workspace --all-targets --locked` — пройдено.
+- Unit-тесты: `kino-core` (9 passed), `kino-app` (13 passed, включая `pause_and_startup_jump_guards`), `kino-bot` (19 passed), `kino-ui` (11 passed), `kino-server --lib` (106 passed, включая `solo_reconnect_preserves_paused_state_and_does_not_tick`) — все пройдены.
+
+### Критерии приёмки
+- [x] При разрыве и последующем переподключении WebSocket (фоновая вкладка > 18 с, сон устройства, кратковременный обрыв сети, рестарт сервера) плеер, поставленный на паузу, остаётся на паузе и не запускает воспроизведение сам (в том числе при возвращении на вкладку через `visibilitychange`).
+- [x] При одиночном переподключении / восстановлении комнаты клиент корректно передаёт текущее состояние паузы (`paused` в `SyncJoinRequest` и досылка при открытии WS) и не теряет `Pause`/`Play`, нажатые в момент отсутствия соединения.
+- [x] Локально нажатая пользователем пауза не перебивается устаревшим `sync_state` в `mark_media_ready` и `open_source` до подтверждения от сервера (при сохранении совместного управления от другого устройства).
+- [x] Добавлены unit-тесты на сохранение паузы при reconnect в `crates/server/src/sync.rs` и `app/src/player.rs`.
+- [ ] Пройдены `clippy`/PostgreSQL-тесты в CI, сборка/деплой на сервер `192.168.3.27` и ручная проверка пользователем.
+
+---
+
+## ISSUE-034: Сдвиг и перескок позиции вперёд при возвращении к фильму
+
+- **Статус:** `Исправлено` (исправлено в `kino-core`, `kino-app`, `kino-server`; локально пройдены `fmt`, `wasm32 check` и unit-тесты; полные `clippy`/интеграционные тесты в CI, деплой на сервер и ручная проверка ожидают согласования)
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Все клиенты (`kino-app`) и сервер (`kino-server`: `sync.rs`, `play.rs`, `pause_cache.rs`, `ffmpeg.rs`, `fmp4.rs`).
+
+### Суть проблемы
+При возвращении к просмотру фильма (возврат во вкладку/приложение с паузы или повторное открытие фильма из каталога) позиция воспроизведения сдвигается или перематывается вперёд по четырём причинам:
+
+1. **Серверные часы комнаты тикают вперёд во время подключения к раздаче и зондирования файла:**
+   - При открытии плеера клиент в `begin_playback` сначала вызывал `POST /api/sync/join` и сохранял `SyncState`, и только потом запускал `POST /api/play`.
+   - `SyncHub::join_in_memory` создавал комнату сразу с `paused: false, waiting: false` (`recompute_waiting` ставит `waiting = true` только при `members.len() > 1`), поэтому для одиночного зрителя серверный таймер `Room::current_pos` и клиентский `ClockSync::expected_position` шли вперёд с первой же секунды загрузки — пока пользователь видел «Подключаемся к раздаче…» и ждал TorrServer/`ffprobe` (10–40+ секунд).
+   - Когда `POST /api/play` наконец отвечал, `apply_play_result` игнорировал `i.start_at` при непустом `sync_state` и брал `clock.expected_position(&st, now_ms)`, запуская поток вперёд на всё время ожидания запуска, а `SyncHub::sweep` каждые 10 с перезаписывал `watch_progress` в БД.
+   - По истории БД на живом сервере видны стартовые сдвиги `position_from` относительно прошлого `position_to` порядка +7…+12 секунд (`998.32 → 1009.98`, `1281.30 → 1290.29`, `1356.79 → 1364.10`, `108.71 → 117.29`, `97.07 → 107.07`).
+
+2. **Связка с `ISSUE-033` (переподключение WS сбрасывает паузу → скачок и ускоренное догнание вперёд):**
+   - После паузы и таймаута `HEARTBEAT_TIMEOUT_MS` (18 с) или рестарта сервера переподключение WS создавало комнату с `paused: false`.
+   - Пока видео физически оставалось на паузе, серверные часы `Room::current_pos` тикали вперёд и каждые 10 с перезаписывали `watch_progress` в БД (у `user_id=1` по `movie 1592` прогресс прыгнул с `7613.19` на `7827.84`, `finished=t`; у `user_id=2` по `movie 672` при кэше паузы на `1289.36` прогресс шагал вперёд каждые 10 с до `1525.48`).
+   - При возврате в плеер (`toggle_play` или авторелоад транскода после ≥ 8 мин `TRANSCODE_PAUSE_RELOAD_MS`) клиент перематывал видео к фиктивному `expected_position`, а при второй «подвисшей» вкладке в комнате (`members.len() > 1`) включал ускорение `v.set_rate` (`×1.05`/`×1.06`) или перескакивал вперёд. Дополнительно в `visibilitychange → "hidden"` отправлялся `Report` с `paused: desired_paused()` вместо учёта `v.paused()`.
+
+3. **Сдвиг шкалы времени при `copy_video` + `-noaccurate_seek`:**
+   - При возобновлении перекодируемого H.264-потока с `start > 0` (`ffmpeg.rs`) используется `-noaccurate_seek -ss <start>` без `-copyts`, поэтому видео начинается с предшествующего ключевого кадра `k0` (на 2–9 с раньше `start_sec`), а клиент выставлял `offset = start_sec` (`1_cd5605...`: `start_sec = 50`, `k0 ≈ 41` с; `2_a6ec79...`: `start_sec = 1289`, `k0 ≈ 1280` с). Счётчик спешил на `start_sec - k0`, вызывая перескок вперёд при перезапусках/продолжении.
+
+4. **Рассинхрон длительности видео и аудио в `ready.mp4` (`pause-cache`) при склейке продолжения:**
+   - В живом кэше `/var/cache/kino-pause/2_a6ec79dda559046a690bc47f77940ef2cf62ab06_1/ready.mp4` видеодорожка длилась `38.080` с (`track_ends[1] = 609280`), а аудиодорожка — `30.109` с (`track_ends[2] = 1445232`, `moof #6` и `#7` без звука). В `stream_ready_with_spliced_continuation` смещения `dts_deltas` сдвигали аудио продолжения на ~8 с вперёд относительно видео.
+
+### Что реализовано
+- **Удержание таймера комнаты при старте (`crates/server/src/sync.rs`, `app/src/player.rs`):**
+  - В `Room` добавлено состояние `startup_pending()` (`members.len() == 1 && !members[0].ready`): пока одиночный зритель подключается к раздаче и не прислал `Ready`, `Room::current_pos` не тикает вперёд, `sweep`/`Report` не перезаписывают `watch_progress` в БД, при таймауте до `Ready` не сохраняется сдвинутая позиция, а `BARRIER_TIMEOUT_MS` срабатывает только для мульти-устройственных комнат (`members.len() > 1`).
+  - В `apply_play_result` (`should_align_start_to_sync`) и при одиночном `toggle_play` / `SyncServerMsg::State` после длинной паузы клиент больше не подтягивает позицию к дрейфующему `expected_position`, пока в комнате один участник (`members.len() <= 1`), открывая поток ровно с `i.start_at` или фактической `cur_pos`. В `visibilitychange → "hidden"` учтён `v.paused()`.
+- **Точный старт `ready.mp4` и проверка A/V-синхронизации (`crates/server/src/torrent/fmp4.rs`, `pause_cache.rs`, `play.rs`, `crates/core/src/release.rs`, `app/src/player.rs`):**
+  - В `fmp4::parse_traf` исправлен подсчёт `total_duration` для `trun` с длительностями по умолчанию (`default_dur` из `tfhd`).
+  - В `fmp4::prepare_ready_segment` выбор границы разреза `split_idx` проверяет, чтобы при наличии аудиодорожки видео и аудио в `ready.mp4` заканчивались согласованно (`|v_sec - a_sec| <= 0.8` с, без хвостов видео без звука).
+  - В `PauseCache::lookup_ready_transcode` и `lookup_ready_stream_start` добавлена проверка `ready_tracks_in_sync`, отсекающая уже лежащие на диске битые `ready.mp4` с рассинхроном A/V > 1 с; в `ReadySegmentMeta` (`actual_start_sec`) и `PlayInfo.stream_start_at` передаётся реальный ключевой кадр `k0`, который `transcode_stream_target` в одиночном просмотре использует как `offset` и стартовую отметку без искажения URL `?start=`.
+
+### Проверки
+- `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check` — пройдено.
+- `cargo check -p kino-app --target wasm32-unknown-unknown --locked` — пройдено.
+- `cargo check --target x86_64-pc-windows-gnullvm --workspace --all-targets --locked` — пройдено.
+- Unit-тесты: `kino-core` (9 passed), `kino-app` (13 passed), `kino-bot` (19 passed), `kino-ui` (11 passed), `kino-server --lib` (106 passed, включая `solo_room_clock_does_not_tick_before_ready`, `trims_trailing_video_only_fragments_with_audio_mismatch`, `lookup_ready_transcode_matches_audio_hw_and_tolerance`) — все пройдены.
+
+### Критерии приёмки
+- [x] Пока одиночный клиент загружается / ждёт TorrServer и `ffprobe` (до `Ready`), серверные часы комнаты и `apply_play_result` не тикают вперёд и не перезаписывают `watch_progress` в БД.
+- [x] Исправлен сброс паузы при reconnect и уходе в фон (`ISSUE-033`), одиночный плеер при возврате не перематывается вперёд по фиктивным часам комнаты.
+- [x] При старте из `ready.mp4` с `-noaccurate_seek` клиентский `offset` согласован с фактическим стартовым ключевым кадром `k0` (без бесконечных циклов при совместном просмотре).
+- [x] В `fmp4::prepare_ready_segment` и `PauseCache::lookup_ready_transcode` исключены «хвосты» видео без звука и битые кэши `ready.mp4` с рассинхроном A/V дорожек.
+- [x] Добавлены unit-тесты на удержание стартовой позиции до `Ready`, обрезку рассинхронизированных фрагментов `ready.mp4` и проверку `stream_start_at`.
+- [ ] Пройдены `clippy`/PostgreSQL-тесты в CI, деплой на сервер `192.168.3.27` и живая проверка воспроизведения после возврата.

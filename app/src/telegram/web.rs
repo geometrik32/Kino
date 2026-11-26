@@ -452,12 +452,35 @@ pub fn set_fullscreen(on: bool) -> bool {
     true
 }
 
-/// Telegram on a phone or tablet (the player then fills the whole screen by itself).
+/// Phone or tablet (Telegram Mini App on Android/iOS, or a regular mobile browser).
 pub fn is_mobile() -> bool {
-    web_app()
+    if web_app()
         .and_then(|w| get(&w, "platform"))
         .and_then(|v| v.as_string())
         .is_some_and(|p| p == "android" || p == "ios")
+    {
+        return true;
+    }
+    let Some(win) = web_sys::window() else {
+        return false;
+    };
+    if let Ok(ua) = win.navigator().user_agent() {
+        let u = ua.to_ascii_lowercase();
+        if u.contains("android")
+            || u.contains("iphone")
+            || u.contains("ipad")
+            || u.contains("ipod")
+            || u.contains("mobile")
+        {
+            return true;
+        }
+    }
+    let touch_points = js_sys::Reflect::get(&win.navigator(), &"maxTouchPoints".into())
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let width = win.inner_width().ok().and_then(|v| v.as_f64()).unwrap_or(1024.0);
+    touch_points > 0.0 && width <= 900.0
 }
 
 /// Whether Telegram is showing the app full screen now.

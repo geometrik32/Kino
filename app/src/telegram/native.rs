@@ -3,10 +3,11 @@
 use std::{
     cell::RefCell,
     collections::BTreeMap,
+    rc::Rc,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-type BackHandler = Box<dyn FnMut()>;
+type BackHandler = Rc<RefCell<dyn FnMut()>>;
 
 static NEXT_BACK_ID: AtomicU64 = AtomicU64::new(1);
 static BACK_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
@@ -28,13 +29,9 @@ fn ensure_back_bridge() {
         dioxus::core::spawn_forever(async {
             let mut bridge = dioxus::document::eval("window.__kinoNativeBack = function() { dioxus.send(1); };");
             while bridge.recv::<i32>().await.is_ok() {
-                let top = BACK_STACK.with(|s| s.borrow_mut().pop());
-                if let Some((id, mut cb)) = top {
-                    let has_more = BACK_STACK.with(|s| !s.borrow().is_empty());
-                    sync_android_back_enabled(has_more);
-                    cb();
-                    // Re-check in case the handler didn't pop itself and wants to remain active.
-                    let _ = id;
+                let top = BACK_STACK.with(|s| s.borrow().last().map(|(_, cb)| Rc::clone(cb)));
+                if let Some(cb) = top {
+                    (cb.borrow_mut())();
                 } else {
                     sync_android_back_enabled(false);
                 }
@@ -57,7 +54,7 @@ pub fn paint_player_bars() {}
 pub fn push_back(handler: impl FnMut() + 'static) -> u64 {
     ensure_back_bridge();
     let id = NEXT_BACK_ID.fetch_add(1, Ordering::Relaxed);
-    BACK_STACK.with(|s| s.borrow_mut().push((id, Box::new(handler))));
+    BACK_STACK.with(|s| s.borrow_mut().push((id, Rc::new(RefCell::new(handler)))));
     sync_android_back_enabled(true);
     id
 }

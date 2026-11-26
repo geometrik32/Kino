@@ -128,6 +128,10 @@ pub struct PlayerState {
     pub muted: bool,
     /// Whether to show the inline desktop volume slider.
     pub show_volume: bool,
+    /// Whether to show the fullscreen button (hidden in native Android immersive mode).
+    pub show_fullscreen: bool,
+    /// True while the player is currently in fullscreen mode.
+    pub fullscreen: bool,
     /// Touch device mode: tapping reveals controls with a center Pause/Play button.
     pub touch_controls: bool,
     /// Season being watched and its episodes (series only); `episode` is the current one.
@@ -197,6 +201,8 @@ impl Default for PlayerState {
             volume: 1.0,
             muted: false,
             show_volume: true,
+            show_fullscreen: true,
+            fullscreen: false,
             touch_controls: false,
             season: 0,
             episode: 0,
@@ -437,9 +443,11 @@ pub fn PlayerView(
     #[props(default)] on_switch_to_disk: Option<EventHandler<()>>,
     #[props(default)] on_dismiss_disk_prompt: Option<EventHandler<()>>,
     #[props(default)] on_jump_episode: Option<EventHandler<(i32, i32)>>,
+    #[props(default)] on_lock: Option<EventHandler<bool>>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
+    let mut lock_hint_gen = use_signal(|| 0u64);
     let mut scrub = use_signal(|| None::<f64>);
     let mut track_el = use_signal(|| None::<Rc<MountedData>>);
     // `(is_vertical, start_coord, length)` so both horizontal and rotated vertical tracks share one drag path.
@@ -454,6 +462,19 @@ pub fn PlayerView(
         if let Some(cb) = on_activity {
             cb.call(());
         }
+    };
+    let mut show_lock_hint = move || {
+        let n = *lock_hint_gen.peek() + 1;
+        lock_hint_gen.set(n);
+        lock_hint.set(true);
+        spawn(async move {
+            let _ = dioxus::document::eval("await new Promise(r => setTimeout(r, 3000)); return 0;")
+                .join::<i32>()
+                .await;
+            if *lock_hint_gen.peek() == n {
+                lock_hint.set(false);
+            }
+        });
     };
 
     let s = state;
@@ -519,7 +540,23 @@ pub fn PlayerView(
         div {
             class: "{player_cls}",
             onpointermove: move |e| {
-                if let Some((vert, start, len)) = *drag_rect.peek() {
+                let active_rect = *drag_rect.peek();
+                if let Some((vert, start, len)) = active_rect {
+                    if e.data().pointer_type() == "mouse"
+                        && !e
+                            .held_buttons()
+                            .contains(dioxus::html::input_data::MouseButton::Primary)
+                    {
+                        let next_gen = *drag_gen.peek() + 1;
+                        drag_gen.set(next_gen);
+                        drag_active.set(false);
+                        drag_end_pos.set(None);
+                        drag_rect.set(None);
+                        if let Some(v) = scrub.take() {
+                            on_seek.call(v);
+                        }
+                        return;
+                    }
                     let c = e.client_coordinates();
                     let coord = if vert { c.y } else { c.x };
                     let frac = ((coord - start) / len).clamp(0.0, 1.0);
@@ -603,14 +640,27 @@ pub fn PlayerView(
             if locked() {
                 div {
                     class: "p-lock-screen",
-                    onclick: move |_| lock_hint.toggle(),
+                    onclick: move |_| {
+                        if *lock_hint.peek() {
+                            let next_gen = *lock_hint_gen.peek() + 1;
+                            lock_hint_gen.set(next_gen);
+                            lock_hint.set(false);
+                        } else {
+                            show_lock_hint();
+                        }
+                    },
                     if lock_hint() {
                         button {
                             class: "p-glass-btn p-unlock-btn",
                             onclick: move |e| {
                                 e.stop_propagation();
                                 locked.set(false);
+                                let next_gen = *lock_hint_gen.peek() + 1;
+                                lock_hint_gen.set(next_gen);
                                 lock_hint.set(false);
+                                if let Some(cb) = on_lock {
+                                    cb.call(false);
+                                }
                                 ping_activity();
                             },
                             Icon { svg: icons::UNLOCK, class: "ic sm" }
@@ -709,7 +759,10 @@ pub fn PlayerView(
                             onclick: move |_| {
                                 on_menu.call(None);
                                 locked.set(true);
-                                lock_hint.set(true);
+                                if let Some(cb) = on_lock {
+                                    cb.call(true);
+                                }
+                                show_lock_hint();
                             },
                             Icon { svg: icons::LOCK, class: "ic sm" }
                         }
@@ -871,6 +924,41 @@ pub fn PlayerView(
                                 drag_end_pos.set(None);
                                 drag_rect.set(None);
                                 let seek_dur = dur;
+                                spawn(async move {
+                                    let kind = dioxus::document::eval(
+                                        "return await new Promise(function(resolve) {
+                                           var done = false;
+                                           var finish = function(k) {
+                                             if (done) return;
+                                             done = true;
+                                             window.removeEventListener('pointerup', onUp);
+                                             window.removeEventListener('blur', onBlur);
+                                             resolve(k);
+                                           };
+                                           var onUp = function() { setTimeout(function() { finish('up'); }, 0); };
+                                           var onBlur = function() { finish('blur'); };
+                                           window.addEventListener('pointerup', onUp);
+                                           window.addEventListener('blur', onBlur);
+                                         });",
+                                    )
+                                    .join::<String>()
+                                    .await
+                                    .unwrap_or_default();
+                                    if *drag_gen.peek() == my_gen
+                                        && (*drag_active.peek() || drag_rect.peek().is_some())
+                                    {
+                                        drag_gen.set(my_gen + 1);
+                                        drag_active.set(false);
+                                        drag_end_pos.set(None);
+                                        drag_rect.set(None);
+                                        let v = scrub.take();
+                                        if kind == "up" {
+                                            if let Some(pos) = v {
+                                                on_seek.call(pos);
+                                            }
+                                        }
+                                    }
+                                });
                                 spawn(async move {
                                     if let Ok(rect) = el.get_client_rect().await {
                                         if *drag_gen.peek() != my_gen {
@@ -1034,12 +1122,14 @@ pub fn PlayerView(
                             Icon { svg: icons::SETTINGS, class: "ic sm" }
                             span { class: "long", "Настройки" }
                         }
-                        button {
-                            class: "p-glass-btn icon p-fs-btn",
-                            title: "Во весь экран",
-                            "aria-label": "Во весь экран",
-                            onclick: move |_| on_fullscreen.call(()),
-                            Icon { svg: icons::FULL, class: "ic sm" }
+                        if s.show_fullscreen {
+                            button {
+                                class: if s.fullscreen { "p-glass-btn icon p-fs-btn active" } else { "p-glass-btn icon p-fs-btn" },
+                                title: if s.fullscreen { "Выйти из полноэкранного режима" } else { "Во весь экран" },
+                                "aria-label": if s.fullscreen { "Выйти из полноэкранного режима" } else { "Во весь экран" },
+                                onclick: move |_| on_fullscreen.call(()),
+                                Icon { svg: if s.fullscreen { icons::EXIT_FULL } else { icons::FULL }, class: "ic sm" }
+                            }
                         }
                     }
                 }

@@ -158,6 +158,7 @@ pub fn MyView(
     #[props(default)] selected_user_id: Option<i64>,
     #[props(default)] peer_library: Option<UserSocialLibrary>,
     #[props(default)] peer_loading: bool,
+    #[props(default)] peer_error: Option<String>,
     #[props(default)] calendar: Vec<CalendarEntry>,
     #[props(default)] today_ymd: String,
     #[props(default)] on_section: Option<EventHandler<MySection>>,
@@ -168,6 +169,7 @@ pub fn MyView(
     #[props(default)] on_cal_month: Option<EventHandler<Option<(i32, u32)>>>,
     #[props(default)] initial_cal_day: Option<String>,
     #[props(default)] on_cal_day: Option<EventHandler<Option<String>>>,
+    #[props(default)] on_open_id: Option<EventHandler<(MediaKind, i64)>>,
     on_filters: EventHandler<MyFilters>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
@@ -433,6 +435,8 @@ pub fn MyView(
                             }
                             if peer_loading {
                                 p { class: "muted", "Загружаем коллекцию участника…" }
+                            } else if let Some(err) = peer_error {
+                                p { class: "err-text", "{err}" }
                             } else if let Some(lib) = peer_library {
                                 {
                                     let pfilter = peer_status_filter();
@@ -503,15 +507,15 @@ pub fn MyView(
                                                     if let Some(mut t) = item.title.clone() {
                                                         {
                                                             let r_val = item.effective_rating.or_else(|| item.rating.map(f32::from));
-                                                            if r_val.is_some() {
-                                                                t.user_rating = r_val;
-                                                            }
+                                                            t.user_rating = r_val;
+                                                            let peer_tip = format!("Оценка: {}", lib.profile.name);
                                                             rsx! {
                                                                 div { key: "peer-{item.kind.as_str()}{item.tmdb_id}", class: "mine",
                                                                     PosterCard {
                                                                         item: t,
                                                                         status_badge: item.status,
                                                                         hide_status_badge: true,
+                                                                        rating_tooltip: Some(peer_tip),
                                                                         on_open,
                                                                     }
                                                                     if item.status.is_some() {
@@ -679,11 +683,12 @@ pub fn MyView(
                                             _ => "Премьера фильма".to_owned(),
                                         };
                                         let st = entry.status;
+                                        let kind = entry.kind;
                                         let id = entry.tmdb_id;
-                                        let href = title_href(entry.kind, id);
+                                        let href = title_href(kind, id);
                                         rsx! {
                                             a {
-                                                key: "cal-{entry.date}-{entry.kind.as_str()}-{id}",
+                                                key: "cal-{entry.date}-{kind.as_str()}-{id}",
                                                 class: "cal-row",
                                                 href: "{href}",
                                                 onclick: move |e: Event<MouseData>| {
@@ -691,6 +696,8 @@ pub fn MyView(
                                                         e.prevent_default();
                                                         if let Some(t) = t_opt.clone() {
                                                             on_open.call(t);
+                                                        } else if let Some(cb) = on_open_id {
+                                                            cb.call((kind, id));
                                                         }
                                                     }
                                                 },
@@ -853,6 +860,8 @@ fn prefs_summary(p: &UserPrefs) -> Vec<(String, bool)> {
     }
     if p.direct_play == Some(true) {
         tags.push(("Без перекодирования".into(), false));
+    } else if p.direct_play == Some(false) {
+        tags.push(("С перекодированием".into(), false));
     }
     if let Some(n) = p.min_seeders.filter(|n| *n > 0) {
         tags.push((format!("от {n} сидов"), false));
@@ -895,6 +904,7 @@ pub fn ProfileView(
     on_theme: EventHandler<Theme>,
     on_prefs: EventHandler<UserPrefs>,
     on_delete_preload: EventHandler<i64>,
+    #[props(default)] dl_error: Option<String>,
     #[props(default)] on_refresh: Option<EventHandler<()>>,
     #[props(default)] initial_prefs_open: bool,
     #[props(default)] on_prefs_open: Option<EventHandler<bool>>,
@@ -994,6 +1004,9 @@ pub fn ProfileView(
                             "Обновить"
                         }
                     }
+                }
+                if let Some(err) = dl_error {
+                    p { class: "err-text", "{err}" }
                 }
                 if preloads.is_empty() {
                     div { class: "panel muted-box",

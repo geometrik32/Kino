@@ -500,6 +500,10 @@ pub struct PlayInfo {
     /// Client requested native direct playback (MKV/HEVC/AC3/DTS without server transcoding).
     #[serde(default)]
     pub native: bool,
+    /// Actual start timestamp (seconds) of a pre-transcoded ready segment when `-noaccurate_seek`
+    /// snapped backward to an earlier keyframe, if known.
+    #[serde(default)]
+    pub stream_start_at: Option<f64>,
 }
 
 /// Body of `POST /api/play/probe`: retries probing an active stream when
@@ -597,6 +601,7 @@ mod tests {
             next: None,
             preloaded: false,
             native: false,
+            stream_start_at: None,
         };
         assert!(info.plays_directly(Some(0)));
         assert!(!info.plays_directly(Some(1)), "another dub needs re-encoding");

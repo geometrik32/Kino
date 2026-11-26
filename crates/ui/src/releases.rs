@@ -678,7 +678,7 @@ fn ReleaseRow(
         (false, false, Some(c)) => c,
         _ => "",
     };
-    let (a, b) = (release.clone(), release.clone());
+    let (a, a_key, b) = (release.clone(), release.clone(), release.clone());
     let added = ru_short_date(&release.added);
     rsx! {
         div {
@@ -686,6 +686,12 @@ fn ReleaseRow(
             role: "button",
             tabindex: "0",
             onclick: move |_| on_pick.call(a.clone()),
+            onkeydown: move |e: Event<KeyboardData>| {
+                if matches!(e.key(), Key::Enter) || matches!(e.key(), Key::Character(ref ch) if ch == " ") {
+                    e.prevent_default();
+                    on_pick.call(a_key.clone());
+                }
+            },
             div { class: if is_uhd { "q-box uhd" } else { "q-box" },
                 b { "{quality_short(&release.quality)}" }
                 if !q_sub.is_empty() { small { "{q_sub}" } }

@@ -1109,6 +1109,19 @@ async fn play(
 
     let (audio_track, subtitle_track) =
         preferred_tracks(&state, user.0, req.kind, req.tmdb_id, &probe, preloaded, req.native).await?;
+    let stream_start_at = if torrent_ts.is_some() && start_at > 0 && !req.native {
+        media.pause_cache.lookup_ready_stream_start(
+            user.0,
+            &hash,
+            file.index,
+            audio_track.unwrap_or(0),
+            start_at as u64,
+            probe.video_copyable(),
+            media.hw,
+        )
+    } else {
+        None
+    };
     if let Some(ts) = torrent_ts {
         media.pause_cache.register_play(
             user.0,
@@ -1146,6 +1159,7 @@ async fn play(
         next,
         preloaded,
         native: req.native,
+        stream_start_at,
     }))
 }
 
