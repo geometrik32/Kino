@@ -1063,6 +1063,9 @@ fn Main(
             Some(&url),
             true,
         );
+        if !telegram::is_telegram() && api::reload_for_web_update(play) {
+            return;
+        }
     };
     let open = move |t: TitleSummary| open_title(t.kind, t.tmdb_id, false);
     let open_person = move |id: i64| {
@@ -1079,6 +1082,9 @@ fn Main(
             Some(&url),
             true,
         );
+        if !telegram::is_telegram() {
+            let _ = api::reload_for_web_update(false);
+        }
     };
     let open_shelf = move |(id, title, subtitle): (String, String, Option<String>)| {
         telegram::haptic(telegram::Haptic::Tap);
@@ -1097,6 +1103,9 @@ fn Main(
             Some(&url),
             true,
         );
+        if !telegram::is_telegram() {
+            let _ = api::reload_for_web_update(false);
+        }
     };
     let go_back = move |_: ()| {
         telegram::haptic(telegram::Haptic::Tap);
@@ -1130,9 +1139,15 @@ fn Main(
                     if !telegram::is_telegram() {
                         telegram::reset_history();
                     }
+                    if api::reload_for_web_update(false) {
+                        return;
+                    }
                     return;
                 }
                 if view() == View::Tab(t) {
+                    if !telegram::is_telegram() && api::reload_for_web_update(false) {
+                        return;
+                    }
                     if t == Tab::Search {
                         let _ = dioxus::document::eval(
                             "var el = document.getElementById('kino-search-input'); if (el) el.focus();",
@@ -1160,6 +1175,9 @@ fn Main(
                         Some(&url),
                         true,
                     );
+                    if api::reload_for_web_update(false) {
+                        return;
+                    }
                 }
                 if t == Tab::Profile {
                     active_preloads.restart();
@@ -3020,6 +3038,9 @@ fn Title(
         let tok_res = token.clone();
         move |(t, mode): (PlayTarget, RewatchMode)| {
             telegram::haptic(telegram::Haptic::Tap);
+            if !telegram::is_telegram() && mode == RewatchMode::All && api::reload_for_web_update(true) {
+                return;
+            }
             if *resolving.peek() {
                 return;
             }
@@ -3142,6 +3163,9 @@ fn Title(
                     let t = auto_target.clone();
                     let ac = auto_choice.clone();
                     move |_| {
+                        if !telegram::is_telegram() && api::reload_for_web_update(true) {
+                            return;
+                        }
                         auto.set(false);
                         if let Some(choice) = ac.clone() {
                             start_playback.call((t.clone(), choice, RewatchMode::All, true));
@@ -3638,6 +3662,9 @@ fn Title(
                                     telegram::pop_history();
                                 }
                             }
+                            if !telegram::is_telegram() && api::reload_for_web_update(false) {
+                                return;
+                            }
                             data.restart();
                             refresh();
                         }
@@ -3651,6 +3678,9 @@ fn Title(
                         if *overlay_pushed.peek() {
                             overlay_pushed.set(false);
                             telegram::pop_history();
+                        }
+                        if !telegram::is_telegram() && api::reload_for_web_update(false) {
+                            return;
                         }
                         data.restart();
                         refresh();

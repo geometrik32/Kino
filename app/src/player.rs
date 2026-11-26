@@ -392,10 +392,11 @@ fn resolve_pause_on_state(desired_paused: bool, st: &SyncState, local_client_id:
     (paused || st.waiting, paused)
 }
 
-/// Solo viewers should resume directly from the server `start_at` saved progress instead of
-/// adding TorrServer/ffprobe startup wait time via `ClockSync::expected_position`.
+/// Solo viewers (and unstarted multi-device rooms where no peer is ready yet) should resume
+/// directly from `start_at` instead of adding TorrServer/ffprobe connect time via `ClockSync`.
 fn should_align_start_to_sync(st: &SyncState, kind: MediaKind, season: i32, episode: i32) -> bool {
-    (kind != MediaKind::Tv || (st.season == season && st.episode == episode)) && (st.members.len() > 1 || st.paused)
+    (kind != MediaKind::Tv || (st.season == season && st.episode == episode))
+        && (st.paused || (st.members.len() > 1 && st.members.iter().any(|m| m.ready)))
 }
 
 /// Returns `(url_start_sec, stream_offset_sec, display_position_sec)` for transcoded playback,
@@ -4501,6 +4502,11 @@ mod tests {
         assert!(!should_align_start_to_sync(&solo_init, MediaKind::Movie, 0, 0));
         let solo_paused = sample_sync_state(true, 1, SyncEventKind::Snapshot, None);
         assert!(should_align_start_to_sync(&solo_paused, MediaKind::Movie, 0, 0));
+        let mut multi_cold = sample_sync_state(false, 2, SyncEventKind::Members, None);
+        for m in &mut multi_cold.members {
+            m.ready = false;
+        }
+        assert!(!should_align_start_to_sync(&multi_cold, MediaKind::Movie, 0, 0));
         let multi = sample_sync_state(false, 2, SyncEventKind::Snapshot, None);
         assert!(should_align_start_to_sync(&multi, MediaKind::Movie, 0, 0));
 

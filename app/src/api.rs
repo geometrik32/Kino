@@ -17,6 +17,96 @@ use serde::de::DeserializeOwned;
 use crate::platform;
 
 const TOKEN_KEY: &str = "kino.token";
+#[cfg(target_arch = "wasm32")]
+const RELOADED_WEB_ASSET_KEY: &str = "kino.web_reloaded_to";
+
+#[cfg(any(test, target_arch = "wasm32"))]
+fn extract_release_web_asset(src: &str) -> Option<&str> {
+    let start = src.find("kino-app-dxh")?;
+    let rest = &src[start..];
+    let end = rest.find(".js")?;
+    let tag = &rest[..end + 3];
+    (tag.len() <= 96
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')))
+    .then_some(tag)
+}
+
+#[cfg(target_arch = "wasm32")]
+static PENDING_WEB_ASSET: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(target_arch = "wasm32")]
+fn current_web_asset() -> Option<&'static str> {
+    static CURRENT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CURRENT
+        .get_or_init(|| {
+            let doc = web_sys::window()?.document()?;
+            let el = doc.query_selector("script[src*='kino-app-dxh']").ok().flatten()?;
+            let src = el.get_attribute("src")?;
+            extract_release_web_asset(&src).map(str::to_owned)
+        })
+        .as_deref()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn note_web_asset_header(resp: &Response) {
+    let Some(cur) = current_web_asset() else { return };
+    let Some(server) = resp
+        .headers()
+        .get("x-kino-web-asset")
+        .and_then(|v| v.to_str().ok())
+        .and_then(extract_release_web_asset)
+    else {
+        return;
+    };
+    if server != cur {
+        if let Ok(mut pending) = PENDING_WEB_ASSET.lock() {
+            *pending = Some(server.to_owned());
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn note_web_asset_header(_resp: &Response) {}
+
+/// If the running WASM bundle is older than the server's deployed web bundle, triggers a clean
+/// page reload (at most once per target asset hash) and returns `true` so callers abort old work.
+#[cfg(target_arch = "wasm32")]
+pub fn reload_for_web_update(autoplay_title: bool) -> bool {
+    let target = PENDING_WEB_ASSET.lock().ok().and_then(|mut g| g.take());
+    let Some(target) = target else {
+        return false;
+    };
+    let Some(win) = web_sys::window() else {
+        return false;
+    };
+    if let Ok(Some(ss)) = win.session_storage() {
+        if ss.get_item(RELOADED_WEB_ASSET_KEY).ok().flatten().as_deref() == Some(target.as_str()) {
+            return false;
+        }
+        let _ = ss.set_item(RELOADED_WEB_ASSET_KEY, &target);
+    }
+    let loc = win.location();
+    if autoplay_title && !crate::telegram::is_telegram() {
+        if let (Ok(path), Ok(search), Ok(hash)) = (loc.pathname(), loc.search(), loc.hash()) {
+            if search.contains("open=") && !search.contains("play=") {
+                let next = format!("{path}{search}&play=1{hash}");
+                if loc.replace(&next).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+    loc.reload().is_ok()
+}
+
+/// If the running WASM bundle is older than the server's deployed web bundle, triggers a clean
+/// page reload and returns `true`. Always `false` on native apps.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn reload_for_web_update(_autoplay_title: bool) -> bool {
+    false
+}
 
 pub async fn saved_token() -> Option<String> {
     platform::storage_get(TOKEN_KEY).await
@@ -82,6 +172,7 @@ impl Failure {
 async fn decode<T: DeserializeOwned>(resp: Response) -> Result<T, Failure> {
     let status = resp.status();
     if status.is_success() {
+        note_web_asset_header(&resp);
         return resp.json().await.map_err(Failure::network);
     }
     match resp.json::<ApiError>().await {
@@ -222,10 +313,25 @@ async fn send_timeout<T: DeserializeOwned>(
     };
     let resp = req.send().await.map_err(Failure::network)?;
     if resp.status().as_u16() == 204 {
+        note_web_asset_header(&resp);
         // No body: decode `null` into `()` (or any type that accepts it).
         return serde_json::from_str("null").map_err(Failure::network);
     }
     decode(resp).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_release_web_asset;
+
+    #[test]
+    fn parses_release_web_asset_tag() {
+        assert_eq!(
+            extract_release_web_asset("/./assets/kino-app-dxheea1653c226931e5.js"),
+            Some("kino-app-dxheea1653c226931e5.js")
+        );
+        assert_eq!(extract_release_web_asset("/assets/kino-app.js"), None);
+    }
 }
 
 pub async fn title_state(token: &str, kind: MediaKind, id: i64) -> Result<TitleState, Failure> {

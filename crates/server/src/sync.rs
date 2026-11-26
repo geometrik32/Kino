@@ -1084,7 +1084,8 @@ impl SyncHub {
             }
 
             let mut barrier_released = false;
-            if room.members.len() > 1 {
+            let any_ready = room.members.iter().any(|m| m.ready);
+            if room.members.len() > 1 && any_ready {
                 for m in &mut room.members {
                     if m.waiting_since_ms
                         .is_some_and(|since| now_ms - since >= BARRIER_TIMEOUT_MS)
@@ -2163,5 +2164,90 @@ mod tests {
         let jobs = hub.sweep(t);
         assert_eq!(jobs.len(), 1);
         assert!((jobs[0].update.position_sec - 1015.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn multi_device_cold_start_barrier_does_not_timeout_before_any_ready() {
+        let hub = SyncHub::new();
+        let mut t = 8_000_000_i64;
+        let mut req_a = join_req("a", "Андроид");
+        req_a.tmdb_id = 606;
+        let mut req_b = join_req("b", "ПК");
+        req_b.tmdb_id = 606;
+
+        hub.join_in_memory(1, &req_a, &[], None, t);
+        let (s_join_b, _) = hub.join_in_memory(1, &req_b, &[], None, t);
+        assert!(s_join_b.waiting);
+        assert_eq!(s_join_b.position_sec, 0.0);
+
+        let (tx_a, mut rx_a) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let (tx_b, _rx_b) = mpsc::channel(WS_OUTBOUND_CAPACITY);
+        let claims_a = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 606,
+            cid: "a".into(),
+            exp: 9_999_999_999,
+        };
+        let claims_b = SyncTicketClaims {
+            uid: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 606,
+            cid: "b".into(),
+            exp: 9_999_999_999,
+        };
+        let (key, conn_a, _) = hub.attach_ws(&claims_a, tx_a, t).unwrap();
+        let (_, conn_b, _) = hub.attach_ws(&claims_b, tx_b, t).unwrap();
+        while rx_a.try_recv().is_ok() {}
+
+        // Both devices stay in cold torrent connect/probe for 45s (> BARRIER_TIMEOUT_MS).
+        for _ in 0..3 {
+            t += 15_000;
+            hub.handle_ws_msg(key, "a", conn_a, SyncClientMsg::Ping { client_ms: t }, None, t);
+            hub.handle_ws_msg(key, "b", conn_b, SyncClientMsg::Ping { client_ms: t }, None, t);
+            while rx_a.try_recv().is_ok() {}
+            assert!(hub.sweep(t).is_empty());
+        }
+
+        // Neither became ready, so barrier must STILL hold waiting and keep position at 0.0.
+        let mut rejoin_b = req_b.clone();
+        rejoin_b.reconnect_pos = Some(0.0);
+        let (st_mid, _) = hub.join_in_memory(1, &rejoin_b, &[], None, t);
+        assert!(st_mid.waiting);
+        assert_eq!(st_mid.position_sec, 0.0);
+
+        // Once both finish loading and report Ready, playback unlocks cleanly from 0.0 (not 45.0).
+        hub.handle_ws_msg(
+            key,
+            "a",
+            conn_a,
+            SyncClientMsg::Ready {
+                position_sec: 0.0,
+                duration_sec: Some(6000.0),
+                file_index: Some(0),
+            },
+            None,
+            t,
+        );
+        hub.handle_ws_msg(
+            key,
+            "b",
+            conn_b,
+            SyncClientMsg::Ready {
+                position_sec: 0.0,
+                duration_sec: Some(6000.0),
+                file_index: Some(0),
+            },
+            None,
+            t,
+        );
+        while let Ok(msg) = rx_a.try_recv() {
+            if let SyncServerMsg::State(st) = msg {
+                if !st.waiting {
+                    assert_eq!(st.event, SyncEventKind::Resumed);
+                    assert_eq!(st.position_sec, 0.0);
+                }
+            }
+        }
     }
 }
