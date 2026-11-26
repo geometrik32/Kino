@@ -201,5 +201,11 @@ pub enum SyncServerMsg {
         tmdb_id: i64,
         season: i32,
         infohash: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        quality: Option<String>,
+        #[serde(default)]
+        voice: Option<String>,
     },
 }

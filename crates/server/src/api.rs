@@ -66,11 +66,11 @@ fn client_key(headers: &HeaderMap) -> String {
 use chrono::{FixedOffset, Utc};
 use kino_core::{
     AuthResponse, CalendarEntry, CatalogRow, ContinueItem, EpisodeRatingUpdate, HistoryEntry, HomeFeed, LoginLink,
-    LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PreloadItem, PreloadRequest,
-    Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role, ScaleUpdate, SearchResults,
-    Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus,
-    TitleSummary, TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary, WatchlistItem, WebAppAuthRequest,
-    WidgetAuthRequest,
+    LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PreloadItem, PreloadPhase,
+    PreloadRequest, PreloadState, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role,
+    ScaleUpdate, SearchResults, Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, TitleDetails, TitleExtras,
+    TitleState, TitleStatus, TitleSummary, TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary,
+    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -429,6 +429,13 @@ async fn save_release_choice(
         ));
     }
     c.infohash.make_ascii_lowercase();
+    if !kino_core::is_infohash(&c.infohash) {
+        if let Ok(known) = crate::torrent::known_infohashes(&state.pool, &[c.infohash.clone()]).await {
+            if let Some(real) = known.get(&c.infohash) {
+                c.infohash = real.clone();
+            }
+        }
+    }
     Ok(Json(db::save_release_choice(&state.pool, user.0, &c).await?))
 }
 
@@ -1045,34 +1052,76 @@ async fn user_titles(
     Ok(Json(lib))
 }
 
-async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Vec<PreloadItem>>, AppError> {
+async fn enrich_preloads(state: &AppState, list: &mut [PreloadItem]) {
     use futures_util::stream::{self, StreamExt};
 
+    if list.is_empty() {
+        return;
+    }
+    let mut unique: Vec<(MediaKind, i64)> = Vec::new();
+    for p in list.iter() {
+        let key = (p.kind, p.tmdb_id);
+        if !unique.contains(&key) {
+            unique.push(key);
+        }
+    }
+    let fetched: HashMap<(MediaKind, i64), Option<TitleSummary>> = stream::iter(
+        unique
+            .into_iter()
+            .map(|(k, id)| async move { ((k, id), summary_of(state, k, id).await) }),
+    )
+    .buffer_unordered(8)
+    .collect()
+    .await;
+    let telemetry = state.media.preload_telemetry.read().await.clone();
+    for p in list.iter_mut() {
+        if let Some(Some(summary)) = fetched.get(&(p.kind, p.tmdb_id)) {
+            p.poster_path = summary.poster_path.clone();
+            p.media_title = Some(summary.title.clone());
+        }
+        if let Some(parsed) = p.title.as_deref().map(crate::torrent::title::parse_title) {
+            if !parsed.quality.is_empty() {
+                p.quality = Some(parsed.quality);
+            }
+            if !parsed.voice.is_empty() {
+                p.voice = Some(parsed.voice);
+            }
+        }
+        match p.state {
+            PreloadState::Ready => {
+                p.speed_bps = 0;
+                p.dl_phase = PreloadPhase::Ready;
+            }
+            PreloadState::Failed => {
+                p.speed_bps = 0;
+                p.dl_phase = PreloadPhase::Failed;
+            }
+            PreloadState::Deleted => {
+                p.speed_bps = 0;
+            }
+            PreloadState::Queued | PreloadState::Downloading => {
+                if let Some(&(spd, ph)) = telemetry.get(&p.infohash.to_ascii_lowercase()) {
+                    p.speed_bps = spd;
+                    p.dl_phase = ph;
+                } else {
+                    p.speed_bps = 0;
+                    p.dl_phase = if p.progress > 0.0 {
+                        PreloadPhase::Downloading
+                    } else {
+                        PreloadPhase::Waiting
+                    };
+                }
+            }
+        }
+    }
+}
+
+async fn preloads(State(state): State<AppState>, user: CurrentUser) -> Result<Json<Vec<PreloadItem>>, AppError> {
     if state.media.qbit.is_some() {
         let _ = crate::jobs::sync_preloads(&state).await;
     }
     let mut list = userdata::preloads(&state.pool, user.0).await?;
-    if !list.is_empty() {
-        let mut unique: Vec<(MediaKind, i64)> = Vec::new();
-        for p in &list {
-            let key = (p.kind, p.tmdb_id);
-            if !unique.contains(&key) {
-                unique.push(key);
-            }
-        }
-        let fetched: HashMap<(MediaKind, i64), Option<String>> = stream::iter(unique.into_iter().map(|(k, id)| {
-            let state = &state;
-            async move { ((k, id), summary_of(state, k, id).await.and_then(|s| s.poster_path)) }
-        }))
-        .buffer_unordered(8)
-        .collect()
-        .await;
-        for p in &mut list {
-            if let Some(Some(path)) = fetched.get(&(p.kind, p.tmdb_id)) {
-                p.poster_path = Some(path.clone());
-            }
-        }
-    }
+    enrich_preloads(&state, &mut list).await;
     Ok(Json(list))
 }
 
@@ -1088,16 +1137,47 @@ async fn add_preload(
             "need a hex infohash, a positive tmdb_id and season >= 0",
         ));
     }
-    r.infohash.make_ascii_lowercase();
+    let orig_key = r.infohash.to_ascii_lowercase();
+    r.infohash = orig_key.clone();
+    let media = &state.media;
+    let Some(qbit) = &media.qbit else {
+        // Without a downloader the request is only recorded (demo mode).
+        let mut item = userdata::preload_add(&state.pool, user.0, &r).await?;
+        enrich_preloads(&state, std::slice::from_mut(&mut item)).await;
+        return Ok(Json(item));
+    };
+    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, &media.indexers).await?;
+    r.infohash = src.infohash.clone().unwrap_or(r.infohash).to_ascii_lowercase();
+    if !src.title.is_empty() {
+        r.title = Some(src.title.clone());
+    }
+    crate::torrent::rebind_synthetic_hash(&state.pool, &orig_key, &r.infohash).await;
     let existing = userdata::preloads(&state.pool, user.0).await?;
+    if let Some(mut cur) = existing
+        .iter()
+        .find(|p| {
+            p.infohash.eq_ignore_ascii_case(&r.infohash)
+                && matches!(
+                    p.state,
+                    PreloadState::Queued | PreloadState::Downloading | PreloadState::Ready
+                )
+        })
+        .cloned()
+    {
+        if state.media.qbit.is_some() {
+            let _ = crate::jobs::sync_preloads(&state).await;
+            if let Ok(fresh) = userdata::preloads(&state.pool, user.0).await {
+                if let Some(updated) = fresh.into_iter().find(|p| p.id == cur.id) {
+                    cur = updated;
+                }
+            }
+        }
+        enrich_preloads(&state, std::slice::from_mut(&mut cur)).await;
+        return Ok(Json(cur));
+    }
     let active_count = existing
         .iter()
-        .filter(|p| {
-            matches!(
-                p.state,
-                kino_core::PreloadState::Downloading | kino_core::PreloadState::Ready
-            ) && p.infohash != r.infohash
-        })
+        .filter(|p| matches!(p.state, PreloadState::Downloading | PreloadState::Ready) && p.infohash != r.infohash)
         .count();
     if active_count >= MAX_ACTIVE_PRELOADS {
         return Err(AppError::new(
@@ -1105,16 +1185,6 @@ async fn add_preload(
             "preload_limit",
             "Достигнут лимит одновременных загрузок (10). Удалите ненужные в профиле.",
         ));
-    }
-    let media = &state.media;
-    let Some(qbit) = &media.qbit else {
-        // Without a downloader the request is only recorded (demo mode).
-        return Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?));
-    };
-    let src = crate::torrent::resolve(&state.pool, &media.http, &r.infohash, &media.indexers).await?;
-    r.infohash = src.infohash.clone().unwrap_or(r.infohash);
-    if r.title.is_none() && !src.title.is_empty() {
-        r.title = Some(src.title.clone());
     }
     qbit.add(&src).await.map_err(|e| {
         tracing::warn!(error = %e, "qBittorrent add failed");
@@ -1124,7 +1194,9 @@ async fn add_preload(
             "Загрузчик сейчас недоступен",
         )
     })?;
-    Ok(Json(userdata::preload_add(&state.pool, user.0, &r).await?))
+    let mut item = userdata::preload_add(&state.pool, user.0, &r).await?;
+    enrich_preloads(&state, std::slice::from_mut(&mut item)).await;
+    Ok(Json(item))
 }
 
 async fn delete_preload(

@@ -1,5 +1,6 @@
 //! qBittorrent Web API: downloading releases in advance to the server's disk.
 
+use kino_core::PreloadPhase;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -25,9 +26,11 @@ pub struct TorrentInfo {
     pub hash: String,
     /// 0.0–1.0.
     pub progress: f32,
-    /// "downloading", "stalledDL", "uploading", "error", "missingFiles", ...
+    /// "downloading", "metaDL", "stalledDL", "queuedDL", "checkingDL", "uploading", "error", "missingFiles", ...
     pub state: String,
     pub size: i64,
+    #[serde(default)]
+    pub dlspeed: i64,
 }
 
 impl TorrentInfo {
@@ -37,6 +40,27 @@ impl TorrentInfo {
 
     pub fn done(&self) -> bool {
         self.progress >= 1.0
+    }
+
+    pub fn speed_bps(&self) -> u64 {
+        self.dlspeed.max(0) as u64
+    }
+
+    pub fn dl_phase(&self) -> PreloadPhase {
+        if self.failed() {
+            return PreloadPhase::Failed;
+        }
+        if self.done() {
+            return PreloadPhase::Ready;
+        }
+        match self.state.as_str() {
+            "metaDL" | "forcedMetaDL" => PreloadPhase::Metadata,
+            "checkingDL" | "checkingUP" | "checkingResumeData" | "allocating" | "moving" => PreloadPhase::Checking,
+            "stalledDL" | "queuedDL" | "pausedDL" | "stoppedDL" => PreloadPhase::Waiting,
+            _ if self.dlspeed > 0 => PreloadPhase::Downloading,
+            _ if self.progress <= 0.0 => PreloadPhase::Waiting,
+            _ => PreloadPhase::Downloading,
+        }
     }
 }
 
@@ -106,32 +130,58 @@ impl QBittorrent {
     }
 
     /// Starts downloading, files in order so the start of each is ready first.
+    /// Idempotent when the same info-hash is already queued or downloading in qBittorrent.
     pub async fn add(&self, src: &Source) -> anyhow::Result<()> {
+        if let Some(hash) = src.infohash.as_deref().filter(|h| !h.is_empty()) {
+            if let Ok(list) = self.info(&[hash.to_owned()]).await {
+                if list.iter().any(|t| t.hash.eq_ignore_ascii_case(hash) && !t.failed()) {
+                    return Ok(());
+                }
+            }
+        }
         let torrent = src.torrent.clone();
         let magnet = src
             .magnet
             .clone()
             .or_else(|| src.infohash.as_ref().map(|h| format!("magnet:?xt=urn:btih:{h}")));
-        self.call(|http, base| {
-            let mut form = reqwest::multipart::Form::new()
-                .text("category", "kino")
-                .text("sequentialDownload", "true")
-                .text("firstLastPiecePrio", "true");
-            if let Some(p) = &self.save_path {
-                form = form.text("savepath", p.clone());
+        let res = self
+            .call(|http, base| {
+                let mut form = reqwest::multipart::Form::new()
+                    .text("category", "kino")
+                    .text("sequentialDownload", "true")
+                    .text("firstLastPiecePrio", "true");
+                if let Some(p) = &self.save_path {
+                    form = form.text("savepath", p.clone());
+                }
+                form = match (&torrent, &magnet) {
+                    (Some(bytes), _) => form.part(
+                        "torrents",
+                        reqwest::multipart::Part::bytes(bytes.clone()).file_name("release.torrent"),
+                    ),
+                    (None, Some(m)) => form.text("urls", m.clone()),
+                    (None, None) => form,
+                };
+                http.post(format!("{base}/api/v2/torrents/add")).multipart(form)
+            })
+            .await;
+        match res {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let is_conflict = e
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(|re| re.status() == Some(reqwest::StatusCode::CONFLICT));
+                if is_conflict {
+                    if let Some(hash) = src.infohash.as_deref().filter(|h| !h.is_empty()) {
+                        if let Ok(list) = self.info(&[hash.to_owned()]).await {
+                            if list.iter().any(|t| t.hash.eq_ignore_ascii_case(hash) && !t.failed()) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                Err(e)
             }
-            form = match (&torrent, &magnet) {
-                (Some(bytes), _) => form.part(
-                    "torrents",
-                    reqwest::multipart::Part::bytes(bytes.clone()).file_name("release.torrent"),
-                ),
-                (None, Some(m)) => form.text("urls", m.clone()),
-                (None, None) => form,
-            };
-            http.post(format!("{base}/api/v2/torrents/add")).multipart(form)
-        })
-        .await?;
-        Ok(())
+        }
     }
 
     pub async fn info(&self, hashes: &[String]) -> anyhow::Result<Vec<TorrentInfo>> {
@@ -179,7 +229,7 @@ impl QBittorrent {
 
 #[cfg(test)]
 mod tests {
-    use super::is_session_cookie;
+    use super::{is_session_cookie, PreloadPhase, TorrentInfo};
 
     #[test]
     fn recognizes_legacy_and_v5_session_cookies() {
@@ -187,5 +237,25 @@ mod tests {
         assert!(is_session_cookie("QBT_SID_8085"));
         assert!(is_session_cookie("QBT_SID_8080"));
         assert!(!is_session_cookie("session"));
+    }
+
+    #[test]
+    fn classifies_qbittorrent_states_into_preload_phases() {
+        let info = |state: &str, progress: f32, dlspeed: i64| TorrentInfo {
+            hash: "a".repeat(40),
+            progress,
+            state: state.into(),
+            size: 1000,
+            dlspeed,
+        };
+        assert_eq!(info("metaDL", 0.0, 0).dl_phase(), PreloadPhase::Metadata);
+        assert_eq!(info("stalledDL", 0.0, 0).dl_phase(), PreloadPhase::Waiting);
+        assert_eq!(info("checkingDL", 0.3, 0).dl_phase(), PreloadPhase::Checking);
+        assert_eq!(
+            info("downloading", 0.25, 5_000_000).dl_phase(),
+            PreloadPhase::Downloading
+        );
+        assert_eq!(info("uploading", 1.0, 0).dl_phase(), PreloadPhase::Ready);
+        assert_eq!(info("error", 0.0, 0).dl_phase(), PreloadPhase::Failed);
     }
 }

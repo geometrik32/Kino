@@ -1212,11 +1212,7 @@ fn PreloadRow(
     on_delete: EventHandler<i64>,
 ) -> Element {
     let pct = (item.progress * 100.0).clamp(0.0, 100.0).round();
-    let status_text = match item.state {
-        PreloadState::Downloading => format!("Скачивается · {pct:.0}%"),
-        PreloadState::Ready => "Готово · играет с диска".to_owned(),
-        other => other.label().to_owned(),
-    };
+    let status_text = item.status_text();
     let delete_tag = match (item.state, item.delete_after) {
         (_, Some(at)) => {
             let days = (at - now).num_hours().max(0) as f64 / 24.0;
@@ -1234,7 +1230,7 @@ fn PreloadRow(
     let (kind, tmdb_id) = (item.kind, item.tmdb_id);
     let cls = match item.state {
         PreloadState::Ready => "tag ok",
-        PreloadState::Downloading => "tag acc",
+        PreloadState::Queued | PreloadState::Downloading => "tag acc",
         PreloadState::Failed => "tag err",
         _ => "tag",
     };
@@ -1243,10 +1239,23 @@ fn PreloadRow(
     } else if item.kind == MediaKind::Tv {
         "TV".to_owned()
     } else {
-        "HD".to_owned()
+        item.quality_short().unwrap_or("HD").to_owned()
     };
-    let title = item.title.clone().unwrap_or_else(|| item.infohash.clone());
+    let primary_title = match (item.media_title.as_deref(), item.kind, item.season) {
+        (Some(name), MediaKind::Tv, s) if s > 0 => format!("{name} · Сезон {s}"),
+        (Some(name), _, _) => name.to_owned(),
+        (None, _, _) => item.title.clone().unwrap_or_else(|| item.infohash.clone()),
+    };
+    let release_sub = item
+        .media_title
+        .as_deref()
+        .and_then(|name| item.title.as_deref().filter(|raw| *raw != name))
+        .map(str::to_owned);
+    let q_tag = item.quality_short();
+    let voice_tag = item.voice.as_deref().map(str::trim).filter(|v| !v.is_empty());
     let href = title_href(kind, tmdb_id);
+    let in_progress = matches!(item.state, PreloadState::Queued | PreloadState::Downloading);
+    let wait_bar = in_progress && item.progress <= 0.001;
     rsx! {
         div { class: "dl-row",
             a {
@@ -1261,16 +1270,21 @@ fn PreloadRow(
                 onauxclick: handle_aux_click,
                 div { class: "dl-poster", style: "background: {fallback_bg(tmdb_id)}",
                     if let Some(p) = &item.poster_path {
-                        img { src: image_url(p, ImageSize::Poster), alt: "{title}", loading: "lazy" }
+                        img { src: image_url(p, ImageSize::Poster), alt: "{primary_title}", loading: "lazy" }
                         span { class: "dl-poster-tag over", "{badge_lbl}" }
                     } else {
                         span { class: "dl-poster-tag", "{badge_lbl}" }
                     }
                 }
                 div { class: "dl-body",
-                    div { class: "dl-title", "{title}" }
+                    div { class: "dl-title", "{primary_title}" }
+                    if let Some(sub) = release_sub {
+                        div { class: "dl-sub", title: "{sub}", "{sub}" }
+                    }
                     div { class: "dl-tags",
                         span { class: "{cls}", "{status_text}" }
+                        if let Some(q) = q_tag { span { class: "tag", "{q}" } }
+                        if let Some(v) = voice_tag { span { class: "tag", "{v}" } }
                         if let Some(s) = size { span { class: "tag", "{s}" } }
                         if let Some((txt, tcls)) = delete_tag {
                             span { class: "{tcls}",
@@ -1279,8 +1293,8 @@ fn PreloadRow(
                             }
                         }
                     }
-                    if item.state == PreloadState::Downloading {
-                        div { class: "dl-bar",
+                    if in_progress {
+                        div { class: if wait_bar { "dl-bar wait" } else { "dl-bar" },
                             div { style: "width: {pct:.0}%" }
                         }
                     }

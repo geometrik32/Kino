@@ -1098,6 +1098,18 @@ pub struct PreloadRequest {
     pub title: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreloadPhase {
+    #[default]
+    Waiting,
+    Metadata,
+    Downloading,
+    Checking,
+    Ready,
+    Failed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PreloadItem {
     pub id: i64,
@@ -1117,6 +1129,164 @@ pub struct PreloadItem {
     /// TMDB poster path for thumbnails in Profile -> Server Downloads.
     #[serde(default)]
     pub poster_path: Option<String>,
+    /// Clean catalog title of the film/series for display in UI.
+    #[serde(default)]
+    pub media_title: Option<String>,
+    /// Normalized quality bucket (`2160p`, `1080p`, `720p`, `SD`) parsed from the release title.
+    #[serde(default)]
+    pub quality: Option<String>,
+    /// Voice-over / studio parsed from the release title.
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// Live download speed in bytes per second when downloading.
+    #[serde(default)]
+    pub speed_bps: u64,
+    /// Fine-grained phase from the downloader (`Metadata`, `Waiting`, `Downloading`, `Checking`).
+    #[serde(default)]
+    pub dl_phase: PreloadPhase,
+}
+
+/// Formats a byte-per-second throughput rate for UI labels (e.g. `"12 МБ/с"`, `"2.4 МБ/с"`, `"420 КБ/с"`).
+pub fn format_speed(bps: u64) -> String {
+    if bps >= 1_048_576 {
+        let mb = bps as f64 / 1_048_576.0;
+        if mb >= 10.0 {
+            format!("{mb:.0}\u{a0}МБ/с")
+        } else {
+            format!("{mb:.1}\u{a0}МБ/с")
+        }
+    } else if bps >= 1024 {
+        format!("{}\u{a0}КБ/с", (bps / 1024).max(1))
+    } else {
+        format!("{bps}\u{a0}Б/с")
+    }
+}
+
+impl PreloadItem {
+    /// Short quality pill label (`"4K"`, `"1080p"`, `"720p"`, `"SD"`).
+    pub fn quality_short(&self) -> Option<&'static str> {
+        self.quality.as_deref().map(|q| match normalize_quality_key(q) {
+            "2160p" => "4K",
+            other => other,
+        })
+    }
+
+    /// Short `quality · voice` summary label when either is known.
+    pub fn quality_voice_label(&self) -> Option<String> {
+        match (
+            self.quality_short(),
+            self.voice.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+        ) {
+            (Some(q), Some(v)) => Some(format!("{q} · {v}")),
+            (Some(q), None) => Some(q.to_owned()),
+            (None, Some(v)) => Some(v.to_owned()),
+            (None, None) => None,
+        }
+    }
+
+    /// Detailed human status shown in Profile -> Server Downloads and title card notices.
+    pub fn status_text(&self) -> String {
+        match self.state {
+            PreloadState::Ready => "Готово · играет с диска".to_owned(),
+            PreloadState::Failed => "Ошибка загрузки".to_owned(),
+            PreloadState::Deleted => "Удалено".to_owned(),
+            PreloadState::Queued | PreloadState::Downloading => {
+                let pct = (self.progress * 100.0).clamp(0.0, 99.0).round() as i32;
+                match self.dl_phase {
+                    PreloadPhase::Metadata => "Получаем файлы…".to_owned(),
+                    PreloadPhase::Checking => "Проверяем файлы…".to_owned(),
+                    PreloadPhase::Waiting if pct == 0 => "Ждём раздающих…".to_owned(),
+                    PreloadPhase::Waiting => format!("Ждём раздающих · {pct}%"),
+                    PreloadPhase::Ready => "Готово · играет с диска".to_owned(),
+                    PreloadPhase::Failed => "Ошибка загрузки".to_owned(),
+                    PreloadPhase::Downloading if self.speed_bps > 0 => {
+                        format!("{pct}% · {}", format_speed(self.speed_bps))
+                    }
+                    PreloadPhase::Downloading if pct == 0 => "Ждём раздающих…".to_owned(),
+                    PreloadPhase::Downloading => format!("Скачивается · {pct}%"),
+                }
+            }
+        }
+    }
+
+    /// Compact button/badge status used in tight rows (ReleasePicker / Player Quality list).
+    pub fn compact_status_text(&self) -> String {
+        match self.state {
+            PreloadState::Ready => "На сервере".to_owned(),
+            PreloadState::Failed => "Ошибка".to_owned(),
+            PreloadState::Deleted => "Удалено".to_owned(),
+            PreloadState::Queued | PreloadState::Downloading => {
+                let pct = (self.progress * 100.0).clamp(0.0, 99.0).round() as i32;
+                match self.dl_phase {
+                    PreloadPhase::Metadata => "Файлы…".to_owned(),
+                    PreloadPhase::Checking => "Проверка…".to_owned(),
+                    PreloadPhase::Waiting if pct == 0 => "Ждём сидов".to_owned(),
+                    PreloadPhase::Waiting => format!("{pct}% · ждём"),
+                    PreloadPhase::Ready => "На сервере".to_owned(),
+                    PreloadPhase::Failed => "Ошибка".to_owned(),
+                    PreloadPhase::Downloading if self.speed_bps > 0 => {
+                        format!("{pct}% · {}", format_speed(self.speed_bps))
+                    }
+                    PreloadPhase::Downloading if pct == 0 => "Ждём сидов".to_owned(),
+                    PreloadPhase::Downloading => format!("{pct}%"),
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod preload_tests {
+    use super::*;
+
+    fn sample_item() -> PreloadItem {
+        PreloadItem {
+            id: 1,
+            kind: MediaKind::Movie,
+            tmdb_id: 969681,
+            season: 0,
+            infohash: "a".repeat(40),
+            title: Some("Spider-Man 2026 WEB-DL 1080p".into()),
+            state: PreloadState::Downloading,
+            progress: 0.0,
+            size_bytes: Some(10_000_000_000),
+            requested_at: Utc::now(),
+            ready_at: None,
+            delete_after: None,
+            poster_path: None,
+            media_title: Some("Человек-паук: Новый день".into()),
+            quality: Some("2160p".into()),
+            voice: Some("Дубляж".into()),
+            speed_bps: 0,
+            dl_phase: PreloadPhase::Metadata,
+        }
+    }
+
+    #[test]
+    fn formats_speed_and_preload_statuses() {
+        assert_eq!(format_speed(15_728_640).replace('\u{a0}', " "), "15 МБ/с");
+        assert_eq!(format_speed(2_621_440).replace('\u{a0}', " "), "2.5 МБ/с");
+        assert_eq!(format_speed(512_000).replace('\u{a0}', " "), "500 КБ/с");
+
+        let mut it = sample_item();
+        assert_eq!(it.quality_short(), Some("4K"));
+        assert_eq!(it.quality_voice_label().as_deref(), Some("4K · Дубляж"));
+        assert_eq!(it.status_text(), "Получаем файлы…");
+        assert_eq!(it.compact_status_text(), "Файлы…");
+
+        it.dl_phase = PreloadPhase::Waiting;
+        assert_eq!(it.status_text(), "Ждём раздающих…");
+        assert_eq!(it.compact_status_text(), "Ждём сидов");
+
+        it.dl_phase = PreloadPhase::Downloading;
+        it.progress = 0.42;
+        it.speed_bps = 12_582_912;
+        assert_eq!(it.status_text().replace('\u{a0}', " "), "42% · 12 МБ/с");
+        assert_eq!(it.compact_status_text().replace('\u{a0}', " "), "42% · 12 МБ/с");
+
+        it.state = PreloadState::Ready;
+        assert_eq!(it.status_text(), "Готово · играет с диска");
+    }
 }
 
 #[cfg(test)]

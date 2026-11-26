@@ -3,7 +3,7 @@
 
 use dioxus::prelude::*;
 pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
-use kino_core::{format_bitrate, ReleaseChoiceUpdate, UserPrefs};
+use kino_core::{format_bitrate, PreloadItem, PreloadState, ReleaseChoiceUpdate, UserPrefs};
 
 use crate::icons::{self, seeder_signal, Icon};
 
@@ -260,11 +260,15 @@ pub fn ReleasePicker(
     /// True for native desktop/mobile players that decode MKV/HEVC/AC3/DTS without transcoding.
     #[props(default)]
     native_player: bool,
+    /// Active or ready server preloads matching this title/season (matched by infohash).
+    #[props(default)]
+    preloads: Vec<PreloadItem>,
     on_filter: EventHandler<ReleaseFilter>,
     on_sort: EventHandler<ReleaseSort>,
     on_panel: EventHandler<Option<PickerPanel>>,
     on_pick: EventHandler<ReleaseOption>,
     on_preload: EventHandler<ReleaseOption>,
+    #[props(default)] on_cancel_preload: Option<EventHandler<i64>>,
     on_close: EventHandler<()>,
 ) -> Element {
     let total = releases.len();
@@ -279,7 +283,16 @@ pub fn ReleasePicker(
         .filter(|r| filter.matches(r))
         .cloned();
     shown.retain(|r| Some(&r.infohash) != chosen.as_ref());
-    let (preloaded_top, rest): (Vec<ReleaseOption>, Vec<ReleaseOption>) = shown.into_iter().partition(|r| r.preloaded);
+    let preload_for = |hash: &str| {
+        preloads
+            .iter()
+            .find(|p| p.infohash.eq_ignore_ascii_case(hash) && p.state != PreloadState::Deleted)
+            .cloned()
+    };
+    let is_ready_rel =
+        |r: &ReleaseOption| r.preloaded || preload_for(&r.infohash).is_some_and(|p| p.state == PreloadState::Ready);
+    let (preloaded_top, rest): (Vec<ReleaseOption>, Vec<ReleaseOption>) =
+        shown.into_iter().partition(|r| is_ready_rel(r));
     let n_active = filter.active();
     let filter_label = if n_active > 0 {
         format!("Фильтры · {n_active}")
@@ -294,7 +307,7 @@ pub fn ReleasePicker(
         }
     };
     let shown_count = preloaded_top.len() + rest.len() + usize::from(pinned.is_some());
-    let has_preloaded_q = |q: &str| releases.iter().any(|r| r.preloaded && r.quality == q);
+    let has_preloaded_q = |q: &str| releases.iter().any(|r| is_ready_rel(r) && r.quality == q);
     let f_all = filter.clone();
     let f_dp = filter.clone();
     rsx! {
@@ -403,46 +416,77 @@ pub fn ReleasePicker(
                     None => rsx! {},
                 }
                 div { class: "rel-list",
-                    if pinned.as_ref().is_some_and(|r| r.preloaded) {
+                    if pinned.as_ref().is_some_and(|r| is_ready_rel(r)) {
                         if let Some(r) = &pinned {
-                            ReleaseRow { key: "pinned-{r.infohash}", release: r.clone(), chosen: true, watched: true, native_player, on_pick, on_preload }
+                            {
+                                let dl = preload_for(&r.infohash);
+                                rsx! {
+                                    ReleaseRow { key: "pinned-{r.infohash}", release: r.clone(), chosen: true, watched: true, native_player, preload: dl, on_pick, on_preload, on_cancel_preload }
+                                }
+                            }
                         }
                         for r in preloaded_top {
-                            ReleaseRow {
-                                key: "{r.infohash}",
-                                watched: watched.contains(&r.infohash),
-                                release: r,
-                                chosen: false,
-                                native_player,
-                                on_pick,
-                                on_preload,
+                            {
+                                let dl = preload_for(&r.infohash);
+                                rsx! {
+                                    ReleaseRow {
+                                        key: "{r.infohash}",
+                                        watched: watched.contains(&r.infohash),
+                                        release: r,
+                                        chosen: false,
+                                        native_player,
+                                        preload: dl,
+                                        on_pick,
+                                        on_preload,
+                                        on_cancel_preload,
+                                    }
+                                }
                             }
                         }
                     } else {
                         for r in preloaded_top {
-                            ReleaseRow {
-                                key: "{r.infohash}",
-                                watched: watched.contains(&r.infohash),
-                                release: r,
-                                chosen: false,
-                                native_player,
-                                on_pick,
-                                on_preload,
+                            {
+                                let dl = preload_for(&r.infohash);
+                                rsx! {
+                                    ReleaseRow {
+                                        key: "{r.infohash}",
+                                        watched: watched.contains(&r.infohash),
+                                        release: r,
+                                        chosen: false,
+                                        native_player,
+                                        preload: dl,
+                                        on_pick,
+                                        on_preload,
+                                        on_cancel_preload,
+                                    }
+                                }
                             }
                         }
                         if let Some(r) = pinned {
-                            ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, on_pick, on_preload }
+                            {
+                                let dl = preload_for(&r.infohash);
+                                rsx! {
+                                    ReleaseRow { key: "pinned-{r.infohash}", release: r, chosen: true, watched: true, native_player, preload: dl, on_pick, on_preload, on_cancel_preload }
+                                }
+                            }
                         }
                     }
                     for r in rest {
-                        ReleaseRow {
-                            key: "{r.infohash}",
-                            watched: watched.contains(&r.infohash),
-                            release: r,
-                            chosen: false,
-                            native_player,
-                            on_pick,
-                            on_preload,
+                        {
+                            let dl = preload_for(&r.infohash);
+                            rsx! {
+                                ReleaseRow {
+                                    key: "{r.infohash}",
+                                    watched: watched.contains(&r.infohash),
+                                    release: r,
+                                    chosen: false,
+                                    native_player,
+                                    preload: dl,
+                                    on_pick,
+                                    on_preload,
+                                    on_cancel_preload,
+                                }
+                            }
                         }
                     }
                     if shown_count == 0 {
@@ -615,11 +659,18 @@ fn ReleaseRow(
     chosen: bool,
     watched: bool,
     #[props(default)] native_player: bool,
+    #[props(default)] preload: Option<PreloadItem>,
     on_pick: EventHandler<ReleaseOption>,
     on_preload: EventHandler<ReleaseOption>,
+    #[props(default)] on_cancel_preload: Option<EventHandler<i64>>,
 ) -> Element {
+    let mut confirm_cancel = use_signal(|| false);
     let low = release.seeders < LOW_SEEDS;
     let is_uhd = quality_rank(&release.quality) >= 2160;
+    let is_ready = release.preloaded || preload.as_ref().is_some_and(|p| p.state == PreloadState::Ready);
+    let active_dl = preload
+        .as_ref()
+        .filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading));
     let q_sub = match (release.dolby_vision, release.hdr, release.codec.as_deref()) {
         (true, true, _) => "DV · HDR",
         (true, false, _) => "DV",
@@ -642,11 +693,13 @@ fn ReleaseRow(
             div { class: "rel-main",
                 div { class: "rel-voice",
                     strong { "{release.voice}" }
-                    if release.preloaded {
+                    if is_ready {
                         span { class: "tag srv", title: "Файл уже скачан на сервер и запускается мгновенно",
                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
                             "На сервере"
                         }
+                    } else if let Some(dl) = active_dl {
+                        span { class: "tag acc", title: "{dl.status_text()}", "{dl.compact_status_text()}" }
                     }
                     if chosen {
                         span { class: "tag acc", "Ваша раздача" }
@@ -682,19 +735,63 @@ fn ReleaseRow(
                 div { class: "rel-raw", title: "{release.title} · {added}", "{release.title}" }
             }
             div { class: "pre-slot",
-                button {
-                    class: if low { "pre-btn recommend" } else { "pre-btn" },
-                    title: if low {
-                        "Мало сидов — лучше скачать заранее на сервер"
+                if is_ready {
+                    span {
+                        class: "pre-btn done",
+                        title: "Файл уже скачан на сервер",
+                        Icon { svg: icons::CHECK, class: "ic sm" }
+                        "На сервере"
+                    }
+                } else if let Some(dl) = active_dl {
+                    if let Some(on_cancel) = on_cancel_preload {
+                        {
+                            let dl_id = dl.id;
+                            let status_lbl = dl.compact_status_text();
+                            rsx! {
+                                button {
+                                    class: if confirm_cancel() { "pre-btn cancel-confirm" } else { "pre-btn active" },
+                                    title: if confirm_cancel() {
+                                        "Нажмите ещё раз, чтобы отменить загрузку"
+                                    } else {
+                                        "Нажмите, чтобы отменить загрузку"
+                                    },
+                                    onblur: move |_| confirm_cancel.set(false),
+                                    onclick: move |e| {
+                                        e.stop_propagation();
+                                        if *confirm_cancel.peek() {
+                                            confirm_cancel.set(false);
+                                            on_cancel.call(dl_id);
+                                        } else {
+                                            confirm_cancel.set(true);
+                                        }
+                                    },
+                                    if confirm_cancel() {
+                                        Icon { svg: icons::CLOSE, class: "ic xs" }
+                                        "Отменить?"
+                                    } else {
+                                        "{status_lbl}"
+                                    }
+                                }
+                            }
+                        }
                     } else {
-                        "Скачать заранее на сервер"
-                    },
-                    onclick: move |e| {
-                        e.stop_propagation();
-                        on_preload.call(b.clone());
-                    },
-                    Icon { svg: icons::DOWNLOAD, class: "ic sm" }
-                    "Заранее"
+                        span { class: "pre-btn active", "{dl.compact_status_text()}" }
+                    }
+                } else {
+                    button {
+                        class: if low { "pre-btn recommend" } else { "pre-btn" },
+                        title: if low {
+                            "Мало сидов — лучше скачать заранее на сервер"
+                        } else {
+                            "Скачать заранее на сервер"
+                        },
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            on_preload.call(b.clone());
+                        },
+                        Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                        "Заранее"
+                    }
                 }
             }
             div { class: "rel-metrics",

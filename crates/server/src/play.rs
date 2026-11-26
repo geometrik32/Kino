@@ -15,7 +15,7 @@ use chrono::Utc;
 use futures_util::StreamExt;
 use kino_core::{
     demo_releases, language_name, normalize_quality_key, MediaKind, MediaTrack, PlayInfo, PlayProbe, PlayProbeRequest,
-    PlayRequest, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ReleaseOption, ResolveReleaseRequest,
+    PlayRequest, PreloadPhase, ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ReleaseOption, ResolveReleaseRequest,
     ResolveReleaseResponse, StreamProgress, TitleDetails, UserPrefs, MOBILE_720P_MIN_SEEDERS,
 };
 use serde::Deserialize;
@@ -57,6 +57,8 @@ pub struct Media {
     pub subtitles: std::sync::Arc<tokio::sync::Semaphore>,
     /// SSD pause-resume cache for torrent streams (Direct and transcoded).
     pub pause_cache: torrent::pause_cache::PauseCache,
+    /// Live `(speed_bps, dl_phase)` telemetry by lowercase infohash from qBittorrent polling.
+    pub preload_telemetry: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, (u64, PreloadPhase)>>>,
 }
 
 /// Default maximum videos re-encoded concurrently (configurable via `MAX_TRANSCODES`).
@@ -135,6 +137,7 @@ impl Media {
             transcodes: transcodes_sem,
             subtitles: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SUBTITLES)),
             pause_cache,
+            preload_telemetry: std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
             http,
         }
     }
@@ -223,6 +226,70 @@ async fn enrich_release_meta(
     Ok(())
 }
 
+fn canon_release_title(t: &str) -> String {
+    t.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase()
+}
+
+fn merge_release_dups(dst: &mut ReleaseOption, src: ReleaseOption) {
+    dst.seeders = dst.seeders.max(src.seeders);
+    dst.preloaded |= src.preloaded;
+    for who in src.picked_by {
+        if !dst.picked_by.contains(&who) {
+            dst.picked_by.push(who);
+        }
+    }
+}
+
+/// Collapses duplicate releases that resolved to the same info-hash or share an
+/// identical byte size and normalized title with an already-hashed release.
+fn dedup_releases(releases: Vec<ReleaseOption>) -> Vec<ReleaseOption> {
+    let mut by_hash: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::with_capacity(releases.len());
+    let mut out: Vec<ReleaseOption> = Vec::with_capacity(releases.len());
+    for mut r in releases {
+        r.infohash.make_ascii_lowercase();
+        if let Some(&idx) = by_hash.get(&r.infohash) {
+            merge_release_dups(&mut out[idx], r);
+        } else {
+            by_hash.insert(r.infohash.clone(), out.len());
+            out.push(r);
+        }
+    }
+    let hashed_sigs: Vec<(u64, String, usize)> = out
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.has_infohash() && r.size_bytes > 0)
+        .map(|(i, r)| (r.size_bytes, canon_release_title(&r.title), i))
+        .collect();
+    let mut merged_into: Vec<Option<usize>> = vec![None; out.len()];
+    for (i, r) in out.iter().enumerate() {
+        if !r.has_infohash() && r.size_bytes > 0 {
+            let ct = canon_release_title(&r.title);
+            if let Some(&(_, _, target_idx)) = hashed_sigs
+                .iter()
+                .find(|(sz, title, _)| *sz == r.size_bytes && title == &ct)
+            {
+                merged_into[i] = Some(target_idx);
+            }
+        }
+    }
+    let mut kept = Vec::with_capacity(out.len());
+    let mut taken: Vec<Option<ReleaseOption>> = out.into_iter().map(Some).collect();
+    for i in 0..taken.len() {
+        if let Some(target_idx) = merged_into[i] {
+            if let Some(dup) = taken[i].take() {
+                if let Some(Some(target)) = taken.get_mut(target_idx) {
+                    merge_release_dups(target, dup);
+                }
+            }
+        }
+    }
+    for slot in taken.into_iter().flatten() {
+        kept.push(slot);
+    }
+    kept
+}
+
 async fn fetch_release_list(
     state: &AppState,
     details: &TitleDetails,
@@ -249,16 +316,13 @@ async fn fetch_release_list(
         .filter(|r| !r.has_infohash())
         .map(|r| r.infohash.clone())
         .collect();
-    let known: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, infohash FROM torrent_source WHERE key = ANY($1) AND infohash IS NOT NULL")
-            .bind(&keys)
-            .fetch_all(&state.pool)
-            .await?;
+    let known = torrent::known_infohashes(&state.pool, &keys).await?;
     for r in &mut releases {
-        if let Some((_, h)) = known.iter().find(|(k, _)| *k == r.infohash) {
+        if let Some(h) = known.get(&r.infohash) {
             r.infohash = h.clone();
         }
     }
+    let mut releases = dedup_releases(releases);
     enrich_release_meta(&state.pool, kind, tmdb_id, season_val, &mut releases).await?;
     Ok(ReleaseList {
         releases,
@@ -496,7 +560,20 @@ async fn resolve_release(
     } else {
         (req.season, req.episode)
     };
-    let mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    let mut mine = db::release_choices(&state.pool, user.0, kind, tmdb_id).await?;
+    let synthetic_keys: Vec<String> = mine
+        .iter()
+        .filter(|c| !kino_core::is_infohash(&c.release.infohash))
+        .map(|c| c.release.infohash.clone())
+        .collect();
+    if !synthetic_keys.is_empty() {
+        let known = torrent::known_infohashes(&state.pool, &synthetic_keys).await?;
+        for c in &mut mine {
+            if let Some(h) = known.get(&c.release.infohash) {
+                c.release.infohash = h.clone();
+            }
+        }
+    }
     let device_kind = if req.is_mobile { "mobile" } else { "desktop" };
     let dev_override = db::device_quality_for(&state.pool, user.0, kind, tmdb_id, season, episode, device_kind).await?;
     let prefs = userdata::get_prefs(&state.pool, user.0).await?;
@@ -661,10 +738,27 @@ async fn resolve_online_tiers(
         });
     }
 
-    let preferred_voice = mine_manual
-        .first()
-        .or_else(|| shared.first())
-        .and_then(|c| c.release.voice.clone());
+    let user_preloads = userdata::title_preloads(&state.pool, user_id, kind, tmdb_id).await?;
+    let preload_voice = user_preloads
+        .iter()
+        .filter(|p| kind == MediaKind::Movie || p.season == 0 || p.season == season)
+        .find_map(|p| {
+            let v = p.title.as_deref().map(torrent::title::parse_title)?.voice;
+            (!v.is_empty()).then_some((v, p.requested_at))
+        });
+    let manual_voice = mine_manual.first().and_then(|c| {
+        c.release
+            .voice
+            .clone()
+            .filter(|v| !v.is_empty())
+            .map(|v| (v, c.chosen_at))
+    });
+    let preferred_voice = match (preload_voice, manual_voice) {
+        (Some((pv, pts)), Some((mv, mts))) => Some(if pts >= mts { pv } else { mv }),
+        (Some((pv, _)), None) => Some(pv),
+        (None, Some((mv, _))) => Some(mv),
+        (None, None) => shared.first().and_then(|c| c.release.voice.clone()),
+    };
     let list = fetch_release_list(state, &details, (kind == MediaKind::Tv).then_some(season)).await?;
 
     let picked = auto_pick_release(
@@ -815,6 +909,7 @@ async fn play(
     let media = &state.media;
     let src = torrent::resolve(&state.pool, &media.http, &key, &media.indexers).await?;
     let hash = src.infohash.clone().ok_or(TorrentError::Unknown)?;
+    torrent::rebind_synthetic_hash(&state.pool, &key, &hash).await;
     let episode = (req.kind == MediaKind::Tv).then_some((req.season.max(1), req.episode.max(1)));
     let (season, ep) = episode.unwrap_or((0, 0));
     let progress = db::title_progress(&state.pool, user.0, req.kind, req.tmdb_id).await?;
@@ -1738,5 +1833,46 @@ mod tests {
             "abc.def"
         );
         assert_eq!(extract_stream_token("abc.def"), "abc.def");
+    }
+
+    #[test]
+    fn deduplicates_same_hash_and_matching_unresolved_release() {
+        let mut r1 = ReleaseOption {
+            infohash: "a".repeat(40),
+            title: "Spider-Man Brand New Day 2026 WEB-DL 1080p".into(),
+            quality: "1080p".into(),
+            size_bytes: 10_488_294_037,
+            seeders: 120,
+            voice: "Дубляж".into(),
+            language: "Русский".into(),
+            tracker: "Rutor".into(),
+            added: "2026-11-25".into(),
+            year: Some(2026),
+            season: None,
+            hdr: false,
+            dolby_vision: false,
+            subtitles: false,
+            direct_play: true,
+            codec: Some("H.264".into()),
+            bitrate_kbps: None,
+            bitrate_approx: false,
+            picked_by: vec!["Анна".into()],
+            preloaded: false,
+        };
+        let mut r2 = r1.clone();
+        r2.infohash = format!("u{}", "b".repeat(39));
+        r2.seeders = 250;
+        r2.tracker = "Kinozal".into();
+        r2.picked_by = vec!["Борис".into()];
+        let mut r3 = r1.clone();
+        r3.infohash = "A".repeat(40);
+        r3.preloaded = true;
+        r1.seeders = 90;
+        let out = dedup_releases(vec![r1, r2, r3]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].infohash, "a".repeat(40));
+        assert_eq!(out[0].seeders, 250);
+        assert!(out[0].preloaded);
+        assert_eq!(out[0].picked_by, vec!["Анна", "Борис"]);
     }
 }

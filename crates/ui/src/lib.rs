@@ -12,8 +12,8 @@ use dioxus::html::{geometry::PixelsVector2D, MountedData, ScrollBehavior};
 use dioxus::prelude::*;
 use kino_core::{
     clock, episode_code, format_rating_short, image_url, rating_description, CastMember, ContinueItem, EpisodeRating,
-    HomeFeed, ImageSize, MediaKind, PeerBadge, PersonDetails, Progress, RewatchMode, SearchResults, Season,
-    SeasonRating, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
+    HomeFeed, ImageSize, MediaKind, PeerBadge, PersonDetails, PreloadItem, PreloadState, Progress, RewatchMode,
+    SearchResults, Season, SeasonRating, TitleDetails, TitleExtras, TitleStatus, TitleSummary,
 };
 
 /// The stylesheet all components rely on.
@@ -1349,6 +1349,9 @@ pub fn TitleView(
     /// Label of the active release for the currently selected season tab (series only).
     #[props(default)]
     season_release_label: Option<String>,
+    /// Active/ready server downloads for this title.
+    #[props(default)]
+    title_downloads: Vec<PreloadItem>,
     on_play: EventHandler<PlayTarget>,
     #[props(default)] on_play_rewatch: Option<EventHandler<(PlayTarget, RewatchMode)>>,
     on_change_release: EventHandler<PlayTarget>,
@@ -1654,6 +1657,36 @@ pub fn TitleView(
                                 span { class: "rel-cta-txt", "{rel_text}" }
                             }
                             Icon { svg: icons::CHEV_R, class: "ic sm muted" }
+                        }
+                    }
+                    {
+                        let active_dls: Vec<&PreloadItem> = title_downloads
+                            .iter()
+                            .filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading))
+                            .collect();
+                        if active_dls.is_empty() {
+                            rsx! {}
+                        } else {
+                            rsx! {
+                                div { class: "title-dl-note",
+                                    for dl in active_dls {
+                                        div { key: "tdl-{dl.id}", class: "title-dl-item",
+                                            Icon { svg: icons::DOWNLOAD, class: "ic xs acc" }
+                                            span { class: "muted", "На сервер качается:" }
+                                            if s.kind == MediaKind::Tv && dl.season > 0 {
+                                                span { class: "tag", {format!("S{:02}", dl.season)} }
+                                            }
+                                            if let Some(q) = dl.quality_short() {
+                                                span { class: "tag", "{q}" }
+                                            }
+                                            if let Some(v) = dl.voice.as_deref().filter(|v| !v.is_empty()) {
+                                                span { class: "tag", "{v}" }
+                                            }
+                                            span { class: "tag acc", "{dl.status_text()}" }
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     div { class: "user-meta-row",

@@ -711,6 +711,31 @@ pub async fn source(pool: &PgPool, key: &str) -> Result<Option<Source>, sqlx::Er
         .await
 }
 
+/// Resolves a list of release keys via `torrent_source`, returning `key -> real infohash`.
+pub async fn known_infohashes(pool: &PgPool, keys: &[String]) -> Result<HashMap<String, String>, sqlx::Error> {
+    if keys.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT key, infohash FROM torrent_source WHERE key = ANY($1) AND infohash IS NOT NULL")
+            .bind(keys)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// Upgrades any stored `release_choice` rows pointing to a synthetic `u...` key to its real infohash.
+pub async fn rebind_synthetic_hash(pool: &PgPool, key: &str, hash: &str) {
+    if key.is_empty() || hash.is_empty() || key.eq_ignore_ascii_case(hash) {
+        return;
+    }
+    let _ = sqlx::query("UPDATE release_choice SET infohash = $2 WHERE infohash = $1")
+        .bind(key)
+        .bind(hash)
+        .execute(pool)
+        .await;
+}
+
 /// Turns a release key into its info-hash, downloading the `.torrent` when the
 /// indexer did not give the hash. Also keeps the `.torrent` for TorrServer.
 pub async fn resolve(

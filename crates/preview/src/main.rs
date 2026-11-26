@@ -170,6 +170,7 @@ fn Page(props: PageProps) -> Element {
                 status,
                 my_rating,
                 release_label,
+                title_downloads: vec![],
                 on_play: |_| {},
                 on_change_release: |_| {},
                 on_status: |_| {},
@@ -191,11 +192,13 @@ fn Page(props: PageProps) -> Element {
                     panel: p.panel,
                     mock: p.mock,
                     note: None,
+                    preloads: vec![],
                     on_filter: |_| {},
                     on_sort: |_| {},
                     on_panel: |_| {},
                     on_pick: |_| {},
                     on_preload: |_| {},
+                    on_cancel_preload: None,
                     on_close: |_| {},
                 }
             }
@@ -405,6 +408,19 @@ async fn main() -> anyhow::Result<()> {
         ready_at: None,
         delete_after: delete_days.map(|d| Utc::now() + Duration::days(d) + Duration::hours(1)),
         poster_path: None,
+        media_title: None,
+        quality: None,
+        voice: None,
+        speed_bps: if state == PreloadState::Downloading {
+            14_200_000
+        } else {
+            0
+        },
+        dl_phase: if state == PreloadState::Ready {
+            kino_core::PreloadPhase::Ready
+        } else {
+            kino_core::PreloadPhase::Downloading
+        },
     };
     let preloads = vec![
         preload(

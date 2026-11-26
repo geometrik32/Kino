@@ -166,32 +166,67 @@ pub async fn remove_files(state: &AppState, infohash: &str) {
     }
 }
 
-/// Copies download progress from qBittorrent into the preload records.
+/// Copies download progress and live telemetry from qBittorrent into the preload records.
 pub async fn sync_preloads(state: &AppState) -> anyhow::Result<()> {
     let Some(qbit) = &state.media.qbit else { return Ok(()) };
     let hashes = userdata::preloads_active(&state.pool).await?;
     if hashes.is_empty() {
+        state.media.preload_telemetry.write().await.clear();
         return Ok(());
     }
     let infos = qbit.info(&hashes).await?;
+    let mut telemetry_updates = HashMap::with_capacity(hashes.len());
     for hash in &hashes {
-        let (st, progress, size) = match infos.iter().find(|i| i.hash.eq_ignore_ascii_case(hash)) {
-            None => (PreloadState::Failed, 0.0, None),
-            Some(i) if i.failed() => (PreloadState::Failed, i.progress, Some(i.size)),
-            Some(i) if i.done() => (PreloadState::Ready, 1.0, Some(i.size)),
-            Some(i) => (PreloadState::Downloading, i.progress, Some(i.size)),
+        let (st, progress, size, speed_bps, dl_phase) = match infos.iter().find(|i| i.hash.eq_ignore_ascii_case(hash)) {
+            None => (PreloadState::Failed, 0.0, None, 0, kino_core::PreloadPhase::Failed),
+            Some(i) if i.failed() => (
+                PreloadState::Failed,
+                i.progress,
+                Some(i.size),
+                0,
+                kino_core::PreloadPhase::Failed,
+            ),
+            Some(i) if i.done() => (
+                PreloadState::Ready,
+                1.0,
+                Some(i.size),
+                0,
+                kino_core::PreloadPhase::Ready,
+            ),
+            Some(i) => (
+                PreloadState::Downloading,
+                i.progress,
+                Some(i.size),
+                i.speed_bps(),
+                i.dl_phase(),
+            ),
         };
+        if matches!(st, PreloadState::Queued | PreloadState::Downloading) {
+            telemetry_updates.insert(hash.to_ascii_lowercase(), (speed_bps, dl_phase));
+        }
         let transitioned = userdata::preload_progress(&state.pool, hash, st, progress, size).await?;
         if st == PreloadState::Ready && !transitioned.is_empty() {
-            let mut by_title: HashMap<(MediaKind, i64, i32), Vec<i64>> = HashMap::new();
-            for (uid, kind, tmdb_id, season) in transitioned {
-                by_title.entry((kind, tmdb_id, season)).or_default().push(uid);
+            let mut by_title: HashMap<(MediaKind, i64, i32), (Vec<i64>, Option<String>)> = HashMap::new();
+            for (uid, kind, tmdb_id, season, title) in transitioned {
+                let entry = by_title
+                    .entry((kind, tmdb_id, season))
+                    .or_insert_with(|| (Vec::new(), None));
+                entry.0.push(uid);
+                if entry.1.is_none() {
+                    entry.1 = title;
+                }
             }
-            for ((kind, tmdb_id, season), users) in by_title {
-                state.sync.notify_preload_ready(&users, kind, tmdb_id, season, hash);
+            for ((kind, tmdb_id, season), (users, title)) in by_title {
+                let parsed = title.as_deref().map(crate::torrent::title::parse_title);
+                let quality = parsed.as_ref().map(|p| p.quality.as_str());
+                let voice = parsed.as_ref().map(|p| p.voice.as_str()).filter(|v| !v.is_empty());
+                state
+                    .sync
+                    .notify_preload_ready(&users, kind, tmdb_id, season, hash, title.as_deref(), quality, voice);
             }
         }
     }
+    *state.media.preload_telemetry.write().await = telemetry_updates;
     Ok(())
 }
 

@@ -2308,6 +2308,35 @@ fn Title(
     let mut picker_ep_scoped = use_signal(|| false);
     let mut picker_preloaded = use_signal(|| None::<(i32, kino_core::ReleaseList)>);
     let mut resolving = use_signal(|| false);
+    let mut resolve_gen = use_signal(|| 0u32);
+    let mut title_preloads = use_signal(Vec::<kino_core::PreloadItem>::new);
+    let mut hash_rebinds = use_signal(Vec::<(String, String)>::new);
+    let mut title_poll_running = use_signal(|| false);
+    let mut title_poll_gen = use_signal(|| 0u32);
+    let refresh_title_preloads = {
+        let tok = token.clone();
+        move || {
+            let t = tok.clone();
+            spawn(async move {
+                let Ok(items) = api::preloads(&t).await else {
+                    return;
+                };
+                let filtered: Vec<kino_core::PreloadItem> = items
+                    .into_iter()
+                    .filter(|p| p.kind == kind && p.tmdb_id == id && p.state != kino_core::PreloadState::Deleted)
+                    .collect();
+                if *title_preloads.peek() != filtered {
+                    title_preloads.set(filtered);
+                }
+            });
+        }
+    };
+    use_hook({
+        let refresh = refresh_title_preloads.clone();
+        move || {
+            refresh();
+        }
+    });
     let mut filter = use_signal(ReleaseFilter::default);
     // The user's default filters are applied when the picker opens; if they leave
     // nothing, the list is shown without them (once the releases have loaded).
@@ -2593,6 +2622,71 @@ fn Title(
             playing.set(Some((t, c, explicit_ep, explicit_rel, mode)));
         },
     );
+    let close_resolving = Callback::new(move |_: ()| {
+        let next = *resolve_gen.peek() + 1;
+        resolve_gen.set(next);
+        resolving.set(false);
+    });
+    let t_poll = token.clone();
+    use_effect(move || {
+        let should_poll = playing().is_none()
+            && (picker().is_some()
+                || title_preloads().iter().any(|p| {
+                    matches!(
+                        p.state,
+                        kino_core::PreloadState::Queued | kino_core::PreloadState::Downloading
+                    )
+                }));
+        if !should_poll {
+            if *title_poll_running.peek() {
+                title_poll_running.set(false);
+                let next = *title_poll_gen.peek() + 1;
+                title_poll_gen.set(next);
+            }
+            return;
+        }
+        if *title_poll_running.peek() {
+            return;
+        }
+        title_poll_running.set(true);
+        let my_gen = *title_poll_gen.peek() + 1;
+        title_poll_gen.set(my_gen);
+        let tok = t_poll.clone();
+        spawn(async move {
+            loop {
+                platform::sleep(4_000).await;
+                if *title_poll_gen.peek() != my_gen || playing.peek().is_some() {
+                    break;
+                }
+                let still_wanted = picker.peek().is_some()
+                    || title_preloads.peek().iter().any(|p| {
+                        matches!(
+                            p.state,
+                            kino_core::PreloadState::Queued | kino_core::PreloadState::Downloading
+                        )
+                    });
+                if !still_wanted {
+                    break;
+                }
+                let Ok(items) = api::preloads(&tok).await else {
+                    continue;
+                };
+                if *title_poll_gen.peek() != my_gen {
+                    break;
+                }
+                let filtered: Vec<kino_core::PreloadItem> = items
+                    .into_iter()
+                    .filter(|p| p.kind == kind && p.tmdb_id == id && p.state != kino_core::PreloadState::Deleted)
+                    .collect();
+                if *title_preloads.peek() != filtered {
+                    title_preloads.set(filtered);
+                }
+            }
+            if *title_poll_gen.peek() == my_gen {
+                title_poll_running.set(false);
+            }
+        });
+    });
     let on_play_rewatch = Callback::new({
         let tok_res = token.clone();
         move |(t, mode): (PlayTarget, RewatchMode)| {
@@ -2600,6 +2694,8 @@ fn Title(
             if *resolving.peek() {
                 return;
             }
+            let my_gen = *resolve_gen.peek() + 1;
+            resolve_gen.set(my_gen);
             resolving.set(true);
             let tok = tok_res.clone();
             let req = ResolveReleaseRequest {
@@ -2609,6 +2705,9 @@ fn Title(
             };
             spawn(async move {
                 let res = api::resolve_release(&tok, kind, id, &req).await;
+                if *resolve_gen.peek() != my_gen {
+                    return;
+                }
                 resolving.set(false);
                 match res {
                     Ok(ResolveReleaseResponse::Ready { choice, .. }) => {
@@ -2700,6 +2799,7 @@ fn Title(
             today_ymd: today_ymd(),
             release_label,
             season_release_label,
+            title_downloads: title_preloads(),
             on_play,
             on_play_rewatch: Some(on_play_rewatch),
             on_change_release: open_picker.clone(),
@@ -2875,7 +2975,28 @@ fn Title(
                         }
                     }
                 },
-                Some(Ok(list)) => rsx! { ReleasePicker {
+                Some(Ok(mut list)) => {
+                    let cur_preloads: Vec<kino_core::PreloadItem> = title_preloads()
+                        .into_iter()
+                        .filter(|p| {
+                            kind == MediaKind::Movie || p.season == 0 || Some(p.season) == picker_season
+                        })
+                        .collect();
+                    {
+                        let rebinds = hash_rebinds.read();
+                        for r in &mut list.releases {
+                            if let Some((_, real)) = rebinds.iter().find(|(k, _)| k == &r.infohash) {
+                                r.infohash = real.clone();
+                            }
+                            if cur_preloads.iter().any(|p| {
+                                p.state == kino_core::PreloadState::Ready
+                                    && p.infohash.eq_ignore_ascii_case(&r.infohash)
+                            }) {
+                                r.preloaded = true;
+                            }
+                        }
+                    }
+                    rsx! { ReleasePicker {
                 heading,
                 releases: list.releases,
                 chosen: chosen_hash,
@@ -2889,6 +3010,7 @@ fn Title(
                     Some(l) => format!("По строгим фильтрам ничего не нашлось — показаны все доступные в озвучке «{l}»."),
                     None => "Ваши фильтры по умолчанию ничего не нашли, показаны все раздачи.".to_owned(),
                 }),
+                preloads: cur_preloads,
                 on_filter: move |f| filter.set(f),
                 on_sort: move |s| sort.set(s),
                 on_panel: move |p| panel.set(p),
@@ -2928,45 +3050,99 @@ fn Title(
                     });
                 },
                 on_preload: {
-                    let summary = details.summary.clone();
                     let t4 = token.clone();
                     let pre_season = picker_season.unwrap_or(0);
                     move |r: ReleaseOption| {
-                        close_picker.call(());
+                        let orig_key = r.infohash.clone();
                         let req = PreloadRequest {
                             kind,
                             tmdb_id: id,
                             season: pre_season,
-                            infohash: r.infohash.clone(),
-                            title: Some(r.title.clone()),
+                            infohash: orig_key.clone(),
+                            title: (!r.title.is_empty()).then(|| r.title.clone()),
                         };
                         let t = t4.clone();
-                        let name = summary.title.clone();
                         telegram::haptic(telegram::Haptic::Success);
                         spawn(async move {
-                            let msg = match api::add_preload(&t, &req).await {
-                                Ok(_) => {
+                            match api::add_preload(&t, &req).await {
+                                Ok(item) => {
+                                    let resolved = item.infohash.clone();
+                                    if !resolved.eq_ignore_ascii_case(&orig_key) {
+                                        hash_rebinds.with_mut(|v| {
+                                            v.retain(|(k, _)| k != &orig_key);
+                                            v.push((orig_key.clone(), resolved.clone()));
+                                        });
+                                        picker_preloaded.with_mut(|pp| {
+                                            if let Some((_, ref mut pl)) = pp.as_mut() {
+                                                for rel in pl.releases.iter_mut() {
+                                                    if rel.infohash == orig_key {
+                                                        rel.infohash = resolved.clone();
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
+                                    title_preloads.with_mut(|v| {
+                                        v.retain(|p| {
+                                            p.id != item.id && !p.infohash.eq_ignore_ascii_case(&item.infohash)
+                                        });
+                                        v.insert(0, item);
+                                    });
                                     on_preloads_changed.call(());
-                                    format!("«{name}» поставлен в загрузку на сервер. Следить можно в профиле, раздел «Загрузки».")
                                 }
-                                Err(e) => format!("Не удалось поставить в загрузку: {}", e.message),
-                            };
-                            if !*notice_pushed.peek() {
-                                notice_pushed.set(true);
-                                telegram::push_history(None);
+                                Err(e) => {
+                                    if !*notice_pushed.peek() {
+                                        notice_pushed.set(true);
+                                        telegram::push_history(None);
+                                    }
+                                    notice.set(Some(format!("Не удалось поставить в загрузку: {}", e.message)));
+                                }
                             }
-                            notice.set(Some(msg));
                         });
                     }
                 },
+                on_cancel_preload: Some(Callback::new({
+                    let t5 = token.clone();
+                    move |preload_id: i64| {
+                        let t = t5.clone();
+                        spawn(async move {
+                            match api::delete_preload(&t, preload_id).await {
+                                Ok(()) => {
+                                    title_preloads.with_mut(|v| v.retain(|p| p.id != preload_id));
+                                    on_preloads_changed.call(());
+                                }
+                                Err(e) => {
+                                    if !*notice_pushed.peek() {
+                                        notice_pushed.set(true);
+                                        telegram::push_history(None);
+                                    }
+                                    notice.set(Some(format!("Не удалось отменить загрузку: {}", e.message)));
+                                }
+                            }
+                        });
+                    }
+                })),
                 on_close: move |_| close_picker.call(()),
-            } },
+            } } },
             }
         }
         if resolving() {
-            div { class: "sheet-bg",
-                div { class: "sheet",
+            div { class: "sheet-bg", onclick: move |_| close_resolving.call(()),
+                div { class: "sheet", onclick: move |e| e.stop_propagation(),
+                    div { class: "sheet-head",
+                        h3 { "Запуск…" }
+                        button {
+                            class: "sheet-close",
+                            title: "Отмена",
+                            "aria-label": "Отмена",
+                            onclick: move |_| close_resolving.call(()),
+                            Icon { svg: icons::CLOSE, class: "ic sm" }
+                        }
+                    }
                     p { class: "muted", "Подбираем подходящую раздачу…" }
+                    div { style: "margin-top:12px;",
+                        button { class: "btn ghost", onclick: move |_| close_resolving.call(()), "Отменить" }
+                    }
                 }
             }
         }
@@ -3067,29 +3243,37 @@ fn Title(
                         });
                     }
                 },
-                on_close: move |from_pop: bool| {
-                    playing.set(None);
-                    if exit_on_close() {
-                        exit_on_close.set(false);
-                        on_exit.call(from_pop);
-                    } else {
-                        if *overlay_pushed.peek() {
-                            overlay_pushed.set(false);
-                            if !from_pop {
-                                telegram::pop_history();
+                on_close: {
+                    let refresh = refresh_title_preloads.clone();
+                    move |from_pop: bool| {
+                        playing.set(None);
+                        if exit_on_close() {
+                            exit_on_close.set(false);
+                            on_exit.call(from_pop);
+                        } else {
+                            if *overlay_pushed.peek() {
+                                overlay_pushed.set(false);
+                                if !from_pop {
+                                    telegram::pop_history();
+                                }
                             }
+                            data.restart();
+                            refresh();
                         }
-                        data.restart();
                     }
                 },
-                on_title: move |_| {
-                    playing.set(None);
-                    exit_on_close.set(false);
-                    if *overlay_pushed.peek() {
-                        overlay_pushed.set(false);
-                        telegram::pop_history();
+                on_title: {
+                    let refresh = refresh_title_preloads.clone();
+                    move |_| {
+                        playing.set(None);
+                        exit_on_close.set(false);
+                        if *overlay_pushed.peek() {
+                            overlay_pushed.set(false);
+                            telegram::pop_history();
+                        }
+                        data.restart();
+                        refresh();
                     }
-                    data.restart();
                 },
                 on_need_release: {
                     let mut open_picker = open_picker.clone();
@@ -3098,8 +3282,12 @@ fn Title(
                         open_picker(PlayTarget { season, episode, position_sec: 0.0 });
                     }
                 },
-                on_preloads_changed: Some(Callback::new(move |_| {
-                    on_preloads_changed.call(());
+                on_preloads_changed: Some(Callback::new({
+                    let refresh = refresh_title_preloads.clone();
+                    move |_| {
+                        refresh();
+                        on_preloads_changed.call(());
+                    }
                 })),
             }
         }

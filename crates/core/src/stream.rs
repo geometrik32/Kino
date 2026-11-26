@@ -72,9 +72,17 @@ impl StreamProgress {
                 trim_mb(self.needed_bytes)
             ));
         }
-        if self.peers > 0 {
-            let n = self.peers;
-            parts.push(format!("{n} {}", plural_peers(n)));
+        if self.seeders > 0 {
+            let s = self.seeders;
+            if self.peers > s {
+                let p = self.peers;
+                parts.push(format!("{s} {} · {p} {}", plural_seeds(s), plural_peers_raw(p)));
+            } else {
+                parts.push(format!("{s} {}", plural_seeds(s)));
+            }
+        } else if self.peers > 0 {
+            let p = self.peers;
+            parts.push(format!("0 сидов · {p} {}", plural_peers_raw(p)));
         }
         if self.speed_bps > 0 {
             parts.push(format!("{} МБ/с", trim_mb(self.speed_bps)));
@@ -101,11 +109,27 @@ fn trim_mb(bytes: u64) -> String {
     }
 }
 
-fn plural_peers(n: u32) -> &'static str {
-    if n % 10 == 1 && n % 100 != 11 {
-        "раздающий"
+fn plural_seeds(n: u32) -> &'static str {
+    let m100 = n % 100;
+    let m10 = n % 10;
+    if m10 == 1 && m100 != 11 {
+        "сид"
+    } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+        "сида"
     } else {
-        "раздающих"
+        "сидов"
+    }
+}
+
+fn plural_peers_raw(n: u32) -> &'static str {
+    let m100 = n % 100;
+    let m10 = n % 10;
+    if m10 == 1 && m100 != 11 {
+        "пир"
+    } else if (2..=4).contains(&m10) && !(12..=14).contains(&m100) {
+        "пира"
+    } else {
+        "пиров"
     }
 }
 
@@ -143,7 +167,17 @@ mod tests {
         assert_eq!(p.eta_sec(), Some(15));
         assert_eq!(
             p.details().replace('\u{a0}', " "),
-            "5.0 из 20 МБ · 3 раздающих · 1.0 МБ/с · ещё ≈ 15 с"
+            "5.0 из 20 МБ · 1 сид · 3 пира · 1.0 МБ/с · ещё ≈ 15 с"
+        );
+        p.seeders = 3;
+        assert_eq!(
+            p.details().replace('\u{a0}', " "),
+            "5.0 из 20 МБ · 3 сида · 1.0 МБ/с · ещё ≈ 15 с"
+        );
+        p.seeders = 0;
+        assert_eq!(
+            p.details().replace('\u{a0}', " "),
+            "5.0 из 20 МБ · 0 сидов · 3 пира · 1.0 МБ/с · ещё ≈ 15 с"
         );
         p.loaded_bytes = 40 << 20;
         assert_eq!(p.percent(), Some(100), "never above 100");
@@ -156,7 +190,11 @@ mod tests {
     fn waits_read_naturally() {
         assert_eq!(human_wait(9), "9 с");
         assert_eq!(human_wait(80), "1 мин 20 с");
-        assert_eq!(plural_peers(1), "раздающий");
-        assert_eq!(plural_peers(5), "раздающих");
+        assert_eq!(plural_seeds(1), "сид");
+        assert_eq!(plural_seeds(2), "сида");
+        assert_eq!(plural_seeds(5), "сидов");
+        assert_eq!(plural_peers_raw(1), "пир");
+        assert_eq!(plural_peers_raw(3), "пира");
+        assert_eq!(plural_peers_raw(5), "пиров");
     }
 }

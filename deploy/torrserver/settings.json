@@ -21,7 +21,7 @@
     "DisableUpload": false,
     "DownloadRateLimit": 0,
     "UploadRateLimit": 0,
-    "ConnectionsLimit": 25,
+    "ConnectionsLimit": 100,
     "PeersListenPort": 32000,
     "ResponsiveMode": true,
     "EnableLPD": true

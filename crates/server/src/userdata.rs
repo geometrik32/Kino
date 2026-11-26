@@ -3,8 +3,8 @@
 
 use chrono::{DateTime, Utc};
 use kino_core::{
-    meets_average_threshold, EpisodeRating, HistoryEntry, MarkWatched, MediaKind, PreloadItem, PreloadRequest,
-    PreloadState, SeasonRating, TitleState, TitleStatus, UserPrefs, VideoScale,
+    meets_average_threshold, EpisodeRating, HistoryEntry, MarkWatched, MediaKind, PreloadItem, PreloadPhase,
+    PreloadRequest, PreloadState, SeasonRating, TitleState, TitleStatus, UserPrefs, VideoScale,
 };
 use sqlx::{postgres::PgRow, PgPool, Row};
 
@@ -903,6 +903,17 @@ fn preload_from_row(row: &PgRow) -> Result<PreloadItem, sqlx::Error> {
         ready_at: row.try_get("ready_at")?,
         delete_after: row.try_get("delete_after")?,
         poster_path: None,
+        media_title: None,
+        quality: None,
+        voice: None,
+        speed_bps: 0,
+        dl_phase: if state == "ready" {
+            PreloadPhase::Ready
+        } else if state == "failed" {
+            PreloadPhase::Failed
+        } else {
+            PreloadPhase::Waiting
+        },
     })
 }
 
@@ -911,6 +922,7 @@ pub async fn preload_add(pool: &PgPool, user_id: i64, r: &PreloadRequest) -> Res
     let row = sqlx::query(&format!(
         "INSERT INTO preload (user_id, media_kind, tmdb_id, season, infohash, title) VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (user_id, infohash) DO UPDATE SET
+           title = COALESCE(EXCLUDED.title, preload.title),
            state = CASE WHEN preload.state IN ('deleted', 'failed') THEN 'queued' ELSE preload.state END,
            progress = CASE WHEN preload.state IN ('deleted', 'failed') THEN 0 ELSE preload.progress END,
            delete_after = NULL, requested_at = now()
@@ -925,6 +937,26 @@ pub async fn preload_add(pool: &PgPool, user_id: i64, r: &PreloadRequest) -> Res
     .fetch_one(pool)
     .await?;
     preload_from_row(&row)
+}
+
+/// All non-deleted preloads for one user & title, newest request first.
+pub async fn title_preloads(
+    pool: &PgPool,
+    user_id: i64,
+    kind: MediaKind,
+    tmdb_id: i64,
+) -> Result<Vec<PreloadItem>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "SELECT {PRELOAD_COLUMNS} FROM preload
+         WHERE user_id = $1 AND media_kind = $2 AND tmdb_id = $3 AND state <> 'deleted'
+         ORDER BY requested_at DESC"
+    ))
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .fetch_all(pool)
+    .await?;
+    rows.iter().map(preload_from_row).collect()
 }
 
 pub async fn preloads(pool: &PgPool, user_id: i64) -> Result<Vec<PreloadItem>, sqlx::Error> {
@@ -992,7 +1024,7 @@ pub async fn preloads_active(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> 
 }
 
 /// Progress from the torrent client, for every user who asked for this release.
-/// Returns the `(user_id, media_kind, tmdb_id, season)` rows updated from `queued`/`downloading`.
+/// Returns the `(user_id, media_kind, tmdb_id, season, title)` rows updated from `queued`/`downloading`.
 /// Finished downloads are kept on disk for at most 7 days unless watched earlier.
 pub async fn preload_progress(
     pool: &PgPool,
@@ -1000,7 +1032,7 @@ pub async fn preload_progress(
     state: PreloadState,
     progress: f32,
     size_bytes: Option<i64>,
-) -> Result<Vec<(i64, MediaKind, i64, i32)>, sqlx::Error> {
+) -> Result<Vec<(i64, MediaKind, i64, i32, Option<String>)>, sqlx::Error> {
     let rows = sqlx::query(
         "UPDATE preload SET state = $2, progress = $3, size_bytes = COALESCE($4, size_bytes),
              ready_at = CASE WHEN $2 = 'ready' THEN COALESCE(ready_at, now()) ELSE ready_at END,
@@ -1009,7 +1041,7 @@ pub async fn preload_progress(
                  ELSE delete_after
              END
          WHERE infohash = $1 AND state IN ('queued', 'downloading')
-         RETURNING user_id, media_kind, tmdb_id, season",
+         RETURNING user_id, media_kind, tmdb_id, season, title",
     )
     .bind(infohash)
     .bind(state.as_str())
@@ -1024,6 +1056,7 @@ pub async fn preload_progress(
                 kind_of(row)?,
                 row.try_get("tmdb_id")?,
                 row.try_get("season")?,
+                row.try_get("title")?,
             ))
         })
         .collect()

@@ -325,6 +325,7 @@ impl SyncHub {
     }
 
     /// Broadcasts `PreloadReady` to active players watching `(kind, tmdb_id)` when their download finishes.
+    #[allow(clippy::too_many_arguments)]
     pub fn notify_preload_ready(
         &self,
         ready_users: &[i64],
@@ -332,10 +333,24 @@ impl SyncHub {
         tmdb_id: i64,
         season: i32,
         infohash: &str,
+        title: Option<&str>,
+        quality: Option<&str>,
+        voice: Option<&str>,
     ) {
-        self.notify_preload_ready_at(ready_users, kind, tmdb_id, season, infohash, Self::now_ms());
+        self.notify_preload_ready_at(
+            ready_users,
+            kind,
+            tmdb_id,
+            season,
+            infohash,
+            title,
+            quality,
+            voice,
+            Self::now_ms(),
+        );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn notify_preload_ready_at(
         &self,
         ready_users: &[i64],
@@ -343,6 +358,9 @@ impl SyncHub {
         tmdb_id: i64,
         season: i32,
         infohash: &str,
+        title: Option<&str>,
+        quality: Option<&str>,
+        voice: Option<&str>,
         now_ms: i64,
     ) {
         if infohash.is_empty() {
@@ -361,6 +379,9 @@ impl SyncHub {
             tmdb_id,
             season,
             infohash: infohash.to_ascii_lowercase(),
+            title: title.map(str::to_owned),
+            quality: quality.map(str::to_owned),
+            voice: voice.map(str::to_owned),
         };
         for (key, room_arc) in room_list {
             let room = room_arc.lock().expect("sync room lock");
@@ -1357,6 +1378,9 @@ mod tests {
             tmdb_id: 603,
             season: 0,
             infohash: "a".repeat(40),
+            title: Some("Матрица 1080p".into()),
+            quality: Some("1080p".into()),
+            voice: Some("Дубляж".into()),
         }];
         for m in &server_msgs {
             let json = serde_json::to_string(m).expect("serialize server msg");
@@ -1838,18 +1862,33 @@ mod tests {
         assert!(hub.has_playing_hash_at(&hash_a, t + 100));
         while rx_a.try_recv().is_ok() {}
 
-        hub.notify_preload_ready_at(&[1], MediaKind::Movie, 603, 0, &hash_a, t + 100);
+        hub.notify_preload_ready_at(
+            &[1],
+            MediaKind::Movie,
+            603,
+            0,
+            &hash_a,
+            Some("Матрица 1080p"),
+            Some("1080p"),
+            Some("Дубляж"),
+            t + 100,
+        );
         match rx_a.try_recv().unwrap() {
             SyncServerMsg::PreloadReady {
                 kind,
                 tmdb_id,
                 season,
                 infohash,
+                quality,
+                voice,
+                ..
             } => {
                 assert_eq!(kind, MediaKind::Movie);
                 assert_eq!(tmdb_id, 603);
                 assert_eq!(season, 0);
                 assert_eq!(infohash, hash_a);
+                assert_eq!(quality.as_deref(), Some("1080p"));
+                assert_eq!(voice.as_deref(), Some("Дубляж"));
             }
             other => panic!("expected PreloadReady, got {other:?}"),
         }

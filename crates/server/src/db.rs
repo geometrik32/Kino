@@ -683,10 +683,11 @@ pub async fn release_pickers(
     season: i32,
 ) -> Result<HashMap<String, Vec<String>>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT rc.infohash,
+        "SELECT COALESCE(NULLIF(ts.infohash, ''), rc.infohash) AS infohash,
                 COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS picker_name
          FROM release_choice rc
          JOIN users u ON u.id = rc.user_id
+         LEFT JOIN torrent_source ts ON ts.key = rc.infohash
          WHERE rc.media_kind = $1 AND rc.tmdb_id = $2 AND rc.manual = TRUE
            AND ($1 = 'movie' OR rc.season = 0 OR $3 = 0 OR rc.season = $3)
          ORDER BY rc.chosen_at DESC",

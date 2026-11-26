@@ -7,7 +7,8 @@ use dioxus::html::MountedData;
 use dioxus::prelude::*;
 pub use kino_core::VideoScale;
 use kino_core::{
-    clock, episode_code, normalize_quality_key, MediaTrack, PreloadState, ReleaseOption, StreamProgress, SyncMemberInfo,
+    clock, episode_code, normalize_quality_key, MediaTrack, PreloadItem, PreloadState, ReleaseOption, StreamProgress,
+    SyncMemberInfo,
 };
 
 use crate::human_size;
@@ -46,6 +47,30 @@ pub struct PlayerEpisode {
     pub number: i32,
     pub title: String,
     pub watched: bool,
+}
+
+/// Banner shown in the player when a preload of the current title finishes downloading to disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiskReadyPrompt {
+    pub infohash: String,
+    pub season: i32,
+    pub title: Option<String>,
+    pub quality: Option<String>,
+    pub voice: Option<String>,
+}
+
+impl DiskReadyPrompt {
+    /// Compact `1080p · Дубляж` hint displayed in the banner title when available.
+    pub fn detail_label(&self) -> Option<String> {
+        let q = self.quality.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let v = self.voice.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        match (q, v) {
+            (Some(q), Some(v)) => Some(format!("{q} · {v}")),
+            (Some(q), None) => Some(q.to_owned()),
+            (None, Some(v)) => Some(v.to_owned()),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Everything the player shows. The app owns the state and the `<video>`.
@@ -124,12 +149,12 @@ pub struct PlayerState {
     pub active_infohash: Option<String>,
     /// Whether quality list finished loading for the current title/season.
     pub qualities_loaded: bool,
-    /// Download states `(infohash, state, progress 0..=1)` for releases of the current title.
-    pub release_downloads: Vec<(String, PreloadState, f32)>,
+    /// Active/finished preloads for releases of the current title/season.
+    pub release_downloads: Vec<PreloadItem>,
     /// Non-blocking notice/error shown inside the Quality tab when queuing a download fails.
     pub download_note: Option<String>,
-    /// True when the active stream finished downloading to disk and awaits user confirmation.
-    pub disk_ready_prompt: bool,
+    /// Info about a release that finished downloading to disk and awaits user switch confirmation.
+    pub disk_ready_prompt: Option<DiskReadyPrompt>,
     /// Optional label shown when rewatching favorite episodes (e.g. `Только любимые (5★)`).
     pub rewatch_label: Option<String>,
     /// Next episode actually present in the current release when the requested episode is missing.
@@ -183,7 +208,7 @@ impl Default for PlayerState {
             qualities_loaded: false,
             release_downloads: Vec::new(),
             download_note: None,
-            disk_ready_prompt: false,
+            disk_ready_prompt: None,
             rewatch_label: None,
             next_available: None,
         }
@@ -200,11 +225,16 @@ impl PlayerState {
                 .is_some_and(|cid| cid != self.sync_client_id)
     }
 
-    pub fn download_status(&self, infohash: &str) -> Option<(PreloadState, f32)> {
+    /// Preload record for `infohash` within the current title/season, if queued or ready.
+    pub fn download_item(&self, infohash: &str) -> Option<&PreloadItem> {
         self.release_downloads
             .iter()
-            .find(|(h, _, _)| h.eq_ignore_ascii_case(infohash))
-            .map(|(_, st, prog)| (*st, *prog))
+            .find(|p| p.infohash.eq_ignore_ascii_case(infohash))
+    }
+
+    /// Download state and progress `0..=1` for `infohash`, if it is queued or ready on disk.
+    pub fn download_status(&self, infohash: &str) -> Option<(PreloadState, f32)> {
+        self.download_item(infohash).map(|p| (p.state, p.progress))
     }
 }
 
@@ -218,16 +248,58 @@ fn track_name(list: &[MediaTrack], index: Option<i32>, none: &str) -> String {
         .unwrap_or_else(|| none.to_owned())
 }
 
+fn quality_rank_bucket(q: &str) -> u32 {
+    match normalize_quality_key(q) {
+        "2160p" => 4,
+        "1080p" => 3,
+        "720p" => 2,
+        _ => 1,
+    }
+}
+
+fn quality_short_label(q: &str) -> &'static str {
+    match normalize_quality_key(q) {
+        "2160p" => "4K",
+        other => other,
+    }
+}
+
+fn voice_from_release_label(label: &str) -> String {
+    let mut parts = label.split(" · ").map(str::trim).filter(|s| !s.is_empty());
+    let Some(first) = parts.next() else {
+        return String::new();
+    };
+    let is_quality = matches!(
+        first.to_ascii_lowercase().as_str(),
+        "4k" | "uhd" | "2160p" | "1080p" | "720p" | "sd"
+    );
+    if is_quality {
+        String::new()
+    } else {
+        first.to_owned()
+    }
+}
+
+fn quality_from_release_label(label: &str) -> String {
+    for part in label.split(" · ").map(str::trim) {
+        let lower = part.to_ascii_lowercase();
+        if matches!(lower.as_str(), "4k" | "uhd" | "2160p" | "1080p" | "720p" | "sd") {
+            return normalize_quality_key(part).to_owned();
+        }
+    }
+    "1080p".to_owned()
+}
+
 fn render_quality_download_action(
     rel: ReleaseOption,
     is_cur: bool,
     playing_preloaded: bool,
-    dl: Option<(PreloadState, f32)>,
+    dl: Option<&PreloadItem>,
     on_download: Option<EventHandler<ReleaseOption>>,
+    on_cancel_download: Option<EventHandler<i64>>,
     on_switch_to_disk: Option<EventHandler<()>>,
 ) -> Element {
-    let is_ready =
-        dl.is_some_and(|(st, _)| st == PreloadState::Ready) || rel.preloaded || (is_cur && playing_preloaded);
+    let is_ready = dl.is_some_and(|p| p.state == PreloadState::Ready) || rel.preloaded || (is_cur && playing_preloaded);
     if is_ready {
         if is_cur && !playing_preloaded {
             if let Some(cb) = on_switch_to_disk {
@@ -252,25 +324,41 @@ fn render_quality_download_action(
             }
         };
     }
-    if let Some((PreloadState::Queued | PreloadState::Downloading, prog)) = dl {
-        let pct = (prog * 100.0).clamp(0.0, 99.0).round() as i32;
+    if let Some(item) = dl.filter(|p| matches!(p.state, PreloadState::Queued | PreloadState::Downloading)) {
+        if let Some(cancel) = on_cancel_download {
+            let dl_id = item.id;
+            return rsx! {
+                button {
+                    class: "p-q-dl busy",
+                    title: "Отменить скачивание на сервер",
+                    "aria-label": "Отменить скачивание на сервер",
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        cancel.call(dl_id);
+                    },
+                    Icon { svg: icons::CLOSE, class: "ic xs" }
+                }
+            };
+        }
         return rsx! {
-            span { class: "p-q-dl busy", title: "Скачивается на сервер ({pct}%)", "{pct}%" }
+            span { class: "p-q-dl busy", title: "{item.status_text()}", "{item.compact_status_text()}" }
         };
     }
-    if let Some(cb) = on_download {
-        return rsx! {
-            button {
-                class: "p-q-dl",
-                title: "Скачать эту раздачу на сервер",
-                "aria-label": "Скачать раздачу на сервер",
-                onclick: move |e| {
-                    e.stop_propagation();
-                    cb.call(rel.clone());
-                },
-                Icon { svg: icons::DOWNLOAD, class: "ic xs" }
-            }
-        };
+    if is_cur {
+        if let Some(cb) = on_download {
+            return rsx! {
+                button {
+                    class: "p-q-dl",
+                    title: "Скачать текущую раздачу на сервер",
+                    "aria-label": "Скачать текущую раздачу на сервер",
+                    onclick: move |e| {
+                        e.stop_propagation();
+                        cb.call(rel.clone());
+                    },
+                    Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                }
+            };
+        }
     }
     rsx! {}
 }
@@ -340,6 +428,7 @@ pub fn PlayerView(
     #[props(default)] on_activity: Option<EventHandler<()>>,
     #[props(default)] on_pick_quality: Option<EventHandler<ReleaseOption>>,
     #[props(default)] on_download_release: Option<EventHandler<ReleaseOption>>,
+    #[props(default)] on_cancel_download: Option<EventHandler<i64>>,
     #[props(default)] on_switch_to_disk: Option<EventHandler<()>>,
     #[props(default)] on_dismiss_disk_prompt: Option<EventHandler<()>>,
     #[props(default)] on_jump_episode: Option<EventHandler<(i32, i32)>>,
@@ -371,11 +460,12 @@ pub fn PlayerView(
     let pct = if dur > 0.0 { display_pos / dur * 100.0 } else { 0.0 };
     let remaining = (dur - display_pos).max(0.0);
     let near_end = dur > 0.0 && dur - pos < NEXT_PROMPT_SEC;
-    let show_disk_prompt = s.disk_ready_prompt;
-    let disk_ready_title = if s.season > 0 {
-        "Сезон скачался"
-    } else {
-        "Фильм скачался"
+    let disk_prompt = s.disk_ready_prompt.clone();
+    let show_disk_prompt = disk_prompt.is_some();
+    let disk_ready_title = match disk_prompt.as_ref().and_then(DiskReadyPrompt::detail_label) {
+        Some(detail) => format!("Скачалось ({detail})"),
+        None if s.season > 0 => "Сезон скачался".to_owned(),
+        None => "Фильм скачался".to_owned(),
     };
     let show_next = !show_disk_prompt
         && near_end
@@ -1045,23 +1135,47 @@ pub fn PlayerView(
                             }
                             if menu == PlayerMenu::Quality {
                                 {
-                                    s.active_infohash
-                                        .as_deref()
-                                        .filter(|h| {
-                                            !h.is_empty()
-                                                && !s
-                                                    .available_qualities
-                                                    .iter()
-                                                    .any(|r| r.infohash.eq_ignore_ascii_case(h))
-                                        })
-                                        .map(|cur_hash| {
-                                            let active_stub = ReleaseOption {
+                                    let mut unified: Vec<ReleaseOption> = s.available_qualities.clone();
+                                    for p in &s.release_downloads {
+                                        if matches!(
+                                            p.state,
+                                            PreloadState::Queued | PreloadState::Downloading | PreloadState::Ready
+                                        ) && !unified.iter().any(|r| r.infohash.eq_ignore_ascii_case(&p.infohash))
+                                        {
+                                            unified.push(ReleaseOption {
+                                                infohash: p.infohash.clone(),
+                                                title: p.title.clone().unwrap_or_default(),
+                                                quality: p.quality.clone().unwrap_or_else(|| "1080p".to_owned()),
+                                                size_bytes: p.size_bytes.unwrap_or(0).max(0) as u64,
+                                                seeders: 0,
+                                                voice: p.voice.clone().unwrap_or_default(),
+                                                language: String::new(),
+                                                tracker: String::new(),
+                                                added: String::new(),
+                                                year: None,
+                                                season: (p.season > 0).then_some(p.season),
+                                                hdr: false,
+                                                dolby_vision: false,
+                                                subtitles: false,
+                                                direct_play: true,
+                                                codec: None,
+                                                bitrate_kbps: None,
+                                                bitrate_approx: false,
+                                                picked_by: Vec::new(),
+                                                preloaded: p.state == PreloadState::Ready,
+                                            });
+                                        }
+                                    }
+                                    if let Some(cur_hash) = s.active_infohash.as_deref().filter(|h| !h.is_empty()) {
+                                        if !unified.iter().any(|r| r.infohash.eq_ignore_ascii_case(cur_hash)) {
+                                            unified.push(ReleaseOption {
                                                 infohash: cur_hash.to_owned(),
-                                                title: s.release.clone(),
-                                                quality: String::new(),
+                                                // Leave synthetic title empty so POST /api/preload resolves the true torrent name.
+                                                title: String::new(),
+                                                quality: quality_from_release_label(&s.release),
                                                 size_bytes: 0,
                                                 seeders: 0,
-                                                voice: String::new(),
+                                                voice: voice_from_release_label(&s.release),
                                                 language: String::new(),
                                                 tracker: String::new(),
                                                 added: String::new(),
@@ -1076,111 +1190,155 @@ pub fn PlayerView(
                                                 bitrate_approx: false,
                                                 picked_by: Vec::new(),
                                                 preloaded: s.preloaded,
-                                            };
-                                            let dl_el = render_quality_download_action(
-                                                active_stub,
-                                                true,
-                                                s.preloaded,
-                                                s.download_status(cur_hash),
-                                                on_download_release,
-                                                on_switch_to_disk,
-                                            );
-                                            rsx! {
-                                                div { class: "p-opt p-q-row on",
-                                                    button { class: "p-q-main", disabled: true,
-                                                        span { class: "p-opt-l",
-                                                            Icon { svg: icons::CHECK, class: "ic xs acc" }
-                                                            span { class: "muted small", "{s.release}" }
-                                                            if s.preloaded {
-                                                                span { class: "tag srv", "На сервере" }
+                                            });
+                                        }
+                                    }
+                                    unified.sort_by_key(|r| {
+                                        let is_cur = s
+                                            .active_infohash
+                                            .as_deref()
+                                            .is_some_and(|h| h.eq_ignore_ascii_case(&r.infohash));
+                                        let dl = s.download_item(&r.infohash);
+                                        let is_ready = dl.is_some_and(|p| p.state == PreloadState::Ready)
+                                            || r.preloaded
+                                            || (is_cur && s.preloaded);
+                                        let is_busy = dl.is_some_and(|p| {
+                                            matches!(p.state, PreloadState::Queued | PreloadState::Downloading)
+                                        });
+                                        (
+                                            std::cmp::Reverse(quality_rank_bucket(&r.quality)),
+                                            !is_cur,
+                                            !is_ready,
+                                            !is_busy,
+                                        )
+                                    });
+                                    let cur_voice = s
+                                        .active_infohash
+                                        .as_deref()
+                                        .and_then(|h| {
+                                            unified
+                                                .iter()
+                                                .find(|r| r.infohash.eq_ignore_ascii_case(h))
+                                                .map(|r| r.voice.trim().to_owned())
+                                        })
+                                        .filter(|v| !v.is_empty())
+                                        .unwrap_or_else(|| voice_from_release_label(&s.release));
+                                    rsx! {
+                                        if unified.is_empty() {
+                                            p { class: "muted small p-pop-note",
+                                                if s.qualities_loaded {
+                                                    "Других вариантов качества не нашлось."
+                                                } else {
+                                                    "Загружаем доступные качества…"
+                                                }
+                                            }
+                                        }
+                                        for rel in unified {
+                                            {
+                                                let is_cur = s.active_infohash.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(&rel.infohash));
+                                                let qk = quality_short_label(&rel.quality);
+                                                let voice_lbl = rel.voice.trim().to_owned();
+                                                let other_voice = !cur_voice.is_empty()
+                                                    && !voice_lbl.is_empty()
+                                                    && !voice_lbl.eq_ignore_ascii_case(&cur_voice);
+                                                let dl_item = s.download_item(&rel.infohash);
+                                                let is_ready = dl_item.is_some_and(|p| p.state == PreloadState::Ready)
+                                                    || rel.preloaded
+                                                    || (is_cur && s.preloaded);
+                                                let is_busy = dl_item.is_some_and(|p| {
+                                                    matches!(p.state, PreloadState::Queued | PreloadState::Downloading)
+                                                });
+                                                let mut meta_parts: Vec<String> = Vec::new();
+                                                if rel.size_bytes > 0 {
+                                                    meta_parts.push(human_size(rel.size_bytes));
+                                                }
+                                                let tracker_lbl = rel.tracker.trim();
+                                                let has_tracker = !tracker_lbl.is_empty() && tracker_lbl != "—";
+                                                if rel.seeders > 0 || has_tracker {
+                                                    meta_parts.push(format!("{} сидов", rel.seeders));
+                                                }
+                                                if has_tracker {
+                                                    meta_parts.push(tracker_lbl.to_owned());
+                                                }
+                                                let meta_line = meta_parts.join(" · ");
+                                                let pick_cnt = rel.picked_by.len();
+                                                let rel_click = rel.clone();
+                                                let dl_el = render_quality_download_action(
+                                                    rel,
+                                                    is_cur,
+                                                    s.preloaded,
+                                                    dl_item,
+                                                    on_download_release,
+                                                    on_cancel_download,
+                                                    on_switch_to_disk,
+                                                );
+                                                let mut row_cls = String::from("p-opt p-q-row");
+                                                if is_cur {
+                                                    row_cls.push_str(" on");
+                                                }
+                                                if is_ready || is_busy {
+                                                    row_cls.push_str(" dl-hot");
+                                                }
+                                                rsx! {
+                                                    div {
+                                                        key: "q-{rel_click.infohash}",
+                                                        class: "{row_cls}",
+                                                        button {
+                                                            class: "p-q-main",
+                                                            disabled: is_cur,
+                                                            onclick: move |_| {
+                                                                if let Some(cb) = on_pick_quality {
+                                                                    cb.call(rel_click.clone());
+                                                                }
+                                                            },
+                                                            div { class: "p-q-stack",
+                                                                div { class: "p-q-top",
+                                                                    if is_cur {
+                                                                        Icon { svg: icons::CHECK, class: "ic xs acc" }
+                                                                    }
+                                                                    strong { "{qk}" }
+                                                                    if !voice_lbl.is_empty() {
+                                                                        span { class: "p-q-voice", "{voice_lbl}" }
+                                                                    }
+                                                                    if other_voice {
+                                                                        span { class: "tag warn", "Другая озвучка" }
+                                                                    }
+                                                                    if is_ready {
+                                                                        span { class: "tag srv", "На сервере" }
+                                                                    } else if let Some(dl) = dl_item.filter(|_| is_busy) {
+                                                                        span { class: "tag acc", title: "{dl.status_text()}", "{dl.compact_status_text()}" }
+                                                                    }
+                                                                    if pick_cnt > 0 {
+                                                                        span { class: "tag acc", "👥 {pick_cnt}" }
+                                                                    }
+                                                                }
+                                                                if !meta_line.is_empty() {
+                                                                    div { class: "p-q-sub", "{meta_line}" }
+                                                                }
                                                             }
                                                         }
+                                                        {dl_el}
                                                     }
-                                                    {dl_el}
                                                 }
                                             }
-                                        })
-                                }
-                                if s.available_qualities.is_empty() {
-                                    p { class: "muted small p-pop-note",
-                                        if s.qualities_loaded {
-                                            "Других вариантов качества не нашлось."
-                                        } else {
-                                            "Загружаем доступные качества…"
                                         }
-                                    }
-                                }
-                                for rel in s.available_qualities.clone() {
-                                    {
-                                        let is_cur = s.active_infohash.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(&rel.infohash));
-                                        let qk = normalize_quality_key(&rel.quality);
-                                        let info = if !rel.voice.is_empty() {
-                                            rel.voice.clone()
-                                        } else {
-                                            rel.tracker.clone()
-                                        };
-                                        let sz = human_size(rel.size_bytes);
-                                        let rel_click = rel.clone();
-                                        let pick_cnt = rel.picked_by.len();
-                                        let dl_status = s.download_status(&rel.infohash);
-                                        let is_ready = dl_status.is_some_and(|(st, _)| st == PreloadState::Ready)
-                                            || rel.preloaded
-                                            || (is_cur && s.preloaded);
-                                        let dl_el = render_quality_download_action(
-                                            rel,
-                                            is_cur,
-                                            s.preloaded,
-                                            dl_status,
-                                            on_download_release,
-                                            on_switch_to_disk,
-                                        );
-                                        rsx! {
-                                            div {
-                                                key: "q-{rel_click.infohash}",
-                                                class: if is_cur { "p-opt p-q-row on" } else { "p-opt p-q-row" },
-                                                button {
-                                                    class: "p-q-main",
-                                                    onclick: move |_| {
-                                                        if let Some(cb) = on_pick_quality {
-                                                            cb.call(rel_click.clone());
-                                                        }
-                                                    },
-                                                    span { class: "p-opt-l",
-                                                        if is_cur {
-                                                            Icon { svg: icons::CHECK, class: "ic xs acc" }
-                                                        }
-                                                        strong { "{qk}" }
-                                                        span { class: "muted small", "{info}" }
-                                                        if is_ready {
-                                                            span { class: "hot-dot", title: "Файл уже скачан на сервер" }
-                                                            span { class: "tag srv", "На сервере" }
-                                                        }
-                                                        if pick_cnt > 0 {
-                                                            span { class: "tag acc", "👥 {pick_cnt}" }
-                                                        }
-                                                    }
-                                                    span { class: "tag", "{sz} · {rel_click.seeders} сидов" }
+                                        if let Some(note) = &s.download_note {
+                                            p { class: "muted small p-pop-note", "{note}" }
+                                        }
+                                        div { class: "p-opt-div",
+                                            button {
+                                                class: "p-opt",
+                                                onclick: move |_| on_pick_release.call(()),
+                                                span { class: "p-opt-l",
+                                                    Icon { svg: icons::SWAP, class: "ic sm acc" }
+                                                    span { "Выбрать другую раздачу" }
                                                 }
-                                                {dl_el}
+                                                Icon { svg: icons::CHEV_R, class: "ic sm muted" }
                                             }
                                         }
+                                        p { class: "muted small p-pop-note", "Выбор качества запоминается для этого устройства." }
                                     }
                                 }
-                                if let Some(note) = &s.download_note {
-                                    p { class: "muted small p-pop-note", "{note}" }
-                                }
-                                div { class: "p-opt-div",
-                                    button {
-                                        class: "p-opt",
-                                        onclick: move |_| on_pick_release.call(()),
-                                        span { class: "p-opt-l",
-                                            Icon { svg: icons::SWAP, class: "ic sm acc" }
-                                            span { "Выбрать другую раздачу" }
-                                        }
-                                        Icon { svg: icons::CHEV_R, class: "ic sm muted" }
-                                    }
-                                }
-                                p { class: "muted small p-pop-note", "Выбор качества запоминается для этого устройства." }
                             } else if menu == PlayerMenu::Speed {
                                 div { class: "p-speed-grid",
                                     for r in SPEEDS {
@@ -1395,9 +1553,36 @@ mod tests {
     fn download_status_matches_case_insensitively() {
         let mut s = PlayerState::default();
         let hash = "AbCd".repeat(10);
-        s.release_downloads
-            .push((hash.to_lowercase(), PreloadState::Downloading, 0.42));
+        s.release_downloads.push(kino_core::PreloadItem {
+            id: 7,
+            kind: kino_core::MediaKind::Movie,
+            tmdb_id: 603,
+            season: 0,
+            infohash: hash.to_lowercase(),
+            title: Some("Матрица WEB-DL 1080p".into()),
+            state: PreloadState::Downloading,
+            progress: 0.42,
+            size_bytes: Some(8_000_000_000),
+            requested_at: chrono::Utc::now(),
+            ready_at: None,
+            delete_after: None,
+            poster_path: None,
+            media_title: Some("Матрица".into()),
+            quality: Some("1080p".into()),
+            voice: Some("Дубляж".into()),
+            speed_bps: 0,
+            dl_phase: kino_core::PreloadPhase::Downloading,
+        });
         assert_eq!(s.download_status(&hash), Some((PreloadState::Downloading, 0.42)));
         assert_eq!(s.download_status(&"f".repeat(40)), None);
+
+        let prompt = super::DiskReadyPrompt {
+            infohash: hash,
+            season: 0,
+            title: None,
+            quality: Some("2160p".into()),
+            voice: Some("Дубляж".into()),
+        };
+        assert_eq!(prompt.detail_label().as_deref(), Some("4K · Дубляж"));
     }
 }
