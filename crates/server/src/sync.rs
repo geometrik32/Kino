@@ -331,7 +331,6 @@ impl SyncHub {
 
     /// Broadcasts `PreloadReady` to active players watching `(kind, tmdb_id)` when their download finishes.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn notify_preload_ready(
         &self,
         ready_users: &[i64],
