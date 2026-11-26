@@ -3587,7 +3587,7 @@ mod tests {
 
         // Pack preload keeps user's default target.
         assert_eq!(
-            auto_play_target_for(MediaKind::Tv, &details, &[p_s1.clone()], None, &default_t),
+            auto_play_target_for(MediaKind::Tv, &details, std::slice::from_ref(&p_s1), None, &default_t),
             default_t
         );
 
