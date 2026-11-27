@@ -752,8 +752,32 @@ async fn resolve_release_auto_picks_quality_and_shares_between_users(pool: PgPoo
     let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&admin.token), None).await;
     let peer = login_ok(&app, 2003, inv["code"].as_str()).await;
 
-    // Mobile auto: torznab.xml has 720p with 12 seeders (>= 7) -> picks 720p automatically
+    // Default Russian language skips the English 720p release -> NeedsPicker when no Russian 720p/SD exists.
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/releases/tv/1396/resolve",
+        Some(&peer.token),
+        Some(json!({ "season": 2, "episode": 1, "is_mobile": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert!(matches!(
+        serde_json::from_value::<ResolveReleaseResponse>(body).unwrap(),
+        ResolveReleaseResponse::NeedsPicker { .. }
+    ));
+
+    // When peer allows any language, mobile auto sees 720p with 12 seeders (>= 7) -> picks 720p automatically
     // without saving a manual override in `release_choice`.
+    let (code, _) = call(
+        &app,
+        Method::PUT,
+        "/api/prefs",
+        Some(&peer.token),
+        Some(serde_json::to_value(UserPrefs::default()).unwrap()),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
     let (code, body) = call(
         &app,
         Method::POST,

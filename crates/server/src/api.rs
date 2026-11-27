@@ -347,6 +347,7 @@ pub async fn persist_progress(state: &AppState, user_id: i64, mut u: ProgressUpd
         r.infohash.make_ascii_lowercase();
     }
     let infohash = u.release.as_ref().map(|r| r.infohash.clone());
+    let newly_finished = kino_core::is_finished(u.position_sec, u.duration_sec);
     let p = db::save_progress(&state.pool, user_id, &u).await?;
     state.media.pause_cache.on_progress(
         user_id,
@@ -360,8 +361,11 @@ pub async fn persist_progress(state: &AppState, user_id: i64, mut u: ProgressUpd
         p.finished,
     );
     userdata::refresh_status(&state.pool, &*state.catalog, user_id, p.kind, p.tmdb_id, true).await?;
-    if p.finished {
+    if newly_finished {
         after_finished(state, user_id, p.kind, p.tmdb_id, p.season, p.episode).await?;
+    } else if u.position_sec > 0.0 {
+        let at = Utc::now() + state.config.preload_keep;
+        userdata::preload_extend_active_watch(&state.pool, p.kind, p.tmdb_id, p.season, p.episode, at).await?;
     }
     Ok(p)
 }
@@ -399,7 +403,7 @@ async fn after_finished(
 ) -> Result<(), AppError> {
     let at = Utc::now() + state.config.preload_keep;
     if kind == MediaKind::Tv && season > 0 && episode > 0 {
-        userdata::preload_schedule_episode_removal(&state.pool, tmdb_id, season, episode, at).await?;
+        userdata::preload_schedule_episode_removal(&state.pool, user_id, tmdb_id, season, episode, at).await?;
     }
     let season_done = match kind {
         MediaKind::Movie => true,
@@ -797,6 +801,9 @@ async fn put_episode_rating(
         ongoing,
     )
     .await?;
+    if u.rating.is_some() {
+        after_finished(&state, user.0, MediaKind::Tv, tmdb_id, season, episode).await?;
+    }
     st.peers = social::title_peers(
         &state.pool,
         &state.config.session_secret,
@@ -1519,7 +1526,7 @@ async fn preloaded_shelf_row(state: &AppState, user_id: i64, page: u32) -> Resul
         return Ok(Some(CatalogRow {
             id: "preloaded".into(),
             title: "Скачано на сервер".into(),
-            subtitle: Some("Готово к просмотру — запускается сразу с диска".into()),
+            subtitle: Some("Готово к просмотру — уже скачано на сервер".into()),
             categories: vec!["for_you".into(), "preloaded".into()],
             loaded: true,
             has_more: false,
@@ -1536,7 +1543,7 @@ async fn preloaded_shelf_row(state: &AppState, user_id: i64, page: u32) -> Resul
     Ok(Some(CatalogRow {
         id: "preloaded".into(),
         title: "Скачано на сервер".into(),
-        subtitle: Some("Готово к просмотру — запускается сразу с диска".into()),
+        subtitle: Some("Готово к просмотру — уже скачано на сервер".into()),
         categories: vec!["for_you".into(), "preloaded".into()],
         loaded: true,
         has_more,

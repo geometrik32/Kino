@@ -6,12 +6,14 @@ pub use kino_core::{demo_releases as mock_releases, ReleaseOption};
 use kino_core::{format_bitrate, MediaKind, PreloadItem, PreloadState, ReleaseChoiceUpdate, UserPrefs};
 
 use crate::icons::{self, seeder_signal, Icon};
+use crate::tooltip::{clear_active_tooltip, use_tip};
 
 /// Video codecs a release can name.
 pub const CODECS: [&str; 3] = ["H.264", "HEVC", "AV1"];
-/// Choices for "at least N seeders" and "at most N GB".
+/// Choices for "at least N seeders", "at most N GB", and "at most N Mbit/s".
 pub const SEEDER_STEPS: [u32; 4] = [5, 20, 50, 100];
 pub const SIZE_STEPS: [u32; 5] = [5, 10, 20, 40, 80];
+pub const BITRATE_STEPS: [u32; 5] = [10, 20, 30, 50, 80];
 
 /// Seeds below this count make streaming unreliable; highlight preloading instead.
 pub const LOW_SEEDS: u32 = 5;
@@ -54,6 +56,10 @@ pub struct ReleaseFilter {
     pub min_seeders: Option<u32>,
     /// At most this many gigabytes.
     pub max_size_gb: Option<u32>,
+    /// At most this many megabits per second (when bitrate is known or estimated).
+    pub max_bitrate_mbps: Option<u32>,
+    /// `Some(false)` hides multi-film collections (`"Без сборников"`).
+    pub collection: Option<bool>,
 }
 
 impl ReleaseFilter {
@@ -78,6 +84,7 @@ impl ReleaseFilter {
             direct_play: p.direct_play,
             min_seeders: p.min_seeders.filter(|n| *n > 0),
             max_size_gb: p.max_size_gb.filter(|n| *n > 0),
+            max_bitrate_mbps: p.max_bitrate_mbps.filter(|n| *n > 0),
             ..Self::default()
         }
     }
@@ -99,6 +106,8 @@ impl ReleaseFilter {
             direct_play: self.direct_play.or(other.direct_play),
             min_seeders: self.min_seeders.or(other.min_seeders),
             max_size_gb: self.max_size_gb.or(other.max_size_gb),
+            max_bitrate_mbps: self.max_bitrate_mbps.or(other.max_bitrate_mbps),
+            collection: self.collection.or(other.collection),
         }
     }
 
@@ -137,6 +146,10 @@ impl ReleaseFilter {
             && ok(&self.direct_play, &r.direct_play)
             && self.min_seeders.is_none_or(|n| r.seeders >= n)
             && self.max_size_gb.is_none_or(|g| r.size_bytes <= u64::from(g) * kino_core::GIB_BYTES)
+            && self
+                .max_bitrate_mbps
+                .is_none_or(|m| r.bitrate_kbps.is_none_or(|kbps| kbps <= m.saturating_mul(1000)))
+            && ok(&self.collection, &r.collection)
     }
 
     pub fn active(&self) -> usize {
@@ -155,6 +168,8 @@ impl ReleaseFilter {
             self.direct_play.is_some(),
             self.min_seeders.is_some(),
             self.max_size_gb.is_some(),
+            self.max_bitrate_mbps.is_some(),
+            self.collection.is_some(),
         ]
         .iter()
         .filter(|on| **on)
@@ -326,6 +341,7 @@ pub fn ReleasePicker(
     } else {
         "Фильтры".to_string()
     };
+    let tip = use_tip();
     let toggle = move |p: PickerPanel| {
         if panel == Some(p) {
             on_panel.call(None)
@@ -340,20 +356,28 @@ pub fn ReleasePicker(
     rsx! {
         div {
             class: "sheet-bg",
-            onclick: move |_| on_close.call(()),
+            onclick: move |_| {
+                tip.hide_all();
+                on_close.call(());
+            },
             div {
                 class: "sheet",
                 role: "dialog",
                 "aria-modal": "true",
                 "aria-label": "Выбор раздачи",
                 tabindex: -1,
+                onscroll: move |_| clear_active_tooltip(),
                 onclick: move |e| e.stop_propagation(),
                 onkeydown: move |e| {
                     if e.key() == Key::Escape {
                         e.stop_propagation();
+                        tip.hide_all();
                         on_close.call(());
                     }
                 },
+                div { class: "sheet-handle-wrap", "aria-hidden": "true",
+                    span { class: "sheet-handle" }
+                }
                 div { class: "sheet-head",
                     div {
                         h3 {
@@ -372,8 +396,11 @@ pub fn ReleasePicker(
                     }
                     button {
                         class: "sheet-close",
-                        title: "Закрыть",
                         "aria-label": "Закрыть",
+                        onmounted: move |e| tip.mount(0, e.data()),
+                        onmouseenter: move |_| tip.show(0, "Закрыть"),
+                        onmouseleave: move |_| tip.hide(0),
+                        onmousedown: move |_| tip.hide(0),
                         onclick: move |_| on_close.call(()),
                         Icon { svg: icons::CLOSE, class: "ic sm" }
                     }
@@ -386,12 +413,13 @@ pub fn ReleasePicker(
                             onclick: move |_| on_filter.call(ReleaseFilter { quality: None, ..f_all.clone() }),
                             "Все"
                         }
-                        for q in qualities.iter().take(4).cloned() {
+                        for (q_idx, q) in qualities.iter().take(4).cloned().enumerate() {
                             {
                                 let active = filter.quality.as_deref() == Some(q.as_str());
                                 let f_q = filter.clone();
                                 let q_val = q.clone();
                                 let q_has_srv = has_preloaded_q(&q);
+                                let q_slot = 10 + q_idx as u32;
                                 rsx! {
                                     button {
                                         key: "q-{q}",
@@ -401,7 +429,12 @@ pub fn ReleasePicker(
                                             on_filter.call(ReleaseFilter { quality: next, ..f_q.clone() });
                                         },
                                         if q_has_srv {
-                                            span { class: "hot-dot", title: "Есть скачанный файл на сервере" }
+                                            span {
+                                                class: "hot-dot",
+                                                onmounted: move |e| tip.mount(q_slot, e.data()),
+                                                onmouseenter: move |_| tip.show(q_slot, "Есть скачанный файл на сервере"),
+                                                onmouseleave: move |_| tip.hide(q_slot),
+                                            }
                                         }
                                         "{quality_short(&q)}"
                                     }
@@ -423,10 +456,14 @@ pub fn ReleasePicker(
                     if let Some(ep) = filter.episode {
                         {
                             let f_ep = filter.clone();
+                            let ep_tip = format!("Показываются раздачи с {ep} серией — нажмите, чтобы показать все");
                             rsx! {
                                 button {
                                     class: "chip sm active",
-                                    title: "Показываются раздачи с {ep} серией — нажмите, чтобы показать все",
+                                    onmounted: move |e| tip.mount(1, e.data()),
+                                    onmouseenter: move |_| tip.show(1, ep_tip.clone()),
+                                    onmouseleave: move |_| tip.hide(1),
+                                    onmousedown: move |_| tip.hide(1),
                                     onclick: move |_| on_filter.call(ReleaseFilter { episode: None, ..f_ep.clone() }),
                                     "Серия {ep} ×"
                                 }
@@ -696,6 +733,16 @@ fn FilterPanel(
                             "{flag_label(f.direct_play, \"Без перекодирования\", \"С перекодированием\")}"
                         }
                     }
+                    if releases.iter().any(|r| r.collection) || f.collection.is_some() {
+                        button {
+                            class: if f.collection == Some(false) { "chip sm active" } else { "chip sm" },
+                            onclick: {
+                                let f = f.clone();
+                                move |_| set(ReleaseFilter { collection: (f.collection != Some(false)).then_some(false), ..f.clone() })
+                            },
+                            "Без сборников"
+                        }
+                    }
                 }
             }
             if voices.len() > 1 || f.voice.is_some() {
@@ -790,6 +837,9 @@ fn FilterPanel(
             FilterRow { name: "Размер", any: "Любой",
                 options: SIZE_STEPS.map(|n| format!("до {n} ГБ")).to_vec(), selected: f.max_size_gb.map(|n| format!("до {n} ГБ")),
                 on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { max_size_gb: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" ГБ").parse().ok()), ..f.clone() }) } }
+            FilterRow { name: "Битрейт", any: "Любой",
+                options: BITRATE_STEPS.map(|n| format!("до {n} Мбит/с")).to_vec(), selected: f.max_bitrate_mbps.map(|n| format!("до {n} Мбит/с")),
+                on_select: { let f = f.clone(); move |v: Option<String>| set(ReleaseFilter { max_bitrate_mbps: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" Мбит/с").parse().ok()), ..f.clone() }) } }
             if trackers.len() > 1 || f.tracker.is_some() {
                 FilterRow { name: "Трекер", any: "Любой",
                     options: trackers, selected: f.tracker.clone(),
@@ -845,6 +895,7 @@ fn ReleaseRow(
     #[props(default)] on_cancel_preload: Option<EventHandler<i64>>,
 ) -> Element {
     let mut confirm_cancel = use_signal(|| false);
+    let tip = use_tip();
     let low = release.seeders < LOW_SEEDS;
     let is_uhd = quality_rank(&release.quality) >= 2160;
     let is_ready = release.preloaded
@@ -883,12 +934,29 @@ fn ReleaseRow(
     };
     let (a, a_key, b) = (release.clone(), release.clone(), release.clone());
     let added = ru_short_date(&release.added);
+    let raw_tip = format!("{} · {added}", release.title);
+    let sd_tip = format!("Раздающих: {} · добавлено {added}", release.seeders);
+    let br_tip = if release.bitrate_approx {
+        "Приблизительно: размер раздачи, делённый на длительность. Включает звук."
+    } else {
+        "Битрейт видео из названия раздачи"
+    };
+    let pre_btn_tip = if low {
+        "Мало сидов — лучше скачать заранее на сервер"
+    } else if download_only {
+        "Скачать на сервер"
+    } else {
+        "Скачать заранее на сервер"
+    };
     rsx! {
         div {
             class: if chosen { "rel-card picked" } else { "rel-card" },
             role: "button",
             tabindex: "0",
-            onclick: move |_| on_pick.call(a.clone()),
+            onclick: move |_| {
+                tip.hide_all();
+                on_pick.call(a.clone());
+            },
             onkeydown: move |e: Event<KeyboardData>| {
                 if matches!(e.key(), Key::Enter) || matches!(e.key(), Key::Character(ref ch) if ch == " ") {
                     e.prevent_default();
@@ -903,12 +971,27 @@ fn ReleaseRow(
                 div { class: "rel-voice",
                     strong { "{release.voice}" }
                     if is_ready {
-                        span { class: "tag srv", title: "Файл уже скачан на сервер и запускается мгновенно",
+                        span {
+                            class: "tag srv",
+                            onmounted: move |e| tip.mount(0, e.data()),
+                            onmouseenter: move |_| tip.show(0, "Файл уже скачан на сервер и запускается мгновенно"),
+                            onmouseleave: move |_| tip.hide(0),
                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
-                            "На сервере"
+                            "Скачан"
                         }
                     } else if let Some((_, _, compact_lbl, status_tip)) = active_dl.as_ref() {
-                        span { class: "tag acc", title: "{status_tip}", "{compact_lbl}" }
+                        {
+                            let st_tip = status_tip.clone();
+                            rsx! {
+                                span {
+                                    class: "tag acc",
+                                    onmounted: move |e| tip.mount(0, e.data()),
+                                    onmouseenter: move |_| tip.show(0, st_tip.clone()),
+                                    onmouseleave: move |_| tip.hide(0),
+                                    "{compact_lbl}"
+                                }
+                            }
+                        }
                     }
                     if chosen {
                         span { class: "tag acc", "Ваша раздача" }
@@ -918,9 +1001,13 @@ fn ReleaseRow(
                     if !release.picked_by.is_empty() {
                         {
                             let cnt = release.picked_by.len();
-                            let tip = format!("Выбрали участники: {}", release.picked_by.join(", "));
+                            let picked_tip = format!("Выбрали участники: {}", release.picked_by.join(", "));
                             rsx! {
-                                span { class: "tag acc", title: "{tip}",
+                                span {
+                                    class: "tag acc",
+                                    onmounted: move |e| tip.mount(1, e.data()),
+                                    onmouseenter: move |_| tip.show(1, picked_tip.clone()),
+                                    onmouseleave: move |_| tip.hide(1),
                                     Icon { svg: icons::USERS, class: "ic xs" }
                                     "{cnt}"
                                 }
@@ -939,33 +1026,54 @@ fn ReleaseRow(
                     if release.subtitles {
                         span { class: "tag", "Субтитры" }
                     }
+                    if release.collection {
+                        span {
+                            class: "tag warn",
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, "В раздаче несколько фильмов — размер указан за весь сборник"),
+                            onmouseleave: move |_| tip.hide(2),
+                            "Сборник"
+                        }
+                    }
                     if let Some(ep_tag) = release.episode_tag() {
                         span { class: "tag", "{ep_tag}" }
                     }
                     span { class: "tag", "{release.tracker}" }
                 }
-                div { class: "rel-raw", title: "{release.title} · {added}", "{release.title}" }
+                div {
+                    class: "rel-raw",
+                    onmounted: move |e| tip.mount(3, e.data()),
+                    onmouseenter: move |_| tip.show(3, raw_tip.clone()),
+                    onmouseleave: move |_| tip.hide(3),
+                    "{release.title}"
+                }
             }
             div { class: "pre-slot",
                 if is_ready {
                     span {
                         class: "pre-btn done",
-                        title: "Файл уже скачан на сервер",
+                        onmounted: move |e| tip.mount(4, e.data()),
+                        onmouseenter: move |_| tip.show(4, "Файл уже скачан на сервер"),
+                        onmouseleave: move |_| tip.hide(4),
                         Icon { svg: icons::CHECK, class: "ic sm" }
-                        "На сервере"
+                        "Скачан"
                     }
                 } else if let Some((dl_id, can_cancel, compact_lbl, _)) = active_dl {
                     if let Some(on_cancel) = on_cancel_preload.filter(|_| can_cancel) {
                         {
                             let status_lbl = compact_lbl;
+                            let cancel_tip = if confirm_cancel() {
+                                "Нажмите ещё раз, чтобы отменить загрузку"
+                            } else {
+                                "Нажмите, чтобы отменить загрузку"
+                            };
                             rsx! {
                                 button {
                                     class: if confirm_cancel() { "pre-btn cancel-confirm" } else { "pre-btn active" },
-                                    title: if confirm_cancel() {
-                                        "Нажмите ещё раз, чтобы отменить загрузку"
-                                    } else {
-                                        "Нажмите, чтобы отменить загрузку"
-                                    },
+                                    onmounted: move |e| tip.mount(4, e.data()),
+                                    onmouseenter: move |_| tip.show(4, cancel_tip),
+                                    onmouseleave: move |_| tip.hide(4),
+                                    onmousedown: move |_| tip.hide(4),
                                     onblur: move |_| confirm_cancel.set(false),
                                     onclick: move |e| {
                                         e.stop_propagation();
@@ -991,13 +1099,10 @@ fn ReleaseRow(
                 } else {
                     button {
                         class: if low { "pre-btn recommend" } else { "pre-btn" },
-                        title: if low {
-                            "Мало сидов — лучше скачать заранее на сервер"
-                        } else if download_only {
-                            "Скачать на сервер"
-                        } else {
-                            "Скачать заранее на сервер"
-                        },
+                        onmounted: move |e| tip.mount(4, e.data()),
+                        onmouseenter: move |_| tip.show(4, pre_btn_tip),
+                        onmouseleave: move |_| tip.hide(4),
+                        onmousedown: move |_| tip.hide(4),
                         onclick: move |e| {
                             e.stop_propagation();
                             on_preload.call(b.clone());
@@ -1012,18 +1117,18 @@ fn ReleaseRow(
                 if let Some(kbps) = release.bitrate_kbps {
                     div {
                         class: "br",
-                        title: if release.bitrate_approx {
-                            "Приблизительно: размер раздачи, делённый на длительность. Включает звук."
-                        } else {
-                            "Битрейт видео из названия раздачи"
-                        },
+                        onmounted: move |e| tip.mount(5, e.data()),
+                        onmouseenter: move |_| tip.show(5, br_tip),
+                        onmouseleave: move |_| tip.hide(5),
                         if release.bitrate_approx { "≈ " }
                         "{format_bitrate(kbps)}"
                     }
                 }
                 div {
                     class: if low { "sd low" } else { "sd ok" },
-                    title: "Раздающих: {release.seeders} · добавлено {added}",
+                    onmounted: move |e| tip.mount(6, e.data()),
+                    onmouseenter: move |_| tip.show(6, sd_tip.clone()),
+                    onmouseleave: move |_| tip.hide(6),
                     span { class: "sig-wrap", "aria-hidden": "true", dangerous_inner_html: seeder_signal(release.seeders) }
                     span { "{release.seeders}" }
                 }
@@ -1123,18 +1228,46 @@ mod tests {
             codec: Some("H.264".into()),
             min_seeders: Some(50),
             max_size_gb: Some(30),
+            max_bitrate_mbps: Some(30),
             hdr: Some(false),
             ..UserPrefs::default()
         };
         let d = ReleaseFilter::from_prefs(&prefs);
-        assert_eq!(d.active(), 5);
+        assert_eq!(d.active(), 6);
         let fit: Vec<_> = all.iter().filter(|r| d.matches(r)).collect();
         assert!(!fit.is_empty());
         assert!(fit.iter().all(|r| r.language == "Русский"
             && r.codec.as_deref() == Some("H.264")
             && r.seeders >= 50
             && r.size_bytes <= 30 * kino_core::GIB_BYTES
+            && r.bitrate_kbps.is_none_or(|b| b <= 30_000)
             && !r.hdr));
+
+        // Bitrate filter excludes releases over the limit while keeping unknown-bitrate packs.
+        let mut over_rate = all[0].clone();
+        over_rate.bitrate_kbps = Some(458_000);
+        let mut under_rate = all[0].clone();
+        under_rate.bitrate_kbps = Some(15_000);
+        let mut no_rate = all[0].clone();
+        no_rate.bitrate_kbps = None;
+        let br_filter = ReleaseFilter {
+            max_bitrate_mbps: Some(30),
+            ..Default::default()
+        };
+        assert!(!br_filter.matches(&over_rate));
+        assert!(br_filter.matches(&under_rate));
+        assert!(br_filter.matches(&no_rate));
+
+        // Collection filter can hide multi-film packs while leaving single releases visible.
+        let mut pack_rel = all[0].clone();
+        pack_rel.collection = true;
+        let hide_cols = ReleaseFilter {
+            collection: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(hide_cols.active(), 1);
+        assert!(!hide_cols.matches(&pack_rel));
+        assert!(hide_cols.matches(&under_rate));
         let mine = ReleaseFilter {
             quality: Some("720p".into()),
             ..Default::default()
@@ -1142,11 +1275,12 @@ mod tests {
         .or(ReleaseFilter::from_prefs(&UserPrefs {
             quality: Some("2160p".into()),
             language: Some("Русский".into()),
+            max_bitrate_mbps: Some(30),
             ..UserPrefs::default()
         }));
         assert_eq!(
-            (mine.quality.as_deref(), mine.language.as_deref()),
-            (Some("720p"), Some("Русский"))
+            (mine.quality.as_deref(), mine.language.as_deref(), mine.max_bitrate_mbps),
+            (Some("720p"), Some("Русский"), Some(30))
         );
         assert_eq!(ReleaseSort::from_key(Some("bitrate")), ReleaseSort::Bitrate);
         assert_eq!(ReleaseSort::from_key(Some("nonsense")), ReleaseSort::Seeders);

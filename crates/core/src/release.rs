@@ -57,6 +57,9 @@ pub struct ReleaseOption {
     /// True when this infohash is already downloaded and ready on the server's disk.
     #[serde(default)]
     pub preloaded: bool,
+    /// True when this release contains multiple films (a collection/anthology) rather than one film.
+    #[serde(default)]
+    pub collection: bool,
 }
 
 /// Minimum seeders needed for mobile auto-selection to pick `720p` over `SD`.
@@ -433,6 +436,7 @@ pub fn demo_releases(title: &TitleSummary, season: Option<i32>) -> Vec<ReleaseOp
                     bitrate_approx: !matches!(h, 'b' | 'g'),
                     picked_by: Vec::new(),
                     preloaded: false,
+                    collection: false,
                 }
             },
         )
@@ -837,6 +841,7 @@ mod tests {
             bitrate_approx: false,
             picked_by: Vec::new(),
             preloaded: false,
+            collection: false,
         };
         assert!(r.matches_episode(8));
         assert_eq!(r.episode_tag(), None);

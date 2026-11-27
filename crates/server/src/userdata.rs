@@ -822,7 +822,7 @@ pub async fn history(pool: &PgPool, user_id: i64, limit: i64) -> Result<Vec<Hist
 pub async fn get_prefs(pool: &PgPool, user_id: i64) -> Result<UserPrefs, sqlx::Error> {
     let row = sqlx::query(
         "SELECT quality, voice, subtitle_lang, language, hdr, dolby_vision, subtitles, codec, direct_play,
-                min_seeders, max_size_gb, sort, desktop_quality, mobile_quality
+                min_seeders, max_size_gb, max_bitrate_mbps, sort, desktop_quality, mobile_quality
          FROM user_prefs WHERE user_id = $1",
     )
     .bind(user_id)
@@ -845,25 +845,28 @@ pub async fn get_prefs(pool: &PgPool, user_id: i64) -> Result<UserPrefs, sqlx::E
                 direct_play: r.try_get("direct_play")?,
                 min_seeders: count("min_seeders")?,
                 max_size_gb: count("max_size_gb")?,
+                max_bitrate_mbps: count("max_bitrate_mbps")?,
                 sort: r.try_get("sort")?,
                 desktop_quality: r.try_get("desktop_quality")?,
                 mobile_quality: r.try_get("mobile_quality")?,
             }
         }
-        None => UserPrefs::default(),
+        None => UserPrefs::recommended_defaults(),
     })
 }
 
 pub async fn set_prefs(pool: &PgPool, user_id: i64, p: &UserPrefs) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO user_prefs (user_id, quality, voice, subtitle_lang, language, hdr, dolby_vision, subtitles,
-                                 codec, direct_play, min_seeders, max_size_gb, sort, desktop_quality, mobile_quality)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                                 codec, direct_play, min_seeders, max_size_gb, max_bitrate_mbps, sort,
+                                 desktop_quality, mobile_quality)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
          ON CONFLICT (user_id) DO UPDATE SET
            quality = EXCLUDED.quality, voice = EXCLUDED.voice, subtitle_lang = EXCLUDED.subtitle_lang,
            language = EXCLUDED.language, hdr = EXCLUDED.hdr, dolby_vision = EXCLUDED.dolby_vision,
            subtitles = EXCLUDED.subtitles, codec = EXCLUDED.codec, direct_play = EXCLUDED.direct_play,
-           min_seeders = EXCLUDED.min_seeders, max_size_gb = EXCLUDED.max_size_gb, sort = EXCLUDED.sort,
+           min_seeders = EXCLUDED.min_seeders, max_size_gb = EXCLUDED.max_size_gb,
+           max_bitrate_mbps = EXCLUDED.max_bitrate_mbps, sort = EXCLUDED.sort,
            desktop_quality = EXCLUDED.desktop_quality, mobile_quality = EXCLUDED.mobile_quality",
     )
     .bind(user_id)
@@ -878,6 +881,7 @@ pub async fn set_prefs(pool: &PgPool, user_id: i64, p: &UserPrefs) -> Result<(),
     .bind(p.direct_play)
     .bind(p.min_seeders.map(|n| n.min(i32::MAX as u32) as i32))
     .bind(p.max_size_gb.map(|n| n.min(i32::MAX as u32) as i32))
+    .bind(p.max_bitrate_mbps.map(|n| n.min(i32::MAX as u32) as i32))
     .bind(p.sort.as_deref())
     .bind(p.desktop_quality.as_deref())
     .bind(p.mobile_quality.as_deref())
@@ -887,11 +891,12 @@ pub async fn set_prefs(pool: &PgPool, user_id: i64, p: &UserPrefs) -> Result<(),
 }
 
 const PRELOAD_COLUMNS: &str = "id, media_kind, tmdb_id, season, infohash, title, state, progress, size_bytes,
-     requested_at, ready_at, delete_after, whole_torrent";
+     requested_at, ready_at, delete_after, owner_watched_at, whole_torrent";
 
 fn preload_from_row(row: &PgRow) -> Result<PreloadItem, sqlx::Error> {
     let state: String = row.try_get("state")?;
     let whole_torrent: bool = row.try_get("whole_torrent").unwrap_or(true);
+    let watched = row.try_get::<Option<DateTime<Utc>>, _>("owner_watched_at")?.is_some();
     Ok(PreloadItem {
         id: row.try_get("id")?,
         kind: kind_of(row)?,
@@ -905,6 +910,7 @@ fn preload_from_row(row: &PgRow) -> Result<PreloadItem, sqlx::Error> {
         requested_at: row.try_get("requested_at")?,
         ready_at: row.try_get("ready_at")?,
         delete_after: row.try_get("delete_after")?,
+        watched,
         poster_path: None,
         media_title: None,
         quality: None,
@@ -936,6 +942,7 @@ pub struct PreloadEpisodeRow {
     pub state: PreloadState,
     pub ready_at: Option<DateTime<Utc>>,
     pub delete_after: Option<DateTime<Utc>>,
+    pub owner_watched_at: Option<DateTime<Utc>>,
 }
 
 impl PreloadEpisodeRow {
@@ -949,6 +956,7 @@ impl PreloadEpisodeRow {
             episode_name: None,
             ready_at: self.ready_at,
             delete_after: self.delete_after,
+            watched: self.owner_watched_at.is_some(),
         }
     }
 }
@@ -962,7 +970,8 @@ async fn load_preload_episodes(
         return Ok(map);
     }
     let rows = sqlx::query(
-        "SELECT preload_id, season, episode, file_index, file_path, size_bytes, progress, state, ready_at, delete_after
+        "SELECT preload_id, season, episode, file_index, file_path, size_bytes, progress, state,
+                ready_at, delete_after, owner_watched_at
          FROM preload_episode
          WHERE preload_id = ANY($1) AND state <> 'deleted'
          ORDER BY season ASC, episode ASC",
@@ -985,6 +994,7 @@ async fn load_preload_episodes(
             state,
             ready_at: r.try_get("ready_at")?,
             delete_after: r.try_get("delete_after")?,
+            owner_watched_at: r.try_get("owner_watched_at")?,
         });
     }
     Ok(map)
@@ -1018,7 +1028,9 @@ pub async fn preload_add(pool: &PgPool, user_id: i64, r: &PreloadRequest) -> Res
                         ELSE preload.state END,
            progress = CASE WHEN preload.state IN ('deleted', 'failed') THEN 0 ELSE preload.progress END,
            ready_at = CASE WHEN preload.state IN ('deleted', 'failed') THEN NULL ELSE preload.ready_at END,
-           delete_after = NULL, requested_at = now()
+           delete_after = NULL,
+           owner_watched_at = CASE WHEN preload.state IN ('deleted', 'failed') THEN NULL ELSE preload.owner_watched_at END,
+           requested_at = now()
          RETURNING {PRELOAD_COLUMNS}"
     ))
     .bind(user_id)
@@ -1039,7 +1051,8 @@ pub async fn preload_add(pool: &PgPool, user_id: i64, r: &PreloadRequest) -> Res
              ON CONFLICT (preload_id, season, episode) DO UPDATE SET
                state = CASE WHEN preload_episode.state IN ('deleted', 'failed') THEN 'queued' ELSE preload_episode.state END,
                progress = CASE WHEN preload_episode.state IN ('deleted', 'failed') THEN 0 ELSE preload_episode.progress END,
-               delete_after = NULL
+               delete_after = NULL,
+               owner_watched_at = CASE WHEN preload_episode.state IN ('deleted', 'failed') THEN NULL ELSE preload_episode.owner_watched_at END
              RETURNING state",
         )
         .bind(item.id)
@@ -1120,7 +1133,8 @@ pub async fn all_server_preloads(
 ) -> Result<Vec<PreloadItem>, sqlx::Error> {
     let rows = sqlx::query(
         "SELECT p.id, p.user_id, p.media_kind, p.tmdb_id, p.season, p.infohash, p.title,
-                p.state, p.progress, p.size_bytes, p.requested_at, p.ready_at, p.delete_after, p.whole_torrent,
+                p.state, p.progress, p.size_bytes, p.requested_at, p.ready_at, p.delete_after,
+                p.owner_watched_at, p.whole_torrent,
                 COALESCE(NULLIF(u.first_name, ''), NULLIF(u.username, ''), 'Участник') AS requester_name
          FROM preload p
          JOIN users u ON u.id = p.user_id
@@ -1186,9 +1200,10 @@ pub async fn all_server_preloads(
                 (a, b) => a.or(b),
             };
             g.item.delete_after = match (g.item.delete_after, item.delete_after) {
-                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), Some(b)) => Some(a.max(b)),
                 (a, b) => a.or(b),
             };
+            g.item.watched &= item.watched;
             for er in ep_rows {
                 let ei = er.into_item();
                 g.ep_map
@@ -1204,9 +1219,10 @@ pub async fn all_server_preloads(
                         };
                         cur.ready_at = cur.ready_at.or(ei.ready_at);
                         cur.delete_after = match (cur.delete_after, ei.delete_after) {
-                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (Some(a), Some(b)) => Some(a.max(b)),
                             (a, b) => a.or(b),
                         };
+                        cur.watched &= ei.watched;
                     })
                     .or_insert(ei);
             }
@@ -1266,6 +1282,18 @@ pub async fn all_server_preloads(
             } else {
                 PreloadState::Failed
             };
+            let ready_eps: Vec<&PreloadEpisodeItem> = g
+                .item
+                .episodes
+                .iter()
+                .filter(|e| e.state == PreloadState::Ready)
+                .collect();
+            if !ready_eps.is_empty() {
+                g.item.watched = ready_eps.iter().all(|e| e.watched);
+                if g.item.delete_after.is_none() {
+                    g.item.delete_after = ready_eps.iter().filter_map(|e| e.delete_after).min();
+                }
+            }
             let known_bytes: i64 = g.item.episodes.iter().filter_map(|e| e.size_bytes).sum();
             if known_bytes > 0 {
                 g.item.size_bytes = Some(known_bytes);
@@ -1355,7 +1383,7 @@ pub async fn preload_delete_for_actor(
     let mut tx = pool.begin().await?;
     let ids: Vec<i64> = if is_admin {
         sqlx::query_scalar(
-            "UPDATE preload SET state = 'deleted', delete_after = NULL
+            "UPDATE preload SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL
              WHERE infohash = $1 AND state <> 'deleted' RETURNING id",
         )
         .bind(&infohash)
@@ -1363,7 +1391,7 @@ pub async fn preload_delete_for_actor(
         .await?
     } else {
         sqlx::query_scalar(
-            "UPDATE preload SET state = 'deleted', delete_after = NULL
+            "UPDATE preload SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL
              WHERE id = $1 AND user_id = $2 AND state <> 'deleted' RETURNING id",
         )
         .bind(id)
@@ -1372,10 +1400,13 @@ pub async fn preload_delete_for_actor(
         .await?
     };
     if !ids.is_empty() {
-        sqlx::query("UPDATE preload_episode SET state = 'deleted', delete_after = NULL WHERE preload_id = ANY($1)")
-            .bind(&ids)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE preload_episode SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL
+             WHERE preload_id = ANY($1)",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?;
     }
     tx.commit().await?;
     Ok(DeletePreloadResult::Deleted(infohash))
@@ -1428,7 +1459,7 @@ pub async fn preload_delete_episode_for_actor(
         return Ok(DeletePreloadResult::NotFound);
     }
     let updated = sqlx::query(
-        "UPDATE preload_episode SET state = 'deleted', delete_after = NULL
+        "UPDATE preload_episode SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL
          WHERE preload_id = ANY($1) AND season = $2 AND episode = $3 AND state <> 'deleted'",
     )
     .bind(&target_ids)
@@ -1447,10 +1478,12 @@ pub async fn preload_delete_episode_for_actor(
         if has_any_ep {
             return Ok(DeletePreloadResult::NotFound);
         }
-        sqlx::query("UPDATE preload SET state = 'deleted', delete_after = NULL WHERE id = ANY($1)")
-            .bind(&target_ids)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE preload SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL WHERE id = ANY($1)",
+        )
+        .bind(&target_ids)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         return Ok(DeletePreloadResult::Deleted(infohash));
     }
@@ -1593,57 +1626,173 @@ pub async fn preload_wanted_for_hash(pool: &PgPool, infohash: &str) -> Result<Wa
     Ok(out)
 }
 
-/// Once a film or a season is watched, its server preload is shortened to `at` (never exceeding the 7-day ready cap).
+/// Once the preload owner finishes a film or season, marks it watched and shortens retention to `at`
+/// (capped by the 7-day ready window on first watch). If another user watches a preload already
+/// watched by its owner, extends `delete_after` to at least `at`; unwatched preloads of other users
+/// keep their 7-day window untouched.
 pub async fn preload_schedule_removal(
     pool: &PgPool,
-    _user_id: i64,
+    user_id: i64,
     kind: MediaKind,
     tmdb_id: i64,
     season: i32,
     at: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
+    let owner_r = sqlx::query(
         "UPDATE preload
-         SET delete_after = LEAST(COALESCE(delete_after, $4), $4)
-         WHERE media_kind = $1 AND tmdb_id = $2 AND season = $3 AND state <> 'deleted' AND whole_torrent = TRUE",
+         SET delete_after = CASE
+                 WHEN owner_watched_at IS NULL THEN LEAST(COALESCE(delete_after, $5), $5)
+                 ELSE GREATEST(COALESCE(delete_after, $5), $5)
+             END,
+             owner_watched_at = COALESCE(owner_watched_at, now())
+         WHERE user_id = $1
+           AND media_kind = $2
+           AND tmdb_id = $3
+           AND season = $4
+           AND state <> 'deleted'
+           AND whole_torrent = TRUE",
     )
+    .bind(user_id)
     .bind(kind.as_str())
     .bind(tmdb_id)
     .bind(season)
     .bind(at)
     .execute(pool)
     .await?;
-    Ok(r.rows_affected())
+
+    let other_r = sqlx::query(
+        "UPDATE preload
+         SET delete_after = GREATEST(COALESCE(delete_after, $5), $5)
+         WHERE user_id <> $1
+           AND media_kind = $2
+           AND tmdb_id = $3
+           AND season = $4
+           AND state <> 'deleted'
+           AND whole_torrent = TRUE
+           AND owner_watched_at IS NOT NULL",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(season)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(owner_r.rows_affected() + other_r.rows_affected())
 }
 
-/// Shortens retention of an individually-downloaded episode once watched to completion.
+/// Applies the same owner-first retention rule to an individually-downloaded episode.
 pub async fn preload_schedule_episode_removal(
     pool: &PgPool,
+    user_id: i64,
     tmdb_id: i64,
     season: i32,
     episode: i32,
     at: DateTime<Utc>,
 ) -> Result<u64, sqlx::Error> {
-    let r = sqlx::query(
+    let owner_r = sqlx::query(
         "UPDATE preload_episode pe
-         SET delete_after = LEAST(COALESCE(pe.delete_after, $4), $4)
+         SET delete_after = CASE
+                 WHEN pe.owner_watched_at IS NULL THEN LEAST(COALESCE(pe.delete_after, $5), $5)
+                 ELSE GREATEST(COALESCE(pe.delete_after, $5), $5)
+             END,
+             owner_watched_at = COALESCE(pe.owner_watched_at, now())
          FROM preload p
          WHERE pe.preload_id = p.id
+           AND p.user_id = $1
            AND p.media_kind = 'tv'
-           AND p.tmdb_id = $1
+           AND p.tmdb_id = $2
            AND p.whole_torrent = FALSE
            AND p.state <> 'deleted'
-           AND pe.season = $2
-           AND pe.episode = $3
+           AND pe.season = $3
+           AND pe.episode = $4
            AND pe.state = 'ready'",
     )
+    .bind(user_id)
     .bind(tmdb_id)
     .bind(season)
     .bind(episode)
     .bind(at)
     .execute(pool)
     .await?;
-    Ok(r.rows_affected())
+
+    let other_r = sqlx::query(
+        "UPDATE preload_episode pe
+         SET delete_after = GREATEST(COALESCE(pe.delete_after, $5), $5)
+         FROM preload p
+         WHERE pe.preload_id = p.id
+           AND p.user_id <> $1
+           AND p.media_kind = 'tv'
+           AND p.tmdb_id = $2
+           AND p.whole_torrent = FALSE
+           AND p.state <> 'deleted'
+           AND pe.season = $3
+           AND pe.episode = $4
+           AND pe.state = 'ready'
+           AND pe.owner_watched_at IS NOT NULL",
+    )
+    .bind(user_id)
+    .bind(tmdb_id)
+    .bind(season)
+    .bind(episode)
+    .bind(at)
+    .execute(pool)
+    .await?;
+    Ok(owner_r.rows_affected() + other_r.rows_affected())
+}
+
+/// Extends post-watch retention to `at` when any participant is actively watching a preload
+/// (or episode) whose owner has already watched it; unwatched 7-day preloads are untouched.
+pub async fn preload_extend_active_watch(
+    pool: &PgPool,
+    kind: MediaKind,
+    tmdb_id: i64,
+    season: i32,
+    episode: i32,
+    at: DateTime<Utc>,
+) -> Result<u64, sqlx::Error> {
+    let mut updated = sqlx::query(
+        "UPDATE preload
+         SET delete_after = GREATEST(COALESCE(delete_after, $4), $4)
+         WHERE media_kind = $1
+           AND tmdb_id = $2
+           AND season = $3
+           AND state <> 'deleted'
+           AND whole_torrent = TRUE
+           AND owner_watched_at IS NOT NULL",
+    )
+    .bind(kind.as_str())
+    .bind(tmdb_id)
+    .bind(if kind == MediaKind::Movie { 0 } else { season })
+    .bind(at)
+    .execute(pool)
+    .await?
+    .rows_affected();
+
+    if kind == MediaKind::Tv && season > 0 && episode > 0 {
+        updated += sqlx::query(
+            "UPDATE preload_episode pe
+             SET delete_after = GREATEST(COALESCE(pe.delete_after, $4), $4)
+             FROM preload p
+             WHERE pe.preload_id = p.id
+               AND p.media_kind = 'tv'
+               AND p.tmdb_id = $1
+               AND p.whole_torrent = FALSE
+               AND p.state <> 'deleted'
+               AND pe.season = $2
+               AND pe.episode = $3
+               AND pe.state = 'ready'
+               AND pe.owner_watched_at IS NOT NULL",
+        )
+        .bind(tmdb_id)
+        .bind(season)
+        .bind(episode)
+        .bind(at)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    }
+    Ok(updated)
 }
 
 /// Individual downloaded episodes whose retention expired before their whole parent torrent.
@@ -1676,12 +1825,15 @@ pub async fn preload_episode_mark_deleted(
     episode: i32,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query("UPDATE preload_episode SET state = 'deleted', delete_after = NULL WHERE preload_id = $1 AND season = $2 AND episode = $3")
-        .bind(preload_id)
-        .bind(season)
-        .bind(episode)
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(
+        "UPDATE preload_episode SET state = 'deleted', delete_after = NULL, owner_watched_at = NULL
+         WHERE preload_id = $1 AND season = $2 AND episode = $3",
+    )
+    .bind(preload_id)
+    .bind(season)
+    .bind(episode)
+    .execute(&mut *tx)
+    .await?;
     recompute_preload_from_episodes_tx(&mut tx, preload_id).await?;
     tx.commit().await?;
     Ok(())
@@ -2049,11 +2201,11 @@ pub async fn preload_in_use_except(pool: &PgPool, infohash: &str, exclude_id: i6
 }
 
 pub async fn preload_mark_deleted(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE preload SET state = 'deleted' WHERE id = $1")
+    sqlx::query("UPDATE preload SET state = 'deleted', owner_watched_at = NULL WHERE id = $1")
         .bind(id)
         .execute(pool)
         .await?;
-    sqlx::query("UPDATE preload_episode SET state = 'deleted' WHERE preload_id = $1")
+    sqlx::query("UPDATE preload_episode SET state = 'deleted', owner_watched_at = NULL WHERE preload_id = $1")
         .bind(id)
         .execute(pool)
         .await?;

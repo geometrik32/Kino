@@ -159,6 +159,10 @@ fn base_options(headless: bool, wid: Option<isize>) -> Vec<(String, String)> {
         ("demuxer-max-bytes", "200MiB"),
         ("demuxer-readahead-secs", "120"),
         ("network-timeout", "30"),
+        (
+            "stream-lavf-o",
+            "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5",
+        ),
         ("user-agent", "KinoDesktop"),
         ("save-position-on-quit", "no"),
         ("terminal", "no"),

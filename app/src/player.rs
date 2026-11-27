@@ -2145,6 +2145,7 @@ pub fn Player(
                                                                             episode_name: None,
                                                                             ready_at: Some(now_utc),
                                                                             delete_after: None,
+                                                                            watched: false,
                                                                         },
                                                                     );
                                                                 }
@@ -2178,6 +2179,7 @@ pub fn Player(
                                                                     episode_name: None,
                                                                     ready_at: Some(now_utc),
                                                                     delete_after: None,
+                                                                    watched: false,
                                                                 }]
                                                             } else {
                                                                 Vec::new()
@@ -2202,6 +2204,7 @@ pub fn Player(
                                                                     requested_at: now_utc,
                                                                     ready_at: Some(now_utc),
                                                                     delete_after: None,
+                                                                    watched: false,
                                                                     poster_path: None,
                                                                     whole_torrent: pepisode <= 0,
                                                                     episodes: eps,

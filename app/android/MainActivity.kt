@@ -54,7 +54,8 @@ class MainActivity : WryActivity() {
     companion object {
         private const val TAG = "KinoExo"
         private const val DARK_BAR_COLOR = 0xFF0E1621.toInt()
-        private const val NO_VIDEO_FRAME_TIMEOUT_MS = 5_000L
+        private const val NO_VIDEO_FRAME_TIMEOUT_MS = 12_000L
+        private const val MAX_IO_RETRIES = 2
     }
 
     private var mWebViewRef: WebView? = null
@@ -91,6 +92,7 @@ class MainActivity : WryActivity() {
 
     private var pendingAudioIdx: Int = -1
     private var pendingSubIdx: Int = -1
+    private var ioRetryCount: Int = 0
     private var userVolume: Float = 1.0f
     private var userMuted: Boolean = false
     @Volatile private var videoScaleMode: Int = 0
@@ -192,6 +194,7 @@ class MainActivity : WryActivity() {
         }
         webView.isVerticalScrollBarEnabled = false
         webView.isHorizontalScrollBarEnabled = false
+        webView.overScrollMode = View.OVER_SCROLL_NEVER
         webView.setBackgroundColor(Color.TRANSPARENT)
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.post {
@@ -518,6 +521,7 @@ class MainActivity : WryActivity() {
 
             override fun onRenderedFirstFrame() {
                 firstFrameRendered = true
+                ioRetryCount = 0
                 Log.i(TAG, "First video frame rendered")
             }
 
@@ -576,6 +580,27 @@ class MainActivity : WryActivity() {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                val isIoError = error.errorCode in 2000..2999
+                if (isIoError && ioRetryCount < MAX_IO_RETRIES) {
+                    ioRetryCount += 1
+                    val seqAtErr = openSeq
+                    val resumeMs = exo.currentPosition.coerceAtLeast(0L)
+                    val wantPlay = exo.playWhenReady
+                    Log.w(
+                        TAG,
+                        "Transient ExoPlayer I/O error (${error.errorCodeName}); retry $ioRetryCount/$MAX_IO_RETRIES at ${resumeMs}ms"
+                    )
+                    isBuffering = true
+                    hasError = false
+                    mainHandler.postDelayed({
+                        val active = player ?: return@postDelayed
+                        if (active !== exo || seqAtErr != openSeq || hasError) return@postDelayed
+                        active.seekTo(resumeMs)
+                        active.playWhenReady = wantPlay
+                        active.prepare()
+                    }, 800L)
+                    return
+                }
                 Log.e(TAG, "ExoPlayer error: ${error.errorCodeName}: ${error.message}", error)
                 isBuffering = false
                 hasError = true
@@ -685,6 +710,7 @@ class MainActivity : WryActivity() {
         hasVideoTrack = false
         firstFrameRendered = false
         playbackStartedAtMs = 0L
+        ioRetryCount = 0
         videoScaleMode = scaleMode
         videoRatio = 0f
         openSeq = seq
@@ -809,6 +835,7 @@ class MainActivity : WryActivity() {
         hasVideoTrack = false
         firstFrameRendered = false
         playbackStartedAtMs = 0L
+        ioRetryCount = 0
         openSeq = seq
         runOnUiThread {
             tickerRunning = false

@@ -184,6 +184,16 @@ pub async fn login(
     .fetch_one(&mut *tx)
     .await?;
     let me = me_from_row(&row)?;
+    sqlx::query(
+        "INSERT INTO user_prefs (user_id, language, max_bitrate_mbps)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (user_id) DO NOTHING",
+    )
+    .bind(me.id)
+    .bind(kino_core::DEFAULT_PREF_LANGUAGE)
+    .bind(i32::try_from(kino_core::DEFAULT_MAX_BITRATE_MBPS).unwrap_or(30))
+    .execute(&mut *tx)
+    .await?;
     if let Some(code) = claimed_invite {
         sqlx::query("UPDATE invites SET used_by = $2 WHERE code = $1")
             .bind(code)

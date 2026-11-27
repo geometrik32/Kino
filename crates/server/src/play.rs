@@ -551,13 +551,18 @@ fn auto_pick_release<'a>(
     target: &TargetQuality,
     preferred_voice: Option<&str>,
     preferred_lang: Option<&str>,
+    max_bitrate_mbps: Option<u32>,
     is_mobile: bool,
     dead_hashes: &std::collections::HashSet<String>,
 ) -> Option<&'a ReleaseOption> {
+    let max_kbps = max_bitrate_mbps.filter(|&m| m > 0).map(|m| m.saturating_mul(1000));
     let for_season: Vec<&ReleaseOption> = releases
         .iter()
         .filter(|r| {
-            kind == MediaKind::Movie || ((r.season.is_none() || r.season == Some(season)) && r.matches_episode(episode))
+            !r.collection
+                && (kind == MediaKind::Movie
+                    || ((r.season.is_none() || r.season == Some(season)) && r.matches_episode(episode)))
+                && max_kbps.is_none_or(|limit| r.bitrate_kbps.is_none_or(|kbps| kbps <= limit))
         })
         .collect();
     if for_season.is_empty() {
@@ -873,6 +878,7 @@ async fn resolve_online_tiers(
         target,
         preferred_voice.as_deref(),
         prefs.language.as_deref(),
+        prefs.max_bitrate_mbps,
         is_mobile,
         &dead_hashes,
     );
@@ -2078,6 +2084,7 @@ mod tests {
             bitrate_approx: false,
             picked_by: vec!["Анна".into()],
             preloaded: false,
+            collection: false,
         };
         let mut r2 = r1.clone();
         r2.infohash = format!("u{}", "b".repeat(39));
@@ -2121,6 +2128,7 @@ mod tests {
             bitrate_approx: false,
             picked_by: Vec::new(),
             preloaded: false,
+            collection: false,
         };
         let top_dead = make(&"1".repeat(40), 877);
         let live = make(&"2".repeat(40), 529);
@@ -2135,11 +2143,102 @@ mod tests {
             &TargetQuality::Exact("1080p".into()),
             None,
             Some("Русский"),
+            None,
             false,
             &dead,
         )
         .unwrap();
         assert_eq!(picked.infohash, live.infohash);
+    }
+
+    #[test]
+    fn auto_pick_respects_max_bitrate_limit() {
+        let make = |hash: &str, quality: &str, seeders: u32, bitrate_kbps: Option<u32>| ReleaseOption {
+            infohash: hash.into(),
+            title: format!("Звёздные войны (1977) {quality}"),
+            quality: quality.into(),
+            size_bytes: 5_000_000_000,
+            seeders,
+            voice: "Дубляж".into(),
+            language: "Русский".into(),
+            tracker: "BitRu".into(),
+            added: "2026-11-26".into(),
+            year: Some(1977),
+            season: None,
+            episode_start: None,
+            episode_end: None,
+            hdr: false,
+            dolby_vision: false,
+            subtitles: false,
+            direct_play: true,
+            codec: Some("H.264".into()),
+            bitrate_kbps,
+            bitrate_approx: true,
+            picked_by: Vec::new(),
+            preloaded: false,
+            collection: false,
+        };
+        let huge_sd = make(&"1".repeat(40), "SD", 500, Some(458_000));
+        let mut collection_1080 = make(&"5".repeat(40), "1080p", 900, None);
+        collection_1080.collection = true;
+        let normal_720 = make(&"2".repeat(40), "720p", 12, Some(6_500));
+        let normal_1080 = make(&"3".repeat(40), "1080p", 80, Some(18_000));
+        let huge_1080 = make(&"4".repeat(40), "1080p", 400, Some(109_000));
+        let releases = [
+            huge_sd,
+            collection_1080,
+            normal_720.clone(),
+            normal_1080.clone(),
+            huge_1080,
+        ];
+        let dead = std::collections::HashSet::new();
+
+        // Mobile auto must skip the 458 Mbit/s SD release and pick 720p within 30 Mbit/s.
+        let mobile_pick = auto_pick_release(
+            &releases,
+            MediaKind::Movie,
+            0,
+            0,
+            &TargetQuality::MobileAuto,
+            None,
+            Some("Русский"),
+            Some(30),
+            true,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(mobile_pick.infohash, normal_720.infohash);
+
+        // Desktop 1080p must skip both the 109 Mbit/s release and the 900-seeder collection.
+        let desktop_pick = auto_pick_release(
+            &releases,
+            MediaKind::Movie,
+            0,
+            0,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            Some(30),
+            false,
+            &dead,
+        )
+        .unwrap();
+        assert_eq!(desktop_pick.infohash, normal_1080.infohash);
+
+        // If every single-movie release in the target bucket exceeds the bitrate cap, fall back to picker (`None`).
+        assert!(auto_pick_release(
+            &releases,
+            MediaKind::Movie,
+            0,
+            0,
+            &TargetQuality::Exact("1080p".into()),
+            None,
+            Some("Русский"),
+            Some(10),
+            false,
+            &dead,
+        )
+        .is_none());
     }
 
     #[test]
@@ -2167,6 +2266,7 @@ mod tests {
             bitrate_approx: false,
             picked_by: Vec::new(),
             preloaded: false,
+            collection: false,
         };
         let mut full = partial.clone();
         full.infohash = "2".repeat(40);
@@ -2186,6 +2286,7 @@ mod tests {
             &TargetQuality::Exact("1080p".into()),
             None,
             Some("Русский"),
+            None,
             false,
             &dead,
         )
@@ -2201,6 +2302,7 @@ mod tests {
             &TargetQuality::Exact("1080p".into()),
             None,
             Some("Русский"),
+            None,
             false,
             &dead,
         )
@@ -2218,6 +2320,7 @@ mod tests {
             &TargetQuality::Exact("1080p".into()),
             None,
             Some("Русский"),
+            None,
             false,
             &dead,
         )

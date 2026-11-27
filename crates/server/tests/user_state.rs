@@ -170,25 +170,39 @@ async fn rating_tracks_prefs(pool: PgPool) {
     assert_eq!(p[0]["finished"], true);
 
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
-    assert_eq!(serde_json::from_value::<UserPrefs>(p).unwrap(), UserPrefs::default());
+    assert_eq!(
+        serde_json::from_value::<UserPrefs>(p).unwrap(),
+        UserPrefs::recommended_defaults()
+    );
     let prefs = json!({
         "quality": "2160p", "voice": null, "subtitle_lang": null, "language": "Русский",
         "hdr": false, "dolby_vision": null, "subtitles": true, "codec": "H.264", "direct_play": true,
-        "min_seeders": 5, "max_size_gb": 40, "sort": "bitrate",
+        "min_seeders": 5, "max_size_gb": 40, "max_bitrate_mbps": 30, "sort": "bitrate",
         "desktop_quality": null, "mobile_quality": null
     });
     let (code, _) = call(&app, Method::PUT, "/api/prefs", Some(&t), Some(prefs.clone())).await;
     assert_eq!(code, StatusCode::OK);
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
     assert_eq!(p, prefs);
+    // Explicitly clearing language and max_bitrate_mbps to null ("Любой") persists and is not overwritten.
+    let cleared = json!({
+        "quality": null, "voice": null, "subtitle_lang": null, "language": null,
+        "hdr": null, "dolby_vision": null, "subtitles": null, "codec": null, "direct_play": null,
+        "min_seeders": null, "max_size_gb": null, "max_bitrate_mbps": null, "sort": null,
+        "desktop_quality": null, "mobile_quality": null
+    });
+    let (code, _) = call(&app, Method::PUT, "/api/prefs", Some(&t), Some(cleared)).await;
+    assert_eq!(code, StatusCode::OK);
+    let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
+    assert_eq!(serde_json::from_value::<UserPrefs>(p).unwrap(), UserPrefs::default());
     // An old client that knows only the first three fields still works, and clears the rest.
     let old = json!({"quality": "1080p", "voice": "LostFilm", "subtitle_lang": null});
     call(&app, Method::PUT, "/api/prefs", Some(&t), Some(old)).await;
     let (_, p) = call(&app, Method::GET, "/api/prefs", Some(&t), None).await;
     let p: UserPrefs = serde_json::from_value(p).unwrap();
     assert_eq!(
-        (p.quality.as_deref(), p.voice.as_deref(), p.language),
-        (Some("1080p"), Some("LostFilm"), None)
+        (p.quality.as_deref(), p.voice.as_deref(), p.language, p.max_bitrate_mbps),
+        (Some("1080p"), Some("LostFilm"), None, None)
     );
 }
 
@@ -647,4 +661,244 @@ async fn social_users_calendar_and_rewatch_excludes_unfinished(pool: PgPool) {
     let (code, cal_body) = call(&app, Method::GET, "/api/calendar", Some(&peer.token), None).await;
     assert_eq!(code, StatusCode::OK);
     let _: Vec<CalendarEntry> = serde_json::from_value(cal_body).unwrap();
+}
+
+fn state_with_preload_keep_2d(pool: PgPool) -> kino_server::AppState {
+    let base = test_state(pool.clone());
+    let mut cfg = (*base.config).clone();
+    cfg.preload_keep = chrono::Duration::days(2);
+    let cfg = std::sync::Arc::new(cfg);
+    kino_server::AppState {
+        pool,
+        media: std::sync::Arc::new(kino_server::play::Media::new(&cfg.torrents)),
+        sync: std::sync::Arc::new(kino_server::sync::SyncHub::new()),
+        config: cfg,
+        catalog: std::sync::Arc::new(kino_server::catalog::DemoCatalog),
+        telegram: reqwest::Client::new(),
+    }
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn preload_retention_follows_owner_then_extends_for_active_peers(pool: PgPool) {
+    let state = state_with_preload_keep_2d(pool.clone());
+    let app = kino_server::app(state.clone());
+    let owner = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&owner.token), None).await;
+    let peer = login_ok(&app, 3003, inv["code"].as_str()).await;
+
+    // Peer already rated and finished the movie before the owner even queued a download.
+    call(
+        &app,
+        Method::PUT,
+        "/api/title/movie/603/rating",
+        Some(&peer.token),
+        Some(json!({ "rating": 2 })),
+    )
+    .await;
+
+    let hash = "bc".repeat(20);
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&owner.token),
+        Some(json!({ "kind": "movie", "tmdb_id": 603, "infohash": hash, "title": "Матрица 1080p" })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+
+    // Simulate download completion: 7-day retention, not watched by owner yet.
+    kino_server::userdata::preload_progress(&pool, &hash, PreloadState::Ready, 1.0, Some(1_000_000))
+        .await
+        .unwrap();
+
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    assert!(!list[0].watched);
+    let initial_delete = list[0].delete_after.expect("ready preload gets 7-day deadline");
+    assert!(
+        (initial_delete - chrono::Utc::now()).num_hours() > 150,
+        "expected ~7 days, got {initial_delete}"
+    );
+
+    // Peer starts rewatching (their watch_progress has sticky finished=true from rating),
+    // and owner only watched 18 seconds: neither may shorten the 7-day timer or mark watched.
+    play(
+        &app,
+        &peer.token,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 1200.0, "duration_sec": 8000.0}),
+    )
+    .await;
+    play(
+        &app,
+        &owner.token,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 18.0, "duration_sec": 8000.0}),
+    )
+    .await;
+
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    assert!(!list[0].watched, "peer activity must not mark owner preload watched");
+    assert_eq!(
+        list[0].delete_after,
+        Some(initial_delete),
+        "peer watch must not shorten owner's 7-day retention"
+    );
+
+    // Now the owner watches to completion -> watched=true and timer drops to ~2 days.
+    play(
+        &app,
+        &owner.token,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 7900.0, "duration_sec": 8000.0}),
+    )
+    .await;
+
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    assert!(list[0].watched);
+    let post_watch_del = list[0].delete_after.unwrap();
+    assert!(
+        (post_watch_del - chrono::Utc::now()).num_hours() <= 49,
+        "expected ~2 days after owner finished, got {post_watch_del}"
+    );
+
+    // Move deadline close to expiry (2 hours left), then peer actively watches mid-film:
+    // Variant A extends the 2-day timer back out so the peer isn't cut off mid-watch.
+    sqlx::query("UPDATE preload SET delete_after = now() + interval '2 hours' WHERE infohash = $1")
+        .bind(&hash)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    play(
+        &app,
+        &peer.token,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 2400.0, "duration_sec": 8000.0}),
+    )
+    .await;
+
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    assert!(list[0].watched);
+    let extended_del = list[0].delete_after.unwrap();
+    assert!(
+        (extended_del - chrono::Utc::now()).num_hours() >= 46,
+        "expected peer active watch to extend post-watch timer to ~2 days, got {extended_del}"
+    );
+
+    // Rewatching a movie the owner already finished earlier: starting a fresh preload at 10s
+    // must keep 7 days until the owner actually finishes again.
+    let hash2 = "bd".repeat(20);
+    let (code, _) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&owner.token),
+        Some(json!({ "kind": "movie", "tmdb_id": 603, "infohash": hash2, "title": "Матрица 4K" })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK);
+    kino_server::userdata::preload_progress(&pool, &hash2, PreloadState::Ready, 1.0, Some(2_000_000))
+        .await
+        .unwrap();
+    play(
+        &app,
+        &owner.token,
+        json!({"kind": "movie", "tmdb_id": 603, "position_sec": 10.0, "duration_sec": 8000.0}),
+    )
+    .await;
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    let rewatch_item = list.iter().find(|p| p.infohash == hash2).unwrap();
+    assert!(!rewatch_item.watched);
+    assert!((rewatch_item.delete_after.unwrap() - chrono::Utc::now()).num_hours() > 150);
+}
+
+#[sqlx::test(migrations = "./migrations")]
+async fn partial_episode_retention_follows_owner_then_extends_for_peers(pool: PgPool) {
+    let state = state_with_preload_keep_2d(pool.clone());
+    let app = kino_server::app(state.clone());
+    let owner = login_ok(&app, ADMIN_TG, None).await;
+    let (_, inv) = call(&app, Method::POST, "/api/invites", Some(&owner.token), None).await;
+    let peer = login_ok(&app, 3004, inv["code"].as_str()).await;
+
+    let hash = "de".repeat(20);
+    let (code, body) = call(
+        &app,
+        Method::POST,
+        "/api/preload",
+        Some(&owner.token),
+        Some(json!({
+            "kind": "tv",
+            "tmdb_id": 1396,
+            "season": 1,
+            "episode": 1,
+            "infohash": hash,
+            "title": "Breaking Bad S01"
+        })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let item: PreloadItem = serde_json::from_value(body).unwrap();
+    kino_server::userdata::upsert_preload_episode_progress(
+        &pool,
+        item.id,
+        1,
+        1,
+        Some(1),
+        Some("S01E01.mkv"),
+        Some(500_000),
+        PreloadState::Ready,
+        1.0,
+        false,
+    )
+    .await
+    .unwrap();
+    kino_server::userdata::update_preload_row_progress(&pool, item.id, PreloadState::Ready, 1.0, Some(500_000))
+        .await
+        .unwrap();
+
+    // Peer finishes S01E01 before the owner: episode stays unwatched with 7-day retention.
+    play(
+        &app,
+        &peer.token,
+        json!({"kind": "tv", "tmdb_id": 1396, "season": 1, "episode": 1, "position_sec": 2900.0, "duration_sec": 3000.0}),
+    )
+    .await;
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    let ep = list[0].episode_for(1, 1).unwrap();
+    assert!(!ep.watched);
+    assert!((ep.delete_after.unwrap() - chrono::Utc::now()).num_hours() > 150);
+
+    // Owner finishes S01E01: episode becomes watched with ~2-day retention.
+    play(
+        &app,
+        &owner.token,
+        json!({"kind": "tv", "tmdb_id": 1396, "season": 1, "episode": 1, "position_sec": 2950.0, "duration_sec": 3000.0}),
+    )
+    .await;
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    let ep = list[0].episode_for(1, 1).unwrap();
+    assert!(ep.watched);
+    assert!((ep.delete_after.unwrap() - chrono::Utc::now()).num_hours() <= 49);
+
+    // Peer starts watching S01E01 when only 1h remains -> extended back to ~2 days.
+    sqlx::query("UPDATE preload_episode SET delete_after = now() + interval '1 hour' WHERE preload_id = $1")
+        .bind(item.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    play(
+        &app,
+        &peer.token,
+        json!({"kind": "tv", "tmdb_id": 1396, "season": 1, "episode": 1, "position_sec": 500.0, "duration_sec": 3000.0}),
+    )
+    .await;
+    let (_, list) = call(&app, Method::GET, "/api/preload", Some(&owner.token), None).await;
+    let list: Vec<PreloadItem> = serde_json::from_value(list).unwrap();
+    let ep = list[0].episode_for(1, 1).unwrap();
+    assert!(ep.watched);
+    assert!((ep.delete_after.unwrap() - chrono::Utc::now()).num_hours() >= 46);
 }

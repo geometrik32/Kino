@@ -16,6 +16,7 @@ use kino_core::{
 
 use crate::human_size;
 use crate::icons::{self, Icon};
+use crate::tooltip::{clear_active_tooltip, provide_tooltip_host, use_tip, TipHandle, TooltipLayer};
 use crate::WindowChrome;
 
 /// `id` of the `<video>` element; the app drives it through the DOM.
@@ -305,15 +306,30 @@ fn quality_from_release_label(label: &str) -> String {
     "1080p".to_owned()
 }
 
-fn render_quality_download_action(
+struct QualityDownloadAction<'a> {
     rel: ReleaseOption,
     is_cur: bool,
     playing_preloaded: bool,
-    dl: Option<&PreloadItem>,
+    dl: Option<&'a PreloadItem>,
     on_download: Option<EventHandler<ReleaseOption>>,
     on_cancel_download: Option<EventHandler<i64>>,
     on_switch_to_disk: Option<EventHandler<()>>,
-) -> Element {
+    tip: TipHandle,
+    slot: u32,
+}
+
+fn render_quality_download_action(ctx: QualityDownloadAction<'_>) -> Element {
+    let QualityDownloadAction {
+        rel,
+        is_cur,
+        playing_preloaded,
+        dl,
+        on_download,
+        on_cancel_download,
+        on_switch_to_disk,
+        tip,
+        slot,
+    } = ctx;
     let is_ready = dl.is_some_and(|p| p.state == PreloadState::Ready) || rel.preloaded || (is_cur && playing_preloaded);
     if is_ready {
         if is_cur && !playing_preloaded {
@@ -321,20 +337,27 @@ fn render_quality_download_action(
                 return rsx! {
                     button {
                         class: "p-q-dl switch",
-                        title: "Переключиться на скачанный файл",
-                        "aria-label": "Переключиться на файл с диска",
+                        "aria-label": "Переключиться на скачанный файл",
+                        onmounted: move |e| tip.mount(slot, e.data()),
+                        onmouseenter: move |_| tip.show(slot, "Переключиться на скачанный файл"),
+                        onmouseleave: move |_| tip.hide(slot),
+                        onmousedown: move |_| tip.hide(slot),
                         onclick: move |e| {
                             e.stop_propagation();
                             cb.call(());
                         },
                         Icon { svg: icons::CHECK, class: "ic xs" }
-                        span { "С диска" }
+                        span { "Скачан" }
                     }
                 };
             }
         }
         return rsx! {
-            span { class: "p-q-dl done", title: "Уже скачано на сервер",
+            span {
+                class: "p-q-dl done",
+                onmounted: move |e| tip.mount(slot, e.data()),
+                onmouseenter: move |_| tip.show(slot, "Уже скачан на сервер"),
+                onmouseleave: move |_| tip.hide(slot),
                 Icon { svg: icons::CHECK, class: "ic xs" }
             }
         };
@@ -345,8 +368,11 @@ fn render_quality_download_action(
             return rsx! {
                 button {
                     class: "p-q-dl busy",
-                    title: "Отменить скачивание на сервер",
                     "aria-label": "Отменить скачивание на сервер",
+                    onmounted: move |e| tip.mount(slot, e.data()),
+                    onmouseenter: move |_| tip.show(slot, "Отменить скачивание на сервер"),
+                    onmouseleave: move |_| tip.hide(slot),
+                    onmousedown: move |_| tip.hide(slot),
                     onclick: move |e| {
                         e.stop_propagation();
                         cancel.call(dl_id);
@@ -355,8 +381,15 @@ fn render_quality_download_action(
                 }
             };
         }
+        let st_tip = item.status_text();
         return rsx! {
-            span { class: "p-q-dl busy", title: "{item.status_text()}", "{item.compact_status_text()}" }
+            span {
+                class: "p-q-dl busy",
+                onmounted: move |e| tip.mount(slot, e.data()),
+                onmouseenter: move |_| tip.show(slot, st_tip.clone()),
+                onmouseleave: move |_| tip.hide(slot),
+                "{item.compact_status_text()}"
+            }
         };
     }
     if is_cur {
@@ -364,8 +397,11 @@ fn render_quality_download_action(
             return rsx! {
                 button {
                     class: "p-q-dl",
-                    title: "Скачать текущую раздачу на сервер",
                     "aria-label": "Скачать текущую раздачу на сервер",
+                    onmounted: move |e| tip.mount(slot, e.data()),
+                    onmouseenter: move |_| tip.show(slot, "Скачать текущую раздачу на сервер"),
+                    onmouseleave: move |_| tip.hide(slot),
+                    onmousedown: move |_| tip.hide(slot),
                     onclick: move |e| {
                         e.stop_propagation();
                         cb.call(rel.clone());
@@ -450,6 +486,8 @@ pub fn PlayerView(
     #[props(default)] on_lock: Option<EventHandler<bool>>,
     #[props(default)] window_chrome: Option<WindowChrome>,
 ) -> Element {
+    let tip_host = provide_tooltip_host();
+    let tip = use_tip();
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
     let mut lock_hint_gen = use_signal(|| 0u64);
@@ -550,6 +588,7 @@ pub fn PlayerView(
     rsx! {
         div {
             class: "{player_cls}",
+            onmounted: move |e| tip_host.mount_root(e.data()),
             onpointermove: move |e| {
                 let active_rect = *drag_rect.peek();
                 if let Some((vert, start, len)) = active_rect {
@@ -743,16 +782,26 @@ pub fn PlayerView(
                     div { class: "p-top-l",
                         button {
                             class: "p-glass-btn icon",
-                            title: "Назад",
                             "aria-label": "Назад",
-                            onmousedown: move |e| e.stop_propagation(),
+                            onmounted: move |e| tip.mount(0, e.data()),
+                            onmouseenter: move |_| tip.show(0, "Назад"),
+                            onmouseleave: move |_| tip.hide(0),
+                            onmousedown: move |e| {
+                                tip.hide(0);
+                                e.stop_propagation();
+                            },
                             onclick: move |_| on_close.call(()),
                             Icon { svg: icons::BACK, class: "ic" }
                         }
                         button {
                             class: "p-title-link",
-                            title: "Открыть страницу тайтла",
-                            onmousedown: move |e| e.stop_propagation(),
+                            onmounted: move |e| tip.mount(1, e.data()),
+                            onmouseenter: move |_| tip.show(1, "Открыть страницу тайтла"),
+                            onmouseleave: move |_| tip.hide(1),
+                            onmousedown: move |e| {
+                                tip.hide(1);
+                                e.stop_propagation();
+                            },
                             onclick: move |_| {
                                 if let Some(cb) = on_title {
                                     cb.call(());
@@ -768,7 +817,7 @@ pub fn PlayerView(
                                 if let Some(sub) = &s.subtitle { span { "{sub} · " } }
                                 span { "{s.release}" }
                                 if let Some(rw) = &s.rewatch_label { span { class: "tag acc", "{rw}" } }
-                                if s.preloaded { span { class: "tag srv", "На сервере" } }
+                                if s.preloaded { span { class: "tag srv", "Скачан" } }
                                 if s.transcoded { span { class: "tag warn", "перекодируется" } }
                             }
                         }
@@ -778,8 +827,11 @@ pub fn PlayerView(
                         onmousedown: move |e| e.stop_propagation(),
                         button {
                             class: "p-glass-btn icon",
-                            title: "Заблокировать экран от случайных нажатий",
                             "aria-label": "Заблокировать экран",
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, "Заблокировать экран от случайных нажатий"),
+                            onmouseleave: move |_| tip.hide(2),
+                            onmousedown: move |_| tip.hide(2),
                             onclick: move |_| {
                                 on_menu.call(None);
                                 locked.set(true);
@@ -799,6 +851,7 @@ pub fn PlayerView(
                                 } else {
                                     format!("Синхронизация активна ({sync_count} устр.)")
                                 };
+                                let sync_tip = sync_title.clone();
                                 rsx! {
                                     button {
                                         class: if s.menu == Some(PlayerMenu::Sync) {
@@ -808,8 +861,11 @@ pub fn PlayerView(
                                         } else {
                                             "p-glass-btn icon p-sync-btn"
                                         },
-                                        title: "{sync_title}",
                                         "aria-label": "{sync_title}",
+                                        onmounted: move |e| tip.mount(3, e.data()),
+                                        onmouseenter: move |_| tip.show(3, sync_tip.clone()),
+                                        onmouseleave: move |_| tip.hide(3),
+                                        onmousedown: move |_| tip.hide(3),
                                         onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Sync) { None } else { Some(PlayerMenu::Sync) }),
                                         span { class: "p-sync-dot" }
                                     }
@@ -835,8 +891,11 @@ pub fn PlayerView(
                     // (hidden via CSS when controls fade out); desktop shows it only while paused.
                     button {
                         class: "p-center p-big",
-                        title: if s.paused { "Продолжить воспроизведение" } else { "Пауза" },
                         "aria-label": if s.paused { "Продолжить воспроизведение" } else { "Пауза" },
+                        onmounted: move |e| tip.mount(16, e.data()),
+                        onmouseenter: move |_| tip.show(16, if s.paused { "Продолжить воспроизведение" } else { "Пауза" }),
+                        onmouseleave: move |_| tip.hide(16),
+                        onmousedown: move |_| tip.hide(16),
                         onpointerdown: move |_| ping_activity(),
                         onclick: move |_| on_toggle.call(()),
                         Icon { svg: if s.paused { icons::PLAY } else { icons::PAUSE }, class: "ic xl" }
@@ -867,8 +926,11 @@ pub fn PlayerView(
                 if s.auto_muted && !s.paused && s.error.is_none() {
                     button {
                         class: "p-glass-btn p-unmute-btn",
-                        title: "Нажмите, чтобы включить звук",
                         "aria-label": "Включить звук",
+                        onmounted: move |e| tip.mount(4, e.data()),
+                        onmouseenter: move |_| tip.show(4, "Нажмите, чтобы включить звук"),
+                        onmouseleave: move |_| tip.hide(4),
+                        onmousedown: move |_| tip.hide(4),
                         onclick: move |_| {
                             if let Some(cb) = on_unmute {
                                 cb.call(());
@@ -897,8 +959,11 @@ pub fn PlayerView(
                         }
                         button {
                             class: "p-glass-btn icon p-next-close",
-                            title: "Позже",
                             "aria-label": "Позже",
+                            onmounted: move |e| tip.mount(5, e.data()),
+                            onmouseenter: move |_| tip.show(5, "Позже"),
+                            onmouseleave: move |_| tip.hide(5),
+                            onmousedown: move |_| tip.hide(5),
                             onclick: move |_| {
                                 if let Some(cb) = on_dismiss_disk_prompt {
                                     cb.call(());
@@ -914,10 +979,14 @@ pub fn PlayerView(
                         let target_sec = skip.end_sec.min((dur - 1.0).max(0.0));
                         let cls = if show_next { "p-glass-btn p-skip-btn with-next" } else { "p-glass-btn p-skip-btn" };
                         let label = skip.kind.skip_label();
+                        let skip_tip = format!("{label} (до {})", clock(target_sec));
                         rsx! {
                             button {
                                 class: "{cls}",
-                                title: "{label} (до {clock(target_sec)})",
+                                onmounted: move |e| tip.mount(6, e.data()),
+                                onmouseenter: move |_| tip.show(6, skip_tip.clone()),
+                                onmouseleave: move |_| tip.hide(6),
+                                onmousedown: move |_| tip.hide(6),
                                 onclick: move |_| on_seek.call(target_sec),
                                 Icon { svg: icons::FWD10, class: "ic sm" }
                                 span { "{label}" }
@@ -938,8 +1007,11 @@ pub fn PlayerView(
                         }
                         button {
                             class: "p-glass-btn icon p-next-close",
-                            title: "Скрыть",
                             "aria-label": "Скрыть",
+                            onmounted: move |e| tip.mount(7, e.data()),
+                            onmouseenter: move |_| tip.show(7, "Скрыть"),
+                            onmouseleave: move |_| tip.hide(7),
+                            onmousedown: move |_| tip.hide(7),
                             onclick: move |_| dismissed_next.set(next_for_dismiss.clone()),
                             Icon { svg: icons::CLOSE, class: "ic sm" }
                         }
@@ -1093,58 +1165,75 @@ pub fn PlayerView(
                     div { class: "p-ctrl-row",
                         button {
                             class: "p-glass-btn icon",
-                            title: "Назад на 10 секунд",
                             "aria-label": "Назад на 10 секунд",
+                            onmounted: move |e| tip.mount(8, e.data()),
+                            onmouseenter: move |_| tip.show(8, "Назад на 10 секунд"),
+                            onmouseleave: move |_| tip.hide(8),
+                            onmousedown: move |_| tip.hide(8),
                             onclick: move |_| on_seek.call((pos - 10.0).max(0.0)),
                             Icon { svg: icons::BACK10, class: "ic" }
                         }
                         button {
                             class: "p-play-btn",
-                            title: if s.paused { "Смотреть" } else { "Пауза" },
                             "aria-label": if s.paused { "Смотреть" } else { "Пауза" },
+                            onmounted: move |e| tip.mount(9, e.data()),
+                            onmouseenter: move |_| tip.show(9, if s.paused { "Смотреть" } else { "Пауза" }),
+                            onmouseleave: move |_| tip.hide(9),
+                            onmousedown: move |_| tip.hide(9),
                             onclick: move |_| on_toggle.call(()),
                             Icon { svg: if s.paused { icons::PLAY } else { icons::PAUSE }, class: "ic" }
                         }
                         button {
                             class: "p-glass-btn icon",
-                            title: "Вперёд на 10 секунд",
                             "aria-label": "Вперёд на 10 секунд",
+                            onmounted: move |e| tip.mount(10, e.data()),
+                            onmouseenter: move |_| tip.show(10, "Вперёд на 10 секунд"),
+                            onmouseleave: move |_| tip.hide(10),
+                            onmousedown: move |_| tip.hide(10),
                             onclick: move |_| on_seek.call(pos + 10.0),
                             Icon { svg: icons::FWD10, class: "ic" }
                         }
                         if s.show_volume {
-                            div { class: "p-vol desktop-only",
-                                button {
-                                    class: "p-vol-btn",
-                                    title: if sync_muted {
-                                        "Звук на другом устройстве — нажмите, чтобы включить здесь"
-                                    } else if effective_muted || s.volume <= 0.001 {
-                                        "Включить звук"
-                                    } else {
-                                        "Выключить звук"
-                                    },
-                                    "aria-label": "Громкость",
-                                    onclick: move |_| {
-                                        if let Some(cb) = on_mute {
-                                            cb.call(());
+                            {
+                                let vol_tip = if sync_muted {
+                                    "Звук на другом устройстве — нажмите, чтобы включить здесь"
+                                } else if effective_muted || s.volume <= 0.001 {
+                                    "Включить звук"
+                                } else {
+                                    "Выключить звук"
+                                };
+                                rsx! {
+                                    div { class: "p-vol desktop-only",
+                                        button {
+                                            class: "p-vol-btn",
+                                            "aria-label": "Громкость",
+                                            onmounted: move |e| tip.mount(11, e.data()),
+                                            onmouseenter: move |_| tip.show(11, vol_tip),
+                                            onmouseleave: move |_| tip.hide(11),
+                                            onmousedown: move |_| tip.hide(11),
+                                            onclick: move |_| {
+                                                if let Some(cb) = on_mute {
+                                                    cb.call(());
+                                                }
+                                            },
+                                            Icon { svg: if effective_muted || s.volume <= 0.001 { icons::VOL_MUTE } else { icons::VOL }, class: "ic sm" }
                                         }
-                                    },
-                                    Icon { svg: if effective_muted || s.volume <= 0.001 { icons::VOL_MUTE } else { icons::VOL }, class: "ic sm" }
-                                }
-                                div { class: "p-vol-track",
-                                    div { class: "p-vol-fill", style: "width: {vol_pct:.0}%" }
-                                    input {
-                                        r#type: "range",
-                                        min: "0",
-                                        max: "100",
-                                        step: "2",
-                                        value: "{vol_pct.round() as i32}",
-                                        "aria-label": "Уровень громкости",
-                                        oninput: move |e| {
-                                            if let (Some(cb), Ok(v)) = (on_volume, e.value().parse::<f32>()) {
-                                                cb.call((v / 100.0).clamp(0.0, 1.0));
+                                        div { class: "p-vol-track",
+                                            div { class: "p-vol-fill", style: "width: {vol_pct:.0}%" }
+                                            input {
+                                                r#type: "range",
+                                                min: "0",
+                                                max: "100",
+                                                step: "2",
+                                                value: "{vol_pct.round() as i32}",
+                                                "aria-label": "Уровень громкости",
+                                                oninput: move |e| {
+                                                    if let (Some(cb), Ok(v)) = (on_volume, e.value().parse::<f32>()) {
+                                                        cb.call((v / 100.0).clamp(0.0, 1.0));
+                                                    }
+                                                },
                                             }
-                                        },
+                                        }
                                     }
                                 }
                             }
@@ -1153,8 +1242,11 @@ pub fn PlayerView(
                         if !s.episodes.is_empty() {
                             button {
                                 class: if s.menu == Some(PlayerMenu::Episodes) { "p-glass-btn p-ep-btn active" } else { "p-glass-btn p-ep-btn" },
-                                title: "Список серий",
                                 "aria-label": "Серии",
+                                onmounted: move |e| tip.mount(12, e.data()),
+                                onmouseenter: move |_| tip.show(12, "Список серий"),
+                                onmouseleave: move |_| tip.hide(12),
+                                onmousedown: move |_| tip.hide(12),
                                 onclick: move |_| on_menu.call(if s.menu == Some(PlayerMenu::Episodes) { None } else { Some(PlayerMenu::Episodes) }),
                                 Icon { svg: icons::LIST, class: "ic sm" }
                                 span { class: "long", "Серии" }
@@ -1163,8 +1255,11 @@ pub fn PlayerView(
                         // Button 1: Headphones (Audio + Subtitles).
                         button {
                             class: if headphones_open { "p-glass-btn audio-btn active" } else { "p-glass-btn audio-btn" },
-                            title: "Наушники: звук и субтитры",
                             "aria-label": "Наушники: звук и субтитры",
+                            onmounted: move |e| tip.mount(13, e.data()),
+                            onmouseenter: move |_| tip.show(13, "Наушники: звук и субтитры"),
+                            onmouseleave: move |_| tip.hide(13),
+                            onmousedown: move |_| tip.hide(13),
                             onclick: move |_| on_menu.call(if headphones_open { None } else { Some(PlayerMenu::Audio) }),
                             Icon { svg: icons::AUDIO_CC, class: "ic sm" }
                             span { class: "long", "Наушники" }
@@ -1172,19 +1267,34 @@ pub fn PlayerView(
                         // Button 2: Settings (Speed + Scale + Quality).
                         button {
                             class: if settings_open { "p-glass-btn settings-btn active" } else { "p-glass-btn settings-btn" },
-                            title: "Настройки: скорость, масштаб и качество",
                             "aria-label": "Настройки",
+                            onmounted: move |e| tip.mount(14, e.data()),
+                            onmouseenter: move |_| tip.show(14, "Настройки: скорость, масштаб и качество"),
+                            onmouseleave: move |_| tip.hide(14),
+                            onmousedown: move |_| tip.hide(14),
                             onclick: move |_| on_menu.call(if settings_open { None } else { Some(PlayerMenu::Speed) }),
                             Icon { svg: icons::SETTINGS, class: "ic sm" }
                             span { class: "long", "Настройки" }
                         }
                         if s.show_fullscreen {
-                            button {
-                                class: if s.fullscreen { "p-glass-btn icon p-fs-btn active" } else { "p-glass-btn icon p-fs-btn" },
-                                title: if s.fullscreen { "Выйти из полноэкранного режима" } else { "Во весь экран" },
-                                "aria-label": if s.fullscreen { "Выйти из полноэкранного режима" } else { "Во весь экран" },
-                                onclick: move |_| on_fullscreen.call(()),
-                                Icon { svg: if s.fullscreen { icons::EXIT_FULL } else { icons::FULL }, class: "ic sm" }
+                            {
+                                let fs_tip = if s.fullscreen {
+                                    "Выйти из полноэкранного режима"
+                                } else {
+                                    "Во весь экран"
+                                };
+                                rsx! {
+                                    button {
+                                        class: if s.fullscreen { "p-glass-btn icon p-fs-btn active" } else { "p-glass-btn icon p-fs-btn" },
+                                        "aria-label": "{fs_tip}",
+                                        onmounted: move |e| tip.mount(15, e.data()),
+                                        onmouseenter: move |_| tip.show(15, fs_tip),
+                                        onmouseleave: move |_| tip.hide(15),
+                                        onmousedown: move |_| tip.hide(15),
+                                        onclick: move |_| on_fullscreen.call(()),
+                                        Icon { svg: if s.fullscreen { icons::EXIT_FULL } else { icons::FULL }, class: "ic sm" }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1196,6 +1306,7 @@ pub fn PlayerView(
                             PlayerMenu::Sync => "p-popover sync",
                             _ => "p-popover",
                         },
+                        onscroll: move |_| clear_active_tooltip(),
                         onpointerdown: move |_| ping_activity(),
                         if matches!(menu, PlayerMenu::Audio | PlayerMenu::Subtitles) {
                             div { class: "p-pop-tabs",
@@ -1390,7 +1501,7 @@ pub fn PlayerView(
                                                 }
                                             }
                                         }
-                                        for rel in unified {
+                                        for (q_idx, rel) in unified.into_iter().enumerate() {
                                             {
                                                 let is_cur = s.active_infohash.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(&rel.infohash));
                                                 let qk = quality_short_label(&rel.quality);
@@ -1420,15 +1531,18 @@ pub fn PlayerView(
                                                 let meta_line = meta_parts.join(" · ");
                                                 let pick_cnt = rel.picked_by.len();
                                                 let rel_click = rel.clone();
-                                                let dl_el = render_quality_download_action(
+                                                let dl_el = render_quality_download_action(QualityDownloadAction {
                                                     rel,
                                                     is_cur,
-                                                    s.preloaded,
-                                                    dl_item,
-                                                    on_download_release,
+                                                    playing_preloaded: s.preloaded,
+                                                    dl: dl_item,
+                                                    on_download: on_download_release,
                                                     on_cancel_download,
                                                     on_switch_to_disk,
-                                                );
+                                                    tip,
+                                                    slot: 100 + q_idx as u32,
+                                                });
+                                                let q_st_slot = 300 + q_idx as u32;
                                                 let mut row_cls = String::from("p-opt p-q-row");
                                                 if is_cur {
                                                     row_cls.push_str(" on");
@@ -1461,9 +1575,20 @@ pub fn PlayerView(
                                                                         span { class: "tag warn", "Другая озвучка" }
                                                                     }
                                                                     if is_ready {
-                                                                        span { class: "tag srv", "На сервере" }
+                                                                        span { class: "tag srv", "Скачан" }
                                                                     } else if let Some(dl) = dl_item.filter(|_| is_busy) {
-                                                                        span { class: "tag acc", title: "{dl.status_text()}", "{dl.compact_status_text()}" }
+                                                                        {
+                                                                            let st_tip = dl.status_text();
+                                                                            rsx! {
+                                                                                span {
+                                                                                    class: "tag acc",
+                                                                                    onmounted: move |e| tip.mount(q_st_slot, e.data()),
+                                                                                    onmouseenter: move |_| tip.show(q_st_slot, st_tip.clone()),
+                                                                                    onmouseleave: move |_| tip.hide(q_st_slot),
+                                                                                    "{dl.compact_status_text()}"
+                                                                                }
+                                                                            }
+                                                                        }
                                                                     }
                                                                     if pick_cnt > 0 {
                                                                         span { class: "tag acc", "👥 {pick_cnt}" }
@@ -1547,7 +1672,7 @@ pub fn PlayerView(
                                 "Воспроизведение, пауза, скорость и перемотка синхронизируются. Звук играет только на одном устройстве."
                             }
                             div { class: "p-sync-list",
-                                for m in s.sync_members.clone() {
+                                for (m_idx, m) in s.sync_members.clone().into_iter().enumerate() {
                                     {
                                         let is_self = !s.sync_client_id.is_empty() && m.client_id == s.sync_client_id;
                                         let has_sound = s.sync_sound_client_id.as_deref() == Some(m.client_id.as_str())
@@ -1581,6 +1706,8 @@ pub fn PlayerView(
                                         } else {
                                             format!("Переключить звук на «{}»", m.device)
                                         };
+                                        let sound_tip = sound_title.clone();
+                                        let sync_slot = 500 + m_idx as u32;
                                         let target_cid = m.client_id.clone();
                                         rsx! {
                                             div {
@@ -1598,8 +1725,12 @@ pub fn PlayerView(
                                                 }
                                                 button {
                                                     class: if has_sound { "p-sync-sound on" } else { "p-sync-sound" },
-                                                    title: "{sound_title}",
+                                                    "aria-label": "{sound_title}",
                                                     "aria-pressed": if has_sound { "true" } else { "false" },
+                                                    onmounted: move |e| tip.mount(sync_slot, e.data()),
+                                                    onmouseenter: move |_| tip.show(sync_slot, sound_tip.clone()),
+                                                    onmouseleave: move |_| tip.hide(sync_slot),
+                                                    onmousedown: move |_| tip.hide(sync_slot),
                                                     onclick: move |_| {
                                                         if let Some(cb) = on_sync_sound {
                                                             cb.call(target_cid.clone());
@@ -1615,16 +1746,33 @@ pub fn PlayerView(
                             }
                         } else {
                             h4 { "Серии · сезон {s.season}" }
-                            for e in s.episodes.clone() {
-                                button {
-                                    key: "e{e.number}",
-                                    class: if e.number == s.episode { "p-opt ep on" } else { "p-opt ep" },
-                                    onclick: move |_| on_episode.call(e.number),
-                                    span { "{e.number}. {e.title}" }
-                                    if e.watched {
-                                        span { class: "p-seen done", title: "Просмотрена", Icon { svg: icons::CHECK, class: "ic xs" } }
-                                    } else {
-                                        span { class: "p-seen", title: "Не просмотрена", "○" }
+                            for (e_idx, e) in s.episodes.clone().into_iter().enumerate() {
+                                {
+                                    let ep_slot = 700 + e_idx as u32;
+                                    rsx! {
+                                        button {
+                                            key: "e{e.number}",
+                                            class: if e.number == s.episode { "p-opt ep on" } else { "p-opt ep" },
+                                            onclick: move |_| on_episode.call(e.number),
+                                            span { "{e.number}. {e.title}" }
+                                            if e.watched {
+                                                span {
+                                                    class: "p-seen done",
+                                                    onmounted: move |ev| tip.mount(ep_slot, ev.data()),
+                                                    onmouseenter: move |_| tip.show(ep_slot, "Просмотрена"),
+                                                    onmouseleave: move |_| tip.hide(ep_slot),
+                                                    Icon { svg: icons::CHECK, class: "ic xs" }
+                                                }
+                                            } else {
+                                                span {
+                                                    class: "p-seen",
+                                                    onmounted: move |ev| tip.mount(ep_slot, ev.data()),
+                                                    onmouseenter: move |_| tip.show(ep_slot, "Не просмотрена"),
+                                                    onmouseleave: move |_| tip.hide(ep_slot),
+                                                    "○"
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1632,6 +1780,7 @@ pub fn PlayerView(
                     }
                 }
             }
+            TooltipLayer { host: tip_host }
         }
     }
 }
@@ -1723,6 +1872,7 @@ mod tests {
             requested_at: chrono::Utc::now(),
             ready_at: None,
             delete_after: None,
+            watched: false,
             poster_path: None,
             media_title: Some("Матрица".into()),
             quality: Some("1080p".into()),

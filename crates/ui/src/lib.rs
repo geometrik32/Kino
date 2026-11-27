@@ -19,6 +19,9 @@ use kino_core::{
 /// The stylesheet all components rely on.
 pub const STYLE: &str = include_str!("style.css");
 
+/// Lightweight Material 3 motion script (ripples, bottom-sheet drag, smooth theme wave & image fade).
+pub const MOTION_SCRIPT: &str = include_str!("motion.js");
+
 /// Browser tab favicon: pure turquoise ring adapting to light/dark chrome.
 pub const FAVICON_URI: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cstyle%3Ecircle%7Bstroke:%230B6B65%7D@media(prefers-color-scheme:dark)%7Bcircle%7Bstroke:%2338C6BD%7D%7D%3C/style%3E%3Ccircle cx='16' cy='16' r='10.5' fill='none' stroke-width='5'/%3E%3C/svg%3E";
 
@@ -26,10 +29,12 @@ mod account;
 pub mod icons;
 mod player;
 mod releases;
+mod tooltip;
 pub use account::*;
 pub use icons::{seeder_signal, Icon};
 pub use player::*;
 pub use releases::*;
+use tooltip::{clear_active_tooltip, provide_tooltip_host, use_tip, ScrollTitle, TooltipLayer};
 
 /// Large brand mark (smooth eagle profile inside a turquoise film-reel ring).
 #[component]
@@ -77,12 +82,15 @@ impl Tab {
         }
     }
 
-    fn icon_svg(self) -> &'static str {
-        match self {
-            Tab::Home => icons::HOME,
-            Tab::Search => icons::SEARCH,
-            Tab::Mine => icons::BOOKMARK,
-            Tab::Profile => icons::HOME,
+    fn icon_svg(self, active: bool) -> &'static str {
+        match (self, active) {
+            (Tab::Home, true) => icons::HOME_FILLED,
+            (Tab::Home, false) => icons::HOME,
+            (Tab::Search, true) => icons::SEARCH_ACTIVE,
+            (Tab::Search, false) => icons::SEARCH,
+            (Tab::Mine, true) => icons::BOOKMARK_FILLED,
+            (Tab::Mine, false) => icons::BOOKMARK,
+            (Tab::Profile, _) => icons::HOME,
         }
     }
 }
@@ -273,6 +281,7 @@ pub fn DesktopDragStrip(chrome: WindowChrome) -> Element {
 /// Minimal Antigravity-style window caption buttons anchored to the top-right corner on Desktop.
 #[component]
 pub fn WindowControls(chrome: WindowChrome) -> Element {
+    let tip = use_tip();
     let max_title = if chrome.maximized {
         "Восстановить"
     } else {
@@ -285,24 +294,33 @@ pub fn WindowControls(chrome: WindowChrome) -> Element {
             button {
                 class: "win-btn",
                 r#type: "button",
-                title: "Свернуть",
                 "aria-label": "Свернуть",
+                onmounted: move |e| tip.mount(0, e.data()),
+                onmouseenter: move |_| tip.show(0, "Свернуть"),
+                onmouseleave: move |_| tip.hide(0),
+                onmousedown: move |_| tip.hide(0),
                 onclick: move |_| chrome.on_minimize.call(()),
                 Icon { svg: icons::WIN_MIN, class: "ic win-ic" }
             }
             button {
                 class: "win-btn",
                 r#type: "button",
-                title: "{max_title}",
                 "aria-label": "{max_title}",
+                onmounted: move |e| tip.mount(1, e.data()),
+                onmouseenter: move |_| tip.show(1, max_title),
+                onmouseleave: move |_| tip.hide(1),
+                onmousedown: move |_| tip.hide(1),
                 onclick: move |_| chrome.on_toggle_maximize.call(()),
                 Icon { svg: if chrome.maximized { icons::WIN_RESTORE } else { icons::WIN_MAX }, class: "ic win-ic" }
             }
             button {
                 class: "win-btn close",
                 r#type: "button",
-                title: "Закрыть",
                 "aria-label": "Закрыть",
+                onmounted: move |e| tip.mount(2, e.data()),
+                onmouseenter: move |_| tip.show(2, "Закрыть"),
+                onmouseleave: move |_| tip.hide(2),
+                onmousedown: move |_| tip.hide(2),
                 onclick: move |_| chrome.on_close.call(()),
                 Icon { svg: icons::WIN_CLOSE, class: "ic win-ic" }
             }
@@ -327,6 +345,8 @@ pub fn Shell(
     on_query: EventHandler<String>,
     children: Element,
 ) -> Element {
+    let tip_host = provide_tooltip_host();
+    let tip = use_tip();
     let is_search_tab = tab == Some(Tab::Search);
     let has_query = !query.is_empty();
     let header_cls = match (is_search_tab, window_chrome.is_some()) {
@@ -338,6 +358,7 @@ pub fn Shell(
     rsx! {
         header {
             class: "{header_cls}",
+            onmounted: move |e| tip_host.mount_root(e.data()),
             onmousedown: move |e| {
                 if let Some(chrome) = &window_chrome {
                     if e.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
@@ -369,8 +390,11 @@ pub fn Shell(
                         button {
                             class: "clear-x",
                             r#type: "button",
-                            title: "Очистить поиск",
                             "aria-label": "Очистить поиск",
+                            onmounted: move |e| tip.mount(0, e.data()),
+                            onmouseenter: move |_| tip.show(0, "Очистить поиск"),
+                            onmouseleave: move |_| tip.hide(0),
+                            onmousedown: move |_| tip.hide(0),
                             onclick: move |e| {
                                 e.prevent_default();
                                 e.stop_propagation();
@@ -386,17 +410,28 @@ pub fn Shell(
             div { class: "top-right",
                 button {
                     class: if tab == Some(Tab::Mine) { "top-icon-btn desktop-only active" } else { "top-icon-btn desktop-only" },
-                    title: "Мои",
                     "aria-label": "Мои",
-                    onmousedown: move |e| e.stop_propagation(),
+                    onmounted: move |e| tip.mount(1, e.data()),
+                    onmouseenter: move |_| tip.show(1, "Мои"),
+                    onmouseleave: move |_| tip.hide(1),
+                    onmousedown: move |e| {
+                        tip.hide(1);
+                        e.stop_propagation();
+                    },
                     onclick: move |_| on_tab.call(Tab::Mine),
-                    Icon { svg: icons::BOOKMARK, class: "ic sm" }
+                    Icon { svg: if tab == Some(Tab::Mine) { icons::BOOKMARK_FILLED } else { icons::BOOKMARK }, class: "ic sm" }
                 }
                 if let Some(pct) = dl_percent {
                     button {
                         class: "dl-pill",
-                        title: "Активная загрузка на сервер",
-                        onmousedown: move |e| e.stop_propagation(),
+                        "aria-label": "Активная загрузка на сервер",
+                        onmounted: move |e| tip.mount(2, e.data()),
+                        onmouseenter: move |_| tip.show(2, "Активная загрузка на сервер"),
+                        onmouseleave: move |_| tip.hide(2),
+                        onmousedown: move |e| {
+                            tip.hide(2);
+                            e.stop_propagation();
+                        },
                         onclick: move |_| on_tab.call(Tab::Profile),
                         Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                         "{pct}%"
@@ -404,9 +439,14 @@ pub fn Shell(
                 }
                 button {
                     class: if tab == Some(Tab::Profile) { "tg-avatar desktop-only active" } else { "tg-avatar desktop-only" },
-                    title: "Профиль",
                     "aria-label": "Профиль",
-                    onmousedown: move |e| e.stop_propagation(),
+                    onmounted: move |e| tip.mount(3, e.data()),
+                    onmouseenter: move |_| tip.show(3, "Профиль"),
+                    onmouseleave: move |_| tip.hide(3),
+                    onmousedown: move |e| {
+                        tip.hide(3);
+                        e.stop_propagation();
+                    },
                     onclick: move |_| on_tab.call(Tab::Profile),
                     AvatarContent { initial: user_initial.clone(), url: avatar_url.clone(), alt: "Профиль".to_owned() }
                 }
@@ -442,8 +482,11 @@ pub fn Shell(
                             if let Some(cb) = on_dismiss_update {
                                 button {
                                     class: "btn glass sm",
-                                    title: "Позже",
                                     "aria-label": "Позже",
+                                    onmounted: move |e| tip.mount(4, e.data()),
+                                    onmouseenter: move |_| tip.show(4, "Позже"),
+                                    onmouseleave: move |_| tip.hide(4),
+                                    onmousedown: move |_| tip.hide(4),
                                     onclick: move |_| cb.call(()),
                                     Icon { svg: icons::CLOSE, class: "ic xs" }
                                 }
@@ -460,24 +503,28 @@ pub fn Shell(
                     button {
                         class: if tab == Some(t) { "active" } else { "" },
                         onclick: move |_| on_tab.call(t),
-                        Icon { svg: t.icon_svg(), class: "ic lg" }
-                        span { "{t.label()}" }
+                        span { class: "tab-pill",
+                            Icon { svg: t.icon_svg(tab == Some(t)), class: "ic lg" }
+                        }
+                        span { class: "tab-lbl", "{t.label()}" }
                     }
                 }
                 button {
                     class: if tab == Some(Tab::Profile) { "tab-profile active" } else { "tab-profile" },
-                    title: "Профиль",
                     "aria-label": "Профиль",
                     onclick: move |_| on_tab.call(Tab::Profile),
-                    if dl_percent.is_some() {
-                        span { class: "tab-dot" }
-                    }
-                    span { class: "tab-avatar",
-                        AvatarContent { initial: user_initial, url: avatar_url, alt: "Профиль".to_owned() }
+                    span { class: "tab-pill tab-pill-avatar",
+                        if dl_percent.is_some() {
+                            span { class: "tab-dot" }
+                        }
+                        span { class: "tab-avatar",
+                            AvatarContent { initial: user_initial, url: avatar_url, alt: "Профиль".to_owned() }
+                        }
                     }
                 }
             }
         }
+        TooltipLayer { host: tip_host }
     }
 }
 
@@ -493,9 +540,35 @@ fn peer_summary_line(p: &PeerBadge) -> String {
         parts.push(st.label().to_lowercase());
     }
     if let Some(r) = p.rating {
-        parts.push(format!("{}★", format_rating_short(r)));
+        parts.push(format!("★ {}", format_rating_short(r)));
     }
     parts.join(" · ")
+}
+
+fn peer_card_chip(peers: &[PeerBadge]) -> Option<(&'static str, String)> {
+    let relevant: Vec<&PeerBadge> = peers
+        .iter()
+        .filter(|p| p.watching_now || p.status == Some(TitleStatus::Watched) || p.rating.is_some())
+        .collect();
+    if relevant.is_empty() {
+        return None;
+    }
+    let label = if relevant.iter().any(|p| p.rating.is_some_and(|r| r >= 4.0)) {
+        "Советуют"
+    } else if relevant
+        .iter()
+        .any(|p| p.status == Some(TitleStatus::Watched) || p.rating.is_some())
+    {
+        "Смотрели"
+    } else {
+        "Смотрят"
+    };
+    let tip = relevant
+        .iter()
+        .map(|p| peer_summary_line(p))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((label, tip))
 }
 
 #[component]
@@ -506,26 +579,31 @@ pub fn PosterCard(
     #[props(default)] rating_tooltip: Option<String>,
     on_open: EventHandler<TitleSummary>,
 ) -> Element {
+    let tip = use_tip();
     let sub = match item.year {
         Some(y) => format!("{} · {y}", kind_label(item.kind)),
         None => kind_label(item.kind).to_owned(),
     };
     let rate = rating(&item);
     let eff_status = status_badge.or(if hide_status_badge { None } else { item.user_status });
-    let peer_tip = if item.peers.is_empty() {
-        String::new()
+    let is_watched = eff_status == Some(TitleStatus::Watched);
+    let peer_chip = peer_card_chip(&item.peers);
+    let has_dots = item.preloaded || is_watched || peer_chip.is_some();
+    let watched_tip = if item.kind == MediaKind::Tv {
+        "Вы уже посмотрели этот сериал"
     } else {
-        item.peers.iter().map(peer_summary_line).collect::<Vec<_>>().join("\n")
+        "Вы уже посмотрели этот фильм"
     };
-    let any_live = item.peers.iter().any(|p| p.watching_now);
-    let peer_count = item.peers.len();
+    let dl_tip = "Скачан на сервер — запускается мгновенно";
     let href = title_href(item.kind, item.tmdb_id);
     let it = item.clone();
     rsx! {
         a {
             class: "poster",
             href: "{href}",
+            onmousedown: move |_| tip.hide_all(),
             onclick: move |e: Event<MouseData>| {
+                tip.hide_all();
                 if is_plain_primary_click(&e) {
                     e.prevent_default();
                     on_open.call(it.clone());
@@ -538,56 +616,107 @@ pub fn PosterCard(
                 } else {
                     div { class: "placeholder", style: "background: {fallback_bg(item.tmdb_id)}", "{item.title}" }
                 }
-                match eff_status {
-                    Some(TitleStatus::Want) => rsx! {
-                        span { class: "p-badge status want", title: "Хочу посмотреть",
-                            Icon { svg: icons::BOOKMARK, class: "ic sm" }
+                if has_dots {
+                    div { class: "p-dots",
+                        if item.preloaded {
+                            span {
+                                class: "p-dot dl",
+                                onmounted: move |e| tip.mount(0, e.data()),
+                                onmouseenter: move |_| tip.show(0, dl_tip),
+                                onmouseleave: move |_| tip.hide(0),
+                            }
                         }
-                    },
-                    Some(TitleStatus::Watching) => rsx! {
-                        span { class: "p-badge status watching", title: "Смотрю",
-                            Icon { svg: icons::PLAY, class: "ic xs" }
+                        if is_watched {
+                            span {
+                                class: "p-dot seen",
+                                onmounted: move |e| tip.mount(1, e.data()),
+                                onmouseenter: move |_| tip.show(1, watched_tip),
+                                onmouseleave: move |_| tip.hide(1),
+                            }
                         }
-                    },
-                    Some(TitleStatus::WaitingEpisode | TitleStatus::WaitingRelease) => rsx! {
-                        span { class: "p-badge status waiting", title: eff_status.map_or("", TitleStatus::label),
-                            Icon { svg: icons::CLOCK, class: "ic sm" }
+                        if let Some((_, ref peer_tip)) = peer_chip {
+                            {
+                                let p_tip = peer_tip.clone();
+                                rsx! {
+                                    span {
+                                        class: "p-dot peers",
+                                        onmounted: move |e| tip.mount(2, e.data()),
+                                        onmouseenter: move |_| tip.show(2, p_tip.clone()),
+                                        onmouseleave: move |_| tip.hide(2),
+                                    }
+                                }
+                            }
                         }
-                    },
-                    _ => rsx! {},
+                    }
                 }
                 if let Some(ur) = item.user_rating.filter(|r| *r > 0.0) {
                     {
-                        let tip = rating_tooltip.as_deref().unwrap_or("Моя оценка");
+                        let r_txt = format_rating_short(ur);
+                        let r_tip = match rating_tooltip.as_deref() {
+                            Some(prefix) => format!("{prefix}: ★ {r_txt} из 5"),
+                            None => format!("Моя оценка: ★ {r_txt} из 5"),
+                        };
                         rsx! {
-                            span { class: "p-badge rate mine", title: "{tip}",
-                                "★ {format_rating_short(ur)}"
+                            span {
+                                class: "p-badge rate mine",
+                                onmounted: move |e| tip.mount(3, e.data()),
+                                onmouseenter: move |_| tip.show(3, r_tip.clone()),
+                                onmouseleave: move |_| tip.hide(3),
+                                "★ {r_txt}"
                             }
                         }
                     }
                 } else if let Some(r) = rate {
-                    span { class: "p-badge rate", "{r}" }
-                }
-                if peer_count > 0 {
-                    span {
-                        class: if any_live { "p-badge peers live" } else { "p-badge peers" },
-                        title: "{peer_tip}",
-                        Icon { svg: icons::USERS, class: "ic xs" }
-                        if peer_count > 1 || any_live {
-                            span { "{peer_count}" }
+                    {
+                        let r_tip = format!("Рейтинг IMDb / TMDB: {r} из 10");
+                        rsx! {
+                            span {
+                                class: "p-badge rate",
+                                onmounted: move |e| tip.mount(4, e.data()),
+                                onmouseenter: move |_| tip.show(4, r_tip.clone()),
+                                onmouseleave: move |_| tip.hide(4),
+                                "{r}"
+                            }
                         }
                     }
                 }
-                if item.preloaded {
-                    span {
-                        class: "p-badge preloaded",
-                        title: "Скачано на сервер — запускается мгновенно",
-                        Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+            }
+            ScrollTitle { title: item.title.clone() }
+            div { class: "sub", "{sub}" }
+            if has_dots {
+                div { class: "p-chips",
+                    if item.preloaded {
+                        span {
+                            class: "p-chip dl",
+                            onmounted: move |e| tip.mount(5, e.data()),
+                            onmouseenter: move |_| tip.show(5, dl_tip),
+                            onmouseleave: move |_| tip.hide(5),
+                            span { class: "p-chip-dot" }
+                            span { "Скачан" }
+                        }
+                    }
+                    if is_watched {
+                        span {
+                            class: "p-chip seen",
+                            onmounted: move |e| tip.mount(6, e.data()),
+                            onmouseenter: move |_| tip.show(6, watched_tip),
+                            onmouseleave: move |_| tip.hide(6),
+                            span { class: "p-chip-dot" }
+                            span { "Просмотрен" }
+                        }
+                    }
+                    if let Some((peer_lbl, peer_tip)) = peer_chip {
+                        span {
+                            class: "p-chip peers",
+                            onmounted: move |e| tip.mount(7, e.data()),
+                            onmouseenter: move |_| tip.show(7, peer_tip.clone()),
+                            onmouseleave: move |_| tip.hide(7),
+                            span { class: "p-chip-dot" }
+                            span { "{peer_lbl}" }
+                        }
                     }
                 }
             }
-            div { class: "name", "{item.title}" }
-            div { class: "sub", "{sub}" }
         }
     }
 }
@@ -602,6 +731,7 @@ pub fn ContinueCard(
     #[props(default)] on_open: Option<EventHandler<(MediaKind, i64)>>,
 ) -> Element {
     let mut menu_open = use_signal(|| false);
+    let tip = use_tip();
     let p = &item.last;
     let name = item
         .title
@@ -665,9 +795,13 @@ pub fn ContinueCard(
                         a {
                             class: "glass-circle",
                             href: "{href}",
-                            title: "Открыть страницу",
                             "aria-label": "Открыть страницу",
+                            onmounted: move |e| tip.mount(0, e.data()),
+                            onmouseenter: move |_| tip.show(0, "Открыть страницу"),
+                            onmouseleave: move |_| tip.hide(0),
+                            onmousedown: move |_| tip.hide(0),
                             onclick: move |e: Event<MouseData>| {
+                                tip.hide(0);
                                 e.stop_propagation();
                                 if is_plain_primary_click(&e) {
                                     e.prevent_default();
@@ -681,9 +815,13 @@ pub fn ContinueCard(
                     }
                     button {
                         class: "glass-circle",
-                        title: "Действия",
                         "aria-label": "Действия",
+                        onmounted: move |e| tip.mount(1, e.data()),
+                        onmouseenter: move |_| tip.show(1, "Действия"),
+                        onmouseleave: move |_| tip.hide(1),
+                        onmousedown: move |_| tip.hide(1),
                         onclick: move |e| {
+                            tip.hide(1);
                             e.stop_propagation();
                             menu_open.toggle();
                         },
@@ -744,7 +882,7 @@ pub fn ContinueCard(
                         }
                     },
                     onauxclick: handle_aux_click,
-                    "{name}"
+                    ScrollTitle { title: name, class: "cw-title-scroll".to_owned() }
                 }
                 if item.stale {
                     button {
@@ -776,6 +914,7 @@ pub fn ScrollRow(
     let mut can_prev = use_signal(|| false);
     let mut can_next = use_signal(|| false);
     let mut restored = use_signal(|| false);
+    let tip = use_tip();
 
     // Re-measure overflow whenever items change (e.g. after appending page 2).
     use_effect(use_reactive((&items_len,), move |_| {
@@ -828,8 +967,11 @@ pub fn ScrollRow(
             if can_prev() {
                 button {
                     class: "row-nav prev",
-                    title: "Прокрутить назад",
                     "aria-label": "Прокрутить назад",
+                    onmounted: move |e| tip.mount(0, e.data()),
+                    onmouseenter: move |_| tip.show(0, "Прокрутить назад"),
+                    onmouseleave: move |_| tip.hide(0),
+                    onmousedown: move |_| tip.hide(0),
                     onclick: move |_| scroll_by(-1.0),
                     Icon { svg: icons::CHEV_L, class: "ic" }
                 }
@@ -859,6 +1001,7 @@ pub fn ScrollRow(
                     }
                 },
                 onscroll: move |e| {
+                    clear_active_tooltip();
                     let left = e.scroll_left();
                     if let Some(cb) = on_scroll_left {
                         cb.call(left);
@@ -884,8 +1027,11 @@ pub fn ScrollRow(
             if can_next() || has_more {
                 button {
                     class: "row-nav next",
-                    title: "Прокрутить вперёд",
                     "aria-label": "Прокрутить вперёд",
+                    onmounted: move |e| tip.mount(1, e.data()),
+                    onmouseenter: move |_| tip.show(1, "Прокрутить вперёд"),
+                    onmouseleave: move |_| tip.hide(1),
+                    onmousedown: move |_| tip.hide(1),
                     onclick: move |_| scroll_by(1.0),
                     Icon { svg: icons::CHEV_R, class: "ic" }
                 }
@@ -1523,6 +1669,7 @@ pub fn TitleView(
     #[props(default)] on_external: Option<EventHandler<String>>,
 ) -> Element {
     let mut rewatch_open = use_signal(|| false);
+    let tip = use_tip();
     let s = &details.summary;
     let (target, play_label) = play_target(&details, &progress);
     let current = progress
@@ -1664,9 +1811,13 @@ pub fn TitleView(
                             }
                         }
                         if s.preloaded {
-                            span { class: "proj-pill ready", title: "Готово на диске сервера — запускается без буферизации",
+                            span {
+                                class: "proj-pill ready",
+                                onmounted: move |e| tip.mount(0, e.data()),
+                                onmouseenter: move |_| tip.show(0, "Скачан на сервер — запускается мгновенно"),
+                                onmouseleave: move |_| tip.hide(0),
                                 Icon { svg: icons::DOWNLOAD, class: "ic xs" }
-                                "На сервере"
+                                "Скачан"
                             }
                         }
                         for m in meta { span { "{m}" } }
@@ -1738,9 +1889,12 @@ pub fn TitleView(
                                         }
                                         button {
                                             class: if rewatch_open() { "play-split-toggle open" } else { "play-split-toggle" },
-                                            title: "Режим запуска",
                                             "aria-label": "Режим запуска",
                                             "aria-expanded": "{rewatch_open()}",
+                                            onmounted: move |e| tip.mount(1, e.data()),
+                                            onmouseenter: move |_| tip.show(1, "Режим запуска"),
+                                            onmouseleave: move |_| tip.hide(1),
+                                            onmousedown: move |_| tip.hide(1),
                                             onclick: move |_| rewatch_open.toggle(),
                                             Icon { svg: icons::CHEV_D, class: "ic sm" }
                                         }
@@ -1819,7 +1973,10 @@ pub fn TitleView(
                         }
                         button {
                             class: "rel-cta-btn",
-                            title: "Сменить раздачу",
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, "Сменить раздачу"),
+                            onmouseleave: move |_| tip.hide(2),
+                            onmousedown: move |_| tip.hide(2),
                             onclick: move |_| on_change_release.call(t_rel.clone()),
                             span { class: "rel-cta-l",
                                 Icon { svg: icons::SWAP, class: "ic sm" }
@@ -1948,9 +2105,11 @@ pub fn TitleView(
                                     if srv_in_s > 0 {
                                         span {
                                             class: "sec-sub srv",
-                                            title: "Скачано на сервер в этом сезоне",
+                                            onmounted: move |e| tip.mount(3, e.data()),
+                                            onmouseenter: move |_| tip.show(3, "Скачано серий на сервер в этом сезоне"),
+                                            onmouseleave: move |_| tip.hide(3),
                                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
-                                            "{srv_in_s} на сервере"
+                                            "{srv_in_s} скачано"
                                         }
                                     }
                                     if s_num > 0 {
@@ -1964,7 +2123,10 @@ pub fn TitleView(
                                             rsx! {
                                                 button {
                                                     class: if s_rel_active { "chip sm active" } else { "chip sm" },
-                                                    title: "Выбрать раздачу для этого сезона",
+                                                    onmounted: move |e| tip.mount(4, e.data()),
+                                                    onmouseenter: move |_| tip.show(4, "Выбрать раздачу для этого сезона"),
+                                                    onmouseleave: move |_| tip.hide(4),
+                                                    onmousedown: move |_| tip.hide(4),
                                                     onclick: move |_| {
                                                         if let Some(cb) = on_sr {
                                                             cb.call(s_num);
@@ -2213,8 +2375,8 @@ fn episode_download_info(downloads: &[PreloadItem], season: i32, episode: i32) -
                 EpisodeDownloadInfo {
                     preload_id: p.id,
                     state: PreloadState::Ready,
-                    compact_text: "На сервере".to_owned(),
-                    status_text: "На сервере".to_owned(),
+                    compact_text: "Скачан".to_owned(),
+                    status_text: "Скачан".to_owned(),
                     quality: p.quality_short().map(str::to_owned),
                     voice: p.voice.clone(),
                     size_bytes: sz,
@@ -2331,6 +2493,7 @@ fn EpisodeRow(
     #[props(default)] on_cancel_download: Option<EventHandler<(i64, i32, i32)>>,
 ) -> Element {
     let mut confirm_del = use_signal(|| false);
+    let tip = use_tip();
     let mut sub = Vec::new();
     if let Some(m) = runtime_min {
         sub.push(format!("{m} мин"));
@@ -2377,7 +2540,10 @@ fn EpisodeRow(
         div { class: if current { "ep-card current" } else { "ep-card" },
             button {
                 class: "ep-still",
-                title: "Смотреть серию {number}",
+                onmounted: move |e| tip.mount(0, e.data()),
+                onmouseenter: move |_| tip.show(0, format!("Смотреть серию {number}")),
+                onmouseleave: move |_| tip.hide(0),
+                onmousedown: move |_| tip.hide(0),
                 onclick: move |_| on_play.call(target.clone()),
                 if let Some(sp) = &still_path {
                     img { src: image_url(sp, ImageSize::Still), alt: "{name}", loading: "lazy" }
@@ -2410,29 +2576,43 @@ fn EpisodeRow(
                             }
                         } else if let Some(dl) = &download {
                             {
-                                let tip = dl_tooltip.clone().unwrap_or_default();
+                                let dl_tip = dl_tooltip.clone().unwrap_or_default();
                                 match dl.state {
                                     PreloadState::Ready => {
                                         let sz_txt = dl.size_bytes.filter(|&b| b > 0).map(|b| human_size(b as u64));
                                         let lbl = match sz_txt {
-                                            Some(sz) => format!("На сервере · {sz}"),
-                                            None => "На сервере".to_owned(),
+                                            Some(sz) => format!("Скачан · {sz}"),
+                                            None => "Скачан".to_owned(),
                                         };
                                         rsx! {
-                                            span { class: "ep-dl-pill ready", title: "{tip}",
+                                            span {
+                                                class: "ep-dl-pill ready",
+                                                onmounted: move |e| tip.mount(1, e.data()),
+                                                onmouseenter: move |_| tip.show(1, dl_tip.clone()),
+                                                onmouseleave: move |_| tip.hide(1),
                                                 Icon { svg: icons::CHECK, class: "ic xs" }
                                                 "{lbl}"
                                             }
                                         }
                                     }
                                     PreloadState::Queued | PreloadState::Downloading => rsx! {
-                                        span { class: "ep-dl-pill busy", title: "{tip}",
+                                        span {
+                                            class: "ep-dl-pill busy",
+                                            onmounted: move |e| tip.mount(1, e.data()),
+                                            onmouseenter: move |_| tip.show(1, dl_tip.clone()),
+                                            onmouseleave: move |_| tip.hide(1),
                                             Icon { svg: icons::DOWNLOAD, class: "ic xs" }
                                             "{dl.compact_text}"
                                         }
                                     },
                                     PreloadState::Failed => rsx! {
-                                        span { class: "ep-dl-pill fail", title: "{tip}", "Ошибка загрузки" }
+                                        span {
+                                            class: "ep-dl-pill fail",
+                                            onmounted: move |e| tip.mount(1, e.data()),
+                                            onmouseenter: move |_| tip.show(1, dl_tip.clone()),
+                                            onmouseleave: move |_| tip.hide(1),
+                                            "Ошибка загрузки"
+                                        }
                                     },
                                     PreloadState::Deleted => rsx! {},
                                 }
@@ -2464,8 +2644,10 @@ fn EpisodeRow(
                     if download_starting {
                         button {
                             class: "round-act busy",
-                            title: "Запуск загрузки серии на сервер…",
                             "aria-label": "Запуск загрузки серии на сервер",
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, "Запуск загрузки серии на сервер…"),
+                            onmouseleave: move |_| tip.hide(2),
                             disabled: true,
                             Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                         }
@@ -2476,16 +2658,19 @@ fn EpisodeRow(
                                 if dl.can_delete {
                                     if let Some(cb) = on_cancel_download {
                                         let confirm = confirm_del();
-                                        let tip = if confirm {
+                                        let tip_txt = if confirm {
                                             "Нажмите ещё раз, чтобы удалить серию с сервера"
                                         } else {
-                                            "Скачано на сервер (нажмите для удаления)"
+                                            "Скачан на сервер (нажмите для удаления)"
                                         };
                                         rsx! {
                                             button {
                                                 class: if confirm { "round-act danger-confirm" } else { "round-act srv" },
-                                                title: "{tip}",
-                                                "aria-label": "{tip}",
+                                                "aria-label": "{tip_txt}",
+                                                onmounted: move |e| tip.mount(2, e.data()),
+                                                onmouseenter: move |_| tip.show(2, tip_txt),
+                                                onmouseleave: move |_| tip.hide(2),
+                                                onmousedown: move |_| tip.hide(2),
                                                 onblur: move |_| confirm_del.set(false),
                                                 onclick: move |_| {
                                                     if *confirm_del.peek() {
@@ -2500,18 +2685,26 @@ fn EpisodeRow(
                                         }
                                     } else {
                                         rsx! {
-                                            span { class: "round-act srv ro", title: "Скачано на сервер",
+                                            span {
+                                                class: "round-act srv ro",
+                                                onmounted: move |e| tip.mount(2, e.data()),
+                                                onmouseenter: move |_| tip.show(2, "Скачан на сервер"),
+                                                onmouseleave: move |_| tip.hide(2),
                                                 Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                                             }
                                         }
                                     }
                                 } else {
-                                    let tip = match &dl.requested_by {
-                                        Some(who) => format!("Скачано на сервер ({who})"),
-                                        None => "Скачано на сервер".to_owned(),
+                                    let tip_txt = match &dl.requested_by {
+                                        Some(who) => format!("Скачан на сервер ({who})"),
+                                        None => "Скачан на сервер".to_owned(),
                                     };
                                     rsx! {
-                                        span { class: "round-act srv ro", title: "{tip}",
+                                        span {
+                                            class: "round-act srv ro",
+                                            onmounted: move |e| tip.mount(2, e.data()),
+                                            onmouseenter: move |_| tip.show(2, tip_txt.clone()),
+                                            onmouseleave: move |_| tip.hide(2),
                                             Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                                         }
                                     }
@@ -2522,7 +2715,7 @@ fn EpisodeRow(
                                 if dl.can_delete {
                                     if let Some(cb) = on_cancel_download {
                                         let confirm = confirm_del();
-                                        let tip = if confirm {
+                                        let tip_txt = if confirm {
                                             "Нажмите ещё раз, чтобы отменить скачивание серии"
                                         } else {
                                             "Скачивается на сервер (нажмите для отмены)"
@@ -2530,8 +2723,11 @@ fn EpisodeRow(
                                         rsx! {
                                             button {
                                                 class: if confirm { "round-act danger-confirm" } else { "round-act busy" },
-                                                title: "{tip}",
-                                                "aria-label": "{tip}",
+                                                "aria-label": "{tip_txt}",
+                                                onmounted: move |e| tip.mount(2, e.data()),
+                                                onmouseenter: move |_| tip.show(2, tip_txt),
+                                                onmouseleave: move |_| tip.hide(2),
+                                                onmousedown: move |_| tip.hide(2),
                                                 onblur: move |_| confirm_del.set(false),
                                                 onclick: move |_| {
                                                     if *confirm_del.peek() {
@@ -2545,15 +2741,25 @@ fn EpisodeRow(
                                             }
                                         }
                                     } else {
+                                        let st_txt = dl.status_text.clone();
                                         rsx! {
-                                            span { class: "round-act busy ro", title: "{dl.status_text}",
+                                            span {
+                                                class: "round-act busy ro",
+                                                onmounted: move |e| tip.mount(2, e.data()),
+                                                onmouseenter: move |_| tip.show(2, st_txt.clone()),
+                                                onmouseleave: move |_| tip.hide(2),
                                                 Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                                             }
                                         }
                                     }
                                 } else {
+                                    let st_txt = dl.status_text.clone();
                                     rsx! {
-                                        span { class: "round-act busy ro", title: "{dl.status_text}",
+                                        span {
+                                            class: "round-act busy ro",
+                                            onmounted: move |e| tip.mount(2, e.data()),
+                                            onmouseenter: move |_| tip.show(2, st_txt.clone()),
+                                            onmouseleave: move |_| tip.hide(2),
                                             Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                                         }
                                     }
@@ -2564,8 +2770,11 @@ fn EpisodeRow(
                                     rsx! {
                                         button {
                                             class: "round-act",
-                                            title: "Повторить скачивание серии на сервер",
                                             "aria-label": "Скачать серию на сервер",
+                                            onmounted: move |e| tip.mount(2, e.data()),
+                                            onmouseenter: move |_| tip.show(2, "Повторить скачивание серии на сервер"),
+                                            onmouseleave: move |_| tip.hide(2),
+                                            onmousedown: move |_| tip.hide(2),
                                             onclick: move |_| cb.call(target_dl.clone()),
                                             Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                                         }
@@ -2578,23 +2787,32 @@ fn EpisodeRow(
                     } else if let (true, Some(cb)) = (season > 0, on_download) {
                         button {
                             class: "round-act",
-                            title: "Скачать серию на сервер",
                             "aria-label": "Скачать серию на сервер",
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, "Скачать серию на сервер"),
+                            onmouseleave: move |_| tip.hide(2),
+                            onmousedown: move |_| tip.hide(2),
                             onclick: move |_| cb.call(target_dl.clone()),
                             Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                         }
                     }
                     button {
                         class: "round-act",
-                        title: "Выбрать раздачу для этой серии",
                         "aria-label": "Выбрать раздачу для этой серии",
+                        onmounted: move |e| tip.mount(3, e.data()),
+                        onmouseenter: move |_| tip.show(3, "Выбрать раздачу для этой серии"),
+                        onmouseleave: move |_| tip.hide(3),
+                        onmousedown: move |_| tip.hide(3),
                         onclick: move |_| on_change_release.call(target_rel.clone()),
                         Icon { svg: icons::SWAP, class: "ic sm" }
                     }
                     button {
                         class: if done { "round-act done" } else { "round-act" },
-                        title: if done { "Снять отметку" } else { "Отметить просмотренной" },
                         "aria-label": if done { "Снять отметку" } else { "Отметить просмотренной" },
+                        onmounted: move |e| tip.mount(4, e.data()),
+                        onmouseenter: move |_| tip.show(4, if done { "Снять отметку" } else { "Отметить просмотренной" }),
+                        onmouseleave: move |_| tip.hide(4),
+                        onmousedown: move |_| tip.hide(4),
                         onclick: move |_| on_mark.call((season, vec![number], !done)),
                         Icon { svg: icons::CHECK, class: "ic sm" }
                     }
@@ -2709,6 +2927,7 @@ pub fn Stars(
     let mut hover = use_signal(|| None::<i16>);
     let mut popped = use_signal(|| None::<(i16, u32)>);
     let mut tick = use_signal(|| 0u32);
+    let tip = use_tip();
     let hovered = hover();
     let display_val = hovered
         .map(f32::from)
@@ -2723,7 +2942,10 @@ pub fn Stars(
             class: if compact { "rating-widget compact" } else { "rating-widget" },
             role: "radiogroup",
             "aria-label": "Ваша оценка",
-            onmouseleave: move |_| hover.set(None),
+            onmouseleave: move |_| {
+                hover.set(None);
+                tip.hide_all();
+            },
             if show_caption {
                 if let Some(h) = hovered {
                     div { class: "rating-tip", "{h}★ — {rating_description(h)}" }
@@ -2746,20 +2968,28 @@ pub fn Stars(
                             _ => "r-star",
                         };
                         let desc = rating_description(n);
-                        let tip = if rating == Some(n) {
+                        let tip_txt = if rating == Some(n) {
                             format!("{n}/5 — {desc} (нажмите, чтобы снять)")
                         } else {
                             format!("{n}/5 — {desc}")
                         };
+                        let slot = n as u32;
                         rsx! {
                             button {
                                 key: "{pop_key}",
                                 class: "{cls}",
                                 role: "radio",
                                 "aria-checked": if rating == Some(n) { "true" } else { "false" },
-                                title: "{tip}",
                                 "aria-label": "{n} из 5: {desc}",
-                                onmouseenter: move |_| hover.set(Some(n)),
+                                onmounted: move |e| tip.mount(slot, e.data()),
+                                onmouseenter: move |_| {
+                                    hover.set(Some(n));
+                                    if !show_caption {
+                                        tip.show(slot, tip_txt.clone());
+                                    }
+                                },
+                                onmouseleave: move |_| tip.hide(slot),
+                                onmousedown: move |_| tip.hide(slot),
                                 onclick: move |_| {
                                     let next = if rating == Some(n) { None } else { Some(n) };
                                     if let Some(v) = next {
@@ -2949,6 +3179,7 @@ mod tests {
             requested_at: now,
             ready_at: None,
             delete_after: None,
+            watched: false,
             poster_path: None,
             media_title: Some("Аутсорс".into()),
             quality: Some("1080p".into()),
@@ -2966,6 +3197,7 @@ mod tests {
                     episode_name: None,
                     ready_at: Some(now),
                     delete_after: None,
+                    watched: false,
                 },
                 kino_core::PreloadEpisodeItem {
                     season: 1,
@@ -2976,6 +3208,7 @@ mod tests {
                     episode_name: None,
                     ready_at: None,
                     delete_after: None,
+                    watched: false,
                 },
             ],
             requested_by: Some("A".into()),
@@ -2990,5 +3223,43 @@ mod tests {
         assert_eq!(ep8.state, PreloadState::Downloading);
 
         assert!(episode_download_info(&[partial], 1, 7).is_none());
+    }
+
+    #[test]
+    fn peer_card_chip_picks_accurate_label_and_tooltip() {
+        let peer = |name: &str, status: Option<TitleStatus>, rating: Option<f32>, watching_now| PeerBadge {
+            user_id: 1,
+            name: name.to_owned(),
+            avatar_url: None,
+            status,
+            rating,
+            watching_now,
+        };
+
+        // Want-only peers do not clutter poster cards.
+        assert_eq!(
+            peer_card_chip(&[peer("Анна", Some(TitleStatus::Want), None, false)]),
+            None
+        );
+
+        // High rating -> "Советуют" with details in tooltip.
+        let (lbl, tip) = peer_card_chip(&[
+            peer("Артём", Some(TitleStatus::Watched), Some(4.5), false),
+            peer("Лена", Some(TitleStatus::Watching), None, true),
+        ])
+        .expect("should produce peer chip");
+        assert_eq!(lbl, "Советуют");
+        assert!(tip.contains("Артём · просмотрено · ★ 4.5"));
+        assert!(tip.contains("Лена · смотрит сейчас"));
+
+        // Watched without high rating -> "Смотрели".
+        let (lbl, _) = peer_card_chip(&[peer("Олег", Some(TitleStatus::Watched), Some(3.0), false)])
+            .expect("watched peer should produce chip");
+        assert_eq!(lbl, "Смотрели");
+
+        // Actively watching -> "Смотрят".
+        let (lbl, _) = peer_card_chip(&[peer("Лена", Some(TitleStatus::Watching), None, true)])
+            .expect("live peer should produce chip");
+        assert_eq!(lbl, "Смотрят");
     }
 }

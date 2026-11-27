@@ -32,10 +32,10 @@ use kino_ui::{
     icons, play_target, AppUpdateUi, DesktopDragStrip, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection,
     MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
     SearchView, ShelfView, Shell, Tab, Theme, TitleExtrasView, TitleView, UpdateBanner, WindowChrome, WindowControls,
-    FAVICON_URI, STYLE,
+    FAVICON_URI, MOTION_SCRIPT, STYLE,
 };
 
-const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
+const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&display=swap";
 const THEME_KEY: &str = "kino.theme";
 const MY_FILTERS_KEY: &str = "kino.my_filters";
 
@@ -280,7 +280,7 @@ fn App() -> Element {
             let saved = platform::storage_get(THEME_KEY).await;
             let initial = Theme::parse(saved.as_deref(), in_tg);
             theme.set(initial);
-            platform::apply_theme(initial);
+            platform::apply_theme(initial, false);
             session.set(establish().await);
         });
     });
@@ -293,7 +293,7 @@ fn App() -> Element {
         } else {
             platform::storage_set(THEME_KEY, next.as_str());
         }
-        platform::apply_theme(next);
+        platform::apply_theme(next, true);
     };
 
     rsx! {
@@ -302,6 +302,7 @@ fn App() -> Element {
         document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
         document::Link { rel: "stylesheet", href: FONTS_URL, media: "print", onload: "this.media='all'" }
         style { "{STYLE}" }
+        script { "{MOTION_SCRIPT}" }
         match session() {
             Session::Checking => rsx! {
                 if let Some(chrome) = window_chrome.clone() {
@@ -1506,98 +1507,114 @@ fn Main(
                 }
                 query.set(q);
             },
-            match view() {
-                View::Tab(Tab::Home) => rsx! {
-                    Home {
-                        key: "home-{home_epoch()}",
-                        token: token.clone(),
-                        active_category: home_category,
-                        cache,
-                        on_open: open,
-                        on_open_title: move |(k, id)| open_title(k, id, false),
-                        on_play: move |(k, id)| open_title(k, id, true),
-                        on_open_shelf: open_shelf,
-                    }
-                },
-                View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, cache, on_open: open } },
-                View::Tab(Tab::Mine) => rsx! {
-                    Mine {
-                        token: token.clone(),
-                        section: my_section,
-                        filters: my_filters,
-                        cache,
-                        on_section: move |s: MySection| {
-                            my_section.set(s);
-                            telegram::replace_history(&view_url(&View::Tab(Tab::Mine), s, &query.peek()));
-                        },
-                        on_filters: move |f: MyFilters| {
-                            telegram::haptic(telegram::Haptic::Select);
-                            my_filters.set(f);
-                            platform::storage_set(MY_FILTERS_KEY, &f.encode());
-                        },
-                        on_open: open,
-                        on_open_id: move |(k, id)| open_title(k, id, false),
-                    }
-                },
-                View::Tab(Tab::Profile) => rsx! {
-                    Profile {
-                        token: token.clone(),
-                        name: name.clone(),
-                        avatar_url: avatar_url.clone(),
-                        theme,
-                        cache,
-                        app_version: updater::is_supported().then(|| updater::APP_VERSION.to_owned()),
-                        update_state: profile_update_ui.clone(),
-                        on_check_update: Some(on_check_update),
-                        on_install_update: Some(on_install_update),
-                        on_theme,
-                        on_preloads_changed: move |_| active_preloads.restart(),
-                        on_open: move |(k, id)| open_title(k, id, false),
-                        on_logout,
-                    }
-                },
-                View::Title {
-                    kind,
-                    id,
-                    autoplay,
-                    season,
-                    release,
-                } => {
-                    let s_key = season.unwrap_or(0);
-                    let r_key = release.as_deref().unwrap_or("");
-                    rsx! {
-                        Title {
-                            key: "{kind.as_str()}{id}{autoplay}{s_key}{r_key}",
-                            token: token.clone(),
-                            kind,
-                            id,
-                            autoplay,
-                            auto_season: season,
-                            auto_release: release,
-                            cache,
-                            window_chrome: window_chrome.clone(),
-                            on_preloads_changed: move |_| active_preloads.restart(),
-                            on_open: open,
-                            on_person: open_person,
-                            // Closing a player started directly from Home / deep-link returns to the previous screen.
-                            on_exit: move |from_pop: bool| {
-                                step_back(view, trail, query, scroll_req, from_pop);
+            {
+                let cur_view = view();
+                let stage_key = match &cur_view {
+                    View::Tab(Tab::Home) => format!("tab-home-{}", home_epoch()),
+                    View::Tab(Tab::Search) => "tab-search".to_owned(),
+                    View::Tab(Tab::Mine) => "tab-mine".to_owned(),
+                    View::Tab(Tab::Profile) => "tab-profile".to_owned(),
+                    View::Title { kind, id, .. } => format!("title-{}-{id}", kind.as_str()),
+                    View::Person(id) => format!("person-{id}"),
+                    View::Shelf { id, .. } => format!("shelf-{id}"),
+                };
+                rsx! {
+                    div { key: "{stage_key}", class: "view-stage",
+                        match cur_view {
+                            View::Tab(Tab::Home) => rsx! {
+                                Home {
+                                    key: "home-{home_epoch()}",
+                                    token: token.clone(),
+                                    active_category: home_category,
+                                    cache,
+                                    on_open: open,
+                                    on_open_title: move |(k, id)| open_title(k, id, false),
+                                    on_play: move |(k, id)| open_title(k, id, true),
+                                    on_open_shelf: open_shelf,
+                                }
+                            },
+                            View::Tab(Tab::Search) => rsx! { Search { token: token.clone(), query, cache, on_open: open } },
+                            View::Tab(Tab::Mine) => rsx! {
+                                Mine {
+                                    token: token.clone(),
+                                    section: my_section,
+                                    filters: my_filters,
+                                    cache,
+                                    on_section: move |s: MySection| {
+                                        my_section.set(s);
+                                        telegram::replace_history(&view_url(&View::Tab(Tab::Mine), s, &query.peek()));
+                                    },
+                                    on_filters: move |f: MyFilters| {
+                                        telegram::haptic(telegram::Haptic::Select);
+                                        my_filters.set(f);
+                                        platform::storage_set(MY_FILTERS_KEY, &f.encode());
+                                    },
+                                    on_open: open,
+                                    on_open_id: move |(k, id)| open_title(k, id, false),
+                                }
+                            },
+                            View::Tab(Tab::Profile) => rsx! {
+                                Profile {
+                                    token: token.clone(),
+                                    name: name.clone(),
+                                    avatar_url: avatar_url.clone(),
+                                    theme,
+                                    cache,
+                                    app_version: updater::is_supported().then(|| updater::APP_VERSION.to_owned()),
+                                    update_state: profile_update_ui.clone(),
+                                    on_check_update: Some(on_check_update),
+                                    on_install_update: Some(on_install_update),
+                                    on_theme,
+                                    on_preloads_changed: move |_| active_preloads.restart(),
+                                    on_open: move |(k, id)| open_title(k, id, false),
+                                    on_logout,
+                                }
+                            },
+                            View::Title {
+                                kind,
+                                id,
+                                autoplay,
+                                season,
+                                release,
+                            } => {
+                                let s_key = season.unwrap_or(0);
+                                let r_key = release.as_deref().unwrap_or("");
+                                rsx! {
+                                    Title {
+                                        key: "{kind.as_str()}{id}{autoplay}{s_key}{r_key}",
+                                        token: token.clone(),
+                                        kind,
+                                        id,
+                                        autoplay,
+                                        auto_season: season,
+                                        auto_release: release,
+                                        cache,
+                                        window_chrome: window_chrome.clone(),
+                                        on_preloads_changed: move |_| active_preloads.restart(),
+                                        on_open: open,
+                                        on_person: open_person,
+                                        // Closing a player started directly from Home / deep-link returns to the previous screen.
+                                        on_exit: move |from_pop: bool| {
+                                            step_back(view, trail, query, scroll_req, from_pop);
+                                        },
+                                    }
+                                }
+                            },
+                            View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, cache, on_open: open } },
+                            View::Shelf { id, title, subtitle } => rsx! {
+                                Shelf {
+                                    key: "shelf-{id}",
+                                    token: token.clone(),
+                                    id,
+                                    title,
+                                    subtitle,
+                                    cache,
+                                    on_open: open,
+                                }
                             },
                         }
                     }
-                },
-                View::Person(id) => rsx! { Person { key: "person{id}", token: token.clone(), id, cache, on_open: open } },
-                View::Shelf { id, title, subtitle } => rsx! {
-                    Shelf {
-                        key: "shelf-{id}",
-                        token: token.clone(),
-                        id,
-                        title,
-                        subtitle,
-                        cache,
-                        on_open: open,
-                    }
-                },
+                }
             }
         }
     }
@@ -3238,7 +3255,7 @@ fn Title(
         }
     };
     let release_label = if target_preloaded && picked_now().is_empty() && !manual_after_preload {
-        Some("На сервере · готово".to_owned())
+        Some("Скачан".to_owned())
     } else {
         display_choice_for(target.season, target.episode).map(|c| choice_label(&c))
     };
@@ -4489,6 +4506,7 @@ mod tests {
             requested_at: Utc::now(),
             ready_at: Some(Utc::now()),
             delete_after: None,
+            watched: false,
             poster_path: None,
             media_title: None,
             quality: Some("4K".into()),

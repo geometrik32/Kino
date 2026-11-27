@@ -28,6 +28,8 @@ pub struct ParsedTitle {
     pub single_episode: bool,
     /// True when the name mentions seasons or episodes (`S01`, `S01-S05`, `Сезон`, `S01E01`).
     pub has_series_marker: bool,
+    /// True when the name contains an explicit multi-year span like `(1977-2005)`.
+    pub has_year_range: bool,
 }
 
 /// Studios recognised by name, in the spelling shown to the user.
@@ -106,6 +108,7 @@ struct Regexes {
     ep_of: Regex,
     sxx_exx: Regex,
     complete_series: Regex,
+    collection_markers: Regex,
 }
 
 impl Regexes {
@@ -157,6 +160,9 @@ impl Regexes {
                 r"(?i)(?:\bs\d{1,2}(?:\s*[-–]\s*s?\d{1,2})?\s*[._-]?\s*e\d{1,3}\b|\b(?:0?[1-9]|[12]\d)x\d{2,3}\b)",
             ),
             complete_series: re(r"(?i)\bcomplete\s+series\b|\bсезоны\b|\bвсе\s+сезоны\b"),
+            collection_markers: re(
+                r"(?iu)\b(?:антология|трилогия|дилогия|квадрология|тетралогия|пенталогия|гексалогия|гепталогия|окталогия|сборник|anthology|trilogy|duology|quadrilogy|tetralogy|pentalogy|hexalogy|heptalogy|octology|все\s+(?:части|фильмы|серии|эпизоды)|все\s+\d{1,2}\s+(?:фильм\w*|част\w*)|\d{1,2}\s*[-–]\s*(?:film|movie)s?\s+collection|(?:complete|full|movie|film|saga)\s+collection|коллекция\s+(?:фильмов|кино)|\d+\s+(?:фильма|фильмов|части|частей)|(?:части|фильмы|эпизоды|эпизод(?:а|ы)?|parts?|films?|movies?|episodes?)\s*[:\-]?\s*\d{1,2}\s*[-–]\s*\d{1,2})\b",
+            ),
         }
     }
 }
@@ -384,6 +390,7 @@ pub fn parse_title(name: &str) -> ParsedTitle {
     let season = season.or(if is_multi_season { None } else { ep_season });
     let single_episode = matches!(episode_range, Some((a, b)) if a == b);
     let has_series_marker = re.season.is_match(name) || raw_ep_range.is_some() || re.complete_series.is_match(name);
+    let has_year_range = year_range_in(name, re).is_some();
 
     ParsedTitle {
         quality,
@@ -400,7 +407,16 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         bitrate_kbps: bitrate_in(name),
         single_episode,
         has_series_marker,
+        has_year_range,
     }
+}
+
+/// Lowercase collection/anthology markers matched in a release title (e.g. `"антология"`, `"все части"`).
+pub fn collection_markers(name: &str) -> Vec<String> {
+    RE.collection_markers
+        .find_iter(name)
+        .map(|m| m.as_str().to_lowercase())
+        .collect()
 }
 
 fn is_rate_unit(rest: &str) -> bool {

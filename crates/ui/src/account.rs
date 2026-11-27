@@ -11,7 +11,8 @@ use kino_core::{
 };
 
 use crate::icons::{self, Icon};
-use crate::releases::{ReleaseSort, CODECS, SEEDER_STEPS, SIZE_STEPS};
+use crate::releases::{ReleaseSort, BITRATE_STEPS, CODECS, SEEDER_STEPS, SIZE_STEPS};
+use crate::tooltip::use_tip;
 use crate::{
     fallback_bg, handle_aux_click, is_plain_primary_click, plural, ru_date, title_href, AvatarContent, PosterCard,
 };
@@ -182,6 +183,7 @@ pub fn MyView(
     let mut peer_status_filter = use_signal(|| initial_peer_status);
     let mut cal_month = use_signal(|| initial_cal_month);
     let mut cal_day = use_signal(|| initial_cal_day);
+    let tip = use_tip();
     let mut set_peer_status = move |next: Option<TitleStatus>| {
         peer_status_filter.set(next);
         if let Some(cb) = on_peer_status {
@@ -369,7 +371,7 @@ pub fn MyView(
                                                     hide_status_badge: filters.status.is_some(),
                                                     on_open,
                                                 }
-                                                if let Some(st) = item.status.filter(|_| filters.status.is_none()) {
+                                                if let Some(st) = item.status.filter(|st| filters.status.is_none() && *st != TitleStatus::Watched) {
                                                     div { class: "mine-meta",
                                                         span { class: "{status_tag_class(st)}", "{st.label()}" }
                                                     }
@@ -576,8 +578,11 @@ pub fn MyView(
                                 div { class: "cal-head",
                                     button {
                                         class: "round-act",
-                                        title: "Предыдущий месяц",
                                         "aria-label": "Предыдущий месяц",
+                                        onmounted: move |e| tip.mount(0, e.data()),
+                                        onmouseenter: move |_| tip.show(0, "Предыдущий месяц"),
+                                        onmouseleave: move |_| tip.hide(0),
+                                        onmousedown: move |_| tip.hide(0),
                                         onclick: move |_| {
                                             set_cal_day(None);
                                             set_cal_month(Some(shift_ym((yr, mo), -1)));
@@ -587,8 +592,11 @@ pub fn MyView(
                                     div { class: "cal-month-title", "{month_name_ru(mo)} {yr}" }
                                     button {
                                         class: "round-act",
-                                        title: "Следующий месяц",
                                         "aria-label": "Следующий месяц",
+                                        onmounted: move |e| tip.mount(1, e.data()),
+                                        onmouseenter: move |_| tip.show(1, "Следующий месяц"),
+                                        onmouseleave: move |_| tip.hide(1),
+                                        onmousedown: move |_| tip.hide(1),
                                         onclick: move |_| {
                                             set_cal_day(None);
                                             set_cal_month(Some(shift_ym((yr, mo), 1)));
@@ -632,12 +640,21 @@ pub fn MyView(
                                                 .collect::<Vec<_>>()
                                                 .join(", ");
                                             let ev_cnt = day_items.len();
+                                            let day_slot = 100 + day;
+                                            let day_tip = titles_preview;
                                             rsx! {
                                                 button {
                                                     key: "{ymd}",
                                                     class: "{cls}",
                                                     disabled: !has_events,
-                                                    title: if titles_preview.is_empty() { String::new() } else { titles_preview.clone() },
+                                                    onmounted: move |e| tip.mount(day_slot, e.data()),
+                                                    onmouseenter: move |_| {
+                                                        if !day_tip.is_empty() {
+                                                            tip.show(day_slot, day_tip.clone());
+                                                        }
+                                                    },
+                                                    onmouseleave: move |_| tip.hide(day_slot),
+                                                    onmousedown: move |_| tip.hide(day_slot),
                                                     onclick: move |_| {
                                                         if is_sel {
                                                             set_cal_day(None);
@@ -874,6 +891,9 @@ fn prefs_summary(p: &UserPrefs) -> Vec<(String, bool)> {
     if let Some(g) = p.max_size_gb.filter(|g| *g > 0) {
         tags.push((format!("до {g} ГБ"), false));
     }
+    if let Some(b) = p.max_bitrate_mbps.filter(|b| *b > 0) {
+        tags.push((format!("до {b} Мбит/с"), false));
+    }
     if let Some(s) = p.sort.as_deref() {
         let sort = ReleaseSort::from_key(Some(s));
         if sort != ReleaseSort::Seeders {
@@ -968,7 +988,7 @@ pub fn ProfileView(
     let tz = FixedOffset::east_opt(utc_offset_min * 60).unwrap_or(FixedOffset::east_opt(0).expect("UTC"));
     let p = prefs.clone();
     let summary_tags = prefs_summary(&p);
-    let has_custom_prefs = !summary_tags.is_empty();
+    let has_custom_prefs = p != UserPrefs::recommended_defaults();
     let initial = name
         .chars()
         .next()
@@ -1011,13 +1031,13 @@ pub fn ProfileView(
                         button {
                             class: if theme == Theme::Dark { "active" } else { "" },
                             onclick: move |_| on_theme.call(Theme::Dark),
-                            Icon { svg: icons::MOON, class: "ic xs" }
+                            Icon { svg: if theme == Theme::Dark { icons::MOON_FILLED } else { icons::MOON }, class: "ic xs" }
                             "{Theme::Dark.label()}"
                         }
                         button {
                             class: if theme == Theme::Light { "active" } else { "" },
                             onclick: move |_| on_theme.call(Theme::Light),
-                            Icon { svg: icons::SUN, class: "ic xs" }
+                            Icon { svg: if theme == Theme::Light { icons::SUN_FILLED } else { icons::SUN }, class: "ic xs" }
                             "{Theme::Light.label()}"
                         }
                         if in_telegram {
@@ -1234,11 +1254,13 @@ pub fn ProfileView(
                             on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { min_seeders: v.and_then(|s| s.trim_start_matches("от ").parse().ok()), subtitle_lang: None, subtitles: None, ..p.clone() }) } }
                         PrefRow { name: "Размер", any: "Любой", options: SIZE_STEPS.map(|n| format!("до {n} ГБ")).to_vec(), selected: p.max_size_gb.map(|n| format!("до {n} ГБ")),
                             on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { max_size_gb: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" ГБ").parse().ok()), subtitle_lang: None, subtitles: None, ..p.clone() }) } }
+                        PrefRow { name: "Макс. битрейт", any: "Любой", options: BITRATE_STEPS.map(|n| format!("до {n} Мбит/с")).to_vec(), selected: p.max_bitrate_mbps.filter(|n| *n > 0).map(|n| format!("до {n} Мбит/с")),
+                            on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { max_bitrate_mbps: v.and_then(|s| s.trim_start_matches("до ").trim_end_matches(" Мбит/с").parse().ok()), subtitle_lang: None, subtitles: None, ..p.clone() }) } }
                         PrefRow { name: "Сортировка", any: "По сидам", options: ReleaseSort::ALL.iter().skip(1).map(|s| s.label().to_owned()).collect(), selected: p.sort.as_deref().map(|k| ReleaseSort::from_key(Some(k))).filter(|s| *s != ReleaseSort::Seeders).map(|s| s.label().to_owned()),
                             on_select: { let p = p.clone(); move |v: Option<String>| on_prefs.call(UserPrefs { sort: v.and_then(|l| ReleaseSort::ALL.into_iter().find(|s| s.label() == l)).map(|s| s.key().to_owned()), subtitle_lang: None, subtitles: None, ..p.clone() }) } }
                         if has_custom_prefs {
                             div { class: "acc-reset",
-                                button { class: "link", onclick: move |_| on_prefs.call(UserPrefs::default()), "Сбросить настройки по умолчанию" }
+                                button { class: "link", onclick: move |_| on_prefs.call(UserPrefs::recommended_defaults()), "Сбросить настройки по умолчанию" }
                             }
                         }
                     }
@@ -1357,11 +1379,12 @@ fn PrefYesNo(name: &'static str, value: Option<bool>, on_select: EventHandler<Op
 
 fn retention_tag(
     state: PreloadState,
+    watched: bool,
     delete_after: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> Option<(String, &'static str)> {
-    match (state, delete_after) {
-        (_, Some(at)) => {
+    match (state, watched, delete_after) {
+        (_, true, Some(at)) => {
             let days = (at - now).num_hours().max(0) as f64 / 24.0;
             if days < 1.0 {
                 Some(("Просмотрено · удалится сегодня".to_string(), "tag warn"))
@@ -1369,7 +1392,15 @@ fn retention_tag(
                 Some((format!("Просмотрено · удалится через {} дн.", days.ceil()), "tag warn"))
             }
         }
-        (PreloadState::Ready, None) => Some(("Удалится после просмотра".to_string(), "tag")),
+        (_, false, Some(at)) => {
+            let days = (at - now).num_hours().max(0) as f64 / 24.0;
+            if days < 1.0 {
+                Some(("Удалится сегодня".to_string(), "tag warn"))
+            } else {
+                Some((format!("Удалится через {} дн.", days.ceil()), "tag"))
+            }
+        }
+        (PreloadState::Ready, _, None) => Some(("Удалится после просмотра".to_string(), "tag")),
         _ => None,
     }
 }
@@ -1410,9 +1441,10 @@ fn PreloadRow(
     on_delete: EventHandler<i64>,
 ) -> Element {
     let mut confirm_del = use_signal(|| false);
+    let tip = use_tip();
     let pct = (item.progress * 100.0).clamp(0.0, 100.0).round();
     let status_text = item.status_text();
-    let delete_tag = retention_tag(item.state, item.delete_after, now);
+    let delete_tag = retention_tag(item.state, item.watched, item.delete_after, now);
     let size = item.size_bytes.map(|b| crate::human_size(b.max(0) as u64));
     let id = item.id;
     let (kind, tmdb_id) = (item.kind, item.tmdb_id);
@@ -1468,7 +1500,18 @@ fn PreloadRow(
                 div { class: "dl-body",
                     div { class: "dl-title", "{primary_title}" }
                     if let Some(sub) = release_sub {
-                        div { class: "dl-sub", title: "{sub}", "{sub}" }
+                        {
+                            let sub_tip = sub.clone();
+                            rsx! {
+                                div {
+                                    class: "dl-sub",
+                                    onmounted: move |e| tip.mount(0, e.data()),
+                                    onmouseenter: move |_| tip.show(0, sub_tip.clone()),
+                                    onmouseleave: move |_| tip.hide(0),
+                                    "{sub}"
+                                }
+                            }
+                        }
                     }
                     div { class: "dl-tags",
                         span { class: "{cls}", "{status_text}" }
@@ -1476,9 +1519,18 @@ fn PreloadRow(
                         if let Some(v) = voice_tag { span { class: "tag", "{v}" } }
                         if let Some(s) = size { span { class: "tag", "{s}" } }
                         if let Some(who) = item.requested_by.as_deref() {
-                            span { class: "tag", title: "Добавил: {who}",
-                                Icon { svg: icons::USERS, class: "ic xs" }
-                                "{who}"
+                            {
+                                let who_tip = format!("Добавил: {who}");
+                                rsx! {
+                                    span {
+                                        class: "tag",
+                                        onmounted: move |e| tip.mount(1, e.data()),
+                                        onmouseenter: move |_| tip.show(1, who_tip.clone()),
+                                        onmouseleave: move |_| tip.hide(1),
+                                        Icon { svg: icons::USERS, class: "ic xs" }
+                                        "{who}"
+                                    }
+                                }
                             }
                         }
                         if let Some((txt, tcls)) = delete_tag {
@@ -1496,21 +1548,33 @@ fn PreloadRow(
                 }
             }
             if item.can_delete {
-                button {
-                    class: if confirm { "round-act danger-confirm" } else { "round-act danger" },
-                    title: if confirm { "Нажмите ещё раз, чтобы удалить загрузку" } else { "Удалить загрузку" },
-                    "aria-label": if confirm { "Подтвердить удаление" } else { "Удалить загрузку" },
-                    onblur: move |_| confirm_del.set(false),
-                    onclick: move |e| {
-                        e.stop_propagation();
-                        if *confirm_del.peek() {
-                            confirm_del.set(false);
-                            on_delete.call(id);
-                        } else {
-                            confirm_del.set(true);
+                {
+                    let del_tip = if confirm {
+                        "Нажмите ещё раз, чтобы удалить загрузку"
+                    } else {
+                        "Удалить загрузку"
+                    };
+                    rsx! {
+                        button {
+                            class: if confirm { "round-act danger-confirm" } else { "round-act danger" },
+                            "aria-label": if confirm { "Подтвердить удаление" } else { "Удалить загрузку" },
+                            onmounted: move |e| tip.mount(2, e.data()),
+                            onmouseenter: move |_| tip.show(2, del_tip),
+                            onmouseleave: move |_| tip.hide(2),
+                            onmousedown: move |_| tip.hide(2),
+                            onblur: move |_| confirm_del.set(false),
+                            onclick: move |e| {
+                                e.stop_propagation();
+                                if *confirm_del.peek() {
+                                    confirm_del.set(false);
+                                    on_delete.call(id);
+                                } else {
+                                    confirm_del.set(true);
+                                }
+                            },
+                            Icon { svg: icons::TRASH, class: "ic sm" }
                         }
-                    },
-                    Icon { svg: icons::TRASH, class: "ic sm" }
+                    }
                 }
             }
         }
@@ -1540,6 +1604,7 @@ fn SeriesPreloadCard(
     #[props(default)] on_delete_episode: Option<EventHandler<(i64, i32, i32)>>,
 ) -> Element {
     let mut confirm_del = use_signal(|| false);
+    let tip = use_tip();
     let primary_title = items
         .iter()
         .find_map(|p| p.media_title.as_deref())
@@ -1665,9 +1730,9 @@ fn SeriesPreloadCard(
     } else if any_ready {
         let lbl = if !ready_ep_keys.is_empty() {
             let n = ready_ep_keys.len();
-            format!("На сервере · {n} {}", plural(n, "серия", "серии", "серий"))
+            format!("Скачан · {n} {}", plural(n, "серия", "серии", "серий"))
         } else {
-            "Готово".to_owned()
+            "Скачан".to_owned()
         };
         ("tag ok", lbl)
     } else {
@@ -1705,7 +1770,11 @@ fn SeriesPreloadCard(
     }
     let delete_tag = if !any_active && any_ready {
         let min_del = items.iter().filter_map(|p| p.delete_after).min();
-        retention_tag(PreloadState::Ready, min_del, now)
+        let all_watched = items
+            .iter()
+            .filter(|p| p.state == PreloadState::Ready)
+            .all(|p| p.watched);
+        retention_tag(PreloadState::Ready, all_watched, min_del, now)
     } else {
         None
     };
@@ -1781,12 +1850,29 @@ fn SeriesPreloadCard(
                     div { class: "dl-body",
                         div { class: "dl-title", "{primary_title}" }
                         if let Some(sub) = release_sub {
-                            div { class: "dl-sub", title: "{sub}", "{sub}" }
+                            {
+                                let sub_tip = sub.clone();
+                                rsx! {
+                                    div {
+                                        class: "dl-sub",
+                                        onmounted: move |e| tip.mount(0, e.data()),
+                                        onmouseenter: move |_| tip.show(0, sub_tip.clone()),
+                                        onmouseleave: move |_| tip.hide(0),
+                                        "{sub}"
+                                    }
+                                }
+                            }
                         }
                         div { class: "dl-tags",
                             span { class: "{status_cls}", "{status_text}" }
                             if let Some(sum) = ep_summary {
-                                span { class: "tag srv", title: "Скачанные серии", "{sum}" }
+                                span {
+                                    class: "tag srv",
+                                    onmounted: move |e| tip.mount(1, e.data()),
+                                    onmouseenter: move |_| tip.show(1, "Скачанные серии"),
+                                    onmouseleave: move |_| tip.hide(1),
+                                    "{sum}"
+                                }
                             }
                             for q in qualities {
                                 span { class: "tag", "{q}" }
@@ -1798,9 +1884,18 @@ fn SeriesPreloadCard(
                                 span { class: "tag", "{crate::human_size(known_bytes as u64)}" }
                             }
                             if let Some(who) = req_label {
-                                span { class: "tag", title: "Добавил: {who}",
-                                    Icon { svg: icons::USERS, class: "ic xs" }
-                                    "{who}"
+                                {
+                                    let who_tip = format!("Добавил: {who}");
+                                    rsx! {
+                                        span {
+                                            class: "tag",
+                                            onmounted: move |e| tip.mount(2, e.data()),
+                                            onmouseenter: move |_| tip.show(2, who_tip.clone()),
+                                            onmouseleave: move |_| tip.hide(2),
+                                            Icon { svg: icons::USERS, class: "ic xs" }
+                                            "{who}"
+                                        }
+                                    }
                                 }
                             }
                             if let Some((txt, tcls)) = delete_tag {
@@ -1820,7 +1915,10 @@ fn SeriesPreloadCard(
                 div { class: "dl-series-acts",
                     button {
                         class: "{toggle_cls}",
-                        title: "{toggle_title}",
+                        onmounted: move |e| tip.mount(3, e.data()),
+                        onmouseenter: move |_| tip.show(3, toggle_title),
+                        onmouseleave: move |_| tip.hide(3),
+                        onmousedown: move |_| tip.hide(3),
                         onclick: move |e| {
                             e.stop_propagation();
                             on_toggle.call(tmdb_id);
@@ -1831,8 +1929,11 @@ fn SeriesPreloadCard(
                     if let Some(pid) = single_deletable_id {
                         button {
                             class: "{del_cls}",
-                            title: "{del_title}",
                             "aria-label": "{del_aria}",
+                            onmounted: move |e| tip.mount(4, e.data()),
+                            onmouseenter: move |_| tip.show(4, del_title),
+                            onmouseleave: move |_| tip.hide(4),
+                            onmousedown: move |_| tip.hide(4),
                             onblur: move |_| confirm_del.set(false),
                             onclick: move |e| {
                                 e.stop_propagation();
@@ -1939,10 +2040,14 @@ fn SeriesPreloadDrawer(
 #[component]
 fn SeriesSeasonDeleteBtn(preload_id: i64, on_delete: EventHandler<i64>) -> Element {
     let mut confirm = use_signal(|| false);
+    let tip = use_tip();
     rsx! {
         button {
             class: if confirm() { "link warn" } else { "link" },
-            title: "Удалить этот сезон с сервера",
+            onmounted: move |e| tip.mount(0, e.data()),
+            onmouseenter: move |_| tip.show(0, "Удалить этот сезон с сервера"),
+            onmouseleave: move |_| tip.hide(0),
+            onmousedown: move |_| tip.hide(0),
             onblur: move |_| confirm.set(false),
             onclick: move |e| {
                 e.stop_propagation();
@@ -1961,6 +2066,7 @@ fn SeriesSeasonDeleteBtn(preload_id: i64, on_delete: EventHandler<i64>) -> Eleme
 #[component]
 fn SeriesPendingReleaseRow(item: PreloadItem, on_delete: EventHandler<i64>) -> Element {
     let mut confirm = use_signal(|| false);
+    let tip = use_tip();
     let label = if item.season > 0 {
         format!("Сезон {}", item.season)
     } else {
@@ -1968,13 +2074,22 @@ fn SeriesPendingReleaseRow(item: PreloadItem, on_delete: EventHandler<i64>) -> E
     };
     let status = item.status_text();
     let pid = item.id;
+    let del_tip = if confirm() {
+        "Нажмите ещё раз, чтобы удалить"
+    } else {
+        "Удалить раздачу"
+    };
     rsx! {
         div { class: "dl-ep-rel-note",
             span { "{label} · {status} — список серий появится после получения метаданных" }
             if item.can_delete {
                 button {
                     class: if confirm() { "round-act xs danger-confirm" } else { "round-act xs danger" },
-                    title: if confirm() { "Нажмите ещё раз, чтобы удалить" } else { "Удалить раздачу" },
+                    "aria-label": "Удалить раздачу",
+                    onmounted: move |e| tip.mount(0, e.data()),
+                    onmouseenter: move |_| tip.show(0, del_tip),
+                    onmouseleave: move |_| tip.hide(0),
+                    onmousedown: move |_| tip.hide(0),
                     onblur: move |_| confirm.set(false),
                     onclick: move |e| {
                         e.stop_propagation();
@@ -2002,6 +2117,7 @@ fn SeriesEpisodeRow(
     #[props(default)] on_delete_episode: Option<EventHandler<(i64, i32, i32)>>,
 ) -> Element {
     let mut confirm_del = use_signal(|| false);
+    let tip = use_tip();
     let ep = &row.ep;
     let code = episode_code(ep.season, ep.episode);
     let title_txt = match ep.episode_name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -2015,7 +2131,7 @@ fn SeriesEpisodeRow(
         PreloadState::Deleted => "tag",
     };
     let st_lbl = if ep.state == PreloadState::Ready {
-        "На сервере".to_owned()
+        "Скачан".to_owned()
     } else {
         ep.status_text(row.dl_phase, row.speed_bps)
     };
@@ -2025,6 +2141,12 @@ fn SeriesEpisodeRow(
     let (s_num, ep_num) = (ep.season, ep.episode);
     let confirm = confirm_del();
     let del_days = ep.delete_after.map(|at| (at - now).num_hours().max(0) as f64 / 24.0);
+    let name_tip = title_txt.clone();
+    let ep_del_tip = if confirm {
+        "Нажмите ещё раз, чтобы удалить серию"
+    } else {
+        "Удалить серию с сервера"
+    };
     rsx! {
         div { class: "dl-ep-row",
             a {
@@ -2038,7 +2160,13 @@ fn SeriesEpisodeRow(
                 },
                 onauxclick: handle_aux_click,
                 span { class: "dl-ep-code", "{code}" }
-                span { class: "dl-ep-name", title: "{title_txt}", "{title_txt}" }
+                span {
+                    class: "dl-ep-name",
+                    onmounted: move |e| tip.mount(0, e.data()),
+                    onmouseenter: move |_| tip.show(0, name_tip.clone()),
+                    onmouseleave: move |_| tip.hide(0),
+                    "{title_txt}"
+                }
             }
             div { class: "dl-ep-meta",
                 if show_release {
@@ -2055,20 +2183,24 @@ fn SeriesEpisodeRow(
                 span { class: "{st_cls}", "{st_lbl}" }
                 if let Some(days) = del_days {
                     {
-                        let del_lbl = if days < 1.0 {
-                            "удалится сегодня".to_owned()
-                        } else {
-                            format!("удалится через {} дн.", days.ceil())
+                        let (del_lbl, del_cls) = match (ep.watched, days < 1.0) {
+                            (true, true) => ("просмотрено · удалится сегодня".to_owned(), "tag warn"),
+                            (true, false) => (format!("просмотрено · удалится через {} дн.", days.ceil()), "tag warn"),
+                            (false, true) => ("удалится сегодня".to_owned(), "tag warn"),
+                            (false, false) => (format!("удалится через {} дн.", days.ceil()), "tag"),
                         };
-                        rsx! { span { class: "tag warn", "{del_lbl}" } }
+                        rsx! { span { class: "{del_cls}", "{del_lbl}" } }
                     }
                 }
             }
             if let (true, Some(cb)) = (row.can_delete, on_delete_episode) {
                 button {
                     class: if confirm { "round-act xs danger-confirm" } else { "round-act xs danger" },
-                    title: if confirm { "Нажмите ещё раз, чтобы удалить серию" } else { "Удалить серию с сервера" },
                     "aria-label": if confirm { "Подтвердить удаление серии" } else { "Удалить серию с сервера" },
+                    onmounted: move |e| tip.mount(1, e.data()),
+                    onmouseenter: move |_| tip.show(1, ep_del_tip),
+                    onmouseleave: move |_| tip.hide(1),
+                    onmousedown: move |_| tip.hide(1),
                     onblur: move |_| confirm_del.set(false),
                     onclick: move |e| {
                         e.stop_propagation();
@@ -2116,6 +2248,7 @@ mod tests {
             requested_at: Utc::now(),
             ready_at: Some(Utc::now()),
             delete_after: None,
+            watched: false,
             poster_path: None,
             media_title: None,
             quality: None,
@@ -2141,5 +2274,34 @@ mod tests {
             _ => panic!("expected series group first"),
         }
         assert!(matches!(grouped[1], DownloadGroup::Movie(ref m) if m.tmdb_id == 603));
+    }
+
+    #[test]
+    fn retention_tag_distinguishes_watched_from_initial_seven_day_cap() {
+        let now = Utc::now();
+        let in_six_days = now + chrono::Duration::days(6) + chrono::Duration::hours(1);
+        let in_two_days = now + chrono::Duration::days(2);
+        let in_five_hours = now + chrono::Duration::hours(5);
+
+        assert_eq!(
+            retention_tag(PreloadState::Ready, false, Some(in_six_days), now),
+            Some(("Удалится через 7 дн.".to_string(), "tag"))
+        );
+        assert_eq!(
+            retention_tag(PreloadState::Ready, false, Some(in_five_hours), now),
+            Some(("Удалится сегодня".to_string(), "tag warn"))
+        );
+        assert_eq!(
+            retention_tag(PreloadState::Ready, true, Some(in_two_days), now),
+            Some(("Просмотрено · удалится через 2 дн.".to_string(), "tag warn"))
+        );
+        assert_eq!(
+            retention_tag(PreloadState::Ready, true, Some(in_five_hours), now),
+            Some(("Просмотрено · удалится сегодня".to_string(), "tag warn"))
+        );
+        assert_eq!(
+            retention_tag(PreloadState::Ready, false, None, now),
+            Some(("Удалится после просмотра".to_string(), "tag"))
+        );
     }
 }

@@ -945,6 +945,11 @@ pub struct HistoryEntry {
     pub title: Option<TitleSummary>,
 }
 
+/// Default preferred audio language for new accounts and reset preferences.
+pub const DEFAULT_PREF_LANGUAGE: &str = "Русский";
+/// Default max bitrate filter in Mbit/s (~100 Mbit/s internet headroom).
+pub const DEFAULT_MAX_BITRATE_MBPS: u32 = 30;
+
 /// Defaults used when picking releases and tracks. Every field is optional:
 /// `None` means "no preference".
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -979,6 +984,9 @@ pub struct UserPrefs {
     /// At most this many gigabytes.
     #[serde(default)]
     pub max_size_gb: Option<u32>,
+    /// At most this many megabits per second (when bitrate is known or estimated).
+    #[serde(default)]
+    pub max_bitrate_mbps: Option<u32>,
     /// How the releases are sorted: "seeders", "size", "bitrate", "name", "source", "date", "watched".
     #[serde(default)]
     pub sort: Option<String>,
@@ -988,6 +996,17 @@ pub struct UserPrefs {
     /// Default auto-selected quality on phones ("auto", "720p", "SD", "1080p", "ask").
     #[serde(default)]
     pub mobile_quality: Option<String>,
+}
+
+impl UserPrefs {
+    /// Recommended defaults applied to new users and when resetting profile preferences.
+    pub fn recommended_defaults() -> Self {
+        Self {
+            language: Some(DEFAULT_PREF_LANGUAGE.to_owned()),
+            max_bitrate_mbps: Some(DEFAULT_MAX_BITRATE_MBPS),
+            ..Self::default()
+        }
+    }
 }
 
 /// Active title being watched right now by a user.
@@ -1131,6 +1150,9 @@ pub struct PreloadEpisodeItem {
     pub ready_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub delete_after: Option<DateTime<Utc>>,
+    /// True once the user who requested this preload has finished watching this episode.
+    #[serde(default)]
+    pub watched: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1149,6 +1171,9 @@ pub struct PreloadItem {
     pub ready_at: Option<DateTime<Utc>>,
     /// Set once watched or ready: the files are removed after this moment.
     pub delete_after: Option<DateTime<Utc>>,
+    /// True once the user who requested this preload has watched it.
+    #[serde(default)]
+    pub watched: bool,
     /// TMDB poster path for thumbnails in Profile -> Server Downloads.
     #[serde(default)]
     pub poster_path: Option<String>,
@@ -1229,13 +1254,7 @@ fn format_preload_status(
     compact: bool,
 ) -> String {
     match state {
-        PreloadState::Ready => {
-            if compact {
-                "На сервере".to_owned()
-            } else {
-                "Готово · играет с диска".to_owned()
-            }
-        }
+        PreloadState::Ready => "Скачан".to_owned(),
         PreloadState::Failed => {
             if compact {
                 "Ошибка".to_owned()
@@ -1275,13 +1294,7 @@ fn format_preload_status(
                         format!("Ждём раздающих · {pct}%")
                     }
                 }
-                PreloadPhase::Ready => {
-                    if compact {
-                        "На сервере".to_owned()
-                    } else {
-                        "Готово · играет с диска".to_owned()
-                    }
-                }
+                PreloadPhase::Ready => "Скачан".to_owned(),
                 PreloadPhase::Failed => {
                     if compact {
                         "Ошибка".to_owned()
@@ -1416,6 +1429,7 @@ mod preload_tests {
             requested_at: Utc::now(),
             ready_at: None,
             delete_after: None,
+            watched: false,
             poster_path: None,
             media_title: Some("Человек-паук: Новый день".into()),
             quality: Some("2160p".into()),
@@ -1452,7 +1466,7 @@ mod preload_tests {
         assert_eq!(it.compact_status_text().replace('\u{a0}', " "), "42% · 12 МБ/с");
 
         it.state = PreloadState::Ready;
-        assert_eq!(it.status_text(), "Готово · играет с диска");
+        assert_eq!(it.status_text(), "Скачан");
 
         it.kind = MediaKind::Tv;
         it.season = 1;
@@ -1466,6 +1480,7 @@ mod preload_tests {
             episode_name: None,
             ready_at: Some(Utc::now()),
             delete_after: None,
+            watched: false,
         }];
         assert!(it.is_ready_for(MediaKind::Tv, 1, 3));
         assert!(!it.is_ready_for(MediaKind::Tv, 1, 4));

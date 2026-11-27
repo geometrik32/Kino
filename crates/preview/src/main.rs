@@ -19,10 +19,10 @@ use kino_server::catalog::{Catalog, DemoCatalog};
 use kino_ui::{
     icons, mock_releases, HomeView, Icon, LoginView, MyFilters, MyView, PersonView, PickerPanel, PlayerEpisode,
     PlayerMenu, PlayerState, PlayerView, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
-    SearchView, Shell, Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI, STYLE,
+    SearchView, Shell, Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI, MOTION_SCRIPT, STYLE,
 };
 
-const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
+const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&display=swap";
 
 #[derive(Clone, PartialEq)]
 struct Picker {
@@ -255,7 +255,7 @@ fn page(screen: Screen, title: &str, light: bool) -> String {
          <link rel=\"preconnect\" href=\"https://fonts.gstatic.com\" crossorigin>\
          <link rel=\"stylesheet\" href=\"{FONTS_URL}\" media=\"print\" onload=\"this.media='all'\">\
          <noscript><link rel=\"stylesheet\" href=\"{FONTS_URL}\"></noscript>\
-         <title>{title} — Орловский кинопоказ</title><style>{STYLE}</style></head><body>{body}</body></html>"
+         <title>{title} — Орловский кинопоказ</title><style>{STYLE}</style></head><body>{body}<script>{MOTION_SCRIPT}</script></body></html>"
     )
 }
 
@@ -409,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         requested_at: Utc::now() - Duration::hours(3),
         ready_at: (state == PreloadState::Ready).then(|| Utc::now() - Duration::hours(1)),
         delete_after: delete_days.map(|d| Utc::now() + Duration::days(d) + Duration::hours(1)),
+        watched: delete_days.is_some_and(|d| d <= 2),
         poster_path: None,
         media_title: None,
         quality: None,
@@ -449,6 +450,7 @@ async fn main() -> anyhow::Result<()> {
             episode_name: Some("Future Days".into()),
             ready_at: Some(Utc::now() - Duration::minutes(40)),
             delete_after: None,
+            watched: false,
         },
         kino_core::PreloadEpisodeItem {
             season: 2,
@@ -459,6 +461,7 @@ async fn main() -> anyhow::Result<()> {
             episode_name: Some("Through the Valley".into()),
             ready_at: None,
             delete_after: None,
+            watched: false,
         },
     ];
     let mut bb_pre = preload(
@@ -484,6 +487,7 @@ async fn main() -> anyhow::Result<()> {
             episode_name: Some(format!("Серия {n}")),
             ready_at: Some(Utc::now() - Duration::hours(2)),
             delete_after: None,
+            watched: false,
         })
         .collect();
     let preloads = vec![

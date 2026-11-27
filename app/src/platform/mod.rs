@@ -105,13 +105,19 @@ pub async fn touch_screen() -> bool {
 }
 
 /// Applies the chosen colour theme to `<html data-theme>` and system/Telegram bars.
-pub fn apply_theme(theme: kino_ui::Theme) {
-    let js = match theme {
-        kino_ui::Theme::Dark => "document.documentElement.dataset.theme = 'dark';",
-        kino_ui::Theme::Light => "document.documentElement.dataset.theme = 'light';",
-        kino_ui::Theme::Auto => "delete document.documentElement.dataset.theme;",
+/// When `animate` is true, triggers a radial View Transition wave from the last pointer click.
+pub fn apply_theme(theme: kino_ui::Theme, animate: bool) {
+    let mode = match theme {
+        kino_ui::Theme::Dark => "'dark'",
+        kino_ui::Theme::Light => "'light'",
+        kino_ui::Theme::Auto => "'auto'",
     };
-    let _ = dioxus::document::eval(js);
+    let anim = if animate { "true" } else { "false" };
+    let js = format!(
+        "if (window.__kinoApplyTheme) {{ window.__kinoApplyTheme({mode}, {anim}); }} \
+         else {{ var m = {mode}; if (m === 'dark' || m === 'light') document.documentElement.dataset.theme = m; else delete document.documentElement.dataset.theme; }}"
+    );
+    let _ = dioxus::document::eval(&js);
     crate::telegram::paint_bars();
     #[cfg(target_os = "android")]
     android::style_bars(theme == kino_ui::Theme::Light);

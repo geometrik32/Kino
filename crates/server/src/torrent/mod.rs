@@ -59,11 +59,11 @@ pub fn release_key(item: &TorznabItem) -> String {
 }
 
 /// Running time of what the release holds, in minutes, when it can be worked out:
-/// a film, one episode, or a season whose length is known.
-fn running_minutes(p: &title::ParsedTitle, details: &TitleDetails) -> Option<f64> {
+/// a single film, one episode, or a season whose length is known.
+fn running_minutes(p: &title::ParsedTitle, details: &TitleDetails, is_collection: bool) -> Option<f64> {
     let each = f64::from(details.runtime_min.filter(|m| *m > 0)?);
     match details.summary.kind {
-        MediaKind::Movie => Some(each),
+        MediaKind::Movie => (!is_collection).then_some(each),
         MediaKind::Tv => {
             if let Some((a, b)) = p.episode_range {
                 let count = (b - a + 1).max(1);
@@ -87,12 +87,32 @@ fn running_minutes(p: &title::ParsedTitle, details: &TitleDetails) -> Option<f64
     }
 }
 
+/// True when a movie release packs multiple films (e.g. an anthology/trilogy/year-span pack)
+/// rather than just the requested film.
+pub fn is_movie_collection(name: &str, p: &title::ParsedTitle, details: &TitleDetails) -> bool {
+    if details.summary.kind != MediaKind::Movie || p.has_series_marker {
+        return false;
+    }
+    if p.has_year_range {
+        return true;
+    }
+    let own_titles: Vec<String> = std::iter::once(details.summary.title.as_str())
+        .chain(details.summary.original_title.as_deref())
+        .chain(details.alternative_titles.iter().map(String::as_str))
+        .map(|s| s.to_lowercase())
+        .collect();
+    title::collection_markers(name)
+        .into_iter()
+        .any(|m| !own_titles.iter().any(|t| t.contains(&m)))
+}
+
 pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     let p = parse_title(&item.title);
+    let collection = is_movie_collection(&item.title, &p, details);
     let (bitrate_kbps, bitrate_approx) = match p.bitrate_kbps {
         Some(b) => (Some(b), false),
         None => (
-            running_minutes(&p, details).and_then(|m| estimate_bitrate_kbps(item.size, m)),
+            running_minutes(&p, details, collection).and_then(|m| estimate_bitrate_kbps(item.size, m)),
             true,
         ),
     };
@@ -124,6 +144,7 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
         bitrate_approx,
         picked_by: Vec::new(),
         preloaded: false,
+        collection,
     }
 }
 
@@ -1321,5 +1342,81 @@ mod tests {
         assert!(is_unreliable_tracker("bigfangroup"));
         assert!(!is_unreliable_tracker("RuTracker"));
         assert!(!is_unreliable_tracker("RuTor"));
+    }
+
+    #[test]
+    fn marks_movie_collections_and_skips_bogus_single_film_bitrate() {
+        let mut sw4 = details(
+            MediaKind::Movie,
+            "Звёздные войны: Эпизод 4 — Новая надежда",
+            "Star Wars",
+            Some(1977),
+        );
+        sw4.runtime_min = Some(121);
+        sw4.alternative_titles = vec!["Star Wars: Episode IV - A New Hope".into()];
+
+        let pack_item = TorznabItem {
+            title: "Звездные Войны / Star Wars (1977-2005) [H.264] HDTVRip (все части)".into(),
+            size: 387 * kino_core::GIB_BYTES,
+            seeders: 50,
+            tracker: "BitRu".into(),
+            link: Some("https://example.com/1.torrent".into()),
+            ..TorznabItem::default()
+        };
+        let pack_rel = to_release(&pack_item, &sw4);
+        assert!(pack_rel.collection);
+        assert_eq!(pack_rel.bitrate_kbps, None);
+
+        let anthology_item = TorznabItem {
+            title: "Звездные войны / Star Wars (1977-2023) BDRip [H.265/1080p] [Антология]".into(),
+            size: 120 * kino_core::GIB_BYTES,
+            seeders: 30,
+            tracker: "RuTracker".into(),
+            link: Some("https://example.com/2.torrent".into()),
+            ..TorznabItem::default()
+        };
+        let anthology_rel = to_release(&anthology_item, &sw4);
+        assert!(anthology_rel.collection);
+        assert_eq!(anthology_rel.bitrate_kbps, None);
+
+        let single_item = TorznabItem {
+            title: "Звёздные войны: Эпизод 4 — Новая надежда / Star Wars: Episode IV - A New Hope (1977) BDRip 1080p"
+                .into(),
+            size: 14 * kino_core::GIB_BYTES,
+            seeders: 120,
+            tracker: "RuTracker".into(),
+            link: Some("https://example.com/3.torrent".into()),
+            ..TorznabItem::default()
+        };
+        let single_rel = to_release(&single_item, &sw4);
+        assert!(!single_rel.collection);
+        assert!(single_rel.bitrate_kbps.is_some());
+
+        // Single film whose own title happens to contain "Trilogy" / "Трилогия" must not be flagged.
+        let mut own = details(MediaKind::Movie, "Трилогия ужаса", "Trilogy of Terror", Some(1975));
+        own.runtime_min = Some(72);
+        let own_item = TorznabItem {
+            title: "Трилогия ужаса / Trilogy of Terror (1975) DVDRip".into(),
+            size: 2 * kino_core::GIB_BYTES,
+            seeders: 10,
+            tracker: "RuTracker".into(),
+            link: Some("https://example.com/4.torrent".into()),
+            ..TorznabItem::default()
+        };
+        let own_rel = to_release(&own_item, &own);
+        assert!(!own_rel.collection);
+        assert!(own_rel.bitrate_kbps.is_some());
+
+        // Criterion Collection is a single-film edition, not a multi-film pack.
+        let crit_item = TorznabItem {
+            title: "Звёздные войны: Эпизод 4 (1977) [Criterion Collection] BDRip 1080p".into(),
+            size: 12 * kino_core::GIB_BYTES,
+            seeders: 15,
+            tracker: "RuTracker".into(),
+            link: Some("https://example.com/5.torrent".into()),
+            ..TorznabItem::default()
+        };
+        let crit_rel = to_release(&crit_item, &sw4);
+        assert!(!crit_rel.collection);
     }
 }
