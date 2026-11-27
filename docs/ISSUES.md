@@ -1454,3 +1454,31 @@
 - [x] Все всплывающие подсказки в интерфейсе переведены на единый стиль приложения вместо нативных системных `title`-тултипов.
 - [ ] Пройдены CI-проверки (`fmt`, `clippy`, `cargo test`, `wasm32`) и визуальная проверка в браузере и нативных клиентах.
 
+
+---
+
+## ISSUE-047: Поломанная вёрстка плеера на всех платформах (отступ от шапки/краёв) и белая пелена поверх видео в Windows-приложении
+
+- **Статус:** `В работе` (причина вёрстки устранена откатом `.view-stage` в `app/src/main.rs` и `crates/ui/src/style.css`; исправление белой пелены на Windows внесено в `app/src/main.rs` и проверено `cargo check` / `cargo fmt`; ожидается пересборка Windows-клиента в CI и живая проверка у пользователя)
+- **Приоритет:** Критический (P0)
+- **Затронутые платформы:**
+  - Вёрстка плеера: все платформы (`web`, Telegram Mini App, `desktop`, `mobile`).
+  - Белая пелена поверх видео: Windows (`kino-app --features desktop`).
+
+### Суть проблемы
+1. **Обрезанный/смещённый плеер (все платформы):** из-за обёртки `<div class="view-stage">` с CSS-анимацией `transform` (`animation: ... both`) в `app/src/main.rs` и `crates/ui/src/style.css` контейнер `.view-stage` становился containing block для `position: fixed`, из-за чего `.player` не перекрывал экран целиком (сверху оставалась `.topbar`, по бокам — отступы `.content`, а нижняя панель `.p-dock` уезжала за нижний край).
+2. **Белая пелена поверх видео в Windows (`desktop`):** при воспроизведении через `libmpv` (`KinoMpvHost` позади основного окна WebView2) в `desktop_config` использовалось `.with_transparent(true)` без `.with_no_redirection_bitmap(true)`. Из-за этого на Windows 11 `tao` включал GDI redirection bitmap + `DwmEnableBlurBehindWindow`, и исходный размер окна (`1280x800`) рисовался непрозрачной белой поверхностью (известная проблема WebView2 + DWM на Windows 11, Tauri #10318), полностью закрывая видео в обычном окне и оставляя белый прямоугольник `1280x800` поверх видео даже после разворачивания на весь экран.
+
+### Что сделано
+1. Откачена обёртка `.view-stage` и её transform-анимация в `app/src/main.rs` и `crates/ui/src/style.css` — проверено пользователем на реальном запуске (плеер снова занимает весь экран со всеми элементами управления).
+2. В `app/src/main.rs` (`desktop_config` под `#[cfg(target_os = "windows")]`) добавлено `.with_no_redirection_bitmap(true)` (`WS_EX_NOREDIRECTIONBITMAP`), чтобы отключить GDI redirection bitmap и `DwmEnableBlurBehindWindow` и оставить чистую DirectComposition-прозрачность WebView2 поверх `KinoMpvHost`.
+
+### Проверки
+- `cargo fmt --manifest-path Kino\Cargo.toml --all -- --check` — пройдено.
+- `cargo check --manifest-path Kino\Cargo.toml -p kino-app --no-default-features --features desktop --locked` — пройдено (предупреждение о ненайденной утилите встраивания иконки на локальной машине без C-тулчейна).
+- `cargo check --manifest-path Kino\Cargo.toml -p kino-app --target wasm32-unknown-unknown --locked` — пройдено.
+- Полная сборка `.exe` и живая проверка запуска на Windows не выполнялись локально (требуется CI `.github/workflows/desktop.yml` и пересборка инсталлятора, см. `ISSUE-002`).
+
+### Критерии приёмки
+- [x] На всех платформах плеер открывается на весь экран без видимой шапки `.topbar` и без смещения нижней панели `.p-dock`.
+- [ ] В Windows-приложении (`orel-kino.exe`) как в обычном окне, так и на весь экран белая пелена отсутствует, а видео `libmpv` свободно видно под прозрачным слоем элементов управления плеером.

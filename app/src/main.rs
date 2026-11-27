@@ -83,7 +83,11 @@ fn desktop_config(head: &str) -> dioxus::desktop::Config {
         .with_transparent(true)
         .with_window_icon(icon);
     #[cfg(target_os = "windows")]
-    let window = window.with_undecorated_shadow(true);
+    let window = window
+        .with_undecorated_shadow(true)
+        // Without `WS_EX_NOREDIRECTIONBITMAP`, Windows 11 + WebView2 leaves an opaque white
+        // GDI redirection surface (`Tauri #10318`) behind transparent `html.native-video` overlays.
+        .with_no_redirection_bitmap(true);
     let mut config = Config::new()
         .with_window(window)
         .with_menu(None)
