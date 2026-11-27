@@ -44,8 +44,10 @@ pub struct Media {
     pub http: reqwest::Client,
     /// Primary release search indexers (extra Torznab such as JacRed when configured, else Jackett).
     pub indexers: Vec<Jackett>,
-    /// Fallback search indexers (Jackett behind Sablier) used only if primary indexers fail to answer.
+    /// Fallback search indexers (Jackett behind Sablier) used only if primary indexers fail to answer,
+    /// or in parallel when `jackett_parallel` is true.
     pub fallback_indexers: Vec<Jackett>,
+    pub jackett_parallel: bool,
     pub torrserver: Option<TorrServer>,
     pub qbit: Option<QBittorrent>,
     /// Recent indexer results; see [`torrent::search_cache`].
@@ -136,6 +138,7 @@ impl Media {
         Self {
             indexers,
             fallback_indexers,
+            jackett_parallel: c.jackett_parallel,
             torrserver: c.torrserver_url.as_ref().map(|url| {
                 let auth = c.torrserver_user.clone().zip(c.torrserver_password.clone());
                 TorrServer::new(url, auth)
@@ -180,6 +183,11 @@ impl Media {
     pub fn wake_jackett(&self) {
         for idx in &self.indexers {
             idx.wake_in_background();
+        }
+        if self.jackett_parallel {
+            for idx in &self.fallback_indexers {
+                idx.wake_in_background();
+            }
         }
     }
 
@@ -375,6 +383,7 @@ async fn fetch_release_list(
         &state.pool,
         &state.media.indexers,
         &state.media.fallback_indexers,
+        state.media.jackett_parallel,
         details,
     )
     .await?;
@@ -940,6 +949,7 @@ pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) 
             &state.pool,
             &state.media.indexers,
             &state.media.fallback_indexers,
+            state.media.jackett_parallel,
             &details,
         )
         .await

@@ -30,6 +30,8 @@ pub struct ParsedTitle {
     pub has_series_marker: bool,
     /// True when the name contains an explicit multi-year span like `(1977-2005)`.
     pub has_year_range: bool,
+    /// True when the name explicitly states Russian dub, voice-over, studio or `Rus` audio.
+    pub has_explicit_audio: bool,
 }
 
 /// Studios recognised by name, in the spelling shown to the user.
@@ -58,6 +60,27 @@ const STUDIOS: &[(&str, &str)] = &[
     ("володарский", "Володарский"),
     ("дохалов", "Дохалов"),
     ("живов", "Живов"),
+    ("le-production", "LE-Production"),
+    ("leproduction", "LE-Production"),
+    ("anilibria", "AniLibria"),
+    ("aniliberty", "AniLibria"),
+    ("anidub", "AniDUB"),
+    ("студийная банда", "Студийная Банда"),
+    ("studioband", "Студийная Банда"),
+    ("studio band", "Студийная Банда"),
+    ("dream cast", "Dream Cast"),
+    ("dreamcast", "Dream Cast"),
+    ("shiza project", "SHIZA Project"),
+    ("anistar", "AniStar"),
+    ("animevost", "AnimeVost"),
+    ("sovetromantica", "SovetRomantica"),
+    ("animaunt", "AniMaunt"),
+    ("amazing dubbing", "Amazing Dubbing"),
+    ("flarrow films", "Flarrow Films"),
+    ("anibelka", "AniBelka"),
+    ("jam club", "JAM Club"),
+    ("levelin", "Levelin"),
+    ("ruanime", "RuAnime"),
 ];
 
 /// Studios that produce official Russian dubbing rather than multi-voiceover (MVO/AVO).
@@ -341,6 +364,9 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         || re.dvo.is_match(name)
         || re.avo.is_match(name)
         || (has_cyr && has_multi_cyr_voice(name));
+    let has_rus_audio = re.rus.is_match(&audio_text);
+    let has_sub = re.sub.is_match(name);
+    let has_explicit_audio = has_dub || !matched_studios.is_empty() || has_other_voice || has_rus_audio;
 
     let voice = if has_dub {
         if matched_studios.len() == 1 && !has_other_voice {
@@ -362,9 +388,9 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         "Двухголосый".into()
     } else if re.avo.is_match(name) {
         "Авторский".into()
-    } else if re.rus.is_match(&audio_text) {
+    } else if has_rus_audio {
         "Русский".into()
-    } else if re.orig.is_match(&audio_text) {
+    } else if re.orig.is_match(&audio_text) || has_sub {
         "Оригинал".into()
     } else if has_cyr {
         "Русский".into()
@@ -408,6 +434,7 @@ pub fn parse_title(name: &str) -> ParsedTitle {
         single_episode,
         has_series_marker,
         has_year_range,
+        has_explicit_audio,
     }
 }
 
@@ -474,7 +501,31 @@ pub(crate) fn is_known_studio(norm_words: &str) -> bool {
     STUDIOS.iter().any(|(k, _)| *k == norm_words)
         || matches!(
             norm_words,
-            "kerob" | "rhs" | "dreamrecords" | "sunshinestudio" | "new team" | "gears media" | "generalfilm"
+            "kerob"
+                | "rhs"
+                | "dreamrecords"
+                | "sunshinestudio"
+                | "new team"
+                | "gears media"
+                | "generalfilm"
+                | "le production"
+                | "leproduction"
+                | "anilibria"
+                | "aniliberty"
+                | "anidub"
+                | "anistar"
+                | "animevost"
+                | "animaunt"
+                | "sovetromantica"
+                | "dream cast"
+                | "dreamcast"
+                | "shiza project"
+                | "amazing dubbing"
+                | "flarrow films"
+                | "anibelka"
+                | "jam club"
+                | "levelin"
+                | "ruanime"
         )
 }
 
@@ -716,5 +767,27 @@ mod tests {
 
         let p = parse_title("Breaking Bad S01-15E01-327 Complete 720p");
         assert_eq!((p.season, p.episode_range), (None, None));
+    }
+
+    #[test]
+    fn anime_studios_and_sub_only_cyrillic_titles() {
+        let lep = parse_title("Ночь глупцов / Ночь дурака / Fool Night 2026 [1080p] | [LE-Production].rus");
+        assert_eq!(lep.voice, "LE-Production");
+        assert_eq!(lep.language, "Русский");
+        assert!(lep.has_explicit_audio);
+
+        let alib = parse_title("Дандадан / Dandadan (2024) [AniLibria] 1080p");
+        assert_eq!(alib.voice, "AniLibria");
+        assert_eq!(alib.language, "Русский");
+        assert!(alib.has_explicit_audio);
+
+        let sub_only = parse_title("Фильм / Movie (2024) BDRip 1080p [Sub Rus]");
+        assert_eq!(sub_only.voice, "Оригинал");
+        assert_eq!(sub_only.language, "Английский");
+        assert!(sub_only.subtitles);
+        assert!(!sub_only.has_explicit_audio);
+
+        let layer = parse_title("Fool Night / Ночь дурака (12 из 12) Complete [1080p]");
+        assert!(!layer.has_explicit_audio);
     }
 }

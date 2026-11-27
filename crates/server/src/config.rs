@@ -76,6 +76,8 @@ pub struct TorrentConfig {
     /// Optional additional Torznab endpoints (e.g. public JacRed mirror)
     /// queried in parallel with Jackett.
     pub extra_torznab: Vec<ExtraTorznabConfig>,
+    /// Query Jackett in parallel with `extra_torznab` instead of only as fallback.
+    pub jackett_parallel: bool,
     pub torrserver_url: Option<String>,
     pub torrserver_user: Option<String>,
     pub torrserver_password: Option<String>,
@@ -115,6 +117,8 @@ impl TorrentConfig {
             jackett_wake_group: opt("JACKETT_WAKE_GROUP").unwrap_or_else(|| "jackett".into()),
             jackett_wake_duration: opt("JACKETT_WAKE_DURATION").unwrap_or_else(|| "10m".into()),
             extra_torznab: parse_extra_torznab(opt("EXTRA_TORZNAB_URLS")),
+            jackett_parallel: opt("JACKETT_PARALLEL")
+                .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")),
             torrserver_url: opt("TORRSERVER_URL"),
             torrserver_user: opt("TORRSERVER_USER"),
             torrserver_password: opt("TORRSERVER_PASSWORD"),
@@ -161,6 +165,7 @@ impl std::fmt::Debug for Config {
             .field("jackett", &self.torrents.jackett_url)
             .field("jackett_wake", &self.torrents.jackett_wake_url)
             .field("extra_torznab", &self.torrents.extra_torznab)
+            .field("jackett_parallel", &self.torrents.jackett_parallel)
             .field("torrserver", &self.torrents.torrserver_url)
             .field("qbittorrent", &self.torrents.qbittorrent_url)
             .field("hwaccel", &self.torrents.hwaccel)

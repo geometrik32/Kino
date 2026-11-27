@@ -640,6 +640,7 @@ struct Details {
     seasons: Vec<RawSeason>,
     external_ids: Option<ExternalIds>,
     alternative_titles: Option<RawAlternativeTitles>,
+    translations: Option<RawTranslations>,
     last_episode_to_air: Option<RawEpisodeRef>,
     next_episode_to_air: Option<RawEpisodeRef>,
 }
@@ -661,6 +662,27 @@ struct RawAlternativeTitle {
     title: Option<String>,
     #[serde(rename = "type", default)]
     kind: String,
+}
+
+#[derive(Deserialize)]
+struct RawTranslations {
+    #[serde(default)]
+    translations: Vec<RawTranslation>,
+}
+
+#[derive(Deserialize)]
+struct RawTranslation {
+    #[serde(default)]
+    iso_3166_1: String,
+    #[serde(default)]
+    iso_639_1: String,
+    data: Option<RawTranslationData>,
+}
+
+#[derive(Deserialize)]
+struct RawTranslationData {
+    title: Option<String>,
+    name: Option<String>,
 }
 
 /// `credits`, `recommendations` and `similar` of a title, as `append_to_response` returns them.
@@ -895,31 +917,85 @@ fn is_usable_alternative_title(raw: &RawAlternativeTitle) -> bool {
     .any(|bad| kind.contains(bad))
 }
 
-fn collect_alternative_titles(alt: Option<RawAlternativeTitles>, primary: &TitleSummary) -> Vec<String> {
-    let Some(alt) = alt else {
+fn has_ascii_alpha(s: &str) -> bool {
+    s.bytes().any(|b| b.is_ascii_alphabetic())
+}
+
+fn collect_english_translations(translations: Option<RawTranslations>) -> Vec<String> {
+    let Some(tr) = translations else {
         return Vec::new();
     };
+    let mut items: Vec<(u8, String)> = tr
+        .translations
+        .into_iter()
+        .filter(|t| t.iso_639_1.eq_ignore_ascii_case("en"))
+        .filter_map(|t| {
+            let data = t.data?;
+            let raw = data.title.or(data.name)?;
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| {
+                let rank = match t.iso_3166_1.as_str() {
+                    "US" => 0,
+                    "GB" => 1,
+                    _ => 2,
+                };
+                (rank, trimmed.to_owned())
+            })
+        })
+        .collect();
+    items.sort_by_key(|(rank, _)| *rank);
+    items.into_iter().map(|(_, title)| title).collect()
+}
+
+fn collect_alternative_titles(
+    alt: Option<RawAlternativeTitles>,
+    translations: Option<RawTranslations>,
+    primary: &TitleSummary,
+) -> Vec<String> {
     let primary_norm = normalize_search_text(&primary.title);
     let orig_norm = primary.original_title.as_deref().map(normalize_search_text);
     let mut seen_norm: Vec<String> = Vec::new();
     let mut out: Vec<String> = Vec::new();
-    for entry in alt.titles.into_iter().chain(alt.results) {
-        if !is_usable_alternative_title(&entry) {
-            continue;
-        }
-        let Some(raw) = entry.title else { continue };
+    let mut push_title = |raw: String| {
         let trimmed = raw.trim();
         let norm = normalize_search_text(trimmed);
         if norm.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
-            continue;
+            return;
         }
         if norm == primary_norm || orig_norm.as_deref() == Some(norm.as_str()) || seen_norm.contains(&norm) {
-            continue;
+            return;
         }
         seen_norm.push(norm);
         out.push(trimmed.to_owned());
-        if out.len() >= 12 {
-            break;
+    };
+    let non_latin_original = !primary.original_title.as_deref().is_some_and(has_ascii_alpha);
+    let en_titles = collect_english_translations(translations);
+    if non_latin_original {
+        for title in en_titles.iter().cloned() {
+            if out.len() >= 12 {
+                break;
+            }
+            push_title(title);
+        }
+    }
+    if let Some(alt) = alt {
+        for entry in alt.titles.into_iter().chain(alt.results) {
+            if !is_usable_alternative_title(&entry) {
+                continue;
+            }
+            let Some(raw) = entry.title else { continue };
+            push_title(raw);
+            if out.len() >= 12 {
+                break;
+            }
+        }
+    }
+    if !non_latin_original {
+        for title in en_titles {
+            if out.len() >= 12 {
+                break;
+            }
+            push_title(title);
         }
     }
     out
@@ -934,7 +1010,7 @@ pub(crate) fn details_from(raw: serde_json::Value, kind: MediaKind) -> Result<Ti
         .or_else(|| d.item.first_air_date.clone())
         .filter(|s| !s.is_empty());
     let summary = d.item.into_summary(Some(kind)).ok_or(CatalogError::NotFound)?;
-    let alternative_titles = collect_alternative_titles(d.alternative_titles, &summary);
+    let alternative_titles = collect_alternative_titles(d.alternative_titles, d.translations, &summary);
     let mut seasons: Vec<SeasonSummary> = d
         .seasons
         .into_iter()
@@ -1624,7 +1700,10 @@ impl Catalog for TmdbCatalog {
     async fn details(&self, kind: MediaKind, tmdb_id: i64) -> Result<TitleDetails, CatalogError> {
         let path = format!("/{}/{tmdb_id}", kind.as_str());
         let raw: serde_json::Value = self
-            .get(&path, &[("append_to_response", "external_ids,alternative_titles")])
+            .get(
+                &path,
+                &[("append_to_response", "external_ids,alternative_titles,translations")],
+            )
             .await?;
         details_from(raw, kind)
     }
@@ -1856,6 +1935,22 @@ mod tests {
         });
         let tv = details_from(tv_raw, MediaKind::Tv).unwrap();
         assert_eq!(tv.alternative_titles, vec!["US Alternate Show"]);
+
+        let anime_raw = json!({
+            "id": 326247,
+            "name": "Ночь дурака",
+            "original_name": "フールナイト",
+            "first_air_date": "2026-11-26",
+            "alternative_titles": { "results": [] },
+            "translations": {
+                "translations": [
+                    {"iso_3166_1": "BR", "iso_639_1": "pt", "data": {"name": "Fool Night"}},
+                    {"iso_3166_1": "US", "iso_639_1": "en", "data": {"name": "Fool Night"}}
+                ]
+            }
+        });
+        let anime = details_from(anime_raw, MediaKind::Tv).unwrap();
+        assert_eq!(anime.alternative_titles, vec!["Fool Night"]);
     }
 
     #[test]

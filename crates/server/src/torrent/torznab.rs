@@ -267,8 +267,14 @@ fn tracker_name(s: &str) -> String {
         ("selezen", "Selezen"),
         ("bitru", "BitRu"),
         ("anilibria", "AniLibria"),
+        ("aniliberty", "AniLibria"),
         ("anidub", "AniDUB"),
+        ("animelayer", "AnimeLayer"),
+        ("leproduction", "LE-Production"),
+        ("rudub", "RuDub"),
+        ("anibelka", "AniBelka"),
         ("lostfilm", "LostFilm"),
+        ("knaben", "Knaben"),
     ];
     for &(needle, canonical) in CANONICAL {
         if base.eq_ignore_ascii_case(needle) {
@@ -329,6 +335,9 @@ mod tests {
         assert_eq!(tracker_name("rutracker, bitru, rutor"), "RuTracker");
         assert_eq!(tracker_name("kinozal, megapeer, rutor"), "Kinozal");
         assert_eq!(tracker_name("nnmclub, bitru"), "NNM-Club");
+        assert_eq!(tracker_name("aniliberty"), "AniLibria");
+        assert_eq!(tracker_name("leproduction"), "LE-Production");
+        assert_eq!(tracker_name("animelayer"), "AnimeLayer");
         assert_eq!(tracker_name("korsars"), "korsars");
     }
 }

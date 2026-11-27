@@ -108,6 +108,17 @@ pub fn is_movie_collection(name: &str, p: &title::ParsedTitle, details: &TitleDe
 
 pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     let p = parse_title(&item.title);
+    let (voice, language) = if let Some(studio) = russian_voice_tracker(&item.tracker) {
+        if p.has_explicit_audio {
+            (p.voice, p.language)
+        } else {
+            (studio.to_owned(), "Русский".to_owned())
+        }
+    } else if is_sub_only_default_tracker(&item.tracker) && !p.has_explicit_audio {
+        ("Оригинал".to_owned(), "Оригинал".to_owned())
+    } else {
+        (p.voice, p.language)
+    };
     let collection = is_movie_collection(&item.title, &p, details);
     let (bitrate_kbps, bitrate_approx) = match p.bitrate_kbps {
         Some(b) => (Some(b), false),
@@ -123,8 +134,8 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
         quality: p.quality,
         size_bytes: item.size,
         seeders: item.seeders,
-        voice: p.voice,
-        language: p.language,
+        voice,
+        language,
         tracker: if item.tracker.is_empty() {
             "—".into()
         } else {
@@ -180,6 +191,36 @@ fn is_non_video(name: &str) -> bool {
         return true;
     }
     !VIDEO_HINT.is_match(name) && (NON_VIDEO_EXT.is_match(name) || NON_VIDEO_SOFTWARE.is_match(name))
+}
+
+fn russian_voice_tracker(tracker: &str) -> Option<&'static str> {
+    match tracker.trim().to_ascii_lowercase().as_str() {
+        "anilibria" | "aniliberty" => Some("AniLibria"),
+        "anidub" => Some("AniDUB"),
+        "le-production" | "leproduction" => Some("LE-Production"),
+        "rudub" => Some("RuDub"),
+        "anibelka" => Some("AniBelka"),
+        "lostfilm" => Some("LostFilm"),
+        _ => None,
+    }
+}
+
+fn is_sub_only_default_tracker(tracker: &str) -> bool {
+    matches!(
+        tracker.trim().to_ascii_lowercase().as_str(),
+        "animelayer" | "knaben" | "nyaa" | "nyaa.si" | "tokyotosho"
+    )
+}
+
+fn has_russian_voice(item: &TorznabItem) -> bool {
+    if russian_voice_tracker(&item.tracker).is_some() {
+        return true;
+    }
+    let parsed = parse_title(&item.title);
+    if is_sub_only_default_tracker(&item.tracker) {
+        return parsed.has_explicit_audio && parsed.language == "Русский";
+    }
+    parsed.language == "Русский"
 }
 
 /// Trackers known to fabricate inflated seeder counts in Torznab feeds.
@@ -577,12 +618,24 @@ fn format_query_with_year(name: &str, year: Option<i32>) -> String {
 
 fn title_queries(details: &TitleDetails, year: Option<i32>) -> Vec<String> {
     let s = &details.summary;
+    let title_norm = normalize(&s.title);
     let mut queries = vec![format_query_with_year(&s.title, year)];
-    if let Some(o) = s
-        .original_title
-        .as_ref()
-        .filter(|o| normalize(o) != normalize(&s.title))
+    let orig_has_latin = s.original_title.as_deref().is_some_and(has_ascii_alpha);
+    if orig_has_latin {
+        if let Some(o) = s.original_title.as_ref().filter(|o| normalize(o) != title_norm) {
+            queries.push(format_query_with_year(o, year));
+        }
+        return queries;
+    }
+    // Non-Latin original titles (e.g. Japanese kana) rarely match trackers directly;
+    // prefer a Latin/English alternative title when TMDB provides one.
+    if let Some(alt) = details
+        .alternative_titles
+        .iter()
+        .find(|a| has_ascii_alpha(a) && !title::has_cyrillic(a) && normalize(a) != title_norm)
     {
+        queries.push(format_query_with_year(alt, year));
+    } else if let Some(o) = s.original_title.as_ref().filter(|o| normalize(o) != title_norm) {
         queries.push(format_query_with_year(o, year));
     }
     queries
@@ -692,12 +745,15 @@ async fn search_group(
     let (cats, queries, fallback) = search_plan(details);
     let (mut seen, mut any_ok, mut first_err) = run_queries(indexers, &queries, cats, details).await;
 
-    // For TV shows (yearless/year mismatch) and movies (regional alternative titles):
-    // if the main queries succeeded with 0 matches, try the fallback queries.
-    if seen.is_empty() && any_ok {
+    // For TV shows (yearless/year mismatch/no Russian dub on year-tagged query) and movies
+    // (regional alternative titles): try the fallback queries when needed.
+    let need_tv_fallback = details.summary.kind == MediaKind::Tv && !seen.values().any(has_russian_voice);
+    if any_ok && (seen.is_empty() || need_tv_fallback) {
         if let Some(fb_queries) = fallback {
             let (fb_seen, fb_ok, fb_err) = run_queries(indexers, &fb_queries, cats, details).await;
-            seen = fb_seen;
+            for (k, it) in fb_seen {
+                merge_torznab_item(&mut seen, k, it);
+            }
             any_ok |= fb_ok;
             first_err = first_err.or(fb_err);
         }
@@ -706,11 +762,12 @@ async fn search_group(
     (seen, any_ok, first_err)
 }
 
-/// Searches `primary` indexers first, falling back to `fallback` only if `primary` failed to answer.
-/// When `fallback` is Jackett behind Sablier, keeping it untouched keeps Jackett asleep.
-pub async fn search_with_fallback(
+/// Searches `primary` indexers first, falling back to `fallback` only if `primary` failed to answer
+/// (unless `parallel_fallback` is true, in which case both groups are queried together).
+pub async fn search_with_mode(
     primary: &[Jackett],
     fallback: &[Jackett],
+    parallel_fallback: bool,
     details: &TitleDetails,
 ) -> Result<Vec<TorznabItem>, TorrentError> {
     if primary.is_empty() && fallback.is_empty() {
@@ -718,6 +775,14 @@ pub async fn search_with_fallback(
     }
     let (mut seen, any_ok, mut first_err) = if primary.is_empty() {
         search_group(fallback, details).await
+    } else if parallel_fallback && !fallback.is_empty() {
+        let ((p_seen, p_ok, p_err), (fb_seen, fb_ok, fb_err)) =
+            tokio::join!(search_group(primary, details), search_group(fallback, details));
+        let mut merged = p_seen;
+        for (k, it) in fb_seen {
+            merge_torznab_item(&mut merged, k, it);
+        }
+        (merged, p_ok || fb_ok, p_err.or(fb_err))
     } else {
         let (p_seen, p_ok, p_err) = search_group(primary, details).await;
         if (!p_ok || (p_seen.is_empty() && p_err.is_some())) && !fallback.is_empty() {
@@ -746,9 +811,19 @@ pub async fn search_with_fallback(
     Ok(items)
 }
 
+/// Searches `primary` indexers first, falling back to `fallback` only if `primary` failed to answer.
+/// When `fallback` is Jackett behind Sablier, keeping it untouched keeps Jackett asleep.
+pub async fn search_with_fallback(
+    primary: &[Jackett],
+    fallback: &[Jackett],
+    details: &TitleDetails,
+) -> Result<Vec<TorznabItem>, TorrentError> {
+    search_with_mode(primary, fallback, false, details).await
+}
+
 /// Searches every configured indexer for the title, by its Russian and original names.
 pub async fn search(indexers: &[Jackett], details: &TitleDetails) -> Result<Vec<TorznabItem>, TorrentError> {
-    search_with_fallback(indexers, &[], details).await
+    search_with_mode(indexers, &[], false, details).await
 }
 
 /// Searches for the title unless that was done recently; the search also records
@@ -758,12 +833,13 @@ pub async fn search_cached(
     pool: &PgPool,
     primary: &[Jackett],
     fallback: &[Jackett],
+    parallel_fallback: bool,
     details: &TitleDetails,
 ) -> Result<std::sync::Arc<Vec<TorznabItem>>, TorrentError> {
     let key = (details.summary.kind, details.summary.tmdb_id);
     cache
         .get_or_search(key, || async {
-            let items = search_with_fallback(primary, fallback, details).await?;
+            let items = search_with_mode(primary, fallback, parallel_fallback, details).await?;
             save_sources(pool, &items).await?;
             Ok(std::sync::Arc::new(items))
         })
@@ -1418,5 +1494,50 @@ mod tests {
         };
         let crit_rel = to_release(&crit_item, &sw4);
         assert!(!crit_rel.collection);
+    }
+
+    #[test]
+    fn anime_search_plan_and_tracker_voice_classification() {
+        let mut fool_night = details(MediaKind::Tv, "Ночь дурака", "フールナイト", Some(2026));
+        fool_night.seasons = vec![season(1, 2026)];
+        fool_night.alternative_titles = vec!["Fool Night".into()];
+
+        let (cats, primary, fallback) = search_plan(&fool_night);
+        assert_eq!(cats, TV_CATS);
+        assert_eq!(primary, vec!["Ночь дурака 2026", "Fool Night 2026"]);
+        assert_eq!(fallback, Some(vec!["Ночь дурака".to_owned(), "Fool Night".to_owned()]));
+
+        let layer_item = TorznabItem {
+            title: "Fool Night / Ночь дурака (12 из 12) Complete [1080p]".into(),
+            tracker: "AnimeLayer".into(),
+            link: Some("magnet:?xt=urn:btih:4ed1bce2c21e40180a0138a9d976470a098dc881".into()),
+            ..TorznabItem::default()
+        };
+        assert!(is_about(&layer_item.title, &fool_night));
+        let layer_rel = to_release(&layer_item, &fool_night);
+        assert_eq!(layer_rel.voice, "Оригинал");
+        assert_eq!(layer_rel.language, "Оригинал");
+
+        let lep_item = TorznabItem {
+            title: "Ночь глупцов / Ночь дурака / Fool Night 2026 [1080p] | [LE-Production].rus".into(),
+            tracker: "LE-Production".into(),
+            link: Some("magnet:?xt=urn:btih:b9348486464cf8a1abdf90686b6c0d1268d86c49".into()),
+            ..TorznabItem::default()
+        };
+        assert!(is_about(&lep_item.title, &fool_night));
+        let lep_rel = to_release(&lep_item, &fool_night);
+        assert_eq!(lep_rel.voice, "LE-Production");
+        assert_eq!(lep_rel.language, "Русский");
+
+        let anidub_item = TorznabItem {
+            title: "Ночь дурака / Fool Night [12 из 12]".into(),
+            tracker: "AniDUB".into(),
+            link: Some("http://jackett:9117/dl/anidub/1".into()),
+            ..TorznabItem::default()
+        };
+        assert!(is_about(&anidub_item.title, &fool_night));
+        let anidub_rel = to_release(&anidub_item, &fool_night);
+        assert_eq!(anidub_rel.voice, "AniDUB");
+        assert_eq!(anidub_rel.language, "Русский");
     }
 }

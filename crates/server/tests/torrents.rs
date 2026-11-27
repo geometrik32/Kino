@@ -1240,11 +1240,11 @@ async fn extra_torznab_is_primary_keeps_jackett_asleep_and_falls_back_on_failure
 
     // When all primary endpoints fail to respond, server wakes Jackett and falls back to it.
     let app_fallback = app(test_state_with(
-        pool,
+        pool.clone(),
         TorrentConfig {
-            jackett_url: Some(jackett),
+            jackett_url: Some(jackett.clone()),
             jackett_api_key: Some("secret".into()),
-            jackett_wake_url: Some(sablier_url),
+            jackett_wake_url: Some(sablier_url.clone()),
             jackett_wake_group: "jackett".into(),
             jackett_wake_duration: "10m".into(),
             extra_torznab: vec![kino_server::config::ExtraTorznabConfig {
@@ -1261,6 +1261,37 @@ async fn extra_torznab_is_primary_keeps_jackett_asleep_and_falls_back_on_failure
     assert_eq!(fb_list.releases.len(), 3);
     assert!(jackett_hits.load(Ordering::SeqCst) >= 2);
     assert!(sablier_hits.load(Ordering::SeqCst) >= 1);
+
+    // When `jackett_parallel` is true, primary and Jackett are queried together and merged.
+    let par_jackett_hits = Arc::new(AtomicU32::new(0));
+    let par_jackett = start_jackett_counted(par_jackett_hits.clone()).await;
+    let par_extra = serve(Router::new().route(
+        "/api/v2.0/indexers/all/results/torznab/api",
+        get(move || async move { extra_feed }),
+    ))
+    .await;
+    let app_parallel = app(test_state_with(
+        pool,
+        TorrentConfig {
+            jackett_url: Some(par_jackett),
+            jackett_api_key: Some("secret".into()),
+            jackett_wake_url: Some(sablier_url),
+            jackett_wake_group: "jackett".into(),
+            jackett_wake_duration: "10m".into(),
+            extra_torznab: vec![kino_server::config::ExtraTorznabConfig {
+                url: par_extra,
+                api_key: None,
+            }],
+            jackett_parallel: true,
+            ..Default::default()
+        },
+    ));
+    let t_par = login_ok(&app_parallel, ADMIN_TG, None).await.token;
+    let (code, body) = call(&app_parallel, Method::GET, "/api/releases/tv/1396", Some(&t_par), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    let par_list: ReleaseList = serde_json::from_value(body).unwrap();
+    assert_eq!(par_list.releases.len(), 4);
+    assert!(par_jackett_hits.load(Ordering::SeqCst) >= 2);
 }
 
 #[sqlx::test(migrations = "./migrations")]
