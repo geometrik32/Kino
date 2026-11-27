@@ -44,6 +44,8 @@ pub struct PlayStart {
     pub video_scale: Option<VideoScale>,
     /// Episode filter active while rewatching favorites (`All` normally).
     pub rewatch_mode: RewatchMode,
+    /// User's manual 1–5 rating for a movie (`None` when unrated or TV).
+    pub my_rating: Option<i16>,
     /// User's manual 1–5 ratings per episode (used by `RewatchMode::Only5` / `FourPlus`).
     pub episode_ratings: Vec<EpisodeRating>,
 }
@@ -615,6 +617,8 @@ pub fn Player(
 
     let rewatch_mode = start.rewatch_mode;
     let ep_ratings = start.episode_ratings.clone();
+    let mut player_film_rating = use_signal(|| start.my_rating);
+    let mut player_ep_ratings = use_signal(|| start.episode_ratings.clone());
     let mut choices = use_signal(|| start.choices.clone());
     let mut target = use_signal(|| (start.season, start.episode));
     let mut release = use_signal(|| start.release.clone());
@@ -3965,6 +3969,14 @@ pub fn Player(
             }
         }
         st.active_infohash = Some(release().infohash);
+        st.my_rating = if kind == MediaKind::Tv {
+            player_ep_ratings()
+                .iter()
+                .find(|e| e.season == season && e.episode == episode)
+                .map(|e| e.rating)
+        } else {
+            player_film_rating()
+        };
         st
     };
 
@@ -4340,6 +4352,34 @@ pub fn Player(
             })),
             on_lock: Some(Callback::new(move |v: bool| {
                 locked.set(v);
+            })),
+            on_rate: Some(Callback::new({
+                let rate_token = token.clone();
+                move |r: Option<i16>| {
+                    telegram::haptic(telegram::Haptic::Select);
+                    let tok = rate_token.clone();
+                    if kind == MediaKind::Tv {
+                        let (s_num, ep_num) = *target.peek();
+                        player_ep_ratings.with_mut(|list| {
+                            list.retain(|e| !(e.season == s_num && e.episode == ep_num));
+                            if let Some(val) = r {
+                                list.push(EpisodeRating {
+                                    season: s_num,
+                                    episode: ep_num,
+                                    rating: val,
+                                });
+                            }
+                        });
+                        spawn(async move {
+                            let _ = api::set_episode_rating(&tok, id, s_num, ep_num, r).await;
+                        });
+                    } else {
+                        player_film_rating.set(r);
+                        spawn(async move {
+                            let _ = api::set_rating(&tok, kind, id, r).await;
+                        });
+                    }
+                }
             })),
             on_audio: {
                 let save_tracks = save_tracks.clone();

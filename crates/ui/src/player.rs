@@ -10,8 +10,8 @@ pub use kino_core::{
     NEXT_PROMPT_END_RATIO, NEXT_PROMPT_MIN_SEC,
 };
 use kino_core::{
-    clock, episode_code, normalize_quality_key, MediaTrack, PreloadItem, PreloadState, ReleaseOption, StreamProgress,
-    SyncMemberInfo,
+    clock, episode_code, normalize_quality_key, rating_description, MediaTrack, PreloadItem, PreloadState,
+    ReleaseOption, StreamProgress, SyncMemberInfo,
 };
 
 use crate::human_size;
@@ -175,6 +175,8 @@ pub struct PlayerState {
     pub next_available: Option<(i32, i32)>,
     /// Detected or community-sourced intro / recap / credits segments for the current video.
     pub segments: Vec<MediaSegment>,
+    /// Current user's 1–5 rating for the playing episode (TV) or movie (`None` if unrated).
+    pub my_rating: Option<i16>,
 }
 
 impl Default for PlayerState {
@@ -230,6 +232,7 @@ impl Default for PlayerState {
             rewatch_label: None,
             next_available: None,
             segments: Vec::new(),
+            my_rating: None,
         }
     }
 }
@@ -484,6 +487,7 @@ pub fn PlayerView(
     #[props(default)] on_dismiss_disk_prompt: Option<EventHandler<()>>,
     #[props(default)] on_jump_episode: Option<EventHandler<(i32, i32)>>,
     #[props(default)] on_lock: Option<EventHandler<bool>>,
+    #[props(default)] on_rate: Option<EventHandler<Option<i16>>>,
     #[props(default)] window_chrome: Option<WindowChrome>,
 ) -> Element {
     let tip_host = provide_tooltip_host();
@@ -499,6 +503,11 @@ pub fn PlayerView(
     let mut drag_active = use_signal(|| false);
     let mut drag_end_pos = use_signal(|| None::<(f64, f64)>);
     let mut dismissed_next = use_signal(|| None::<String>);
+    let mut dismissed_rate = use_signal(|| None::<(i32, i32)>);
+    let mut rate_just_saved = use_signal(|| None::<(i32, i32)>);
+    let mut rate_hover = use_signal(|| None::<i16>);
+    let mut rate_popped = use_signal(|| None::<(i16, u32)>);
+    let mut rate_tick = use_signal(|| 0u32);
     let mut last_mouse = use_signal(|| None::<(f64, f64)>);
     let mut tap_gen = use_signal(|| 0u64);
     let ping_activity = move || {
@@ -542,6 +551,15 @@ pub fn PlayerView(
         && s.next.is_some()
         && dismissed_next().as_deref() != s.next.as_deref()
         && !locked();
+    let rate_ep_key = (s.season, s.episode);
+    let show_rate = on_rate.is_some()
+        && !show_disk_prompt
+        && near_end
+        && !locked()
+        && !s.waiting
+        && s.error.is_none()
+        && dismissed_rate() != Some(rate_ep_key)
+        && (s.my_rating.is_none() || rate_just_saved() == Some(rate_ep_key));
     let active_skip = if !locked() && !show_disk_prompt && !s.waiting && s.error.is_none() {
         active_skip_segment(pos, dur, &s.segments, s.next.is_some()).cloned()
     } else {
@@ -990,6 +1008,104 @@ pub fn PlayerView(
                                 onclick: move |_| on_seek.call(target_sec),
                                 Icon { svg: icons::FWD10, class: "ic sm" }
                                 span { "{label}" }
+                            }
+                        }
+                    }
+                }
+
+                if show_rate {
+                    {
+                        let rate_cls = if show_next {
+                            "p-next-card p-rate-card with-next"
+                        } else {
+                            "p-next-card p-rate-card"
+                        };
+                        let hovered_star = rate_hover();
+                        let display_star = hovered_star.or(s.my_rating).unwrap_or(0);
+                        let sub_text = if let Some(h) = hovered_star {
+                            format!("{h}★ — {}", rating_description(h))
+                        } else if let Some(r) = s.my_rating {
+                            format!("Оценка {r}★ — {}", rating_description(r))
+                        } else if s.season > 0 {
+                            "Как вам серия?".to_owned()
+                        } else {
+                            "Как вам фильм?".to_owned()
+                        };
+                        let pop_state = rate_popped();
+                        rsx! {
+                            div {
+                                class: "{rate_cls}",
+                                onmouseleave: move |_| rate_hover.set(None),
+                                div { class: "p-next-info",
+                                    div { class: "p-next-sub", "{sub_text}" }
+                                    div {
+                                        class: "p-rate-stars",
+                                        role: "radiogroup",
+                                        "aria-label": "Оценка",
+                                        for n in 1..=5i16 {
+                                            {
+                                                let is_on = n <= display_star;
+                                                let is_popped = pop_state.is_some_and(|(pn, _)| pn == n) && s.my_rating == Some(n);
+                                                let cls = match (is_on, is_popped) {
+                                                    (true, true) => "p-rate-star on pop",
+                                                    (true, false) => "p-rate-star on",
+                                                    _ => "p-rate-star",
+                                                };
+                                                let star_key = if is_popped {
+                                                    format!("p-star-{n}-{}", pop_state.map(|(_, t)| t).unwrap_or(0))
+                                                } else {
+                                                    format!("p-star-{n}")
+                                                };
+                                                let desc = rating_description(n);
+                                                rsx! {
+                                                    button {
+                                                        key: "{star_key}",
+                                                        class: "{cls}",
+                                                        role: "radio",
+                                                        "aria-checked": if s.my_rating == Some(n) { "true" } else { "false" },
+                                                        "aria-label": "{n} из 5: {desc}",
+                                                        onmouseenter: move |_| rate_hover.set(Some(n)),
+                                                        onclick: move |_| {
+                                                            rate_hover.set(None);
+                                                            let t = rate_tick() + 1;
+                                                            rate_tick.set(t);
+                                                            rate_popped.set(Some((n, t)));
+                                                            rate_just_saved.set(Some(rate_ep_key));
+                                                            if let Some(cb) = on_rate {
+                                                                cb.call(Some(n));
+                                                            }
+                                                            spawn(async move {
+                                                                let _ = dioxus::document::eval(
+                                                                    "await new Promise(r => setTimeout(r, 2200)); return 0;",
+                                                                )
+                                                                .join::<i32>()
+                                                                .await;
+                                                                if *rate_tick.peek() == t {
+                                                                    rate_just_saved.set(None);
+                                                                }
+                                                            });
+                                                        },
+                                                        Icon { svg: icons::STAR, class: "ic" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                button {
+                                    class: "p-glass-btn icon p-next-close",
+                                    "aria-label": "Скрыть",
+                                    onmounted: move |e| tip.mount(17, e.data()),
+                                    onmouseenter: move |_| tip.show(17, "Скрыть"),
+                                    onmouseleave: move |_| tip.hide(17),
+                                    onmousedown: move |_| tip.hide(17),
+                                    onclick: move |_| {
+                                        tip.hide(17);
+                                        rate_just_saved.set(None);
+                                        dismissed_rate.set(Some(rate_ep_key));
+                                    },
+                                    Icon { svg: icons::CLOSE, class: "ic sm" }
+                                }
                             }
                         }
                     }

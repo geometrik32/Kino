@@ -70,6 +70,7 @@ fn Page(props: PageProps) -> Element {
         Screen::Search(..) => Some(Tab::Search),
         Screen::Mine(..) => Some(Tab::Mine),
         Screen::Profile(..) => Some(Tab::Profile),
+        Screen::Title { .. } | Screen::Person(..) => Some(Tab::Home),
         _ => None,
     };
     let query = match &props.screen {

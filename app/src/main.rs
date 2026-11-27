@@ -1198,7 +1198,18 @@ fn Main(
         .unwrap_or_default();
     let tab = match view() {
         View::Tab(t) => Some(t),
-        View::Title { .. } | View::Person(_) | View::Shelf { .. } => None,
+        View::Title { .. } | View::Person(_) | View::Shelf { .. } => {
+            let active = trail
+                .peek()
+                .iter()
+                .rev()
+                .find_map(|entry| match entry.view {
+                    View::Tab(t) => Some(t),
+                    _ => None,
+                })
+                .unwrap_or(Tab::Home);
+            Some(active)
+        }
     };
     let open_title = move |kind: MediaKind, id: i64, play: bool| {
         let url = format!("/?open={}_{id}", kind.as_str());
@@ -1439,6 +1450,32 @@ fn Main(
                         schedule_scroll(scroll_req, 0.0);
                     }
                     return;
+                }
+                if !matches!(view(), View::Tab(_)) && tab == Some(t) {
+                    let target = trail.with_mut(|tr| {
+                        if let Some(pos) = tr.iter().rposition(|e| matches!(e.view, View::Tab(tab) if tab == t)) {
+                            let last = tr.split_off(pos);
+                            last.into_iter().next()
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(prev) = target {
+                        view.set(prev.view);
+                        schedule_scroll(scroll_req, prev.scroll_y);
+                        if !telegram::is_telegram() {
+                            telegram::replace_history(&view_url(&View::Tab(t), *my_section.peek(), &query.peek()));
+                        }
+                        if t == Tab::Search {
+                            spawn(async move {
+                                platform::sleep(60).await;
+                                let _ = dioxus::document::eval(
+                                    "var el = document.getElementById('kino-search-input'); if (el) el.focus();",
+                                );
+                            });
+                        }
+                        return;
+                    }
                 }
                 if telegram::is_telegram() {
                     trail.set(Vec::new());
@@ -4321,6 +4358,7 @@ fn Title(
                     explicit_release,
                     video_scale: scale_now().or(st.video_scale),
                     rewatch_mode,
+                    my_rating,
                     episode_ratings: st.episode_ratings.clone(),
                 },
                 on_scale: {
