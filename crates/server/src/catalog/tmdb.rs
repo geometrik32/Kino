@@ -957,6 +957,9 @@ fn collect_alternative_titles(
     let mut seen_norm: Vec<String> = Vec::new();
     let mut out: Vec<String> = Vec::new();
     let mut push_title = |raw: String| {
+        if out.len() >= 12 {
+            return;
+        }
         let trimmed = raw.trim();
         let norm = normalize_search_text(trimmed);
         if norm.chars().filter(|c| c.is_alphanumeric()).count() < 3 {
@@ -972,9 +975,6 @@ fn collect_alternative_titles(
     let en_titles = collect_english_translations(translations);
     if non_latin_original {
         for title in en_titles.iter().cloned() {
-            if out.len() >= 12 {
-                break;
-            }
             push_title(title);
         }
     }
@@ -985,16 +985,10 @@ fn collect_alternative_titles(
             }
             let Some(raw) = entry.title else { continue };
             push_title(raw);
-            if out.len() >= 12 {
-                break;
-            }
         }
     }
     if !non_latin_original {
         for title in en_titles {
-            if out.len() >= 12 {
-                break;
-            }
             push_title(title);
         }
     }

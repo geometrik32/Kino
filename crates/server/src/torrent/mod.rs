@@ -108,6 +108,15 @@ pub fn is_movie_collection(name: &str, p: &title::ParsedTitle, details: &TitleDe
 
 pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     let p = parse_title(&item.title);
+    let collection = is_movie_collection(&item.title, &p, details);
+    let (bitrate_kbps, bitrate_approx) = match p.bitrate_kbps {
+        Some(b) => (Some(b), false),
+        None => (
+            running_minutes(&p, details, collection).and_then(|m| estimate_bitrate_kbps(item.size, m)),
+            true,
+        ),
+    };
+    let direct_play = p.codec.as_deref() == Some("H.264") && !p.hdr && p.quality != "2160p";
     let (voice, language) = if let Some(studio) = russian_voice_tracker(&item.tracker) {
         if p.has_explicit_audio {
             (p.voice, p.language)
@@ -119,15 +128,6 @@ pub fn to_release(item: &TorznabItem, details: &TitleDetails) -> ReleaseOption {
     } else {
         (p.voice, p.language)
     };
-    let collection = is_movie_collection(&item.title, &p, details);
-    let (bitrate_kbps, bitrate_approx) = match p.bitrate_kbps {
-        Some(b) => (Some(b), false),
-        None => (
-            running_minutes(&p, details, collection).and_then(|m| estimate_bitrate_kbps(item.size, m)),
-            true,
-        ),
-    };
-    let direct_play = p.codec.as_deref() == Some("H.264") && !p.hdr && p.quality != "2160p";
     ReleaseOption {
         infohash: release_key(item),
         title: item.title.clone(),
