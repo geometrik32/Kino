@@ -16,6 +16,7 @@ use kino_core::{
 
 use crate::human_size;
 use crate::icons::{self, Icon};
+use crate::WindowChrome;
 
 /// `id` of the `<video>` element; the app drives it through the DOM.
 pub const VIDEO_ID: &str = "kino-video";
@@ -447,6 +448,7 @@ pub fn PlayerView(
     #[props(default)] on_dismiss_disk_prompt: Option<EventHandler<()>>,
     #[props(default)] on_jump_episode: Option<EventHandler<(i32, i32)>>,
     #[props(default)] on_lock: Option<EventHandler<bool>>,
+    #[props(default)] window_chrome: Option<WindowChrome>,
 ) -> Element {
     let mut locked = use_signal(|| false);
     let mut lock_hint = use_signal(|| false);
@@ -728,18 +730,29 @@ pub fn PlayerView(
                     }
                 }
 
-                div { class: "p-top", onpointerdown: move |_| ping_activity(),
+                div {
+                    class: if window_chrome.is_some() { "p-top has-win-chrome" } else { "p-top" },
+                    onpointerdown: move |_| ping_activity(),
+                    onmousedown: move |e| {
+                        if let Some(chrome) = &window_chrome {
+                            if e.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                                chrome.on_drag.call(());
+                            }
+                        }
+                    },
                     div { class: "p-top-l",
                         button {
                             class: "p-glass-btn icon",
                             title: "Назад",
                             "aria-label": "Назад",
+                            onmousedown: move |e| e.stop_propagation(),
                             onclick: move |_| on_close.call(()),
                             Icon { svg: icons::BACK, class: "ic" }
                         }
                         button {
                             class: "p-title-link",
                             title: "Открыть страницу тайтла",
+                            onmousedown: move |e| e.stop_propagation(),
                             onclick: move |_| {
                                 if let Some(cb) = on_title {
                                     cb.call(());
@@ -760,7 +773,9 @@ pub fn PlayerView(
                             }
                         }
                     }
-                    div { class: "p-top-r",
+                    div {
+                        class: "p-top-r",
+                        onmousedown: move |e| e.stop_propagation(),
                         button {
                             class: "p-glass-btn icon",
                             title: "Заблокировать экран от случайных нажатий",

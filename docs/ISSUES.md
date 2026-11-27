@@ -1161,3 +1161,64 @@
 - [x] Сборка `.github/workflows/desktop.yml` проходит целиком и публикует релиз `desktop-latest` с `Orel-Kino-Setup.exe`, `Orel-Kino-portable.zip` и `version.json` (проверено в прогоне `45981606581`, `0.1.8`).
 - [x] Приложение для ПК (`kino-app --features desktop`) использует `kino-mpv` (`libmpv`) через `platform::video` для прямого воспроизведения без серверного `ffmpeg`, сохраняет прогресс, синхронизацию, пропуск сегментов и переключение дорожек (реализовано и проверено сборкой/тестами CI `45981606581`, ожидает живой проверки на ПК).
 - [x] В `kino-ui` и `kino-app` отображается текущая версия приложения, кнопка ручной проверки обновлений в профиле, баннер доступного обновления и 1-кликовая установка с проверкой SHA-256 (ожидает живой проверки обновления между версиями на ПК и Android).
+
+---
+
+## ISSUE-039: Консоль при запуске на Windows, полоса прокрутки справа и системная рамка окна
+
+- **Статус:** `Исправлено` (реализовано в `kino-app` и `kino-ui`, проверено компиляцией под Windows Desktop / WASM и unit-тестами; ожидает сборки релиза `desktop-latest` и живой проверки у пользователя)
+- **Приоритет:** Средний (P2)
+- **Затронутые платформы:** Desktop / Windows (`kino-app --features desktop`), а также прокрутка в `kino-ui` (`style.css`).
+
+### Суть проблемы
+1. При запуске Windows-приложения `orel-kino.exe` вместе с окном программы открывается окно консоли (`SUBSYSTEM:CONSOLE`).
+2. Справа в окне отображается стандартная серая полоса прокрутки WebView2.
+3. Верхняя рамка окна (`Орловский кинопоказ`, `- □ ×`) выполнена в виде отдельной системной серой шапки Windows вместо кнопок управления окном, встроенных в тёмный интерфейс приложения (в стиле Antigravity).
+
+### Что реализовано
+1. **Запуск без консольного окна (`app/src/main.rs`):**
+   - Добавлен атрибут `#![cfg_attr(all(not(test), target_os = "windows", feature = "desktop"), windows_subsystem = "windows")]` — проверено на собранном `kino-app.exe` (PE Subsystem = `2`, Windows GUI).
+2. **Скрытие правой полосы прокрутки (`crates/ui/src/style.css`):**
+   - Для `html, body`, `.sheet` и `.p-popover` скрыты визуальные скроллбары (`scrollbar-width: none`, `-ms-overflow-style: none`, `::-webkit-scrollbar { display: none; }`) при сохранении прокрутки колесом мыши, тачпадом и клавиатурой.
+3. **Интегрированные кнопки управления окном (`app/src/main.rs`, `app/src/player.rs`, `crates/ui/src/lib.rs`, `crates/ui/src/player.rs`, `crates/ui/src/icons.rs`, `crates/ui/src/style.css`):**
+   - В `desktop_config` отключена системная рамка (`with_decorations(false)`), сохранены тень/изменение размеров и привязка к рабочей области (`with_undecorated_shadow(true)`), задан тёмный стартовый фон `(14, 22, 33, 255)`.
+   - Добавлены `WindowChrome`, `WindowControls` (`Свернуть`, `Развернуть`/`Восстановить`, `Закрыть` в правом верхнем углу в стиле Antigravity, с автоматическим скрытием в плеере при затухании панели управления) и `DesktopDragStrip` для перетаскивания и двойного клика на экранах загрузки/входа; в `Shell` (`.topbar`) и `PlayerView` (`.p-top`) верхняя панель поддерживает перетаскивание окна и двойной клик для разворачивания/восстановления без перехвата кликов по интерактивным кнопкам и поиску, а состояние `is_maximized` отслеживается через `use_wry_event_handler`.
+
+### Проверки
+- `cargo +stable-x86_64-pc-windows-msvc fmt --all -- --check` — пройдено.
+- `cargo check -p kino-app --target wasm32-unknown-unknown --locked` (с `RUSTFLAGS="-D warnings"`) — пройдено.
+- `cargo check --target x86_64-pc-windows-gnullvm --workspace --all-targets --locked` (с `RUSTFLAGS="-D warnings"`) — пройдено.
+- `cargo test --target x86_64-pc-windows-gnullvm --workspace --lib --locked` — все unit-тесты пройдены (`kino-core`: 12, `kino-mpv`: 0, `kino-server`: 115, `kino-ui`: 13, `kino-app --no-default-features --features desktop`: 17).
+- `cargo build --target x86_64-pc-windows-gnullvm -p kino-app --no-default-features --features desktop --locked` — собран `kino-app.exe`, PE Subsystem = `2` (Windows GUI).
+
+### Критерии приёмки
+- [x] Windows-сборка (`kino-app --features desktop`) собирается с `windows_subsystem = "windows"` и запускается без окна консоли (подтверждено проверкой PE Subsystem = `2`).
+- [x] Скрыта визуальная полоса прокрутки справа на страницах и во всплывающих листах (`scrollbar-width: none` / `::-webkit-scrollbar`) при сохранении прокрутки колесом мыши, тачпадом и клавиатурой.
+- [x] Окно Windows-приложения работает без системной верхней шапки (`with_decorations(false)` + тень `with_undecorated_shadow(true)`), а кнопки управления окном (`—`, `□`/`❐`, `×`) и перетаскивание за верхнюю панель вписаны в дизайн на всех экранах (`Загрузка`, `Вход`, `Shell`, `Плеер`).
+
+---
+
+## ISSUE-039: Центрирование интерфейса с вырезом, скрытие хедера и полосы прокрутки в Android-приложении
+
+- **Статус:** `Исправлено` (реализовано в `app/android/MainActivity.kt`, `app/src/main.rs`, `crates/ui/src/style.css`; ожидает сборки APK в `.github/workflows/android.yml` и проверки на устройстве)
+- **Приоритет:** Средний (P2)
+- **Затронутые платформы:** Android-приложение (`kino-app --features mobile`, `kino-ui`).
+
+### Суть проблемы
+1. В ландшафтном режиме (в плеере и на экранах приложения) при наличии выреза камеры с одной стороны отступ добавлялся только с этой стороны (`cut.left`/`bars.left`), из-за чего нижняя панель управления плеера и интерфейс смещались относительно центра экрана.
+2. В Android-приложении сверху продолжал отображаться лишний хедер с логотипом, хотя вся навигация уже вынесена в нижнюю панель `.tabbar`.
+3. На экранах Android-приложения справа отображалась вертикальная полоса прокрутки WebView.
+
+### Что реализовано
+- **`app/android/MainActivity.kt`:**
+  - В `OnApplyWindowInsetsListener` горизонтальные отступы выравниваются симметрично (`maxOf(cut.left, cut.right)` для `--android-sal`/`--android-sar` в плеере и `maxOf(bars.left, bars.right)` для отступов контейнера вне плеера), чтобы интерфейс оставался строго по центру экрана.
+  - В `onWebViewCreate` отключены системные полосы прокрутки `webView.isVerticalScrollBarEnabled = false` и `webView.isHorizontalScrollBarEnabled = false`.
+- **`app/src/main.rs` и `crates/ui/src/style.css`:**
+  - Для Android-сборки (`target_os = "android"`) на `<html>` добавляется класс `kino-android`.
+  - В `style.css` для `html.kino-android` скрыты все полосы прокрутки (`scrollbar-width: none` и `::-webkit-scrollbar { display: none; width: 0; height: 0; }`), а в мобильном брейкпоинте (`<= 720px`, где активна нижняя панель `.tabbar`) скрыт `.topbar:not(.is-search)` с сохранением поля ввода поиска на вкладке «Поиск».
+
+### Критерии приёмки
+- [x] Горизонтальные отступы от выреза камеры и системных панелей в `MainActivity.kt` применяются симметрично слева и справа.
+- [x] Верхний хедер в мобильном режиме Android-приложения скрыт (поле поиска на вкладке «Поиск» сохранено).
+- [x] Полоса прокрутки справа скрыта на уровне `WebView` и CSS.
+- [ ] Пройдены CI-проверки (`.github/workflows/android.yml`) и визуальная проверка на Android-устройстве.

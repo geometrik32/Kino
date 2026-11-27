@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(test), target_os = "windows", feature = "desktop"),
+    windows_subsystem = "windows"
+)]
+
 //! Kino client. One codebase for the website and the Telegram Mini App;
 //! desktop and mobile builds come later (see README).
 //!
@@ -24,9 +29,10 @@ use kino_core::{
     VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
-    icons, play_target, AppUpdateUi, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection, MyView, PersonView,
-    PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView,
-    ShelfView, Shell, Tab, Theme, TitleExtrasView, TitleView, UpdateBanner, FAVICON_URI, STYLE,
+    icons, play_target, AppUpdateUi, DesktopDragStrip, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection,
+    MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
+    SearchView, ShelfView, Shell, Tab, Theme, TitleExtrasView, TitleView, UpdateBanner, WindowChrome, WindowControls,
+    FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
@@ -38,20 +44,23 @@ fn main() {
     {
         // The WebView's own page: let the picture go under the notch and system bars
         // (the screens add the safe-area padding themselves), and apply saved theme early.
-        const HEAD: &str = r#"<script>
-            var m = document.querySelector('meta[name=viewport]');
+        const HEAD_BODY: &str = r#"var m = document.querySelector('meta[name=viewport]');
             if (m) { m.content = 'width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover'; }
             try {
                 var t = localStorage.getItem('kino.theme');
                 if (t === 'dark' || t === 'light') { document.documentElement.dataset.theme = t; }
             } catch (e) {}
         </script>"#;
+        #[cfg(target_os = "android")]
+        let head = format!("<script>document.documentElement.classList.add('kino-android');\n{HEAD_BODY}");
+        #[cfg(not(target_os = "android"))]
+        let head = format!("<script>\n{HEAD_BODY}");
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
-        let config = desktop_config(HEAD);
+        let config = desktop_config(&head);
         #[cfg(feature = "mobile")]
         let config = dioxus::mobile::Config::new()
             .with_background_color((0, 0, 0, 0))
-            .with_custom_head(HEAD.to_owned());
+            .with_custom_head(head);
         dioxus::LaunchBuilder::new().with_cfg(config).launch(App);
     }
 
@@ -61,6 +70,8 @@ fn main() {
 
 #[cfg(all(feature = "desktop", not(feature = "mobile")))]
 fn desktop_config(head: &str) -> dioxus::desktop::Config {
+    #[cfg(target_os = "windows")]
+    use dioxus::desktop::tao::platform::windows::WindowBuilderExtWindows;
     use dioxus::desktop::{tao::window::Icon, Config, LogicalSize, WindowBuilder};
 
     let icon = Icon::from_rgba(include_bytes!("../../desktop/assets/icon-64.rgba").to_vec(), 64, 64).ok();
@@ -68,10 +79,14 @@ fn desktop_config(head: &str) -> dioxus::desktop::Config {
         .with_title("Орловский кинопоказ")
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
         .with_min_inner_size(LogicalSize::new(480.0, 600.0))
+        .with_decorations(false)
         .with_window_icon(icon);
+    #[cfg(target_os = "windows")]
+    let window = window.with_undecorated_shadow(true);
     let mut config = Config::new()
         .with_window(window)
         .with_menu(None)
+        .with_background_color((14, 22, 33, 255))
         .with_custom_head(head.to_owned());
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         config = config.with_data_directory(
@@ -81,6 +96,81 @@ fn desktop_config(head: &str) -> dioxus::desktop::Config {
         );
     }
     config
+}
+
+#[cfg(all(feature = "desktop", not(feature = "mobile")))]
+fn use_window_chrome() -> Option<WindowChrome> {
+    use dioxus::desktop::{
+        tao::event::{Event, WindowEvent},
+        use_window, use_wry_event_handler,
+    };
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        time::{Duration, Instant},
+    };
+
+    let win = use_window();
+    let mut maximized = use_signal(|| win.is_maximized());
+    let win_for_ev = win.clone();
+    use_wry_event_handler(move |ev, _| {
+        if let Event::WindowEvent {
+            event: WindowEvent::Resized(_) | WindowEvent::Moved(_),
+            ..
+        } = ev
+        {
+            let now_max = win_for_ev.is_maximized();
+            if *maximized.peek() != now_max {
+                maximized.set(now_max);
+            }
+        }
+    });
+
+    let last_drag_tap = use_hook(|| Rc::new(RefCell::new(None::<(Instant, Option<(i32, i32)>)>)));
+    let w_drag = win.clone();
+    let w_min = win.clone();
+    let w_max = win.clone();
+    let w_close = win;
+
+    Some(WindowChrome {
+        maximized: maximized(),
+        on_drag: Callback::new(move |_| {
+            let pos = w_drag.outer_position().ok().map(|p| (p.x, p.y));
+            let now = Instant::now();
+            let is_double = {
+                let mut slot = last_drag_tap.borrow_mut();
+                let hit = slot
+                    .as_ref()
+                    .is_some_and(|(t, p)| now.duration_since(*t) < Duration::from_millis(400) && *p == pos);
+                if hit {
+                    *slot = None;
+                    true
+                } else {
+                    *slot = Some((now, pos));
+                    false
+                }
+            };
+            if is_double {
+                w_drag.toggle_maximized();
+            } else {
+                w_drag.drag();
+            }
+        }),
+        on_minimize: Callback::new(move |_| {
+            w_min.set_minimized(true);
+        }),
+        on_toggle_maximize: Callback::new(move |_| {
+            w_max.toggle_maximized();
+        }),
+        on_close: Callback::new(move |_| {
+            w_close.close();
+        }),
+    })
+}
+
+#[cfg(not(all(feature = "desktop", not(feature = "mobile"))))]
+fn use_window_chrome() -> Option<WindowChrome> {
+    None
 }
 
 #[derive(Clone, PartialEq)]
@@ -159,6 +249,7 @@ async fn establish() -> Session {
 
 #[component]
 fn App() -> Element {
+    let window_chrome = use_window_chrome();
     let mut session = use_signal(|| Session::Checking);
     let mut theme = use_signal(|| {
         if telegram::is_telegram() {
@@ -198,14 +289,26 @@ fn App() -> Element {
         document::Link { rel: "stylesheet", href: FONTS_URL, media: "print", onload: "this.media='all'" }
         style { "{STYLE}" }
         match session() {
-            Session::Checking => rsx! { p { class: "muted", style: "padding: 24px", "Загрузка…" } },
-            Session::LoggedOut { error } => rsx! { Login { error, on_login: move |s| session.set(s) } },
+            Session::Checking => rsx! {
+                if let Some(chrome) = window_chrome.clone() {
+                    DesktopDragStrip { chrome }
+                }
+                p { class: "muted", style: "padding: 24px", "Загрузка…" }
+            },
+            Session::LoggedOut { error } => rsx! {
+                Login {
+                    error,
+                    window_chrome: window_chrome.clone(),
+                    on_login: move |s| session.set(s),
+                }
+            },
             Session::LoggedIn { token, name, avatar_url } => rsx! {
                 Main {
                     token,
                     name,
                     avatar_url,
                     theme: theme(),
+                    window_chrome: window_chrome.clone(),
                     on_theme,
                     on_logout: move |_| {
                         api::forget_token();
@@ -214,6 +317,9 @@ fn App() -> Element {
                     },
                 }
             },
+        }
+        if let Some(chrome) = window_chrome {
+            WindowControls { chrome }
         }
     }
 }
@@ -240,7 +346,11 @@ fn open_link(e: &Event<MouseData>, url: &str) {
 }
 
 #[component]
-fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
+fn Login(
+    error: Option<String>,
+    #[props(default)] window_chrome: Option<WindowChrome>,
+    on_login: EventHandler<Session>,
+) -> Element {
     let mut state = use_signal(|| LinkLogin::Idle);
     // Made in advance so the button is a plain link: browsers block pop-ups
     // opened after a network round trip.
@@ -305,7 +415,7 @@ fn Login(error: Option<String>, on_login: EventHandler<Session>) -> Element {
         .trim_start_matches("http://")
         .to_owned();
     rsx! {
-        LoginView { invite: telegram::invite(), error: shown_error,
+        LoginView { invite: telegram::invite(), error: shown_error, window_chrome,
             if !platform::is_web() && state() != LinkLogin::Waiting {
                 input {
                     class: "input-field",
@@ -860,6 +970,7 @@ fn Main(
     name: String,
     avatar_url: Option<String>,
     theme: Theme,
+    #[props(default)] window_chrome: Option<WindowChrome>,
     on_theme: EventHandler<Theme>,
     on_logout: EventHandler<()>,
 ) -> Element {
@@ -1276,6 +1387,7 @@ fn Main(
             update_banner,
             on_install_update: Some(on_install_update),
             on_dismiss_update: Some(Callback::new(move |_| update_dismissed.set(true))),
+            window_chrome: window_chrome.clone(),
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
                 if t != Tab::Search {
@@ -1449,6 +1561,7 @@ fn Main(
                             auto_season: season,
                             auto_release: release,
                             cache,
+                            window_chrome: window_chrome.clone(),
                             on_preloads_changed: move |_| active_preloads.restart(),
                             on_open: open,
                             on_person: open_person,
@@ -2636,6 +2749,7 @@ fn Title(
     #[props(default)] auto_season: Option<i32>,
     #[props(default)] auto_release: Option<String>,
     cache: Signal<AppCache>,
+    #[props(default)] window_chrome: Option<WindowChrome>,
     on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<TitleSummary>,
     on_person: EventHandler<i64>,
@@ -4149,6 +4263,7 @@ fn Title(
             Player {
                 key: "{t.season}-{t.episode}-{rel.infohash}",
                 token: token.clone(),
+                window_chrome: window_chrome.clone(),
                 start: PlayStart {
                     kind,
                     tmdb_id: id,

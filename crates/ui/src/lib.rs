@@ -247,6 +247,71 @@ pub struct UpdateBanner {
     pub error: Option<String>,
 }
 
+/// Actions for custom frameless desktop window controls (minimize, maximize/restore, close, drag).
+#[derive(Clone, PartialEq)]
+pub struct WindowChrome {
+    pub maximized: bool,
+    pub on_drag: EventHandler<()>,
+    pub on_minimize: EventHandler<()>,
+    pub on_toggle_maximize: EventHandler<()>,
+    pub on_close: EventHandler<()>,
+}
+
+/// Invisible top drag strip for screens without the main topbar (loading, login).
+#[component]
+pub fn DesktopDragStrip(chrome: WindowChrome) -> Element {
+    rsx! {
+        div {
+            class: "win-drag-strip",
+            onmousedown: move |e| {
+                if e.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                    chrome.on_drag.call(());
+                }
+            },
+        }
+    }
+}
+
+/// Minimal Antigravity-style window caption buttons anchored to the top-right corner on Desktop.
+#[component]
+pub fn WindowControls(chrome: WindowChrome) -> Element {
+    let max_title = if chrome.maximized {
+        "Восстановить"
+    } else {
+        "Развернуть"
+    };
+    rsx! {
+        div {
+            class: "win-controls",
+            onmousedown: move |e| e.stop_propagation(),
+            button {
+                class: "win-btn",
+                r#type: "button",
+                title: "Свернуть",
+                "aria-label": "Свернуть",
+                onclick: move |_| chrome.on_minimize.call(()),
+                Icon { svg: icons::WIN_MIN, class: "ic win-ic" }
+            }
+            button {
+                class: "win-btn",
+                r#type: "button",
+                title: "{max_title}",
+                "aria-label": "{max_title}",
+                onclick: move |_| chrome.on_toggle_maximize.call(()),
+                Icon { svg: if chrome.maximized { icons::WIN_RESTORE } else { icons::WIN_MAX }, class: "ic win-ic" }
+            }
+            button {
+                class: "win-btn close",
+                r#type: "button",
+                title: "Закрыть",
+                "aria-label": "Закрыть",
+                onclick: move |_| chrome.on_close.call(()),
+                Icon { svg: icons::WIN_CLOSE, class: "ic win-ic" }
+            }
+        }
+    }
+}
+
 /// Top bar on wide screens, bottom 4-tab bar (with circular Telegram avatar) on phones.
 /// No custom UI back button: browser, Android swipe, and Telegram's native BackButton handle back navigation.
 #[component]
@@ -259,20 +324,38 @@ pub fn Shell(
     #[props(default)] update_banner: Option<UpdateBanner>,
     #[props(default)] on_install_update: Option<EventHandler<()>>,
     #[props(default)] on_dismiss_update: Option<EventHandler<()>>,
+    #[props(default)] window_chrome: Option<WindowChrome>,
     on_tab: EventHandler<Tab>,
     on_query: EventHandler<String>,
     children: Element,
 ) -> Element {
     let is_search_tab = tab == Some(Tab::Search);
     let has_query = !query.is_empty();
-    let header_cls = if is_search_tab { "topbar is-search" } else { "topbar" };
+    let header_cls = match (is_search_tab, window_chrome.is_some()) {
+        (true, true) => "topbar is-search has-win-chrome",
+        (true, false) => "topbar is-search",
+        (false, true) => "topbar has-win-chrome",
+        (false, false) => "topbar",
+    };
     rsx! {
-        header { class: "{header_cls}",
+        header {
+            class: "{header_cls}",
+            onmousedown: move |e| {
+                if let Some(chrome) = &window_chrome {
+                    if e.trigger_button() == Some(dioxus::html::input_data::MouseButton::Primary) {
+                        chrome.on_drag.call(());
+                    }
+                }
+            },
             div { class: "top-left",
-                div { class: "top-brand-slot",
+                div {
+                    class: "top-brand-slot",
+                    onmousedown: move |e| e.stop_propagation(),
                     BrandPlaque { on_click: move |_| on_tab.call(Tab::Home) }
                 }
-                nav { class: "nav-pills",
+                nav {
+                    class: "nav-pills",
+                    onmousedown: move |e| e.stop_propagation(),
                     for t in DESKTOP_TABS {
                         button {
                             class: if tab == Some(t) { "active" } else { "" },
@@ -284,7 +367,9 @@ pub fn Shell(
                 }
             }
             div { class: "top-center",
-                div { class: "search-box",
+                div {
+                    class: "search-box",
+                    onmousedown: move |e| e.stop_propagation(),
                     span { class: "muted", "aria-hidden": "true", Icon { svg: icons::SEARCH, class: "ic sm" } }
                     input {
                         id: "kino-search-input",
@@ -317,6 +402,7 @@ pub fn Shell(
                     button {
                         class: "dl-pill",
                         title: "Активная загрузка на сервер",
+                        onmousedown: move |e| e.stop_propagation(),
                         onclick: move |_| on_tab.call(Tab::Profile),
                         Icon { svg: icons::DOWNLOAD, class: "ic sm" }
                         "{pct}%"
@@ -326,6 +412,7 @@ pub fn Shell(
                     class: if tab == Some(Tab::Profile) { "tg-avatar desktop-only active" } else { "tg-avatar desktop-only" },
                     title: "Профиль",
                     "aria-label": "Профиль",
+                    onmousedown: move |e| e.stop_propagation(),
                     onclick: move |_| on_tab.call(Tab::Profile),
                     AvatarContent { initial: user_initial.clone(), url: avatar_url.clone(), alt: "Профиль".to_owned() }
                 }
@@ -2716,8 +2803,16 @@ pub fn Stars(
 }
 
 #[component]
-pub fn LoginView(invite: Option<String>, error: Option<String>, children: Element) -> Element {
+pub fn LoginView(
+    invite: Option<String>,
+    error: Option<String>,
+    #[props(default)] window_chrome: Option<WindowChrome>,
+    children: Element,
+) -> Element {
     rsx! {
+        if let Some(chrome) = window_chrome {
+            DesktopDragStrip { chrome }
+        }
         div { class: "login-page",
             div { class: "login-glow" }
             div { class: "login-card",

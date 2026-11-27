@@ -11,6 +11,7 @@ use kino_core::{
 };
 use kino_ui::{
     next_prompt_start, DiskReadyPrompt, PlayerEpisode, PlayerMenu, PlayerState, PlayerView, ReleaseOption, VideoScale,
+    WindowChrome,
 };
 
 use crate::{
@@ -598,6 +599,7 @@ impl Drop for NativePlayerGuard {
 pub fn Player(
     token: String,
     start: PlayStart,
+    #[props(default)] window_chrome: Option<WindowChrome>,
     on_scale: EventHandler<VideoScale>,
     on_close: EventHandler<bool>,
     on_title: EventHandler<()>,
@@ -3977,6 +3979,7 @@ pub fn Player(
         native::BackButton { on_back: move |_| close.call(()) }
         PlayerView {
             state: shown,
+            window_chrome,
             on_tap: {
                 let mut toggle_play = toggle_play.clone();
                 move |_| {
