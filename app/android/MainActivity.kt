@@ -1,13 +1,16 @@
 package dev.dioxus.main
 
+import android.content.Intent
 import android.content.pm.ActivityInfo
 import android.graphics.Color
 import android.media.AudioManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
 import android.view.TextureView
@@ -18,6 +21,7 @@ import android.webkit.WebView
 import android.widget.FrameLayout
 import androidx.activity.OnBackPressedCallback
 import androidx.annotation.OptIn
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
@@ -40,6 +44,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.SubtitleView
+import java.io.File
 import java.util.Locale
 
 typealias BuildConfig = ru.aatterra.orelkino.BuildConfig
@@ -67,6 +72,8 @@ class MainActivity : WryActivity() {
     private var isLightBars = false
     private var currentBarColor: Int = DARK_BAR_COLOR
     private var lastCssInsets: Array<String>? = null
+    private var pendingInstallApkPath: String? = null
+    private var awaitingInstallPermission = false
 
     @Volatile private var openSeq: Long = 0L
     @Volatile private var seekSeq: Long = 0L
@@ -112,6 +119,9 @@ class MainActivity : WryActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         volumeControlStream = AudioManager.STREAM_MUSIC
+        runCatching {
+            File(cacheDir, "updates").listFiles()?.forEach { it.delete() }
+        }
         WindowCompat.setDecorFitsSystemWindows(window, false)
         applyWindowBarAppearance()
         val cb = object : OnBackPressedCallback(false) {
@@ -183,6 +193,56 @@ class MainActivity : WryActivity() {
             ensurePlayerContainer()
             applyLastCssInsets()
             findViewById<View>(android.R.id.content)?.let { ViewCompat.requestApplyInsets(it) }
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (awaitingInstallPermission) {
+            awaitingInstallPermission = false
+            val path = pendingInstallApkPath
+            if (path != null && (Build.VERSION.SDK_INT < Build.VERSION_CODES.O || packageManager.canRequestPackageInstalls())) {
+                pendingInstallApkPath = null
+                launchApkInstall(path)
+            }
+        }
+    }
+
+    fun kinoCacheDir(): String = cacheDir.absolutePath
+
+    fun kinoInstallApk(path: String): Boolean {
+        val file = File(path)
+        if (!file.isFile) return false
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            pendingInstallApkPath = path
+            awaitingInstallPermission = true
+            runOnUiThread {
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:$packageName")
+                )
+                startActivity(intent)
+            }
+            return false
+        }
+        runOnUiThread {
+            launchApkInstall(path)
+        }
+        return true
+    }
+
+    private fun launchApkInstall(path: String) {
+        try {
+            val file = File(path)
+            if (!file.isFile) return
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start APK installer", e)
         }
     }
 

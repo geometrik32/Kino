@@ -894,6 +894,17 @@ fn device_icon(dev: &str) -> &'static str {
     }
 }
 
+/// Update state displayed inside the native app profile section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppUpdateUi {
+    UpToDate,
+    Checking,
+    Available(String),
+    Downloading(u8),
+    Installing,
+    Error { can_retry_install: bool, message: String },
+}
+
 #[component]
 pub fn ProfileView(
     name: String,
@@ -903,6 +914,10 @@ pub fn ProfileView(
     prefs: UserPrefs,
     theme: Theme,
     in_telegram: bool,
+    #[props(default)] app_version: Option<String>,
+    #[props(default)] update_state: Option<AppUpdateUi>,
+    #[props(default)] on_check_update: Option<EventHandler<()>>,
+    #[props(default)] on_install_update: Option<EventHandler<()>>,
     /// Current time and the viewer's UTC offset in minutes, for dates.
     now: DateTime<Utc>,
     utc_offset_min: i32,
@@ -1010,6 +1025,76 @@ pub fn ProfileView(
                                 class: if theme == Theme::Auto { "active" } else { "" },
                                 onclick: move |_| on_theme.call(Theme::Auto),
                                 "{Theme::Auto.label()}"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(ver) = app_version {
+                section { class: "section",
+                    div { class: "sec-head",
+                        h2 { "Приложение" }
+                    }
+                    div { class: "panel theme-panel",
+                        div {
+                            div { class: "theme-lbl", "Версия {ver}" }
+                            div { class: "muted theme-sub",
+                                match update_state.as_ref() {
+                                    Some(AppUpdateUi::Checking) => "Проверяем наличие обновлений…".to_owned(),
+                                    Some(AppUpdateUi::UpToDate) => "Установлена последняя версия".to_owned(),
+                                    Some(AppUpdateUi::Available(new_v)) => format!("Доступна новая версия {new_v}"),
+                                    Some(AppUpdateUi::Downloading(pct)) => format!("Скачиваем обновление… {pct}%"),
+                                    Some(AppUpdateUi::Installing) => "Запускаем установку обновления…".to_owned(),
+                                    Some(AppUpdateUi::Error { message, .. }) => message.clone(),
+                                    None => "Обновления проверяются автоматически".to_owned(),
+                                }
+                            }
+                        }
+                        div { class: "update-actions",
+                            match update_state.as_ref() {
+                                Some(AppUpdateUi::Available(new_v)) => rsx! {
+                                    if let Some(cb) = on_install_update {
+                                        button {
+                                            class: "btn primary sm",
+                                            onclick: move |_| cb.call(()),
+                                            Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                            "Обновить до {new_v}"
+                                        }
+                                    }
+                                },
+                                Some(AppUpdateUi::Downloading(_)) | Some(AppUpdateUi::Installing) | Some(AppUpdateUi::Checking) => rsx! {
+                                    button { class: "btn glass sm", disabled: true, "Подождите…" }
+                                },
+                                Some(AppUpdateUi::Error { can_retry_install, .. }) => rsx! {
+                                    if *can_retry_install {
+                                        if let Some(cb) = on_install_update {
+                                            button {
+                                                class: "btn primary sm",
+                                                onclick: move |_| cb.call(()),
+                                                Icon { svg: icons::DOWNLOAD, class: "ic xs" }
+                                                "Повторить обновление"
+                                            }
+                                        }
+                                    } else if let Some(cb) = on_check_update {
+                                        button {
+                                            class: "btn glass sm",
+                                            onclick: move |_| cb.call(()),
+                                            Icon { svg: icons::REFRESH, class: "ic xs" }
+                                            "Проверить снова"
+                                        }
+                                    }
+                                },
+                                _ => rsx! {
+                                    if let Some(cb) = on_check_update {
+                                        button {
+                                            class: "btn glass sm",
+                                            onclick: move |_| cb.call(()),
+                                            Icon { svg: icons::REFRESH, class: "ic xs" }
+                                            "Проверить обновления"
+                                        }
+                                    }
+                                },
                             }
                         }
                     }

@@ -668,6 +668,7 @@ pub fn Player(
     let mut last_revision = use_signal(|| 0_u64);
     let mut clock = use_signal(sync::ClockSync::default);
     let mut desired_paused = use_signal(|| false);
+    let mut close_requested = use_signal(|| false);
     let mut awaiting_ready = use_signal(|| true);
     let mut canplay_seen = use_signal(|| false);
     let mut last_seek_cmd_ms = use_signal(|| 0_i64);
@@ -988,12 +989,30 @@ pub fn Player(
         };
         if native {
             let mode = saved_scale.peek().map_or(0, scale_code);
-            platform::video::native_open(&src, at, f64::from(rate()), audio, sub_track, !hold, mode);
+            let native_title = if kind == MediaKind::Tv {
+                format!("{} · {}", ui.peek().title, episode_code(cur_s, cur_e))
+            } else {
+                ui.peek().title.clone()
+            };
+            let native_next = ui.peek().next.clone();
+            platform::video::native_open(
+                &src,
+                &native_title,
+                native_next.as_deref(),
+                at,
+                f64::from(rate()),
+                audio,
+                sub_track,
+                !hold,
+                mode,
+            );
             if let Some(v) = video() {
                 v.set_volume(f64::from(volume()));
                 v.set_muted(muted() || auto_muted() || ui.peek().is_sync_muted());
             }
-            let _ = dioxus::document::eval("document.documentElement.classList.add('native-video');");
+            if cfg!(target_os = "android") {
+                let _ = dioxus::document::eval("document.documentElement.classList.add('native-video');");
+            }
         } else {
             platform::video::native_close();
             let _ = dioxus::document::eval("document.documentElement.classList.remove('native-video');");
@@ -3236,6 +3255,16 @@ pub fn Player(
                         active_scale.set(scale_from_code(platform::video::native_scale_mode()));
                     }
                 }
+                "next" => {
+                    let (cur_s, cur_e) = *target.peek();
+                    let s_next = info.peek().as_ref().and_then(|i| i.next);
+                    if next_target_episode(cur_s, cur_e, s_next, rewatch_mode, &ep_ratings_ev).is_some() {
+                        go_next();
+                    }
+                }
+                "closed" => {
+                    close_requested.set(true);
+                }
                 "error" => {
                     let s = ui.peek().clone();
                     if s.src.is_empty() {
@@ -3343,6 +3372,12 @@ pub fn Player(
         }
     });
     let close = Callback::new(move |_: ()| finish_close.call(false));
+    use_effect(move || {
+        if close_requested() {
+            close_requested.set(false);
+            finish_close.call(false);
+        }
+    });
     let open_title = Callback::new(move |_: ()| finish_close.call(true));
 
     // On a phone in Telegram the film takes the whole screen, and Telegram's Back closes it.
@@ -3547,12 +3582,22 @@ pub fn Player(
                  var onMeta = function(e) {{
                    if (e && e.target && e.target.id === 'kino-video') sync();
                  }};
-                 var onResize = function() {{ sync(); }};
+                 var onResize = function() {{
+                   sync();
+                   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(sync);
+                 }};
+                 var onOrientation = function() {{
+                   onResize();
+                   setTimeout(sync, 120);
+                 }};
                  document.addEventListener('loadedmetadata', onMeta, true);
                  document.addEventListener('loadeddata', onMeta, true);
                  document.addEventListener('resize', onMeta, true);
-                 document.addEventListener('fullscreenchange', onResize);
+                 document.addEventListener('fullscreenchange', onOrientation);
+                 document.addEventListener('webkitfullscreenchange', onOrientation);
                  window.addEventListener('resize', onResize);
+                 window.addEventListener('orientationchange', onOrientation);
+                 if (window.visualViewport) window.visualViewport.addEventListener('resize', onResize);
                  if (typeof ResizeObserver === 'function') {{
                    ro = new ResizeObserver(function() {{ sync(); }});
                  }}
@@ -3562,8 +3607,11 @@ pub fn Player(
                    document.removeEventListener('loadedmetadata', onMeta, true);
                    document.removeEventListener('loadeddata', onMeta, true);
                    document.removeEventListener('resize', onMeta, true);
-                   document.removeEventListener('fullscreenchange', onResize);
+                   document.removeEventListener('fullscreenchange', onOrientation);
+                   document.removeEventListener('webkitfullscreenchange', onOrientation);
                    window.removeEventListener('resize', onResize);
+                   window.removeEventListener('orientationchange', onOrientation);
+                   if (window.visualViewport) window.visualViewport.removeEventListener('resize', onResize);
                    if (ro) ro.disconnect();
                    delete window.__kinoSyncVideoScale;
                    delete window.__kinoVideoScaleMode;

@@ -295,3 +295,35 @@ pub fn poll_native_player() -> Option<NativePlayerSnapshot> {
         scale_mode: p.next().and_then(|s| s.parse().ok()).unwrap_or(1),
     })
 }
+
+pub fn cache_dir() -> Option<String> {
+    let vm = JAVA_VM.get()?;
+    let activity = ACTIVITY.read().unwrap_or_else(|e| e.into_inner()).clone()?;
+    let mut env = vm.attach_current_thread_as_daemon().ok()?;
+    match env.with_local_frame(16, |env| -> jni::errors::Result<Option<String>> {
+        let obj = env
+            .call_method(activity.as_obj(), "kinoCacheDir", "()Ljava/lang/String;", &[])?
+            .l()?;
+        if obj.is_null() {
+            return Ok(None);
+        }
+        let jstr = JString::from(obj);
+        let text: String = env.get_string(&jstr)?.into();
+        Ok(Some(text))
+    }) {
+        Ok(res) => res,
+        Err(_) => {
+            let _ = env.exception_clear();
+            None
+        }
+    }
+}
+
+pub fn install_apk(path: &str) {
+    let path = path.to_owned();
+    on_activity("install apk", move |env, activity| {
+        let jpath = env.new_string(&path)?;
+        let _ = env.call_method(activity, "kinoInstallApk", "(Ljava/lang/String;)Z", &[(&jpath).into()])?;
+        Ok(())
+    });
+}

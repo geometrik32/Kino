@@ -12,9 +12,9 @@
 
 ## ISSUE-001: Нативное воспроизведение сложных кодеков и контейнеров (Desktop + Android)
 
-- **Статус:** `В работе` (часть **Android** + протокол `PlayRequest.native` и UI реализованы в коде; локально пройдены `cargo fmt --all --check`, `cargo check --workspace --all-targets --locked` и `cargo check -p kino-app --target wasm32-unknown-unknown --locked`, ожидает прогона `cargo check/clippy --features mobile`, сборки `.apk` через `.github/workflows/android.yml` и проверки на устройстве; часть **Desktop / Windows** временно отложена по решению владельца)
+- **Статус:** `В работе` (часть **Android** + протокол `PlayRequest.native` и UI реализованы в коде; часть **Desktop / Windows** возвращена в работу по запросу владельца — интеграция `libmpv` через `crates/mpv` и `app/src/platform/video.rs`)
 - **Приоритет:** Высокий (P1)
-- **Затронутые платформы:** Windows / macOS / Linux (`kino-app --features desktop` — отложено) и Android (`kino-app --features mobile`), а также серверное API (`kino-core`, `kino-server`).
+- **Затронутые платформы:** Windows / macOS / Linux (`kino-app --features desktop`) и Android (`kino-app --features mobile`), а также серверное API (`kino-core`, `kino-server`).
 
 ### Суть проблемы
 Сейчас нативные приложения для компьютера (`desktop`) и телефона (`mobile`) используют системный WebView и HTML-элемент `<video>` ([app/src/platform/video.rs](../app/src/platform/video.rs)). Одновременно сервер в `POST /api/play` ([crates/server/src/play.rs](../crates/server/src/play.rs)) жёстко решает совместимость через `probe.browser_ok()` (`mov,mp4` + `h264|vp9|av1` + `aac|mp3|opus|vorbis`), а `PlayInfo::plays_directly()` ([crates/core/src/release.rs](../crates/core/src/release.rs)) отправляет на перекодирование при любом переключении аудиодорожки.
@@ -1140,3 +1140,24 @@
 - [x] Реализовано получение опенингов/титров/повторов из открытых источников (**IntroDB**, **AniSkip**) при онлайн-просмотре с кэшированием в БД.
 - [x] Реализован фоновый анализатор для предзагруженных на диск сериалов (главы MKV, парный аудио-анализ Chromaprint между сериями, детект чёрных титров в хвосте) с постоянным сохранением результатов в общую таблицу БД.
 - [ ] Пройдены CI (`clippy`, интеграционные тесты БД), согласовано обновление сервера `192.168.3.27` и проведена проверка на реальном контенте.
+
+---
+
+## ISSUE-038: Сборка Windows-приложения, постоянная подпись Android и автообновление (ПК + Android)
+
+- **Статус:** `В работе`
+- **Приоритет:** Высокий (P1)
+- **Затронутые платформы:** Windows (`kino-app --features desktop`, `desktop/`, `.github/workflows/desktop.yml`) и Android (`kino-app --features mobile`, `app/android/`, `.github/workflows/android.yml`).
+
+### Суть задачи
+1. Наладить публикацию подписанного Android APK (`android-latest`) с постоянным ключом подписи в GitHub Secrets.
+2. Подключить сборку Windows-установщика (`Orel-Kino-Setup.exe`) и портативной версии (`Orel-Kino-portable.zip`) с `libmpv-2.dll` в `.github/workflows/desktop.yml` (`desktop-latest`), чтобы приложение на ПК воспроизводило любые форматы без перекодирования на сервере.
+3. Реализовать встроенную проверку и установку обновлений через релизы GitHub (`version.json` без лимитов GitHub API, с проверкой SHA-256):
+   - на Windows — фоновая и ручная проверка в профиле, скачивание установщика, тихая установка поверх текущей версии (`/S /RELAUNCH=1`) и автоматический перезапуск;
+   - на Android — фоновая и ручная проверка в профиле, скачивание APK во внутренний кэш и запуск системного установщика через `FileProvider` (с запросом `REQUEST_INSTALL_PACKAGES` и автоматическим продолжением после возврата из настроек).
+
+### Критерии приёмки
+- [ ] Сборка `.github/workflows/android.yml` проходит целиком и публикует подписанный релиз `android-latest` с `orel-kino-arm64.apk` и `version.json`.
+- [ ] Сборка `.github/workflows/desktop.yml` проходит целиком и публикует релиз `desktop-latest` с `Orel-Kino-Setup.exe`, `Orel-Kino-portable.zip` и `version.json`.
+- [ ] Приложение для ПК (`kino-app --features desktop`) использует `kino-mpv` (`libmpv`) через `platform::video` для прямого воспроизведения без серверного `ffmpeg`, сохраняет прогресс, синхронизацию, пропуск сегментов и переключение дорожек.
+- [ ] В `kino-ui` и `kino-app` отображается текущая версия приложения, кнопка ручной проверки обновлений в профиле, баннер доступного обновления и 1-кликовая установка с проверкой SHA-256.

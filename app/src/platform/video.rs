@@ -128,6 +128,8 @@ mod imp {
     }
     pub fn native_open(
         _url: &str,
+        _title: &str,
+        _next: Option<&str>,
         _start_sec: f64,
         _rate: f64,
         _audio: Option<i32>,
@@ -162,11 +164,14 @@ mod imp {
 
     use super::{PlayOutcome, VIDEO_ID};
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", all(feature = "desktop", not(target_os = "android"))))]
     use std::{
         sync::atomic::AtomicU64,
         time::{Duration, Instant},
     };
+
+    #[cfg(all(feature = "desktop", not(target_os = "android")))]
+    use std::collections::VecDeque;
 
     #[derive(Clone, Copy)]
     struct Snapshot {
@@ -188,8 +193,36 @@ mod imp {
     static NATIVE_ACTIVE: AtomicBool = AtomicBool::new(false);
     static NATIVE_SCALE_MODE: AtomicU8 = AtomicU8::new(1);
 
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", all(feature = "desktop", not(target_os = "android"))))]
     static NATIVE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    #[cfg(all(feature = "desktop", not(target_os = "android")))]
+    struct DesktopMpv {
+        session: Option<kino_mpv::Session>,
+        events: VecDeque<&'static str>,
+        seq: u64,
+        paused: bool,
+        buffering: bool,
+        ready: bool,
+        ignore_paused_until: Option<Instant>,
+        last_volume: f64,
+        last_muted: bool,
+        last_rate: f64,
+    }
+
+    #[cfg(all(feature = "desktop", not(target_os = "android")))]
+    static DESKTOP_MPV: Mutex<DesktopMpv> = Mutex::new(DesktopMpv {
+        session: None,
+        events: VecDeque::new(),
+        seq: 0,
+        paused: true,
+        buffering: false,
+        ready: false,
+        ignore_paused_until: None,
+        last_volume: 1.0,
+        last_muted: false,
+        last_rate: 1.0,
+    });
 
     #[cfg(target_os = "android")]
     #[derive(Clone, Copy, Default)]
@@ -233,7 +266,18 @@ mod imp {
     }
 
     pub fn supports_native() -> bool {
-        cfg!(target_os = "android")
+        #[cfg(target_os = "android")]
+        {
+            true
+        }
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        {
+            kino_mpv::is_available()
+        }
+        #[cfg(not(any(target_os = "android", feature = "desktop")))]
+        {
+            false
+        }
     }
 
     pub fn is_native_active() -> bool {
@@ -243,6 +287,8 @@ mod imp {
     #[cfg(target_os = "android")]
     pub fn native_open(
         url: &str,
+        _title: &str,
+        _next: Option<&str>,
         start_sec: f64,
         rate: f64,
         audio: Option<i32>,
@@ -270,9 +316,176 @@ mod imp {
         NATIVE_ACTIVE.store(true, Ordering::Relaxed);
     }
 
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "desktop", not(target_os = "android")))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn native_open(
+        url: &str,
+        title: &str,
+        next: Option<&str>,
+        start_sec: f64,
+        rate: f64,
+        audio: Option<i32>,
+        subtitle: Option<i32>,
+        autoplay: bool,
+        scale_mode: u8,
+    ) {
+        let start = start_sec.max(0.0);
+        let eff_scale = if scale_mode == 2 { 2 } else { 1 };
+        *SNAPSHOT.lock().expect("video snapshot") = Snapshot {
+            time: start,
+            duration: f64::NAN,
+            paused: !autoplay,
+            ready_state: 0,
+            buffered_ahead: f64::NAN,
+        };
+        NATIVE_SCALE_MODE.store(eff_scale, Ordering::Relaxed);
+        let seq = NATIVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        let full_url = if url.starts_with('/') {
+            super::super::abs(url)
+        } else {
+            url.to_owned()
+        };
+
+        let (opts, existing) = {
+            let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+            m.seq = seq;
+            m.events.clear();
+            m.paused = !autoplay;
+            m.buffering = false;
+            m.ready = false;
+            m.ignore_paused_until = Some(Instant::now() + Duration::from_millis(600));
+            m.last_rate = rate;
+            let opts = kino_mpv::PlayOptions {
+                url: full_url,
+                title: title.to_owned(),
+                start,
+                audio: audio.and_then(|i| usize::try_from(i).ok()),
+                subtitle: subtitle.and_then(|i| usize::try_from(i).ok()),
+                next: next.map(str::to_owned),
+                autoplay,
+                rate,
+                volume: m.last_volume,
+                muted: m.last_muted,
+                scale_mode: eff_scale,
+            };
+            let existing = m.session.take();
+            (opts, existing)
+        };
+
+        NATIVE_ACTIVE.store(true, Ordering::Relaxed);
+
+        if let Some(sess) = existing {
+            if let Err(err) = sess.load(opts) {
+                eprintln!("mpv load failed: {err}");
+                NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                DESKTOP_MPV.lock().expect("desktop mpv").events.push_back("error");
+            } else {
+                DESKTOP_MPV.lock().expect("desktop mpv").session = Some(sess);
+            }
+            return;
+        }
+
+        match kino_mpv::Session::start(opts, false, move |ev| {
+            let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+            if m.seq != seq {
+                return;
+            }
+            match ev {
+                kino_mpv::PlayerEvent::Loaded { duration, .. } => {
+                    m.ready = true;
+                    m.buffering = false;
+                    let mut snap = SNAPSHOT.lock().expect("video snapshot");
+                    snap.duration = duration.unwrap_or(f64::NAN);
+                    snap.ready_state = 4;
+                    m.events.push_back("metadata");
+                    m.events.push_back("canplay");
+                    if !m.paused {
+                        m.events.push_back("playing");
+                    }
+                }
+                kino_mpv::PlayerEvent::Position { position, duration } => {
+                    let mut snap = SNAPSHOT.lock().expect("video snapshot");
+                    snap.time = position;
+                    if let Some(d) = duration {
+                        snap.duration = d;
+                    }
+                    if m.ready {
+                        m.events.push_back("time");
+                    }
+                }
+                kino_mpv::PlayerEvent::Paused(p) => {
+                    let guarded = m.ignore_paused_until.is_some_and(|u| Instant::now() < u);
+                    if guarded {
+                        if p == m.paused {
+                            m.ignore_paused_until = None;
+                        }
+                        return;
+                    }
+                    m.ignore_paused_until = None;
+                    if p != m.paused {
+                        m.paused = p;
+                        SNAPSHOT.lock().expect("video snapshot").paused = p;
+                        m.events.push_back(if p { "pause" } else { "play" });
+                    }
+                }
+                kino_mpv::PlayerEvent::Buffering(b) => {
+                    if b != m.buffering {
+                        m.buffering = b;
+                        SNAPSHOT.lock().expect("video snapshot").ready_state = if b { 1 } else { 4 };
+                        m.events.push_back(if b {
+                            "waiting"
+                        } else if !m.paused {
+                            "playing"
+                        } else {
+                            "canplay"
+                        });
+                    }
+                }
+                kino_mpv::PlayerEvent::Seeked => {
+                    m.events.push_back("seeked");
+                }
+                kino_mpv::PlayerEvent::NextRequested => {
+                    m.events.push_back("next");
+                }
+                kino_mpv::PlayerEvent::Ended => {
+                    SNAPSHOT.lock().expect("video snapshot").paused = true;
+                    m.paused = true;
+                    m.events.push_back("ended");
+                }
+                kino_mpv::PlayerEvent::Closed { .. } => {
+                    m.session = None;
+                    NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                    m.events.push_back("closed");
+                }
+                kino_mpv::PlayerEvent::Error(err) => {
+                    eprintln!("mpv playback error: {err}");
+                    NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                    m.events.push_back("error");
+                }
+                kino_mpv::PlayerEvent::Tracks { .. } => {}
+            }
+        }) {
+            Ok(sess) => {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                if m.seq == seq {
+                    m.session = Some(sess);
+                } else {
+                    sess.close();
+                }
+            }
+            Err(err) => {
+                eprintln!("mpv start failed: {err}");
+                NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                DESKTOP_MPV.lock().expect("desktop mpv").events.push_back("error");
+            }
+        }
+    }
+
+    #[cfg(not(any(target_os = "android", feature = "desktop")))]
     pub fn native_open(
         _url: &str,
+        _title: &str,
+        _next: Option<&str>,
         _start_sec: f64,
         _rate: f64,
         _audio: Option<i32>,
@@ -287,7 +500,13 @@ mod imp {
         if is_native_active() {
             super::super::android::native_select_audio(audio);
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        if is_native_active() {
+            if let Some(sess) = DESKTOP_MPV.lock().expect("desktop mpv").session.as_ref() {
+                sess.set_audio(audio.and_then(|i| usize::try_from(i).ok()));
+            }
+        }
+        #[cfg(not(any(target_os = "android", feature = "desktop")))]
         let _ = audio;
     }
 
@@ -296,7 +515,13 @@ mod imp {
         if is_native_active() {
             super::super::android::native_select_subtitle(subtitle);
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        if is_native_active() {
+            if let Some(sess) = DESKTOP_MPV.lock().expect("desktop mpv").session.as_ref() {
+                sess.set_subtitle(subtitle.and_then(|i| usize::try_from(i).ok()));
+            }
+        }
+        #[cfg(not(any(target_os = "android", feature = "desktop")))]
         let _ = subtitle;
     }
 
@@ -307,6 +532,12 @@ mod imp {
         #[cfg(target_os = "android")]
         if is_native_active() {
             super::super::android::native_set_scale(mode);
+        }
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        if is_native_active() {
+            if let Some(sess) = DESKTOP_MPV.lock().expect("desktop mpv").session.as_ref() {
+                sess.set_scale(mode);
+            }
         }
     }
 
@@ -323,7 +554,20 @@ mod imp {
                 super::super::android::native_close();
             }
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        {
+            let _ = was_active;
+            let sess = {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.seq = NATIVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+                m.events.clear();
+                m.session.take()
+            };
+            if let Some(s) = sess {
+                s.close();
+            }
+        }
+        #[cfg(not(any(target_os = "android", feature = "desktop")))]
         let _ = was_active;
     }
 
@@ -352,7 +596,7 @@ mod imp {
             snapshot().ready_state
         }
         pub fn buffered_ahead(&self) -> Option<f64> {
-            #[cfg(target_os = "android")]
+            #[cfg(any(target_os = "android", all(feature = "desktop", not(target_os = "android"))))]
             if is_native_active() {
                 return None;
             }
@@ -374,6 +618,13 @@ mod imp {
                 super::super::android::native_seek(t);
                 return;
             }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            if is_native_active() {
+                if let Some(sess) = DESKTOP_MPV.lock().expect("desktop mpv").session.as_ref() {
+                    sess.seek(t);
+                }
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.currentTime={t};"
             ));
@@ -389,6 +640,19 @@ mod imp {
                     st.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
                 }
                 super::super::android::native_play();
+                on_done(PlayOutcome::Ok);
+                return;
+            }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            if is_native_active() {
+                {
+                    let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                    m.paused = false;
+                    m.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
+                    if let Some(sess) = m.session.as_ref() {
+                        sess.pause(false);
+                    }
+                }
                 on_done(PlayOutcome::Ok);
                 return;
             }
@@ -424,6 +688,16 @@ mod imp {
                 super::super::android::native_pause();
                 return;
             }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            if is_native_active() {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.paused = true;
+                m.ignore_paused_until = Some(Instant::now() + Duration::from_millis(500));
+                if let Some(sess) = m.session.as_ref() {
+                    sess.pause(true);
+                }
+                return;
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.pause==='function') v.pause();"
             ));
@@ -439,6 +713,17 @@ mod imp {
                 super::super::android::native_set_rate(rate as f32);
                 return;
             }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.last_rate = rate;
+                if is_native_active() {
+                    if let Some(sess) = m.session.as_ref() {
+                        sess.set_rate(rate);
+                    }
+                    return;
+                }
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') {{ v.defaultPlaybackRate={rate}; v.playbackRate={rate}; }}"
             ));
@@ -450,6 +735,17 @@ mod imp {
                 super::super::android::native_set_volume(vol as f32);
                 return;
             }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.last_volume = vol;
+                if is_native_active() {
+                    if let Some(sess) = m.session.as_ref() {
+                        sess.set_volume(vol);
+                    }
+                    return;
+                }
+            }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.volume={vol};"
             ));
@@ -459,6 +755,17 @@ mod imp {
             if is_native_active() {
                 super::super::android::native_set_muted(muted);
                 return;
+            }
+            #[cfg(all(feature = "desktop", not(target_os = "android")))]
+            {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.last_muted = muted;
+                if is_native_active() {
+                    if let Some(sess) = m.session.as_ref() {
+                        sess.set_muted(muted);
+                    }
+                    return;
+                }
             }
             run(format!(
                 "var v=document.getElementById('{VIDEO_ID}'); if(v && typeof v.play==='function') v.muted={muted};"
@@ -643,7 +950,7 @@ mod imp {
         events
     }
 
-    /// Polls Android's native ExoPlayer state and forwards transitions to `on_video`.
+    /// Polls native player (Android ExoPlayer or Desktop libmpv) and forwards transitions to `on_video`.
     pub fn use_native_events(on_video: Callback<&'static str>) {
         #[cfg(target_os = "android")]
         use_hook(|| {
@@ -660,7 +967,23 @@ mod imp {
                 }
             });
         });
-        #[cfg(not(target_os = "android"))]
+        #[cfg(all(feature = "desktop", not(target_os = "android")))]
+        use_hook(|| {
+            spawn(async move {
+                loop {
+                    let ms = if is_native_active() { 150 } else { 400 };
+                    super::super::sleep(ms).await;
+                    let pending: Vec<&'static str> = {
+                        let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                        m.events.drain(..).collect()
+                    };
+                    for ev in pending {
+                        on_video.call(ev);
+                    }
+                }
+            });
+        });
+        #[cfg(not(any(target_os = "android", feature = "desktop")))]
         let _ = on_video;
     }
 }

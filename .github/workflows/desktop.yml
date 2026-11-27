@@ -1,0 +1,134 @@
+name: Desktop (Windows)
+
+# Builds the Windows app with native libmpv playback and NSIS installer.
+# `main` publishes release "desktop-latest" with Orel-Kino-Setup.exe, portable ZIP, and version.json.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "desktop/**"
+      - "crates/mpv/**"
+      - "crates/ui/**"
+      - "crates/core/**"
+      - "app/**"
+      - "Cargo.*"
+      - ".github/workflows/desktop.yml"
+  pull_request:
+    paths:
+      - "desktop/**"
+      - "crates/mpv/**"
+      - "crates/ui/**"
+      - "crates/core/**"
+      - "app/**"
+      - "Cargo.*"
+      - ".github/workflows/desktop.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Version
+        id: ver
+        shell: bash
+        run: echo "v=0.1.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
+      - run: cargo clippy -p kino-app -p kino-mpv --no-default-features --features desktop --all-targets --locked -- -D warnings
+      - run: cargo test -p kino-app -p kino-mpv --no-default-features --features desktop --locked
+      - name: Build Windows binary
+        shell: bash
+        env:
+          KINO_APP_VERSION: ${{ steps.ver.outputs.v }}
+          KINO_APP_BUILD: ${{ github.run_number }}
+        run: cargo build --release -p kino-app --no-default-features --features desktop --locked
+
+      # libmpv: native video player library (HEVC, AV1, HDR, MKV, AC3/DTS) loaded at runtime.
+      - name: Fetch libmpv
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod -Headers @{ Authorization = "Bearer $env:GH_TOKEN" } https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match '^mpv-dev-x86_64-\d' } | Select-Object -First 1
+          if (-not $asset) { throw "no mpv-dev asset in release $($rel.tag_name)" }
+          Write-Host "libmpv from $($rel.tag_name): $($asset.name)"
+          Invoke-WebRequest $asset.browser_download_url -OutFile mpv-dev.7z
+          7z x mpv-dev.7z -ompv-dev -y | Out-Null
+          New-Item -ItemType Directory -Force stage | Out-Null
+          $dll = Get-ChildItem mpv-dev -Recurse -Filter 'libmpv-2.dll' | Select-Object -First 1
+          if (-not $dll) { throw "libmpv-2.dll not found in the archive" }
+          Copy-Item $dll.FullName stage/libmpv-2.dll
+          Copy-Item target/release/kino-app.exe stage/orel-kino.exe
+
+      - name: Installer
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress | Out-Null
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $stage = (Resolve-Path stage).Path
+          $out = Join-Path (Get-Location) "dist/Orel-Kino-Setup.exe"
+          & "C:\Program Files (x86)\NSIS\makensis.exe" /V2 "/DVERSION=${{ steps.ver.outputs.v }}" "/DSTAGE=$stage" "/DOUTFILE=$out" desktop/installer/orel-kino.nsi
+          if ($LASTEXITCODE -ne 0) { throw "makensis failed" }
+          Compress-Archive -Path stage/* -DestinationPath dist/Orel-Kino-portable.zip
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orel-kino-windows
+          path: dist/*
+          retention-days: 30
+
+      - name: Publish release
+        if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          COMMIT_SHA: ${{ github.sha }}
+          APP_VERSION: ${{ steps.ver.outputs.v }}
+          APP_BUILD: ${{ github.run_number }}
+        run: |
+          if [ "$EVENT_NAME" = "push" ]; then
+            tag="desktop-latest"
+            title="Windows: последняя сборка из main, ${APP_VERSION}"
+          else
+            tag="desktop-preview"
+            title="Windows: пробная сборка (ветка ${HEAD_REF}), ${APP_VERSION}"
+          fi
+          TAG="$tag" python3 - <<'PY'
+          import hashlib, json, os
+          with open("dist/Orel-Kino-Setup.exe", "rb") as f:
+              sha = hashlib.sha256(f.read()).hexdigest()
+          tag = os.environ["TAG"]
+          manifest = {
+              "version": os.environ["APP_VERSION"],
+              "build": int(os.environ["APP_BUILD"]),
+              "url": f"https://github.com/geometrik32/Kino/releases/download/{tag}/Orel-Kino-Setup.exe",
+              "sha256": sha,
+          }
+          with open("dist/version.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+          PY
+          notes="Установщик «Орловского кинопоказа» для Windows (libmpv). Коммит ${COMMIT_SHA}."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/Orel-Kino-Setup.exe dist/Orel-Kino-portable.zip dist/version.json --clobber
+            gh release edit "$tag" --prerelease --title "$title" --notes "$notes"
+          else
+            gh release create "$tag" dist/Orel-Kino-Setup.exe dist/Orel-Kino-portable.zip dist/version.json \
+              --prerelease --title "$title" --notes "$notes"
+          fi

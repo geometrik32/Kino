@@ -128,7 +128,7 @@ jobs:
           lines = [
               "",
               "[bundle.android]",
-              f'jks_file = {json.dumps(os.path.abspath("app/android/release.jks"))}',
+              'jks_file = "app/android/release.jks"',
               f'jks_password = {json.dumps(os.environ.get("ANDROID_KEYSTORE_PASSWORD", ""))}',
               f'key_alias = {json.dumps(os.environ.get("ANDROID_KEY_ALIAS", ""))}',
               f'key_password = {json.dumps(os.environ.get("ANDROID_KEY_PASSWORD", ""))}',
@@ -147,6 +147,8 @@ jobs:
         env:
           APP_VERSION_NAME: ${{ steps.ver.outputs.v }}
           APP_VERSION_CODE: ${{ github.run_number }}
+          KINO_APP_VERSION: ${{ steps.ver.outputs.v }}
+          KINO_APP_BUILD: ${{ github.run_number }}
         run: |
           dx build --package kino-app --platform android --target aarch64-linux-android --release
           GRADLE_DIR="$(find target/dx -maxdepth 6 -type f -name gradlew -exec dirname {} \; | head -n 1)"
@@ -191,6 +193,26 @@ jobs:
               return re.sub(r'(<application\b)', rf'\1 android:{attr}="{value}"', text, count=1)
           xml = set_app_attr(xml, "allowBackup", "false")
           xml = set_app_attr(xml, "usesCleartextTraffic", "false")
+          if "REQUEST_INSTALL_PACKAGES" not in xml:
+              xml = re.sub(
+                  r'(<manifest\b[^>]*>)',
+                  r'\1\n    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />',
+                  xml,
+                  count=1,
+              )
+          if "androidx.core.content.FileProvider" not in xml:
+              provider = (
+                  '\n        <provider\n'
+                  '            android:name="androidx.core.content.FileProvider"\n'
+                  '            android:authorities="${applicationId}.fileprovider"\n'
+                  '            android:exported="false"\n'
+                  '            android:grantUriPermissions="true">\n'
+                  '            <meta-data\n'
+                  '                android:name="android.support.FILE_PROVIDER_PATHS"\n'
+                  '                android:resource="@xml/file_paths" />\n'
+                  '        </provider>'
+              )
+              xml = xml.replace("</application>", provider + "\n    </application>", 1)
           with open(path, "w", encoding="utf-8") as f:
               f.write(xml)
           PY
@@ -253,6 +275,7 @@ jobs:
           HEAD_REF: ${{ github.head_ref }}
           COMMIT_SHA: ${{ github.sha }}
           APP_VERSION: ${{ needs.android.outputs.version }}
+          APP_BUILD: ${{ github.run_number }}
           IS_SIGNED: ${{ needs.android.outputs.signed }}
         run: |
           if [ "$EVENT_NAME" = "push" ]; then
@@ -270,11 +293,25 @@ jobs:
             fi
             title="Android: пробная сборка (ветка ${HEAD_REF})${suffix}, ${APP_VERSION}"
           fi
+          TAG="$tag" python3 - <<'PY'
+          import hashlib, json, os
+          with open("out/orel-kino-arm64.apk", "rb") as f:
+              sha = hashlib.sha256(f.read()).hexdigest()
+          tag = os.environ["TAG"]
+          manifest = {
+              "version": os.environ["APP_VERSION"],
+              "build": int(os.environ["APP_BUILD"]),
+              "url": f"https://github.com/geometrik32/Kino/releases/download/{tag}/orel-kino-arm64.apk",
+              "sha256": sha,
+          }
+          with open("out/version.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, ensure_ascii=False, indent=2)
+          PY
           notes="APK «Орловского кинопоказа» (arm64, ExoPlayer + Jellyfin FFmpeg). Коммит ${COMMIT_SHA}."
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" out/orel-kino-arm64.apk --clobber
+            gh release upload "$tag" out/orel-kino-arm64.apk out/version.json --clobber
             gh release edit "$tag" --prerelease --title "$title" --notes "$notes"
           else
-            gh release create "$tag" out/orel-kino-arm64.apk \
+            gh release create "$tag" out/orel-kino-arm64.apk out/version.json \
               --prerelease --title "$title" --notes "$notes"
           fi

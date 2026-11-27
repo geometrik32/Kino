@@ -9,6 +9,7 @@ mod platform;
 mod player;
 mod sync;
 mod telegram;
+mod updater;
 
 use player::{PlayStart, Player};
 
@@ -23,9 +24,9 @@ use kino_core::{
     VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
-    icons, play_target, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection, MyView, PersonView, PickerPanel,
-    PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView, ShelfView, Shell,
-    Tab, Theme, TitleExtrasView, TitleView, FAVICON_URI, STYLE,
+    icons, play_target, AppUpdateUi, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection, MyView, PersonView,
+    PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort, SearchView,
+    ShelfView, Shell, Tab, Theme, TitleExtrasView, TitleView, UpdateBanner, FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,500;0,600;0,700;1,500&display=swap";
@@ -46,7 +47,9 @@ fn main() {
             } catch (e) {}
         </script>"#;
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
-        let config = dioxus::desktop::Config::new().with_custom_head(HEAD.to_owned());
+        let config = dioxus::desktop::Config::new()
+            .with_window(dioxus::desktop::WindowBuilder::new().with_title("Орловский кинопоказ"))
+            .with_custom_head(HEAD.to_owned());
         #[cfg(feature = "mobile")]
         let config = dioxus::mobile::Config::new()
             .with_background_color((0, 0, 0, 0))
@@ -1112,6 +1115,127 @@ fn Main(
         telegram::haptic(telegram::Haptic::Tap);
         step_back(view, trail, query, scroll_req, false);
     };
+    let mut update_state = use_signal(|| None::<updater::UpdateState>);
+    let mut update_dismissed = use_signal(|| false);
+    use_hook(|| {
+        if updater::is_supported() {
+            spawn(async move {
+                platform::sleep(2_000).await;
+                if update_state.peek().is_none() {
+                    if let Ok(Some(manifest)) = updater::check_for_update().await {
+                        update_state.set(Some(updater::UpdateState::Available(manifest)));
+                    }
+                }
+            });
+        }
+    });
+    let on_check_update = Callback::new(move |_: ()| {
+        if !updater::is_supported() {
+            return;
+        }
+        if matches!(
+            *update_state.peek(),
+            Some(
+                updater::UpdateState::Checking
+                    | updater::UpdateState::Downloading { .. }
+                    | updater::UpdateState::Installing(_)
+            )
+        ) {
+            return;
+        }
+        update_state.set(Some(updater::UpdateState::Checking));
+        spawn(async move {
+            match updater::check_for_update().await {
+                Ok(Some(manifest)) => {
+                    update_dismissed.set(false);
+                    update_state.set(Some(updater::UpdateState::Available(manifest)));
+                }
+                Ok(None) => update_state.set(Some(updater::UpdateState::UpToDate)),
+                Err(message) => update_state.set(Some(updater::UpdateState::Error {
+                    manifest: None,
+                    message,
+                })),
+            }
+        });
+    });
+    let on_install_update = Callback::new(move |_: ()| {
+        let manifest = match update_state.peek().clone() {
+            Some(updater::UpdateState::Available(m)) | Some(updater::UpdateState::Error { manifest: Some(m), .. }) => m,
+            _ => return,
+        };
+        update_dismissed.set(false);
+        update_state.set(Some(updater::UpdateState::Downloading {
+            manifest: manifest.clone(),
+            percent: 0,
+        }));
+        spawn(async move {
+            let m_prog = manifest.clone();
+            let res = updater::download_and_install(manifest.clone(), move |pct| {
+                update_state.set(Some(updater::UpdateState::Downloading {
+                    manifest: m_prog.clone(),
+                    percent: pct,
+                }));
+            })
+            .await;
+            match res {
+                Ok(()) => update_state.set(Some(updater::UpdateState::Available(manifest))),
+                Err(message) => update_state.set(Some(updater::UpdateState::Error {
+                    manifest: Some(manifest),
+                    message,
+                })),
+            }
+        });
+    });
+    let update_banner = if !updater::is_supported() || update_dismissed() {
+        None
+    } else {
+        match update_state() {
+            Some(updater::UpdateState::Available(m)) => Some(UpdateBanner {
+                version: m.version,
+                downloading_pct: None,
+                installing: false,
+                error: None,
+            }),
+            Some(updater::UpdateState::Downloading { manifest, percent }) => Some(UpdateBanner {
+                version: manifest.version,
+                downloading_pct: Some(percent),
+                installing: false,
+                error: None,
+            }),
+            Some(updater::UpdateState::Installing(m)) => Some(UpdateBanner {
+                version: m.version,
+                downloading_pct: None,
+                installing: true,
+                error: None,
+            }),
+            Some(updater::UpdateState::Error {
+                manifest: Some(m),
+                message,
+            }) => Some(UpdateBanner {
+                version: m.version,
+                downloading_pct: None,
+                installing: false,
+                error: Some(message),
+            }),
+            _ => None,
+        }
+    };
+    let profile_update_ui = if updater::is_supported() {
+        match update_state() {
+            Some(updater::UpdateState::Checking) => Some(AppUpdateUi::Checking),
+            Some(updater::UpdateState::Available(m)) => Some(AppUpdateUi::Available(m.version)),
+            Some(updater::UpdateState::Downloading { percent, .. }) => Some(AppUpdateUi::Downloading(percent)),
+            Some(updater::UpdateState::Installing(_)) => Some(AppUpdateUi::Installing),
+            Some(updater::UpdateState::Error { manifest, message }) => Some(AppUpdateUi::Error {
+                can_retry_install: manifest.is_some(),
+                message,
+            }),
+            Some(updater::UpdateState::UpToDate) => Some(AppUpdateUi::UpToDate),
+            None => None,
+        }
+    } else {
+        None
+    };
     let can_back = !trail().is_empty();
     rsx! {
         if can_back {
@@ -1123,6 +1247,9 @@ fn Main(
             user_initial: initial,
             avatar_url: avatar_url.clone(),
             dl_percent,
+            update_banner,
+            on_install_update: Some(on_install_update),
+            on_dismiss_update: Some(Callback::new(move |_| update_dismissed.set(true))),
             on_tab: move |t| {
                 telegram::haptic(telegram::Haptic::Tap);
                 if t != Tab::Search {
@@ -1267,6 +1394,10 @@ fn Main(
                         avatar_url: avatar_url.clone(),
                         theme,
                         cache,
+                        app_version: updater::is_supported().then(|| updater::APP_VERSION.to_owned()),
+                        update_state: profile_update_ui.clone(),
+                        on_check_update: Some(on_check_update),
+                        on_install_update: Some(on_install_update),
                         on_theme,
                         on_preloads_changed: move |_| active_preloads.restart(),
                         on_open: move |(k, id)| open_title(k, id, false),
@@ -2158,6 +2289,10 @@ fn Profile(
     avatar_url: Option<String>,
     theme: Theme,
     cache: Signal<AppCache>,
+    #[props(default)] app_version: Option<String>,
+    #[props(default)] update_state: Option<AppUpdateUi>,
+    #[props(default)] on_check_update: Option<EventHandler<()>>,
+    #[props(default)] on_install_update: Option<EventHandler<()>>,
     on_theme: EventHandler<Theme>,
     on_preloads_changed: EventHandler<()>,
     on_open: EventHandler<(MediaKind, i64)>,
@@ -2235,6 +2370,10 @@ fn Profile(
             prefs: prefs_now().unwrap_or(prefs),
             theme,
             in_telegram: telegram::is_telegram(),
+            app_version,
+            update_state,
+            on_check_update,
+            on_install_update,
             now,
             utc_offset_min,
             on_theme,
@@ -3671,7 +3810,7 @@ fn Title(
                 filter: filter(),
                 sort: sort(),
                 panel: panel(),
-                native_player: cfg!(feature = "mobile"),
+                native_player: platform::video::supports_native(),
                 episode_count: picker_episode_count,
                 mock: !list.configured,
                 note: picker_note,

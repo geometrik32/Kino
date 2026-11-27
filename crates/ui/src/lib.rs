@@ -238,6 +238,15 @@ pub(crate) fn AvatarContent(initial: String, url: Option<String>, alt: String) -
     }
 }
 
+/// Banner shown at the top of native apps when a newer release is available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateBanner {
+    pub version: String,
+    pub downloading_pct: Option<u8>,
+    pub installing: bool,
+    pub error: Option<String>,
+}
+
 /// Top bar on wide screens, bottom 4-tab bar (with circular Telegram avatar) on phones.
 /// No custom UI back button: browser, Android swipe, and Telegram's native BackButton handle back navigation.
 #[component]
@@ -247,6 +256,9 @@ pub fn Shell(
     user_initial: String,
     #[props(default)] avatar_url: Option<String>,
     #[props(default)] dl_percent: Option<u8>,
+    #[props(default)] update_banner: Option<UpdateBanner>,
+    #[props(default)] on_install_update: Option<EventHandler<()>>,
+    #[props(default)] on_dismiss_update: Option<EventHandler<()>>,
     on_tab: EventHandler<Tab>,
     on_query: EventHandler<String>,
     children: Element,
@@ -319,7 +331,48 @@ pub fn Shell(
                 }
             }
         }
-        main { class: if tab.is_none() { "content no-tabbar" } else { "content" }, {children} }
+        main { class: if tab.is_none() { "content no-tabbar" } else { "content" },
+            if let Some(upd) = update_banner {
+                div { class: "update-banner",
+                    div { class: "update-banner-l",
+                        Icon { svg: icons::DOWNLOAD, class: "ic sm" }
+                        div { class: "update-banner-txt",
+                            if upd.installing {
+                                strong { "Запускаем установку версии {upd.version}…" }
+                            } else if let Some(pct) = upd.downloading_pct {
+                                strong { "Скачиваем обновление {upd.version}… {pct}%" }
+                            } else if let Some(err) = upd.error {
+                                strong { "Не удалось обновить до {upd.version}" }
+                                span { class: "update-banner-err", " · {err}" }
+                            } else {
+                                strong { "Доступна новая версия {upd.version}" }
+                            }
+                        }
+                    }
+                    div { class: "update-banner-r",
+                        if !upd.installing && upd.downloading_pct.is_none() {
+                            if let Some(cb) = on_install_update {
+                                button {
+                                    class: "btn primary sm",
+                                    onclick: move |_| cb.call(()),
+                                    "Обновить"
+                                }
+                            }
+                            if let Some(cb) = on_dismiss_update {
+                                button {
+                                    class: "btn glass sm",
+                                    title: "Позже",
+                                    "aria-label": "Позже",
+                                    onclick: move |_| cb.call(()),
+                                    Icon { svg: icons::CLOSE, class: "ic xs" }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            {children}
+        }
         if tab.is_some() {
             nav { class: "tabbar",
                 for t in MOBILE_TABS {
