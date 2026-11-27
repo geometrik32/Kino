@@ -1411,8 +1411,8 @@
 3. Множество элементов с `backdrop-filter: blur(...)` внутри прокручиваемых карточек (`.p-badge`, `.p-dots`, `.glass-circle`, `.cw-time-pill`), фиксированная панель `.tabbar`, тени карточек и безусловный `container-type: inline-size` на `.row-wrap` нагружали мобильный GPU при каждом кадре скролла.
 
 ### Что реализовано
-- **`crates/ui/src/motion.js`:** для Android (`html.kino-android`) отключены `MutationObserver`-скрытие изображений и ripple на прокручиваемых карточках при касании (ripple сохранён на кнопках/чипах/табах).
-- **`crates/ui/src/style.css`:** `container-type: inline-size` возвращён только в десктопный брейкпоинт, на сенсорных экранах отключён `scroll-behavior: smooth` у `.row`, а для `html.kino-android` убраны `backdrop-filter` у карточек/панелей, каскадные анимации сетки/сцены и лишние тени карточек.
+- По запросу владельца дизайн и анимации Material You полностью откачены к классической системе «Афиша + Бирюзовое кольцо» (`crates/ui/src/style.css` возвращён к состоянию `4fc105f`, отключён `crates/ui/src/motion.js` с `MutationObserver` и `m3-ripple`, убрана обёртка `.view-stage` в `app/src/main.rs`).
+- При этом сохранены все функциональные доработки: точки/чипы статусов на карточках, бегущая строка длинных названий, стилизованные подсказки, `overscroll-behavior: none`, скрытие полос прокрутки/хедера и отключение `backdrop-filter`/теней на Android (`html.kino-android`), а также `container-type: inline-size` только для десктопа.
 
 ### Критерии приёмки
 - [x] Карточки и изображения в Android-приложении отображаются сразу без задержки `data-m3-img-wait` и каскадных задержек.
