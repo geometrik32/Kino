@@ -770,3 +770,27 @@ pub async fn device_quality_for(
     .fetch_optional(pool)
     .await
 }
+
+pub async fn get_bool_setting(pool: &PgPool, key: &str) -> Result<Option<bool>, sqlx::Error> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT value FROM server_settings WHERE key = $1")
+        .bind(key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|(v,)| match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" => Some(true),
+        "false" | "0" => Some(false),
+        _ => None,
+    }))
+}
+
+pub async fn set_bool_setting(pool: &PgPool, key: &str, value: bool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO server_settings (key, value, updated_at) VALUES ($1, $2, now())
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at",
+    )
+    .bind(key)
+    .bind(if value { "true" } else { "false" })
+    .execute(pool)
+    .await?;
+    Ok(())
+}

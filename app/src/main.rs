@@ -24,15 +24,15 @@ use dioxus::prelude::*;
 use kino_core::{
     image_url, normalize_quality_key, AuthResponse, CalendarEntry, ContinueItem, HistoryEntry, HomeFeed, ImageSize,
     MarkWatched, MediaKind, PersonDetails, PreloadItem, PreloadRequest, PreloadState, Progress, ReleaseChoice,
-    ReleaseChoiceUpdate, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, SearchResults, Season,
-    TitleDetails, TitleExtras, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
-    VideoScale, WidgetAuthRequest,
+    ReleaseChoiceUpdate, ResolveReleaseRequest, ResolveReleaseResponse, RewatchMode, SearchResults,
+    SearchSourcesSettings, Season, TitleDetails, TitleExtras, TitleState, TitleStatus, TitleSummary, UserPrefs,
+    UserPublicProfile, UserSocialLibrary, VideoScale, WidgetAuthRequest,
 };
 use kino_ui::{
     icons, play_target, AppUpdateUi, DesktopDragStrip, HomeView, Icon, LoginView, MyFilters, MyKindFilter, MySection,
     MyView, PersonView, PickerPanel, PlayTarget, ProfileView, ReleaseFilter, ReleaseOption, ReleasePicker, ReleaseSort,
     SearchView, ShelfView, Shell, Tab, Theme, TitleExtrasView, TitleView, UpdateBanner, WindowChrome, WindowControls,
-    FAVICON_URI, MOTION_SCRIPT, STYLE,
+    FAVICON_URI, STYLE,
 };
 
 const FONTS_URL: &str = "https://fonts.googleapis.com/css2?family=Golos+Text:wght@400;500;600;700&display=swap";
@@ -302,7 +302,6 @@ fn App() -> Element {
         document::Link { rel: "preconnect", href: "https://fonts.gstatic.com", crossorigin: "anonymous" }
         document::Link { rel: "stylesheet", href: FONTS_URL, media: "print", onload: "this.media='all'" }
         style { "{STYLE}" }
-        script { "{MOTION_SCRIPT}" }
         match session() {
             Session::Checking => rsx! {
                 if let Some(chrome) = window_chrome.clone() {
@@ -640,6 +639,7 @@ struct ProfileCache {
     history: Option<Vec<HistoryEntry>>,
     preloads: Option<Vec<PreloadItem>>,
     prefs: Option<UserPrefs>,
+    search_sources: Option<Option<SearchSourcesSettings>>,
     prefs_open: bool,
     hist_limit: Option<usize>,
     expanded_series: Vec<i64>,
@@ -1519,7 +1519,7 @@ fn Main(
                     View::Shelf { id, .. } => format!("shelf-{id}"),
                 };
                 rsx! {
-                    div { key: "{stage_key}", class: "view-stage",
+                    div { key: "{stage_key}",
                         match cur_view {
                             View::Tab(Tab::Home) => rsx! {
                                 Home {
@@ -2370,41 +2370,6 @@ where
     .await
 }
 
-async fn join3<A, B, C, FA, FB, FC>(fa: FA, fb: FB, fc: FC) -> (A, B, C)
-where
-    FA: std::future::Future<Output = A>,
-    FB: std::future::Future<Output = B>,
-    FC: std::future::Future<Output = C>,
-{
-    let mut fa = std::pin::pin!(fa);
-    let mut fb = std::pin::pin!(fb);
-    let mut fc = std::pin::pin!(fc);
-    let (mut ra, mut rb, mut rc) = (None, None, None);
-    std::future::poll_fn(|cx| {
-        if ra.is_none() {
-            if let std::task::Poll::Ready(v) = fa.as_mut().poll(cx) {
-                ra = Some(v);
-            }
-        }
-        if rb.is_none() {
-            if let std::task::Poll::Ready(v) = fb.as_mut().poll(cx) {
-                rb = Some(v);
-            }
-        }
-        if rc.is_none() {
-            if let std::task::Poll::Ready(v) = fc.as_mut().poll(cx) {
-                rc = Some(v);
-            }
-        }
-        if ra.is_some() && rb.is_some() && rc.is_some() {
-            std::task::Poll::Ready((ra.take().unwrap(), rb.take().unwrap(), rc.take().unwrap()))
-        } else {
-            std::task::Poll::Pending
-        }
-    })
-    .await
-}
-
 async fn join4<A, B, C, D, FA, FB, FC, FD>(fa: FA, fb: FB, fc: FC, fd: FD) -> (A, B, C, D)
 where
     FA: std::future::Future<Output = A>,
@@ -2472,28 +2437,38 @@ fn Profile(
     let mut history_state = use_signal(|| cached.history.clone());
     let mut preloads_state = use_signal(|| cached.preloads.clone());
     let mut prefs_state = use_signal(|| cached.prefs.clone());
+    let mut search_sources_state = use_signal(|| cached.search_sources.flatten());
     let t1 = token.clone();
     let mut data = use_resource(move || {
         let t = t1.clone();
         async move {
-            let (history, preloads, prefs) = join3(api::history(&t), api::preloads(&t), api::prefs(&t)).await;
-            Ok::<_, api::Failure>((history?, preloads?, prefs?))
+            let (history, preloads, prefs, search_sources) = join4(
+                api::history(&t),
+                api::preloads(&t),
+                api::prefs(&t),
+                api::admin_search_sources(&t),
+            )
+            .await;
+            Ok::<_, api::Failure>((history?, preloads?, prefs?, search_sources.unwrap_or(None)))
         }
     });
     use_effect(move || {
-        if let Some(Ok((h, pl, pr))) = &*data.read() {
+        if let Some(Ok((h, pl, pr, src))) = &*data.read() {
             history_state.set(Some(h.clone()));
             preloads_state.set(Some(pl.clone()));
             prefs_state.set(Some(pr.clone()));
+            search_sources_state.set(*src);
             cache.with_mut(|c| {
                 let p = c.profile.get_or_insert_with(ProfileCache::default);
                 p.history = Some(h.clone());
                 p.preloads = Some(pl.clone());
                 p.prefs = Some(pr.clone());
+                p.search_sources = Some(*src);
             });
         }
     });
     let mut prefs_now = use_signal(|| None::<UserPrefs>);
+    let mut search_sources_now = use_signal(|| None::<SearchSourcesSettings>);
     let mut dl_error = use_signal(|| None::<String>);
     let state = data.read().clone();
     let active_preloads_list = preloads_state();
@@ -2531,6 +2506,8 @@ fn Profile(
     let (now, utc_offset_min) = platform::now();
     let t2 = token.clone();
     let t3 = token.clone();
+    let t4 = token.clone();
+    let cur_search_sources = search_sources_now().or_else(move || search_sources_state());
     rsx! {
         ProfileView {
             name,
@@ -2619,6 +2596,38 @@ fn Profile(
                         list.remove(pos);
                     } else {
                         list.push(tid);
+                    }
+                });
+            },
+            search_sources: cur_search_sources,
+            on_toggle_jackett: move |enabled: bool| {
+                let prev = cur_search_sources;
+                let optimistic = SearchSourcesSettings {
+                    available: true,
+                    jackett_parallel: enabled,
+                };
+                search_sources_now.set(Some(optimistic));
+                search_sources_state.set(Some(optimistic));
+                cache.with_mut(|c| {
+                    c.profile.get_or_insert_with(ProfileCache::default).search_sources = Some(Some(optimistic));
+                });
+                let t = t4.clone();
+                spawn(async move {
+                    match api::save_admin_search_sources(&t, enabled).await {
+                        Ok(saved) => {
+                            search_sources_now.set(Some(saved));
+                            search_sources_state.set(Some(saved));
+                            cache.with_mut(|c| {
+                                c.profile.get_or_insert_with(ProfileCache::default).search_sources = Some(Some(saved));
+                            });
+                        }
+                        Err(_) => {
+                            search_sources_now.set(prev);
+                            search_sources_state.set(prev);
+                            cache.with_mut(|c| {
+                                c.profile.get_or_insert_with(ProfileCache::default).search_sources = Some(prev);
+                            });
+                        }
                     }
                 });
             },

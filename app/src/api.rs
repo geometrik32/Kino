@@ -7,9 +7,9 @@ use kino_core::{
     LoginLink, LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, MediaSegment, PersonDetails, PlayInfo,
     PlayProbe, PlayProbeRequest, PlayRequest, PreloadItem, PreloadRequest, Progress, ProgressUpdate, RatingUpdate,
     ReleaseChoice, ReleaseChoiceUpdate, ReleaseList, ResolveReleaseRequest, ResolveReleaseResponse, SearchResults,
-    Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, StreamProgress, SyncJoinRequest, SyncJoinResponse,
-    SyncLeaveRequest, TitleDetails, TitleExtras, TitleState, TitleStatus, TracksUpdate, UserPrefs, UserPublicProfile,
-    UserSocialLibrary, VideoScale, WebAppAuthRequest, WidgetAuthRequest,
+    SearchSourcesSettings, SearchSourcesUpdate, Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, StreamProgress,
+    SyncJoinRequest, SyncJoinResponse, SyncLeaveRequest, TitleDetails, TitleExtras, TitleState, TitleStatus,
+    TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary, VideoScale, WebAppAuthRequest, WidgetAuthRequest,
 };
 use reqwest::{Client, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
@@ -404,6 +404,24 @@ pub async fn prefs(token: &str) -> Result<UserPrefs, Failure> {
 
 pub async fn save_prefs(token: &str, p: &UserPrefs) -> Result<UserPrefs, Failure> {
     send("PUT", "/api/prefs", token, Some(p)).await
+}
+
+pub async fn admin_search_sources(token: &str) -> Result<Option<SearchSourcesSettings>, Failure> {
+    match get::<SearchSourcesSettings>("/api/admin/search-sources", token).await {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.code == "admin_only" => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub async fn save_admin_search_sources(token: &str, jackett_parallel: bool) -> Result<SearchSourcesSettings, Failure> {
+    send(
+        "PUT",
+        "/api/admin/search-sources",
+        token,
+        Some(&SearchSourcesUpdate { jackett_parallel }),
+    )
+    .await
 }
 
 pub async fn preloads(token: &str) -> Result<Vec<PreloadItem>, Failure> {

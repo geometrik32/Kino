@@ -47,7 +47,7 @@ pub struct Media {
     /// Fallback search indexers (Jackett behind Sablier) used only if primary indexers fail to answer,
     /// or in parallel when `jackett_parallel` is true.
     pub fallback_indexers: Vec<Jackett>,
-    pub jackett_parallel: bool,
+    pub jackett_parallel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     pub torrserver: Option<TorrServer>,
     pub qbit: Option<QBittorrent>,
     /// Recent indexer results; see [`torrent::search_cache`].
@@ -138,7 +138,7 @@ impl Media {
         Self {
             indexers,
             fallback_indexers,
-            jackett_parallel: c.jackett_parallel,
+            jackett_parallel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(c.jackett_parallel)),
             torrserver: c.torrserver_url.as_ref().map(|url| {
                 let auth = c.torrserver_user.clone().zip(c.torrserver_password.clone());
                 TorrServer::new(url, auth)
@@ -178,13 +178,26 @@ impl Media {
         out
     }
 
+    pub fn is_jackett_parallel(&self) -> bool {
+        self.jackett_parallel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_jackett_parallel(&self, enabled: bool) {
+        self.jackett_parallel
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn has_parallel_toggle(&self) -> bool {
+        !self.indexers.is_empty() && !self.fallback_indexers.is_empty()
+    }
+
     /// Proactively wakes a sleeping primary indexer (i.e. Jackett when no external
     /// primary Torznab is configured) in the background when a user starts browsing.
     pub fn wake_jackett(&self) {
         for idx in &self.indexers {
             idx.wake_in_background();
         }
-        if self.jackett_parallel {
+        if self.is_jackett_parallel() {
             for idx in &self.fallback_indexers {
                 idx.wake_in_background();
             }
@@ -383,7 +396,7 @@ async fn fetch_release_list(
         &state.pool,
         &state.media.indexers,
         &state.media.fallback_indexers,
-        state.media.jackett_parallel,
+        state.media.is_jackett_parallel(),
         details,
     )
     .await?;
@@ -949,7 +962,7 @@ pub fn prefetch_releases(state: &AppState, user_id: i64, details: TitleDetails) 
             &state.pool,
             &state.media.indexers,
             &state.media.fallback_indexers,
-            state.media.jackett_parallel,
+            state.media.is_jackett_parallel(),
             &details,
         )
         .await

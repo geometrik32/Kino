@@ -1295,6 +1295,97 @@ async fn extra_torznab_is_primary_keeps_jackett_asleep_and_falls_back_on_failure
 }
 
 #[sqlx::test(migrations = "./migrations")]
+async fn admin_search_sources_toggle_updates_runtime_and_db(pool: PgPool) {
+    let jackett_hits = Arc::new(AtomicU32::new(0));
+    let jackett = start_jackett_counted(jackett_hits.clone()).await;
+    let extra_feed = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:torznab="http://torznab.com/schemas/2015/feed"><channel>
+  <item>
+    <title>Во все тяжкие / Breaking Bad S02 (2009) WEB-DL 1080p Дубляж</title>
+    <jackettindexer id="all">rutracker, bitru, rutor</jackettindexer>
+    <link>magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa</link>
+    <category>5000</category>
+    <size>24000000000</size>
+    <torznab:attr name="seeders" value="320" />
+    <torznab:attr name="infohash" value="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" />
+  </item>
+</channel></rss>"#;
+    let extra_url = serve(Router::new().route(
+        "/api/v2.0/indexers/all/results/torznab/api",
+        get(move || async move { extra_feed }),
+    ))
+    .await;
+    let state = test_state_with(
+        pool.clone(),
+        TorrentConfig {
+            jackett_url: Some(jackett),
+            jackett_api_key: Some("secret".into()),
+            extra_torznab: vec![kino_server::config::ExtraTorznabConfig {
+                url: extra_url,
+                api_key: None,
+            }],
+            ..Default::default()
+        },
+    );
+    let app_srv = app(state.clone());
+
+    let admin_t = login_ok(&app_srv, ADMIN_TG, None).await.token;
+    let (code, body) = call(&app_srv, Method::POST, "/api/invites", Some(&admin_t), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let invite = body["code"].as_str().unwrap().to_owned();
+    let user_t = login_ok(&app_srv, 2002, Some(&invite)).await.token;
+
+    // Non-admin user cannot read or toggle server search sources.
+    let (code, _) = call(&app_srv, Method::GET, "/api/admin/search-sources", Some(&user_t), None).await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+    let (code, _) = call(
+        &app_srv,
+        Method::PUT,
+        "/api/admin/search-sources",
+        Some(&user_t),
+        Some(json!({ "jackett_parallel": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::FORBIDDEN);
+
+    // Initially off -> primary only (1 release, 0 Jackett hits).
+    let (code, body) = call(&app_srv, Method::GET, "/api/admin/search-sources", Some(&admin_t), None).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "available": true, "jackett_parallel": false }));
+
+    let (code, body) = call(&app_srv, Method::GET, "/api/releases/tv/1396", Some(&admin_t), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let list_off: ReleaseList = serde_json::from_value(body).unwrap();
+    assert_eq!(list_off.releases.len(), 1);
+    assert_eq!(jackett_hits.load(Ordering::SeqCst), 0);
+
+    // Admin flips toggle ON -> clears cache, queries Jackett in parallel, and persists in DB.
+    let (code, body) = call(
+        &app_srv,
+        Method::PUT,
+        "/api/admin/search-sources",
+        Some(&admin_t),
+        Some(json!({ "jackett_parallel": true })),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body, json!({ "available": true, "jackett_parallel": true }));
+    assert!(state.media.is_jackett_parallel());
+
+    let (code, body) = call(&app_srv, Method::GET, "/api/releases/tv/1396", Some(&admin_t), None).await;
+    assert_eq!(code, StatusCode::OK);
+    let list_on: ReleaseList = serde_json::from_value(body).unwrap();
+    assert_eq!(list_on.releases.len(), 4);
+    assert!(jackett_hits.load(Ordering::SeqCst) >= 2);
+    assert_eq!(
+        kino_server::db::get_bool_setting(&pool, "jackett_parallel")
+            .await
+            .unwrap(),
+        Some(true)
+    );
+}
+
+#[sqlx::test(migrations = "./migrations")]
 async fn preload_ready_sends_telegram_notification_once(pool: PgPool) {
     let sent: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
     let mock_tg = Router::new().route(

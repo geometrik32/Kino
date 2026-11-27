@@ -998,8 +998,8 @@ pub struct UserPrefs {
     pub mobile_quality: Option<String>,
 }
 
+/// Recommended defaults applied to new users and when resetting profile preferences.
 impl UserPrefs {
-    /// Recommended defaults applied to new users and when resetting profile preferences.
     pub fn recommended_defaults() -> Self {
         Self {
             language: Some(DEFAULT_PREF_LANGUAGE.to_owned()),
@@ -1007,6 +1007,22 @@ impl UserPrefs {
             ..Self::default()
         }
     }
+}
+
+/// Server-level torrent search source settings (admin-only).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSourcesSettings {
+    /// True when both an external Torznab indexer and local Jackett are configured,
+    /// so Jackett can be toggled between fallback-only and parallel search.
+    pub available: bool,
+    /// Query local Jackett in parallel with external Torznab indexers.
+    pub jackett_parallel: bool,
+}
+
+/// Request body for `PUT /api/admin/search-sources`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchSourcesUpdate {
+    pub jackett_parallel: bool,
 }
 
 /// Active title being watched right now by a user.

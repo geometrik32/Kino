@@ -6,8 +6,8 @@ use chrono::{DateTime, Datelike, FixedOffset, NaiveDate, Utc};
 use dioxus::prelude::*;
 use kino_core::{
     clock, episode_code, format_episode_ranges, format_speed, image_url, normalize_quality_key, CalendarEntry,
-    HistoryEntry, ImageSize, MediaKind, PreloadEpisodeItem, PreloadItem, PreloadPhase, PreloadState, TitleState,
-    TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
+    HistoryEntry, ImageSize, MediaKind, PreloadEpisodeItem, PreloadItem, PreloadPhase, PreloadState,
+    SearchSourcesSettings, TitleState, TitleStatus, TitleSummary, UserPrefs, UserPublicProfile, UserSocialLibrary,
 };
 
 use crate::icons::{self, Icon};
@@ -953,6 +953,8 @@ pub fn ProfileView(
     #[props(default)] on_hist_limit: Option<EventHandler<usize>>,
     #[props(default)] initial_expanded_series: Vec<i64>,
     #[props(default)] on_toggle_series: Option<EventHandler<i64>>,
+    #[props(default)] search_sources: Option<SearchSourcesSettings>,
+    #[props(default)] on_toggle_jackett: Option<EventHandler<bool>>,
     on_open: EventHandler<(MediaKind, i64)>,
     on_logout: EventHandler<()>,
 ) -> Element {
@@ -1045,6 +1047,50 @@ pub fn ProfileView(
                                 class: if theme == Theme::Auto { "active" } else { "" },
                                 onclick: move |_| on_theme.call(Theme::Auto),
                                 "{Theme::Auto.label()}"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if let Some(src) = search_sources.filter(|s| s.available) {
+                section { class: "section",
+                    div { class: "sec-head",
+                        h2 { "Источники поиска" }
+                    }
+                    div { class: "panel theme-panel",
+                        div {
+                            div { class: "theme-lbl", "Локальный Jackett (AniDUB и др.)" }
+                            div { class: "muted theme-sub",
+                                if src.jackett_parallel {
+                                    "Включён: ищет на локальных трекерах параллельно с JacRed и держит Jackett активным 10 мин"
+                                } else {
+                                    "Резерв: Jackett спит и не тратит память, пока работает основной поиск"
+                                }
+                            }
+                        }
+                        div { class: "seg",
+                            button {
+                                class: if !src.jackett_parallel { "active" } else { "" },
+                                onclick: move |_| {
+                                    if src.jackett_parallel {
+                                        if let Some(cb) = on_toggle_jackett {
+                                            cb.call(false);
+                                        }
+                                    }
+                                },
+                                "Выкл"
+                            }
+                            button {
+                                class: if src.jackett_parallel { "active" } else { "" },
+                                onclick: move |_| {
+                                    if !src.jackett_parallel {
+                                        if let Some(cb) = on_toggle_jackett {
+                                            cb.call(true);
+                                        }
+                                    }
+                                },
+                                "Вкл"
                             }
                         }
                     }

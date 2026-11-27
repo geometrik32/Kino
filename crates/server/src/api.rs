@@ -68,9 +68,9 @@ use kino_core::{
     AuthResponse, CalendarEntry, CatalogRow, ContinueItem, EpisodeRatingUpdate, HistoryEntry, HomeFeed, LoginLink,
     LoginLinkRequest, LoginLinkStatus, MarkWatched, Me, MediaKind, PersonDetails, PreloadItem, PreloadPhase,
     PreloadRequest, PreloadState, Progress, ProgressUpdate, RatingUpdate, ReleaseChoice, ReleaseChoiceUpdate, Role,
-    ScaleUpdate, SearchResults, Season, SeasonRatingUpdate, ShelfPage, StatusUpdate, TitleDetails, TitleExtras,
-    TitleState, TitleStatus, TitleSummary, TracksUpdate, UserPrefs, UserPublicProfile, UserSocialLibrary,
-    WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
+    ScaleUpdate, SearchResults, SearchSourcesSettings, SearchSourcesUpdate, Season, SeasonRatingUpdate, ShelfPage,
+    StatusUpdate, TitleDetails, TitleExtras, TitleState, TitleStatus, TitleSummary, TracksUpdate, UserPrefs,
+    UserPublicProfile, UserSocialLibrary, WatchlistItem, WebAppAuthRequest, WidgetAuthRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -137,6 +137,7 @@ pub fn router() -> Router<AppState> {
             put(watchlist_add).delete(watchlist_remove),
         )
         .route("/invites", post(create_invite))
+        .route("/admin/search-sources", get(get_search_sources).put(put_search_sources))
         .route("/catalog/home", get(catalog_home))
         .route("/catalog/home/shelves", get(catalog_home_shelves))
         .route("/catalog/shelf/{id}", get(catalog_shelf))
@@ -1468,6 +1469,43 @@ async fn create_invite(State(state): State<AppState>, user: CurrentUser) -> Resu
     let code = db::create_invite(&state.pool, Some(me.id)).await?;
     let link = format!("{}/?invite={code}", state.config.public_url);
     Ok(Json(InviteResponse { code, link }))
+}
+
+async fn get_search_sources(
+    State(state): State<AppState>,
+    user: CurrentUser,
+) -> Result<Json<SearchSourcesSettings>, AppError> {
+    let me = load_me(&state, &user).await?;
+    if me.role != Role::Admin {
+        return Err(AppError::forbidden("admin_only", "Только для администратора"));
+    }
+    Ok(Json(SearchSourcesSettings {
+        available: state.media.has_parallel_toggle(),
+        jackett_parallel: state.media.is_jackett_parallel(),
+    }))
+}
+
+async fn put_search_sources(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Json(req): Json<SearchSourcesUpdate>,
+) -> Result<Json<SearchSourcesSettings>, AppError> {
+    let me = load_me(&state, &user).await?;
+    if me.role != Role::Admin {
+        return Err(AppError::forbidden("admin_only", "Только для администратора"));
+    }
+    db::set_bool_setting(&state.pool, "jackett_parallel", req.jackett_parallel).await?;
+    state.media.set_jackett_parallel(req.jackett_parallel);
+    state.media.searches.clear();
+    if req.jackett_parallel {
+        for idx in &state.media.fallback_indexers {
+            idx.wake_in_background();
+        }
+    }
+    Ok(Json(SearchSourcesSettings {
+        available: state.media.has_parallel_toggle(),
+        jackett_parallel: state.media.is_jackett_parallel(),
+    }))
 }
 
 impl From<CatalogError> for AppError {

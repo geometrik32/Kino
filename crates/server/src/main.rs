@@ -37,6 +37,11 @@ async fn main() -> anyhow::Result<()> {
         image_cache,
     )?;
     let media = Arc::new(kino_server::play::Media::new(&config.torrents));
+    match db::get_bool_setting(&pool, "jackett_parallel").await {
+        Ok(Some(enabled)) => media.set_jackett_parallel(enabled),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(error = %e, "could not load jackett_parallel setting from db"),
+    }
     let telegram =
         kino_server::config::http_client(config.telegram_proxy.as_deref(), std::time::Duration::from_secs(15))
             .unwrap_or_else(|e| {

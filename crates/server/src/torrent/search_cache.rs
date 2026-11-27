@@ -79,6 +79,10 @@ impl SearchCache {
         cell.get_or_try_init(search).await.cloned()
     }
 
+    pub fn clear(&self) {
+        self.entries.lock().expect("search cache lock").clear();
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
