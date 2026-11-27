@@ -11,6 +11,29 @@ mod native;
 #[cfg(not(target_arch = "wasm32"))]
 pub use native::*;
 
+/// Computes an updated `<meta name="viewport">` `content` string with `viewport-fit=cover`,
+/// returning `None` if `viewport-fit=cover` is already present.
+#[cfg_attr(not(any(test, target_arch = "wasm32")), allow(dead_code))]
+pub fn viewport_cover_content(current: &str) -> Option<String> {
+    if current
+        .split(',')
+        .any(|part| part.trim().eq_ignore_ascii_case("viewport-fit=cover"))
+    {
+        return None;
+    }
+    let mut parts: Vec<&str> = current
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !part.to_ascii_lowercase().starts_with("viewport-fit="))
+        .collect();
+    if parts.is_empty() {
+        parts.push("width=device-width");
+        parts.push("initial-scale=1");
+    }
+    parts.push("viewport-fit=cover");
+    Some(parts.join(", "))
+}
+
 /// Deep-link target used to open a title (optionally starting playback at once).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenTarget {
@@ -229,6 +252,30 @@ mod tests {
                 season: None,
                 release: None,
             })
+        );
+    }
+
+    #[test]
+    fn viewport_cover_content_adds_or_replaces_viewport_fit() {
+        assert_eq!(
+            viewport_cover_content("width=device-width, initial-scale=1").as_deref(),
+            Some("width=device-width, initial-scale=1, viewport-fit=cover")
+        );
+        assert_eq!(
+            viewport_cover_content("width=device-width, initial-scale=1, viewport-fit=contain").as_deref(),
+            Some("width=device-width, initial-scale=1, viewport-fit=cover")
+        );
+        assert_eq!(
+            viewport_cover_content("").as_deref(),
+            Some("width=device-width, initial-scale=1, viewport-fit=cover")
+        );
+        assert_eq!(
+            viewport_cover_content("width=device-width, initial-scale=1, viewport-fit=cover"),
+            None
+        );
+        assert_eq!(
+            viewport_cover_content("width=device-width, VIEWPORT-FIT=COVER, initial-scale=1"),
+            None
         );
     }
 }

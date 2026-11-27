@@ -145,10 +145,13 @@ class MainActivity : WryActivity() {
                 val cut = windowInsets.getInsets(WindowInsetsCompat.Type.displayCutout())
                 if (isPlayerMode) {
                     view.setPadding(0, 0, 0, 0)
-                    // Pass only real camera cutout margins into CSS; hidden nav bar width stays excluded.
-                    applyCssInsets(cut.left, cut.top, cut.right, cut.bottom)
+                    // Pass symmetric horizontal camera cutout margins into CSS so controls stay centered;
+                    // hidden nav bar width stays excluded.
+                    val symCut = maxOf(cut.left, cut.right)
+                    applyCssInsets(symCut, cut.top, symCut, cut.bottom)
                 } else {
-                    view.setPadding(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom))
+                    val symBars = maxOf(bars.left, bars.right)
+                    view.setPadding(symBars, bars.top, symBars, maxOf(bars.bottom, ime.bottom))
                     applyCssInsets(0, 0, 0, 0)
                 }
                 WindowInsetsCompat.CONSUMED
@@ -187,6 +190,8 @@ class MainActivity : WryActivity() {
                 safeBrowsingEnabled = true
             }
         }
+        webView.isVerticalScrollBarEnabled = false
+        webView.isHorizontalScrollBarEnabled = false
         webView.setBackgroundColor(Color.TRANSPARENT)
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null)
         webView.post {

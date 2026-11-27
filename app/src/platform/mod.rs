@@ -151,6 +151,7 @@ pub fn toggle_fullscreen() {
             } else if (root.webkitRequestFullscreen) { \
               window.__kinoFsUserExit = false; \
               root.webkitRequestFullscreen(); \
+              if (window.matchMedia('(pointer: coarse)').matches && screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } \
             } else if (vid && vid.webkitEnterFullscreen) { \
               window.__kinoFsUserExit = false; \
               vid.webkitEnterFullscreen(); \
@@ -190,43 +191,65 @@ pub fn player_mode(on: bool) {
         // intercepts system Back, and swallows taps on the player UI.
         let js = if on {
             "try { \
-               if (window.__kinoFsRetry) { document.removeEventListener('pointerup', window.__kinoFsRetry, true); window.__kinoFsRetry = null; } \
+               if (window.__kinoFsRetry) { \
+                 ['pointerup', 'touchend', 'click'].forEach(function (t) { document.removeEventListener(t, window.__kinoFsRetry, true); }); \
+                 window.__kinoFsRetry = null; \
+               } \
                if (window.matchMedia('(pointer: coarse)').matches) { \
                  var root = document.documentElement; \
                  var tg = window.Telegram && window.Telegram.WebApp; \
                  var inTg = root.classList.contains('tg') || !!(tg && tg.initData); \
                  var lock = function () { if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(function () {}); } }; \
+                 var isFs = function () { return !!(document.fullscreenElement || document.webkitFullscreenElement); }; \
                  if (inTg) { \
                    if (tg && tg.unlockOrientation) { tg.unlockOrientation(); } \
                    root.classList.add('tg-player-rot'); \
                    if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen().catch(function () {}); } \
+                   else if (document.webkitFullscreenElement && document.webkitExitFullscreen) { document.webkitExitFullscreen(); } \
                    lock(); \
                  } else { \
+                   var fsBusy = false; \
                    var enterFs = function () { \
-                     if (root.requestFullscreen && !document.fullscreenElement) { \
-                       try { root.requestFullscreen({ navigationUI: 'hide' }).then(lock, function () { try { root.requestFullscreen().then(lock, lock); } catch (e) { lock(); } }); } \
-                       catch (e) { try { root.requestFullscreen().then(lock, lock); } catch (e2) { lock(); } } \
+                     if (fsBusy) return; \
+                     if (isFs()) { lock(); return; } \
+                     if (root.requestFullscreen && document.fullscreenEnabled !== false) { \
+                       fsBusy = true; \
+                       var done = function () { fsBusy = false; lock(); }; \
+                       try { \
+                         root.requestFullscreen({ navigationUI: 'hide' }).then(done, function () { \
+                           try { root.requestFullscreen().then(done, done); } catch (e) { done(); } \
+                         }); \
+                       } catch (e) { \
+                         try { root.requestFullscreen().then(done, done); } catch (e2) { done(); } \
+                       } \
+                     } else if (root.webkitRequestFullscreen) { \
+                       try { root.webkitRequestFullscreen(); } catch (e) {} \
+                       lock(); \
                      } else { lock(); } \
                    }; \
                    enterFs(); \
                    window.__kinoFsRetry = function (ev) { \
                      if (!document.documentElement.classList.contains('kino-playing')) return; \
                      if (window.__kinoFsUserExit) return; \
-                     if (ev && ev.target && ev.target.closest && ev.target.closest('.p-fs-btn')) return; \
-                     if (!document.fullscreenElement) { enterFs(); } \
+                     if (ev && ev.target && ev.target.closest && ev.target.closest('.p-fs-btn, button[aria-label=\"Назад\"]')) return; \
+                     if (!isFs()) { enterFs(); } \
                      else { lock(); } \
                    }; \
-                   document.addEventListener('pointerup', window.__kinoFsRetry, true); \
+                   ['pointerup', 'touchend', 'click'].forEach(function (t) { document.addEventListener(t, window.__kinoFsRetry, true); }); \
                  } \
                } \
              } catch (e) {}"
         } else {
             "try { \
-               if (window.__kinoFsRetry) { document.removeEventListener('pointerup', window.__kinoFsRetry, true); window.__kinoFsRetry = null; } \
+               if (window.__kinoFsRetry) { \
+                 ['pointerup', 'touchend', 'click'].forEach(function (t) { document.removeEventListener(t, window.__kinoFsRetry, true); }); \
+                 window.__kinoFsRetry = null; \
+               } \
                if (screen.orientation && screen.orientation.unlock) { screen.orientation.unlock(); } \
                var tg = window.Telegram && window.Telegram.WebApp; \
                if (tg && tg.unlockOrientation) { tg.unlockOrientation(); } \
                if (document.fullscreenElement && document.exitFullscreen) { document.exitFullscreen().catch(function () {}); } \
+               else if (document.webkitFullscreenElement && document.webkitExitFullscreen) { document.webkitExitFullscreen(); } \
              } catch (e) {}"
         };
         let _ = dioxus::document::eval(js);

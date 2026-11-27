@@ -128,16 +128,34 @@ pub fn init() {
 
 /// Lets the page use the whole screen (`viewport-fit=cover`), so `env(safe-area-inset-*)`
 /// reports the notch and the home bar and the stylesheet can keep clear of them.
-fn cover_notch() {
-    let Some(meta) = web_sys::window()
-        .and_then(|w| w.document())
-        .and_then(|d| d.query_selector("meta[name=viewport]").ok().flatten())
-    else {
-        return;
-    };
-    let content = meta.get_attribute("content").unwrap_or_default();
-    if !content.contains("viewport-fit") {
-        let _ = meta.set_attribute("content", &format!("{content}, viewport-fit=cover"));
+pub fn cover_notch() {
+    let Some(win) = web_sys::window() else { return };
+    let Some(doc) = win.document() else { return };
+    let Some(head) = doc.head() else { return };
+    if let Some(meta) = doc.query_selector("meta[name=viewport]").ok().flatten() {
+        let content = meta.get_attribute("content").unwrap_or_default();
+        let Some(updated) = super::viewport_cover_content(&content) else {
+            return;
+        };
+        // Replace the meta node rather than mutating in place so WebKit re-evaluates `viewport-fit=cover`.
+        if let Ok(fresh) = doc.create_element("meta") {
+            let _ = fresh.set_attribute("name", "viewport");
+            let _ = fresh.set_attribute("content", &updated);
+            if let Some(parent) = meta.parent_node() {
+                let _ = parent.replace_child(&fresh, &meta);
+            } else {
+                let _ = head.append_child(&fresh);
+            }
+        } else {
+            let _ = meta.set_attribute("content", &updated);
+        }
+    } else if let Ok(fresh) = doc.create_element("meta") {
+        let _ = fresh.set_attribute("name", "viewport");
+        let _ = fresh.set_attribute("content", "width=device-width, initial-scale=1, viewport-fit=cover");
+        let _ = head.append_child(&fresh);
+    }
+    if let Ok(ev) = web_sys::Event::new("resize") {
+        let _ = win.dispatch_event(&ev);
     }
 }
 

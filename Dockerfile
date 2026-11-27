@@ -18,6 +18,8 @@ RUN cargo build --release --locked -p kino-server -p kino-bot
 RUN cd app && dx bundle --web --release -p kino-app \
  && mkdir -p /out \
  && cp -r "$(dirname "$(find /src/target/dx -path '*release/web/public/index.html' | head -n1)")" /out/web \
+ && perl -0777 -i -pe 'if (!/viewport-fit=/i) { s{(<meta\b[^>]*\bname=["\x27]?viewport["\x27]?[^>]*>)}{ my $t = $1; $t =~ s{(\bcontent=["\x27])([^"\x27]*)}{$1 . ($2 ? "$2, " : "") . "viewport-fit=cover"}ie; $t }ige }' /out/web/index.html \
+ && grep -qi 'viewport-fit=cover' /out/web/index.html \
  && find /out/web -type f \( -name '*.wasm' -o -name '*.js' -o -name '*.css' -o -name '*.html' -o -name '*.svg' \) \
     -exec sh -c 'gzip -9 -k "$1" && brotli -9 -k "$1"' _ {} \;
 

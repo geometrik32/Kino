@@ -52,6 +52,7 @@ async fn ensure_telegram_sdk() {
 
 /// Called once before the first screen.
 pub async fn init() {
+    crate::telegram::cover_notch();
     let origin = web_sys::window()
         .and_then(|w| w.location().origin().ok())
         .unwrap_or_default();
