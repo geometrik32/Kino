@@ -2507,7 +2507,7 @@ fn Profile(
     let t2 = token.clone();
     let t3 = token.clone();
     let t4 = token.clone();
-    let cur_search_sources = search_sources_now().or_else(move || search_sources_state());
+    let cur_search_sources = search_sources_now().or(search_sources_state());
     rsx! {
         ProfileView {
             name,
