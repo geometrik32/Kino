@@ -1,4 +1,4 @@
-; Installer of «Орловский кинопоказ» for Windows (NSIS).
+﻿; Installer of «Орловский кинопоказ» for Windows (NSIS).
 ; Built by .github/workflows/desktop.yml:
 ;   makensis /DVERSION=0.1.5 /DSTAGE=<dir with orel-kino.exe and libmpv-2.dll> /DOUTFILE=<setup.exe> orel-kino.nsi
 Unicode true

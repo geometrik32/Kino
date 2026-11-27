@@ -47,9 +47,7 @@ fn main() {
             } catch (e) {}
         </script>"#;
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
-        let config = dioxus::desktop::Config::new()
-            .with_window(dioxus::desktop::WindowBuilder::new().with_title("Орловский кинопоказ"))
-            .with_custom_head(HEAD.to_owned());
+        let config = desktop_config(HEAD);
         #[cfg(feature = "mobile")]
         let config = dioxus::mobile::Config::new()
             .with_background_color((0, 0, 0, 0))
@@ -59,6 +57,30 @@ fn main() {
 
     #[cfg(not(any(feature = "mobile", feature = "desktop")))]
     dioxus::launch(App);
+}
+
+#[cfg(all(feature = "desktop", not(feature = "mobile")))]
+fn desktop_config(head: &str) -> dioxus::desktop::Config {
+    use dioxus::desktop::{tao::window::Icon, Config, LogicalSize, WindowBuilder};
+
+    let icon = Icon::from_rgba(include_bytes!("../../desktop/assets/icon-64.rgba").to_vec(), 64, 64).ok();
+    let window = WindowBuilder::new()
+        .with_title("Орловский кинопоказ")
+        .with_inner_size(LogicalSize::new(1280.0, 800.0))
+        .with_min_inner_size(LogicalSize::new(480.0, 600.0))
+        .with_window_icon(icon);
+    let mut config = Config::new()
+        .with_window(window)
+        .with_menu(None)
+        .with_custom_head(head.to_owned());
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        config = config.with_data_directory(
+            std::path::PathBuf::from(local_app_data)
+                .join("Orel Kino")
+                .join("webview"),
+        );
+    }
+    config
 }
 
 #[derive(Clone, PartialEq)]
