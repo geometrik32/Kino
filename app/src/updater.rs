@@ -7,6 +7,10 @@ pub const APP_VERSION: &str = match option_env!("KINO_APP_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 #[allow(clippy::cast_lossless)]
 const fn parse_build_const(raw: Option<&str>) -> Option<u64> {
     let Some(s) = raw else {
@@ -29,6 +33,10 @@ const fn parse_build_const(raw: Option<&str>) -> Option<u64> {
     Some(acc)
 }
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 pub const APP_BUILD: Option<u64> = parse_build_const(option_env!("KINO_APP_BUILD"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -38,8 +46,12 @@ pub struct ReleaseManifest {
     pub build: u64,
     pub url: String,
     pub sha256: String,
-    #[serde(default)]
-    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadStep {
+    Progress(u8),
+    Installing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +77,10 @@ pub fn is_supported() -> bool {
     ))
 }
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 pub fn manifest_url() -> Option<&'static str> {
     if cfg!(target_os = "android") {
         Some("https://github.com/geometrik32/Kino/releases/download/android-latest/version.json")
@@ -75,6 +91,10 @@ pub fn manifest_url() -> Option<&'static str> {
     }
 }
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 pub fn is_allowed_download_url(url: &str) -> bool {
     let allowed_prefix = if cfg!(target_os = "android") {
         "https://github.com/geometrik32/Kino/releases/download/android-latest/"
@@ -84,6 +104,10 @@ pub fn is_allowed_download_url(url: &str) -> bool {
     url.starts_with(allowed_prefix) && url.len() <= 512 && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     let core = v.trim().trim_start_matches('v').split(['-', '+']).next()?;
     let mut parts = core.split('.');
@@ -93,6 +117,10 @@ pub fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+#[cfg(any(
+    test,
+    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
+))]
 pub fn is_newer(remote: &ReleaseManifest) -> bool {
     let Some(remote_ver) = parse_semver(&remote.version) else {
         return false;
@@ -115,7 +143,7 @@ mod imp {
     use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
 
-    use super::{is_allowed_download_url, is_newer, manifest_url, ReleaseManifest};
+    use super::{is_allowed_download_url, is_newer, manifest_url, DownloadStep, ReleaseManifest};
 
     fn http_client() -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
@@ -150,7 +178,7 @@ mod imp {
 
     pub async fn download_and_install(
         manifest: ReleaseManifest,
-        mut on_progress: impl FnMut(u8),
+        mut on_step: impl FnMut(DownloadStep),
     ) -> Result<(), String> {
         if !is_allowed_download_url(&manifest.url) {
             return Err("Недопустимая ссылка обновления.".to_owned());
@@ -200,11 +228,11 @@ mod imp {
                 .await
                 .map_err(|e| format!("Ошибка записи файла обновления: {e}"))?;
             downloaded = downloaded.saturating_add(chunk.len() as u64);
-            if total > 0 {
-                let pct = ((downloaded.saturating_mul(100)) / total).min(100) as u8;
+            if let Some(raw_pct) = downloaded.saturating_mul(100).checked_div(total) {
+                let pct = raw_pct.min(100) as u8;
                 if pct != last_pct {
                     last_pct = pct;
-                    on_progress(pct);
+                    on_step(DownloadStep::Progress(pct));
                 }
             }
         }
@@ -224,6 +252,7 @@ mod imp {
             .await
             .map_err(|e| format!("Не удалось подготовить установщик: {e}"))?;
 
+        on_step(DownloadStep::Installing);
         launch_installer(&target_path).await
     }
 
@@ -278,13 +307,16 @@ mod imp {
 
 #[cfg(not(all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))))]
 mod imp {
-    use super::ReleaseManifest;
+    use super::{DownloadStep, ReleaseManifest};
 
     pub async fn check_for_update() -> Result<Option<ReleaseManifest>, String> {
         Ok(None)
     }
 
-    pub async fn download_and_install(_manifest: ReleaseManifest, _on_progress: impl FnMut(u8)) -> Result<(), String> {
+    pub async fn download_and_install(
+        _manifest: ReleaseManifest,
+        _on_step: impl FnMut(DownloadStep),
+    ) -> Result<(), String> {
         Err("Обновление поддерживается только в приложении для Windows и Android.".into())
     }
 }
@@ -306,7 +338,6 @@ mod tests {
             build: 0,
             url: "https://github.com/geometrik32/Kino/releases/download/desktop-latest/Orel-Kino-Setup.exe".into(),
             sha256: "a".repeat(64),
-            notes: None,
         };
         let newer = ReleaseManifest {
             version: "0.1.10".into(),

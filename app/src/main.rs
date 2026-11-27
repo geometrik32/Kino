@@ -1170,11 +1170,15 @@ fn Main(
         }));
         spawn(async move {
             let m_prog = manifest.clone();
-            let res = updater::download_and_install(manifest.clone(), move |pct| {
-                update_state.set(Some(updater::UpdateState::Downloading {
-                    manifest: m_prog.clone(),
-                    percent: pct,
-                }));
+            let res = updater::download_and_install(manifest.clone(), move |step| {
+                let next = match step {
+                    updater::DownloadStep::Progress(pct) => updater::UpdateState::Downloading {
+                        manifest: m_prog.clone(),
+                        percent: pct,
+                    },
+                    updater::DownloadStep::Installing => updater::UpdateState::Installing(m_prog.clone()),
+                };
+                update_state.set(Some(next));
             })
             .await;
             match res {

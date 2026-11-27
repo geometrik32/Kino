@@ -126,6 +126,7 @@ mod imp {
     pub fn supports_native() -> bool {
         false
     }
+    #[allow(clippy::too_many_arguments)]
     pub fn native_open(
         _url: &str,
         _title: &str,
@@ -285,6 +286,7 @@ mod imp {
     }
 
     #[cfg(target_os = "android")]
+    #[allow(clippy::too_many_arguments)]
     pub fn native_open(
         url: &str,
         _title: &str,
@@ -483,6 +485,7 @@ mod imp {
     }
 
     #[cfg(not(any(target_os = "android", feature = "desktop")))]
+    #[allow(clippy::too_many_arguments)]
     pub fn native_open(
         _url: &str,
         _title: &str,
