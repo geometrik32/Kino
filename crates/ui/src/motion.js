@@ -37,6 +37,12 @@
     '.dl-pill'
   ].join(',');
 
+  var isAndroid = function () {
+    return document.documentElement && document.documentElement.classList.contains('kino-android');
+  };
+
+  var TOUCH_SKIP_RIPPLE_SEL = '.poster .img, .cw-thumb, .ep-card, .rel-card, .cal-row, .hist-row, .dl-row, .user-card';
+
   var reducedMotion = function () {
     return window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
   };
@@ -48,6 +54,7 @@
     if (e.button > 0 || reducedMotion()) return;
     var target = e.target && e.target.closest ? e.target.closest(RIPPLE_SEL) : null;
     if (!target || target.disabled || target.classList.contains('ro')) return;
+    if ((e.pointerType === 'touch' || isAndroid()) && target.matches && target.matches(TOUCH_SKIP_RIPPLE_SEL)) return;
 
     var rect = target.getBoundingClientRect();
     if (!rect.width || !rect.height) return;
@@ -159,7 +166,7 @@
     var list = root.querySelectorAll(FADE_IMG_SEL);
     for (var i = 0; i < list.length; i++) markImg(list[i]);
   };
-  if (typeof MutationObserver !== 'undefined') {
+  if (!isAndroid() && typeof MutationObserver !== 'undefined') {
     var mo = new MutationObserver(function (muts) {
       for (var i = 0; i < muts.length; i++) {
         var added = muts[i].addedNodes;
