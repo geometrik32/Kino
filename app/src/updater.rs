@@ -7,6 +7,7 @@ pub const APP_VERSION: &str = match option_env!("KINO_APP_VERSION") {
     None => env!("CARGO_PKG_VERSION"),
 };
 
+#[allow(clippy::cast_lossless)]
 const fn parse_build_const(raw: Option<&str>) -> Option<u64> {
     let Some(s) = raw else {
         return None;
@@ -22,7 +23,7 @@ const fn parse_build_const(raw: Option<&str>) -> Option<u64> {
         if !b.is_ascii_digit() {
             return None;
         }
-        acc = acc.saturating_mul(10).saturating_add(u64::from(b - b'0'));
+        acc = acc.saturating_mul(10).saturating_add((b - b'0') as u64);
         i += 1;
     }
     Some(acc)

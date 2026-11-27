@@ -1,6 +1,7 @@
 // Windows: embeds the application icon and metadata into the desktop executable.
 fn main() {
-    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() && std::env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
+    #[cfg(all(windows, feature = "desktop"))]
+    if std::env::var_os("CARGO_CFG_WINDOWS").is_some() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("../desktop/assets/icon.ico");
         res.set("ProductName", "Орловский кинопоказ");

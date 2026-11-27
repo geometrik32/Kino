@@ -432,13 +432,14 @@ mod imp {
                     if b != m.buffering {
                         m.buffering = b;
                         SNAPSHOT.lock().expect("video snapshot").ready_state = if b { 1 } else { 4 };
-                        m.events.push_back(if b {
+                        let ev = if b {
                             "waiting"
                         } else if !m.paused {
                             "playing"
                         } else {
                             "canplay"
-                        });
+                        };
+                        m.events.push_back(ev);
                     }
                 }
                 kino_mpv::PlayerEvent::Seeked => {
