@@ -48,6 +48,7 @@ pub struct ReleaseManifest {
     pub sha256: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DownloadStep {
     Progress(u8),
@@ -77,10 +78,7 @@ pub fn is_supported() -> bool {
     ))
 }
 
-#[cfg(any(
-    test,
-    all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android"))
-))]
+#[cfg(all(not(target_arch = "wasm32"), any(target_os = "windows", target_os = "android")))]
 pub fn manifest_url() -> Option<&'static str> {
     if cfg!(target_os = "android") {
         Some("https://github.com/geometrik32/Kino/releases/download/android-latest/version.json")

@@ -271,6 +271,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
           COMMIT_SHA: ${{ github.sha }}

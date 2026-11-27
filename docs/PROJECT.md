@@ -11,7 +11,7 @@
 
 ## 2. Платформы и структура репозитория
 
-Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
+Workspace Cargo (`Kino/Cargo.toml`) состоит из 7 крейтов:
 
 | Крейт | Путь | Назначение |
 |---|---|---|
@@ -19,7 +19,8 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 | `kino-server` | `crates/server` | HTTP API на `axum` + PostgreSQL (`sqlx`), авторизация через Telegram, проксирование TMDB/постеров, поиск раздач через Jackett, стриминг через TorrServer, перекодирование/субтитры через `ffmpeg`/`ffprobe`, предзагрузка через qBittorrent, фоновые джобы, раздача веб-статики. |
 | `kino-bot` | `crates/bot` | Telegram-бот на `teloxide`: поиск, «Продолжить просмотр», списки, одноразовый вход на сайт (`/login`), приглашения (`/invite`), кнопка Mini App, уведомления о новых сериях. |
 | `kino-ui` | `crates/ui` | Чистые UI-компоненты на Dioxus 0.7 (экраны, карточки, выбор раздачи, плеер, профиль, CSS-темы «Афиша» + «Бирюзовое кольцо»). Без сетевой логики и роутинга. |
-| `kino-app` | `app` | Клиент на Dioxus 0.7 с 3 целевыми сборками: `web` (WASM + Telegram Mini App), `desktop` (Windows/macOS/Linux через `dioxus/desktop` WebView), `mobile` (Android через `dioxus/mobile` WebView + JNI в `app/src/platform/android.rs`). |
+| `kino-mpv` | `crates/mpv` | Безопасная обёртка над `libmpv` (подгружается динамически во время работы) для нативного воспроизведения в окне `mpv` на ПК без перекодирования на сервере. |
+| `kino-app` | `app` | Клиент на Dioxus 0.7 с 3 целевыми сборками: `web` (WASM + Telegram Mini App), `desktop` (Windows через `dioxus/desktop` + `kino-mpv` + встроенное автообновление), `mobile` (Android через `dioxus/mobile` + JNI/ExoPlayer + встроенное автообновление). |
 | `kino-preview` | `crates/preview` | Генерация статического HTML на демо-данных для визуальной проверки экранов без сборки WASM. |
 
 ---
@@ -90,7 +91,8 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 ### 3.6. База данных и деплой
 - PostgreSQL (миграции `crates/server/migrations/0001..0013`): таблицы `users`, `invites`, `watch_progress`, `watchlist`, `release_choice`, `device_quality_choice`, `title_state`, `season_rating`, `episode_rating`, `watch_history`, `user_prefs`, `preload`, `preload_episode`, `media_segment`, `media_segment_lookup`, `media_analysis_done`, `torrent_source`, `login_link`, `media_cache`, `search_cache`.
 - Docker / TrueNAS стек (`deploy/compose.yaml`, `Dockerfile`): `kino-db`, `kino-server` (с пробросом `/dev/dri` для VA-API/QSV, кешем картинок на M.2 SSD, `MAX_TRANSCODES = 6`, лимит `1280m`), `kino-bot`, `torrserver` (потоковый буфер в RAM `UseDisk: false`, `GOMEMLIMIT: 960MiB`, лимит `1280m`, `TorrentDisconnectTimeout: 90`), `jackett` (автосон через `sablier`), `qbittorrent` за Traefik.
-- CI (`.github/workflows/ci.yml`, `.github/workflows/android.yml`): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo clippy -p kino-app --target wasm32-unknown-unknown --locked -- -D warnings`, сборка Docker-образа; отдельный workflow `.github/workflows/android.yml` для сборки `arm64` APK (`dx bundle --package kino-app --platform android --target aarch64-linux-android --release --package-types apk`).
+- CI (`.github/workflows/ci.yml`, `.github/workflows/android.yml`, `.github/workflows/desktop.yml`): `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `cargo clippy -p kino-app --target wasm32-unknown-unknown --locked -- -D warnings`, сборка Docker-образа; workflow `.github/workflows/android.yml` для сборки подписанного `arm64` APK + `version.json` в релиз `android-latest`; workflow `.github/workflows/desktop.yml` для сборки Windows-установщика (`Orel-Kino-Setup.exe` + `libmpv-2.dll`), портативного архива и `version.json` в релиз `desktop-latest`.
+- Встроенное автообновление (`app/src/updater.rs`, `app/android/MainActivity.kt`, `desktop/installer/orel-kino.nsi`, `crates/ui/src/lib.rs`, `crates/ui/src/account.rs`): нативные приложения Windows и Android проверяют `version.json` из релизов GitHub (`desktop-latest` / `android-latest`), скачивают обновление с проверкой SHA-256 и запускают установку (тихо с перезапуском на Windows, системный установщик через `FileProvider` на Android).
 
 ---
 
@@ -99,5 +101,5 @@ Workspace Cargo (`Kino/Cargo.toml`) состоит из 6 крейтов:
 | Платформа | Клиент | Требования к воспроизведению | Текущий статус |
 |---|---|---|---|
 | **Web / Telegram Mini App** | `kino-app` (`web`) | Браузерный `<video>`, серверная адаптация через `ffmpeg` для несовместимых форматов. | Работает. |
-| **Desktop (Windows / macOS / Linux)** | `kino-app` (`desktop`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `AV1`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с переключением аудиодорожек и субтитров. | **Отложено по решению владельца** (сейчас приоритет на Android; общий серверный протокол `PlayRequest.native` готов, см. `ISSUE-001` в `docs/ISSUES.md`). |
-| **Android** | `kino-app` (`mobile`) | Должен воспроизводить сложные кодеки и контейнеры (`HEVC`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте без перекодирования на сервере**, с сохранением внутриприложенческого UX (прогресс, дорожки, следующая серия). | **Реализовано в коде (`ExoPlayer` + `Jellyfin FFmpeg`)**; ожидает сборки APK в GitHub Actions и проверки на реальном Android-устройстве (см. `ISSUE-001`). |
+| **Desktop (Windows)** | `kino-app` (`desktop`) | Воспроизводит сложные кодеки и контейнеры (`HEVC`, `AV1`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую через `libmpv`** без перекодирования на сервере, с синхронизацией, дорожками, переходом к следующей серии и автообновлением. | **Реализовано и собрано в `desktop-latest`** (`Orel-Kino-Setup.exe` + `Orel-Kino-portable.zip`); ожидает живой проверки на Windows-ПК пользователя. |
+| **Android** | `kino-app` (`mobile`) | Воспроизводит сложные кодеки и контейнеры (`HEVC`, `HDR`, `.mkv`, `AC3`/`DTS`) **напрямую на клиенте (`ExoPlayer` + `Jellyfin FFmpeg`)** без перекодирования на сервере, с сохранением UX и автообновлением. | **Реализовано и настроена постоянная подпись в `android-latest`**; ожидает живой проверки APK и автообновления на телефоне. |
