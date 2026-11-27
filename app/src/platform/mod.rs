@@ -121,7 +121,17 @@ pub fn apply_theme(theme: kino_ui::Theme) {
 /// fullscreen that covers Telegram's header/BackButton) and DOM fullscreen in regular browsers
 /// (including iOS Safari's `webkitEnterFullscreen` fallback on `<video>`).
 pub fn toggle_fullscreen() {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    {
+        let win = dioxus::desktop::window();
+        let next = win.fullscreen().is_none();
+        win.set_fullscreen(next);
+        video::sync_desktop_host();
+        let _ = dioxus::document::eval(&format!(
+            "window.__kinoDesktopFs = {next}; window.dispatchEvent(new Event('kino-fs'));"
+        ));
+    }
+    #[cfg(all(not(target_os = "android"), not(all(feature = "desktop", not(feature = "mobile")))))]
     {
         let js = "try { \
             var root = document.documentElement; \
@@ -181,6 +191,14 @@ pub fn player_mode(on: bool) {
 
     #[cfg(target_os = "android")]
     android::player_mode(on);
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    if !on {
+        let win = dioxus::desktop::window();
+        if win.fullscreen().is_some() {
+            win.set_fullscreen(false);
+        }
+        let _ = dioxus::document::eval("window.__kinoDesktopFs = false; window.dispatchEvent(new Event('kino-fs'));");
+    }
     #[cfg(not(target_os = "android"))]
     {
         // Never call `tg.lockOrientation()` in portrait: in Bot API 8.0+ it locks

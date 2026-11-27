@@ -1316,6 +1316,7 @@ pub fn PlayerView(
                                                 bitrate_approx: false,
                                                 picked_by: Vec::new(),
                                                 preloaded: p.state == PreloadState::Ready,
+                                                collection: false,
                                             });
                                         }
                                     }
@@ -1345,6 +1346,7 @@ pub fn PlayerView(
                                                 bitrate_approx: false,
                                                 picked_by: Vec::new(),
                                                 preloaded: s.preloaded,
+                                                collection: false,
                                             });
                                         }
                                     }

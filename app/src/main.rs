@@ -54,7 +54,7 @@ fn main() {
         #[cfg(target_os = "android")]
         let head = format!("<script>document.documentElement.classList.add('kino-android');\n{HEAD_BODY}");
         #[cfg(not(target_os = "android"))]
-        let head = format!("<script>\n{HEAD_BODY}");
+        let head = format!("<style>html,body{{background:#0E1621;margin:0;}}</style><script>\n{HEAD_BODY}");
         #[cfg(all(feature = "desktop", not(feature = "mobile")))]
         let config = desktop_config(&head);
         #[cfg(feature = "mobile")]
@@ -80,13 +80,13 @@ fn desktop_config(head: &str) -> dioxus::desktop::Config {
         .with_inner_size(LogicalSize::new(1280.0, 800.0))
         .with_min_inner_size(LogicalSize::new(480.0, 600.0))
         .with_decorations(false)
+        .with_transparent(true)
         .with_window_icon(icon);
     #[cfg(target_os = "windows")]
     let window = window.with_undecorated_shadow(true);
     let mut config = Config::new()
         .with_window(window)
         .with_menu(None)
-        .with_background_color((14, 22, 33, 255))
         .with_custom_head(head.to_owned());
     if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
         config = config.with_data_directory(
@@ -100,6 +100,8 @@ fn desktop_config(head: &str) -> dioxus::desktop::Config {
 
 #[cfg(all(feature = "desktop", not(feature = "mobile")))]
 fn use_window_chrome() -> Option<WindowChrome> {
+    #[cfg(target_os = "windows")]
+    use dioxus::desktop::tao::platform::windows::WindowExtWindows;
     use dioxus::desktop::{
         tao::event::{Event, WindowEvent},
         use_window, use_wry_event_handler,
@@ -111,17 +113,29 @@ fn use_window_chrome() -> Option<WindowChrome> {
     };
 
     let win = use_window();
+    #[cfg(target_os = "windows")]
+    use_hook(|| {
+        platform::video::set_desktop_main_hwnd(win.hwnd() as isize);
+    });
     let mut maximized = use_signal(|| win.is_maximized());
     let win_for_ev = win.clone();
     use_wry_event_handler(move |ev, _| {
-        if let Event::WindowEvent {
-            event: WindowEvent::Resized(_) | WindowEvent::Moved(_),
-            ..
-        } = ev
-        {
-            let now_max = win_for_ev.is_maximized();
-            if *maximized.peek() != now_max {
-                maximized.set(now_max);
+        if let Event::WindowEvent { event, .. } = ev {
+            match event {
+                WindowEvent::Resized(_)
+                | WindowEvent::Moved(_)
+                | WindowEvent::Focused(_)
+                | WindowEvent::ScaleFactorChanged { .. } => {
+                    let now_max = win_for_ev.is_maximized();
+                    if *maximized.peek() != now_max {
+                        maximized.set(now_max);
+                    }
+                    platform::video::sync_desktop_host();
+                }
+                WindowEvent::Destroyed | WindowEvent::CloseRequested => {
+                    platform::video::native_close();
+                }
+                _ => {}
             }
         }
     });

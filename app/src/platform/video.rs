@@ -146,6 +146,12 @@ mod imp {
         1
     }
     pub fn native_close() {}
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    #[allow(dead_code)]
+    pub fn set_desktop_main_hwnd(_hwnd: isize) {}
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    #[allow(dead_code)]
+    pub fn sync_desktop_host() {}
 
     /// Starts mirroring (nothing to do in a browser).
     pub fn use_bridge() {}
@@ -200,6 +206,7 @@ mod imp {
     #[cfg(all(feature = "desktop", not(target_os = "android")))]
     struct DesktopMpv {
         session: Option<kino_mpv::Session>,
+        host_hwnd: Option<isize>,
         events: VecDeque<&'static str>,
         seq: u64,
         paused: bool,
@@ -214,6 +221,7 @@ mod imp {
     #[cfg(all(feature = "desktop", not(target_os = "android")))]
     static DESKTOP_MPV: Mutex<DesktopMpv> = Mutex::new(DesktopMpv {
         session: None,
+        host_hwnd: None,
         events: VecDeque::new(),
         seq: 0,
         paused: true,
@@ -224,6 +232,271 @@ mod imp {
         last_muted: false,
         last_rate: 1.0,
     });
+
+    #[cfg(all(target_os = "windows", feature = "desktop", not(feature = "mobile")))]
+    mod win_host {
+        use std::ffi::c_void;
+        use std::sync::{
+            atomic::{AtomicIsize, Ordering},
+            Mutex, Once,
+        };
+
+        #[repr(C)]
+        struct Rect {
+            left: i32,
+            top: i32,
+            right: i32,
+            bottom: i32,
+        }
+
+        #[repr(C)]
+        struct Point {
+            x: i32,
+            y: i32,
+        }
+
+        #[repr(C)]
+        struct WndClassExW {
+            cb_size: u32,
+            style: u32,
+            lpfn_wnd_proc: unsafe extern "system" fn(isize, u32, usize, isize) -> isize,
+            cb_cls_extra: i32,
+            cb_wnd_extra: i32,
+            h_instance: isize,
+            h_icon: isize,
+            h_cursor: isize,
+            hbr_background: isize,
+            lpsz_menu_name: *const u16,
+            lpsz_class_name: *const u16,
+            h_icon_sm: isize,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleW(lp_module_name: *const u16) -> isize;
+        }
+
+        #[link(name = "gdi32")]
+        extern "system" {
+            fn GetStockObject(i: i32) -> isize;
+        }
+
+        #[link(name = "user32")]
+        extern "system" {
+            fn RegisterClassExW(lpwcx: *const WndClassExW) -> u16;
+            fn CreateWindowExW(
+                dw_ex_style: u32,
+                lp_class_name: *const u16,
+                lp_window_name: *const u16,
+                dw_style: u32,
+                x: i32,
+                y: i32,
+                n_width: i32,
+                n_height: i32,
+                h_wnd_parent: isize,
+                h_menu: isize,
+                h_instance: isize,
+                lp_param: *const c_void,
+            ) -> isize;
+            fn DefWindowProcW(h_wnd: isize, msg: u32, w_param: usize, l_param: isize) -> isize;
+            fn DestroyWindow(h_wnd: isize) -> i32;
+            fn ShowWindow(h_wnd: isize, n_cmd_show: i32) -> i32;
+            fn SetWindowPos(
+                h_wnd: isize,
+                h_wnd_insert_after: isize,
+                x: i32,
+                y: i32,
+                cx: i32,
+                cy: i32,
+                u_flags: u32,
+            ) -> i32;
+            fn GetClientRect(h_wnd: isize, lp_rect: *mut Rect) -> i32;
+            fn ClientToScreen(h_wnd: isize, lp_point: *mut Point) -> i32;
+            fn IsIconic(h_wnd: isize) -> i32;
+            fn IsWindowVisible(h_wnd: isize) -> i32;
+            fn IsWindow(h_wnd: isize) -> i32;
+        }
+
+        const BLACK_BRUSH: i32 = 4;
+        const WS_POPUP: u32 = 0x8000_0000;
+        const WS_DISABLED: u32 = 0x0800_0000;
+        const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+        const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+        const SW_HIDE: i32 = 0;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        const SWP_SHOWWINDOW: u32 = 0x0040;
+
+        static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+        static PENDING_DESTROY: Mutex<Vec<isize>> = Mutex::new(Vec::new());
+        static CLASS_INIT: Once = Once::new();
+
+        unsafe extern "system" fn host_wnd_proc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        fn class_name_utf16() -> Vec<u16> {
+            "KinoMpvHost\0".encode_utf16().collect()
+        }
+
+        pub fn set_main_hwnd(hwnd: isize) {
+            MAIN_HWND.store(hwnd, Ordering::Relaxed);
+        }
+
+        fn main_client_bounds(main_hwnd: isize) -> Option<(i32, i32, i32, i32)> {
+            if main_hwnd == 0 {
+                return None;
+            }
+            // SAFETY: valid Win32 HWND checked by `IsWindow` and out-pointers live on stack.
+            unsafe {
+                if IsWindow(main_hwnd) == 0 {
+                    return None;
+                }
+                let mut rc = Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                if GetClientRect(main_hwnd, &mut rc) == 0 {
+                    return None;
+                }
+                let mut tl = Point { x: rc.left, y: rc.top };
+                if ClientToScreen(main_hwnd, &mut tl) == 0 {
+                    return None;
+                }
+                Some((tl.x, tl.y, (rc.right - rc.left).max(1), (rc.bottom - rc.top).max(1)))
+            }
+        }
+
+        pub fn drain_pending_destroy() {
+            let list: Vec<isize> = {
+                let mut q = PENDING_DESTROY.lock().expect("pending destroy");
+                std::mem::take(&mut *q)
+            };
+            for hwnd in list {
+                destroy(hwnd);
+            }
+        }
+
+        pub fn queue_destroy(hwnd: isize) {
+            if hwnd != 0 {
+                PENDING_DESTROY.lock().expect("pending destroy").push(hwnd);
+            }
+        }
+
+        pub fn create() -> Option<isize> {
+            drain_pending_destroy();
+            let main_hwnd = MAIN_HWND.load(Ordering::Relaxed);
+            let (x, y, w, h) = main_client_bounds(main_hwnd)?;
+            let cls = class_name_utf16();
+            // SAFETY: class registration and window creation use valid static proc and NUL-terminated UTF-16 class name.
+            unsafe {
+                let hinst = GetModuleHandleW(std::ptr::null());
+                CLASS_INIT.call_once(|| {
+                    let wc = WndClassExW {
+                        cb_size: std::mem::size_of::<WndClassExW>() as u32,
+                        style: 0,
+                        lpfn_wnd_proc: host_wnd_proc,
+                        cb_cls_extra: 0,
+                        cb_wnd_extra: 0,
+                        h_instance: hinst,
+                        h_icon: 0,
+                        h_cursor: 0,
+                        hbr_background: GetStockObject(BLACK_BRUSH),
+                        lpsz_menu_name: std::ptr::null(),
+                        lpsz_class_name: cls.as_ptr(),
+                        h_icon_sm: 0,
+                    };
+                    RegisterClassExW(&wc);
+                });
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                    cls.as_ptr(),
+                    std::ptr::null(),
+                    WS_POPUP | WS_DISABLED,
+                    x,
+                    y,
+                    w,
+                    h,
+                    0,
+                    0,
+                    hinst,
+                    std::ptr::null(),
+                );
+                if hwnd == 0 {
+                    return None;
+                }
+                sync(hwnd);
+                Some(hwnd)
+            }
+        }
+
+        pub fn sync(video_hwnd: isize) {
+            if video_hwnd == 0 {
+                return;
+            }
+            let main_hwnd = MAIN_HWND.load(Ordering::Relaxed);
+            if main_hwnd == 0 {
+                return;
+            }
+            // SAFETY: Win32 window state queries and z-order/bounds update on valid HWNDs.
+            unsafe {
+                if IsWindow(video_hwnd) == 0 || IsWindow(main_hwnd) == 0 {
+                    return;
+                }
+                if IsIconic(main_hwnd) != 0 || IsWindowVisible(main_hwnd) == 0 {
+                    ShowWindow(video_hwnd, SW_HIDE);
+                    return;
+                }
+                if let Some((x, y, w, h)) = main_client_bounds(main_hwnd) {
+                    // Place `video_hwnd` immediately behind `main_hwnd` in global z-order without stealing focus.
+                    SetWindowPos(video_hwnd, main_hwnd, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+            }
+        }
+
+        pub fn hide(video_hwnd: isize) {
+            if video_hwnd != 0 {
+                // SAFETY: `IsWindow` checked before `ShowWindow`.
+                unsafe {
+                    if IsWindow(video_hwnd) != 0 {
+                        ShowWindow(video_hwnd, SW_HIDE);
+                    }
+                }
+            }
+        }
+
+        pub fn destroy(video_hwnd: isize) {
+            if video_hwnd != 0 {
+                // SAFETY: called on the creating main thread after mpv detached.
+                unsafe {
+                    if IsWindow(video_hwnd) != 0 {
+                        DestroyWindow(video_hwnd);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    pub fn set_desktop_main_hwnd(hwnd: isize) {
+        #[cfg(target_os = "windows")]
+        win_host::set_main_hwnd(hwnd);
+        #[cfg(not(target_os = "windows"))]
+        let _ = hwnd;
+    }
+
+    #[cfg(all(feature = "desktop", not(feature = "mobile")))]
+    pub fn sync_desktop_host() {
+        #[cfg(target_os = "windows")]
+        {
+            win_host::drain_pending_destroy();
+            let hwnd = DESKTOP_MPV.lock().expect("desktop mpv").host_hwnd;
+            if let Some(h) = hwnd {
+                win_host::sync(h);
+            }
+        }
+    }
 
     #[cfg(target_os = "android")]
     #[derive(Clone, Copy, Default)]
@@ -348,7 +621,7 @@ mod imp {
             url.to_owned()
         };
 
-        let (opts, existing) = {
+        let (mut opts, existing, existing_host) = {
             let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
             m.seq = seq;
             m.events.clear();
@@ -369,9 +642,11 @@ mod imp {
                 volume: m.last_volume,
                 muted: m.last_muted,
                 scale_mode: eff_scale,
+                wid: None,
             };
             let existing = m.session.take();
-            (opts, existing)
+            let existing_host = m.host_hwnd.take();
+            (opts, existing, existing_host)
         };
 
         NATIVE_ACTIVE.store(true, Ordering::Relaxed);
@@ -380,105 +655,159 @@ mod imp {
             if let Err(err) = sess.load(opts) {
                 eprintln!("mpv load failed: {err}");
                 NATIVE_ACTIVE.store(false, Ordering::Relaxed);
-                DESKTOP_MPV.lock().expect("desktop mpv").events.push_back("error");
+                #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                if let Some(h) = existing_host {
+                    win_host::hide(h);
+                }
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.host_hwnd = existing_host;
+                m.events.push_back("error");
             } else {
-                DESKTOP_MPV.lock().expect("desktop mpv").session = Some(sess);
+                #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                if let Some(h) = existing_host {
+                    win_host::sync(h);
+                }
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                m.session = Some(sess);
+                m.host_hwnd = existing_host;
             }
             return;
         }
 
+        #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+        let host_hwnd = existing_host.or_else(win_host::create);
+        #[cfg(not(all(target_os = "windows", not(feature = "mobile"))))]
+        let host_hwnd: Option<isize> = existing_host;
+        opts.wid = host_hwnd;
+
         match kino_mpv::Session::start(opts, false, move |ev| {
-            let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
-            if m.seq != seq {
-                return;
-            }
-            match ev {
-                kino_mpv::PlayerEvent::Loaded { duration, .. } => {
-                    m.ready = true;
-                    m.buffering = false;
-                    let mut snap = SNAPSHOT.lock().expect("video snapshot");
-                    snap.duration = duration.unwrap_or(f64::NAN);
-                    snap.ready_state = 4;
-                    m.events.push_back("metadata");
-                    m.events.push_back("canplay");
-                    if !m.paused {
-                        m.events.push_back("playing");
-                    }
+            let mut stale_session = None;
+            let mut stale_host = None;
+            {
+                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                if m.seq != seq {
+                    return;
                 }
-                kino_mpv::PlayerEvent::Position { position, duration } => {
-                    let mut snap = SNAPSHOT.lock().expect("video snapshot");
-                    snap.time = position;
-                    if let Some(d) = duration {
-                        snap.duration = d;
-                    }
-                    if m.ready {
-                        m.events.push_back("time");
-                    }
-                }
-                kino_mpv::PlayerEvent::Paused(p) => {
-                    let guarded = m.ignore_paused_until.is_some_and(|u| Instant::now() < u);
-                    if guarded {
-                        if p == m.paused {
-                            m.ignore_paused_until = None;
+                match ev {
+                    kino_mpv::PlayerEvent::Loaded { duration, .. } => {
+                        m.ready = true;
+                        m.buffering = false;
+                        let mut snap = SNAPSHOT.lock().expect("video snapshot");
+                        snap.duration = duration.unwrap_or(f64::NAN);
+                        snap.ready_state = 4;
+                        m.events.push_back("metadata");
+                        m.events.push_back("canplay");
+                        if !m.paused {
+                            m.events.push_back("playing");
                         }
-                        return;
                     }
-                    m.ignore_paused_until = None;
-                    if p != m.paused {
-                        m.paused = p;
-                        SNAPSHOT.lock().expect("video snapshot").paused = p;
-                        m.events.push_back(if p { "pause" } else { "play" });
+                    kino_mpv::PlayerEvent::Position { position, duration } => {
+                        let mut snap = SNAPSHOT.lock().expect("video snapshot");
+                        snap.time = position;
+                        if let Some(d) = duration {
+                            snap.duration = d;
+                        }
+                        if m.ready {
+                            m.events.push_back("time");
+                        }
                     }
-                }
-                kino_mpv::PlayerEvent::Buffering(b) => {
-                    if b != m.buffering {
-                        m.buffering = b;
-                        SNAPSHOT.lock().expect("video snapshot").ready_state = if b { 1 } else { 4 };
-                        let ev = if b {
-                            "waiting"
-                        } else if !m.paused {
-                            "playing"
-                        } else {
-                            "canplay"
-                        };
-                        m.events.push_back(ev);
+                    kino_mpv::PlayerEvent::Paused(p) => {
+                        let guarded = m.ignore_paused_until.is_some_and(|u| Instant::now() < u);
+                        if guarded {
+                            if p == m.paused {
+                                m.ignore_paused_until = None;
+                            }
+                            return;
+                        }
+                        m.ignore_paused_until = None;
+                        if p != m.paused {
+                            m.paused = p;
+                            SNAPSHOT.lock().expect("video snapshot").paused = p;
+                            m.events.push_back(if p { "pause" } else { "play" });
+                        }
                     }
+                    kino_mpv::PlayerEvent::Buffering(b) => {
+                        if b != m.buffering {
+                            m.buffering = b;
+                            SNAPSHOT.lock().expect("video snapshot").ready_state = if b { 1 } else { 4 };
+                            let ev = if b {
+                                "waiting"
+                            } else if !m.paused {
+                                "playing"
+                            } else {
+                                "canplay"
+                            };
+                            m.events.push_back(ev);
+                        }
+                    }
+                    kino_mpv::PlayerEvent::Seeked => {
+                        m.events.push_back("seeked");
+                    }
+                    kino_mpv::PlayerEvent::NextRequested => {
+                        m.events.push_back("next");
+                    }
+                    kino_mpv::PlayerEvent::Ended => {
+                        SNAPSHOT.lock().expect("video snapshot").paused = true;
+                        m.paused = true;
+                        m.events.push_back("ended");
+                    }
+                    kino_mpv::PlayerEvent::Closed { .. } => {
+                        stale_session = m.session.take();
+                        stale_host = m.host_hwnd.take();
+                        NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                        m.events.push_back("closed");
+                    }
+                    kino_mpv::PlayerEvent::Error(err) => {
+                        eprintln!("mpv playback error: {err}");
+                        NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                        m.events.push_back("error");
+                    }
+                    kino_mpv::PlayerEvent::Tracks { .. } => {}
                 }
-                kino_mpv::PlayerEvent::Seeked => {
-                    m.events.push_back("seeked");
-                }
-                kino_mpv::PlayerEvent::NextRequested => {
-                    m.events.push_back("next");
-                }
-                kino_mpv::PlayerEvent::Ended => {
-                    SNAPSHOT.lock().expect("video snapshot").paused = true;
-                    m.paused = true;
-                    m.events.push_back("ended");
-                }
-                kino_mpv::PlayerEvent::Closed { .. } => {
-                    m.session = None;
-                    NATIVE_ACTIVE.store(false, Ordering::Relaxed);
-                    m.events.push_back("closed");
-                }
-                kino_mpv::PlayerEvent::Error(err) => {
-                    eprintln!("mpv playback error: {err}");
-                    NATIVE_ACTIVE.store(false, Ordering::Relaxed);
-                    m.events.push_back("error");
-                }
-                kino_mpv::PlayerEvent::Tracks { .. } => {}
             }
+            drop(stale_session);
+            #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+            if let Some(h) = stale_host {
+                win_host::hide(h);
+                win_host::queue_destroy(h);
+            }
+            #[cfg(not(all(target_os = "windows", not(feature = "mobile"))))]
+            let _ = stale_host;
         }) {
             Ok(sess) => {
-                let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
-                if m.seq == seq {
-                    m.session = Some(sess);
-                } else {
-                    sess.close();
+                let outdated = {
+                    let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
+                    if m.seq == seq {
+                        m.session = Some(sess);
+                        m.host_hwnd = host_hwnd;
+                        None
+                    } else {
+                        Some(sess)
+                    }
+                };
+                if let Some(old) = outdated {
+                    #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                    if let Some(h) = host_hwnd {
+                        win_host::hide(h);
+                    }
+                    old.close();
+                    std::thread::spawn(move || {
+                        drop(old);
+                        #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                        if let Some(h) = host_hwnd {
+                            win_host::queue_destroy(h);
+                        }
+                    });
                 }
             }
             Err(err) => {
                 eprintln!("mpv start failed: {err}");
                 NATIVE_ACTIVE.store(false, Ordering::Relaxed);
+                #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                if let Some(h) = host_hwnd {
+                    win_host::hide(h);
+                    win_host::destroy(h);
+                }
                 DESKTOP_MPV.lock().expect("desktop mpv").events.push_back("error");
             }
         }
@@ -561,14 +890,35 @@ mod imp {
         #[cfg(all(feature = "desktop", not(target_os = "android")))]
         {
             let _ = was_active;
-            let sess = {
+            let (sess, host) = {
                 let mut m = DESKTOP_MPV.lock().expect("desktop mpv");
                 m.seq = NATIVE_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
                 m.events.clear();
-                m.session.take()
+                (m.session.take(), m.host_hwnd.take())
             };
+            #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+            {
+                if let Some(h) = host {
+                    win_host::hide(h);
+                }
+                win_host::drain_pending_destroy();
+            }
             if let Some(s) = sess {
                 s.close();
+                std::thread::spawn(move || {
+                    drop(s);
+                    #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                    if let Some(h) = host {
+                        win_host::queue_destroy(h);
+                    }
+                });
+            } else {
+                #[cfg(all(target_os = "windows", not(feature = "mobile")))]
+                if let Some(h) = host {
+                    win_host::destroy(h);
+                }
+                #[cfg(not(all(target_os = "windows", not(feature = "mobile"))))]
+                let _ = host;
             }
         }
         #[cfg(not(any(target_os = "android", feature = "desktop")))]
@@ -996,3 +1346,5 @@ pub use imp::{
     native_close, native_open, native_scale_mode, native_set_audio, native_set_scale, native_set_subtitle,
     supports_native, use_bridge, use_native_events, video,
 };
+#[cfg(all(feature = "desktop", not(feature = "mobile")))]
+pub use imp::{set_desktop_main_hwnd, sync_desktop_host};

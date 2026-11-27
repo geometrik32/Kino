@@ -87,8 +87,6 @@ impl Tab {
     }
 }
 
-/// Desktop topbar tabs (Search lives in the search box, Profile behind the user avatar).
-const DESKTOP_TABS: [Tab; 2] = [Tab::Home, Tab::Mine];
 /// First three slots of the 4-tab mobile bottom bar; the 4th slot is the user's Telegram avatar.
 const MOBILE_TABS: [Tab; 3] = [Tab::Home, Tab::Search, Tab::Mine];
 
@@ -353,18 +351,6 @@ pub fn Shell(
                     onmousedown: move |e| e.stop_propagation(),
                     BrandPlaque { on_click: move |_| on_tab.call(Tab::Home) }
                 }
-                nav {
-                    class: "nav-pills",
-                    onmousedown: move |e| e.stop_propagation(),
-                    for t in DESKTOP_TABS {
-                        button {
-                            class: if tab == Some(t) { "active" } else { "" },
-                            onclick: move |_| on_tab.call(t),
-                            Icon { svg: t.icon_svg(), class: "ic sm" }
-                            "{t.label()}"
-                        }
-                    }
-                }
             }
             div { class: "top-center",
                 div {
@@ -398,6 +384,14 @@ pub fn Shell(
                 }
             }
             div { class: "top-right",
+                button {
+                    class: if tab == Some(Tab::Mine) { "top-icon-btn desktop-only active" } else { "top-icon-btn desktop-only" },
+                    title: "Мои",
+                    "aria-label": "Мои",
+                    onmousedown: move |e| e.stop_propagation(),
+                    onclick: move |_| on_tab.call(Tab::Mine),
+                    Icon { svg: icons::BOOKMARK, class: "ic sm" }
+                }
                 if let Some(pct) = dl_percent {
                     button {
                         class: "dl-pill",
@@ -814,8 +808,8 @@ pub fn ScrollRow(
             };
             let w = rect.width();
             let max_left = (size.width - w).max(0.0);
-            let step = (w * 0.82).max(240.0);
-            let target = (offset.x + dir * step).clamp(0.0, max_left);
+            let stride = if w > 0.0 { w + 16.0 } else { 240.0 };
+            let target = (offset.x + dir * stride).clamp(0.0, max_left);
             can_prev.set(target > 8.0);
             can_next.set(target + w < size.width - 8.0);
             let _ = el
@@ -1049,12 +1043,14 @@ fn ShelfSkeleton() -> Element {
     rsx! {
         section { class: "section",
             div { class: "skel-title" }
-            div { class: "row",
-                for i in 0..7 {
-                    div { key: "row-skel-{i}", class: "poster skel",
-                        div { class: "img skel-box" }
-                        div { class: "skel-line" }
-                        div { class: "skel-line short" }
+            div { class: "row-wrap",
+                div { class: "row",
+                    for i in 0..7 {
+                        div { key: "row-skel-{i}", class: "poster skel",
+                            div { class: "img skel-box" }
+                            div { class: "skel-line" }
+                            div { class: "skel-line short" }
+                        }
                     }
                 }
             }

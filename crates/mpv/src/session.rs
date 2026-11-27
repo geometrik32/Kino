@@ -53,6 +53,8 @@ pub struct PlayOptions {
     pub muted: bool,
     /// `1` = fit inside window, `2` = crop/fill proportionally (`panscan=1`).
     pub scale_mode: u8,
+    /// Optional parent window handle (`HWND` on Windows) to embed video inside the host app window.
+    pub wid: Option<isize>,
 }
 
 impl Default for PlayOptions {
@@ -69,6 +71,7 @@ impl Default for PlayOptions {
             volume: 1.0,
             muted: false,
             scale_mode: 1,
+            wid: None,
         }
     }
 }
@@ -129,8 +132,8 @@ pub struct Session {
 }
 
 /// Window and decoding settings; `headless` is for tests (no window, no sound).
-fn base_options(headless: bool) -> Vec<(&'static str, &'static str)> {
-    let mut o = vec![
+fn base_options(headless: bool, wid: Option<isize>) -> Vec<(String, String)> {
+    let mut o: Vec<(String, String)> = vec![
         ("config", "no"),
         ("idle", "yes"),
         ("keep-open", "no"),
@@ -159,12 +162,38 @@ fn base_options(headless: bool) -> Vec<(&'static str, &'static str)> {
         ("user-agent", "KinoDesktop"),
         ("save-position-on-quit", "no"),
         ("terminal", "no"),
-    ];
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .collect();
     if headless {
-        o.retain(|(k, _)| !matches!(*k, "vo" | "force-window" | "osc"));
-        o.push(("vo", "null"));
-        o.push(("ao", "null"));
-        o.push(("force-window", "no"));
+        o.retain(|(k, _)| !matches!(k.as_str(), "vo" | "force-window" | "osc"));
+        o.push(("vo".into(), "null".into()));
+        o.push(("ao".into(), "null".into()));
+        o.push(("force-window".into(), "no".into()));
+    } else if let Some(handle) = wid {
+        // Embedded inside the host window: disable mpv's own OSC and window/input handling.
+        o.retain(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "osc"
+                    | "input-default-bindings"
+                    | "input-vo-keyboard"
+                    | "window-dragging"
+                    | "autofit"
+                    | "autofit-larger"
+                    | "title"
+            )
+        });
+        o.push(("osc".into(), "no".into()));
+        o.push(("input-default-bindings".into(), "no".into()));
+        o.push(("input-vo-keyboard".into(), "no".into()));
+        o.push(("input-cursor".into(), "no".into()));
+        o.push(("cursor-autohide".into(), "no".into()));
+        o.push(("window-dragging".into(), "no".into()));
+        o.push(("keepaspect".into(), "yes".into()));
+        o.push(("background-color".into(), "#000000".into()));
+        o.push(("wid".into(), handle.to_string()));
     }
     o
 }
@@ -176,10 +205,7 @@ impl Session {
         headless: bool,
         on_event: impl Fn(PlayerEvent) + Send + 'static,
     ) -> Result<Self, Error> {
-        let mut options: Vec<(String, String)> = base_options(headless)
-            .into_iter()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect();
+        let mut options = base_options(headless, opts.wid);
         // For debugging: KINO_MPV_OPTS="vo=x11;hwdec=no" overrides the defaults.
         if let Ok(extra) = std::env::var("KINO_MPV_OPTS") {
             for pair in extra.split(';') {
@@ -196,9 +222,11 @@ impl Session {
         mpv.observe("aid", 4, Format::Str)?;
         mpv.observe("sid", 5, Format::Str)?;
         mpv.observe("paused-for-cache", 6, Format::Flag)?;
-        // N (Shift+n) asks for the next episode.
-        for key in ["n", "N"] {
-            let _ = mpv.command(&["keybind", key, "script-message kino-next"]);
+        if opts.wid.is_none() {
+            // Standalone fallback window: N (Shift+n) asks for the next episode.
+            for key in ["n", "N"] {
+                let _ = mpv.command(&["keybind", key, "script-message kino-next"]);
+            }
         }
         let shared = Arc::new(Mutex::new(Shared::default()));
         let closing = Arc::new(AtomicBool::new(false));
@@ -305,6 +333,10 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         if let Some(t) = self.thread.take() {
+            // Never join the event loop thread from within itself (prevents self-join deadlock on Shutdown).
+            if t.thread().id() == std::thread::current().id() {
+                return;
+            }
             self.close();
             let _ = t.join();
         }
@@ -488,5 +520,20 @@ fn event_loop(mpv: Arc<Mpv>, shared: Arc<Mutex<Shared>>, closing: Arc<AtomicBool
                 _ => {}
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base_options;
+
+    #[test]
+    fn embedded_wid_disables_osc_and_sets_wid() {
+        let opts = base_options(false, Some(123456));
+        assert!(opts.iter().any(|(k, v)| k == "wid" && v == "123456"));
+        assert!(opts.iter().any(|(k, v)| k == "osc" && v == "no"));
+        assert!(opts.iter().any(|(k, v)| k == "input-default-bindings" && v == "no"));
+        assert!(opts.iter().any(|(k, v)| k == "window-dragging" && v == "no"));
+        assert!(!opts.iter().any(|(k, _)| k == "autofit"));
     }
 }

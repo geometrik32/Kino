@@ -325,6 +325,7 @@ fn best_per_quality(
             bitrate_approx: false,
             picked_by: Vec::new(),
             preloaded: p.is_ready_for(kind, season, episode),
+            collection: false,
         };
         let insert_at = out
             .iter()
@@ -1012,7 +1013,7 @@ pub fn Player(
                 v.set_volume(f64::from(volume()));
                 v.set_muted(muted() || auto_muted() || ui.peek().is_sync_muted());
             }
-            if cfg!(target_os = "android") {
+            if native {
                 let _ = dioxus::document::eval("document.documentElement.classList.add('native-video');");
             }
         } else {
@@ -3740,6 +3741,7 @@ pub fn Player(
                    var root = document.documentElement;
                    var inTg = root.classList.contains('tg') || !!(tg && tg.initData);
                    if (inTg && tg && typeof tg.isFullscreen === 'boolean') return !!tg.isFullscreen;
+                   if (typeof window.__kinoDesktopFs === 'boolean') return window.__kinoDesktopFs;
                    return !!(document.fullscreenElement || document.webkitFullscreenElement || (vid && vid.webkitDisplayingFullscreen));
                  };
                  var emit = function() {
@@ -3750,6 +3752,7 @@ pub fn Player(
                  document.addEventListener('webkitfullscreenchange', emit);
                  document.addEventListener('webkitbeginfullscreen', emit, true);
                  document.addEventListener('webkitendfullscreen', emit, true);
+                 window.addEventListener('kino-fs', emit);
                  var tg = window.Telegram && window.Telegram.WebApp;
                  if (tg && tg.onEvent) { tg.onEvent('fullscreenChanged', emit); }
                  emit();
@@ -3758,6 +3761,7 @@ pub fn Player(
                    document.removeEventListener('webkitfullscreenchange', emit);
                    document.removeEventListener('webkitbeginfullscreen', emit, true);
                    document.removeEventListener('webkitendfullscreen', emit, true);
+                   window.removeEventListener('kino-fs', emit);
                    if (tg && tg.offEvent) { tg.offEvent('fullscreenChanged', emit); }
                    delete window.__kinoPlayerFsStop;
                  };",
@@ -3839,7 +3843,10 @@ pub fn Player(
                         }
                         "full" => toggle_fullscreen(),
                         "esc" => {
-                            if ui.peek().menu.is_some() {
+                            if *fullscreen.peek() && cfg!(all(feature = "desktop", not(feature = "mobile"))) {
+                                toggle_fullscreen();
+                                show_controls();
+                            } else if ui.peek().menu.is_some() {
                                 ui.with_mut(|s| s.menu = None);
                                 show_controls();
                             } else {
